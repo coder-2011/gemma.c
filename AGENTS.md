@@ -2,7 +2,7 @@
 
 ## Architecture Reference
 
-`gemma4_architechture.md` is the architecture document for this project. Refer to it frequently when making design, implementation, optimization, or correctness decisions.
+`gemma4_architecture.md` is the architecture document for this project. Refer to it frequently when making design, implementation, optimization, or correctness decisions.
 
 ## Goals
 
@@ -62,6 +62,13 @@ Approximate model memory footprints:
 - Python 3.11 for scripts and reference tooling.
 - `uv` for Python environment management.
 - Latest stable PyTorch installed through `uv`.
+
+## Source Layout
+
+- Keep shared model metadata, config helpers, checkpoint loading, and CPU-side orchestration in plain C under `src/`.
+- Keep raw CUDA kernels under `src/kernels/`.
+- Use `.cu` files for GPU inference and kernel-launch code; do not put real CUDA inference work in plain `.c` files.
+- Prefer stable filenames such as `gemma4.c`, `gemma4_infer.cu`, and `kernels/gemma4_kernels.cu`; specialize behavior through config/constants rather than checkpoint-specific filenames like `gemma-4-31B.cu`.
 
 ## Scope
 
