@@ -13,7 +13,6 @@ typedef struct {
     int32_t hidden_size;
     int32_t intermediate_size;
     int32_t num_layers;
-    int32_t context_window;
     int32_t max_position_embeddings;
 
     int32_t num_query_heads;

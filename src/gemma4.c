@@ -5,7 +5,6 @@ const Gemma4DenseConfig gemma4_config = {
     .hidden_size = 5376,
     .intermediate_size = 21504,
     .num_layers = 60,
-    .context_window = 256000,
     .max_position_embeddings = 262144,
 
     .num_query_heads = 32,
