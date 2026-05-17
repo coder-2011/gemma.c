@@ -69,6 +69,8 @@ Approximate model memory footprints:
 - Keep model metadata, config helpers, checkpoint loading, CPU-side orchestration, and CUDA sources under `src/`.
 - Use `.cu` files for GPU inference and kernel-launch code; do not put real CUDA inference work in plain `.c` files.
 - Prefer stable filenames such as `gemma4.c`, `gemma4_infer.cu`, and `gemma4_kernels.cu`; specialize behavior through config/constants rather than checkpoint-specific filenames like `gemma-4-31B.cu`.
+- Keep exploratory CUDA experiments under `src/experiments/`.
+- Track experiment notes, commands, measurements, failures, and follow-up ideas in `src/experiments/EXPERIMENTS.md` before promoting an experiment into the main inference path.
 
 ## Kernel Inventory
 
