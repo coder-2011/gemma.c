@@ -71,6 +71,8 @@ Approximate model memory footprints:
 - Prefer stable filenames such as `gemma4.c`, `gemma4_infer.cu`, and `gemma4_kernels.cu`; specialize behavior through config/constants rather than checkpoint-specific filenames like `gemma-4-31B.cu`.
 - Keep exploratory CUDA experiments under `src/experiments/`.
 - Track experiment notes, commands, measurements, failures, and follow-up ideas in `src/experiments/EXPERIMENTS.md` before promoting an experiment into the main inference path.
+- Log each experiment in `src/experiments/EXPERIMENTS.md` under a dated, descriptive heading, generally formatted as `## YYYY-MM-DD - Descriptive experiment title`.
+- After the dated title, agents may write the entry in whatever structure best captures the experiment, but it should preserve enough commands, measurements, failures, and conclusions for later comparison.
 
 ## Kernel Inventory
 
