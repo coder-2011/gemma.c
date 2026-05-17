@@ -65,10 +65,26 @@ Approximate model memory footprints:
 
 ## Source Layout
 
-- Keep shared model metadata, config helpers, checkpoint loading, and CPU-side orchestration in plain C under `src/`.
-- Keep raw CUDA kernels under `src/kernels/`.
+- Keep model metadata, config helpers, checkpoint loading, CPU-side orchestration, and CUDA sources under `src/`.
 - Use `.cu` files for GPU inference and kernel-launch code; do not put real CUDA inference work in plain `.c` files.
-- Prefer stable filenames such as `gemma4.c`, `gemma4_infer.cu`, and `kernels/gemma4_kernels.cu`; specialize behavior through config/constants rather than checkpoint-specific filenames like `gemma-4-31B.cu`.
+- Prefer stable filenames such as `gemma4.c`, `gemma4_infer.cu`, and `gemma4_kernels.cu`; specialize behavior through config/constants rather than checkpoint-specific filenames like `gemma-4-31B.cu`.
+
+## Layer Pipeline Optimization
+
+Use this rough compute/memory classification when deciding what to fuse and what to leave to library GEMMs:
+
+```text
+input
+  -> residual_add + layernorm      [memory-bound, fuse candidate]
+  -> QKV matmul                    [compute-bound, leave to cuBLAS]
+  -> attention (QK^T, softmax, AV) [fuse candidate, this is FlashAttention]
+  -> projection matmul             [compute-bound, cuBLAS]
+  -> residual_add + layernorm      [memory-bound, fuse candidate]
+  -> FFN matmul                    [compute-bound, cuBLAS]
+  -> GELU                          [memory-bound, fuse into FFN output]
+  -> FFN matmul                    [compute-bound, cuBLAS]
+  -> residual_add                  [fuse with next layernorm]
+```
 
 ## Scope
 
