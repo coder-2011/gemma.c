@@ -4,4 +4,4 @@
 
 The long-term goal is a highly optimized mega-kernel inference path: start from straightforward, correct kernels, build a fast unfused implementation, then progressively fuse the hot path into a minimal set of specialized kernels.
 
-Development guidance for agents and contributors lives in `AGENTS.md`.
+Development guidance for agents lives in `AGENTS.md`.
