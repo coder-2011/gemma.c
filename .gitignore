@@ -1,3 +1,5 @@
 .env.local
+.venv/
 .agents/
 skills-lock.json
+models/
