@@ -245,9 +245,9 @@ cudaError_t gemma4_decode_gemv4_fixed4_tuned(const __nv_bfloat16 *x,
   return cudaGetLastError();
 }
 
-extern "C" cublasStatus_t gemma4_ffn_gate_up_prefill(
+static cublasStatus_t gemma4_bf16_prefill_gemm(
     cublasHandle_t handle, const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m, int k, int n,
     cudaStream_t stream) {
   if (m <= 0) {
     return CUBLAS_STATUS_SUCCESS;
@@ -264,12 +264,82 @@ extern "C" cublasStatus_t gemma4_ffn_gate_up_prefill(
   // cuBLAS is column-major. This computes the row-major result
   // Y[M, N] = X[M, K] * W[K, N] as:
   // Y^T[N, M] = W^T[N, K] * X^T[K, M].
-  return cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                      GEMMA4_PACKED_FFN_SIZE, m, GEMMA4_HIDDEN_SIZE, &alpha,
-                      w_col_major, CUDA_R_16BF, GEMMA4_HIDDEN_SIZE, x,
-                      CUDA_R_16BF, GEMMA4_HIDDEN_SIZE, &beta, y, CUDA_R_16BF,
-                      GEMMA4_PACKED_FFN_SIZE, CUBLAS_COMPUTE_32F,
+  return cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha,
+                      w_col_major, CUDA_R_16BF, k, x, CUDA_R_16BF, k, &beta,
+                      y, CUDA_R_16BF, n, CUBLAS_COMPUTE_32F,
                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+extern "C" cublasStatus_t gemma4_ffn_gate_up_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
+                                  GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE,
+                                  stream);
+}
+
+extern "C" cublasStatus_t gemma4_ffn_down_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
+                                  GEMMA4_INTERMEDIATE_SIZE,
+                                  GEMMA4_HIDDEN_SIZE, stream);
+}
+
+extern "C" cublasStatus_t gemma4_sliding_qkv_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
+                                  GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE,
+                                  stream);
+}
+
+extern "C" cublasStatus_t gemma4_sliding_o_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
+                                  GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
+                                  GEMMA4_HIDDEN_SIZE, stream);
+}
+
+extern "C" cublasStatus_t gemma4_global_q_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
+                                  GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE,
+                                  stream);
+}
+
+extern "C" cublasStatus_t gemma4_global_k_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
+                                  GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
+                                  stream);
+}
+
+extern "C" cublasStatus_t gemma4_global_o_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
+                                  GEMMA4_GLOBAL_ATTENTION_OUT_SIZE,
+                                  GEMMA4_HIDDEN_SIZE, stream);
+}
+
+extern "C" cublasStatus_t gemma4_final_logits_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
+                                  GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE,
+                                  stream);
 }
 
 extern "C" cudaError_t gemma4_ffn_gate_up_decode(const __nv_bfloat16 *x,
