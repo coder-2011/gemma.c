@@ -12,7 +12,7 @@ static constexpr int GEMMA4_WARP_SIZE = 32;
 using floatX = __nv_bfloat16;
 
 template <typename T, typename U>
-__host__ __device__ constexpr auto gemma4_div_up(T n, U d)
+__host__ __device__ constexpr auto div_up(T n, U d)
     -> decltype((n + d - 1) / d) {
   return (n + d - 1) / d;
 }
