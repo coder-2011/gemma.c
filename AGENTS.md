@@ -74,6 +74,23 @@ Approximate model memory footprints:
 - Log each experiment in `src/experiments/EXPERIMENTS.md` under a dated, descriptive heading, generally formatted as `## YYYY-MM-DD - Descriptive experiment title`.
 - After the dated title, agents may write the entry in whatever structure best captures the experiment, but it should preserve enough commands, measurements, failures, and conclusions for later comparison.
 
+## CUDA Kernel Structure
+
+- Keep load computation, index computation, and load/store logic separate throughout CUDA kernels and device helpers. This makes later fusion into larger kernels easier.
+- Do not hardcode block, thread, warp, or lane assumptions inside reusable `__device__` helpers. The caller should own the threading model.
+- Pass lane IDs, row indices, offsets, strides, and dimensions explicitly into device helpers instead of reading `threadIdx`, `blockIdx`, or assuming a fixed warp layout inside the helper.
+- Example pattern:
+
+```cpp
+__device__ inline void gather_token(
+    floatX *dst,
+    const floatX *wte,
+    int ix,
+    int token_idx,
+    int lane,
+    int C);
+```
+
 ## Kernel Inventory
 
 The first implementation target is the Gemma 4 31B dense text inference path. Vision kernels can come later; do not block the first correct unfused text path on multimodal support.
