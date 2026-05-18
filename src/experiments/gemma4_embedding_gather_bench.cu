@@ -1,70 +1,16 @@
 #include "gemma4_embedding_gather.cuh"
+#include "gemma4_bench_utils.cuh"
 #include "gemma4.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <stdexcept>
-#include <string>
 #include <vector>
 
 namespace {
-
-#define CUDA_CHECK(expr)                                                       \
-    do {                                                                       \
-        cudaError_t status = (expr);                                           \
-        if (status != cudaSuccess) {                                           \
-            throw std::runtime_error(std::string("CUDA error: ") +            \
-                                     cudaGetErrorString(status));              \
-        }                                                                      \
-    } while (0)
-
-struct TimingStats {
-    float best_ms = 0.0f;
-    float avg_ms = 0.0f;
-};
-
-template <typename Fn>
-float time_ms_once(Fn&& fn, cudaStream_t stream, int warmup, int iters) {
-    for (int i = 0; i < warmup; ++i) {
-        fn();
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    cudaEvent_t start = nullptr;
-    cudaEvent_t stop = nullptr;
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-    CUDA_CHECK(cudaEventRecord(start, stream));
-    for (int i = 0; i < iters; ++i) {
-        fn();
-    }
-    CUDA_CHECK(cudaEventRecord(stop, stream));
-    CUDA_CHECK(cudaEventSynchronize(stop));
-
-    float total_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
-    CUDA_CHECK(cudaEventDestroy(start));
-    CUDA_CHECK(cudaEventDestroy(stop));
-    return total_ms / static_cast<float>(iters);
-}
-
-template <typename Fn>
-TimingStats time_ms(Fn&& fn, cudaStream_t stream, int warmup, int iters, int trials) {
-    TimingStats stats;
-    stats.best_ms = 1.0e30f;
-    for (int i = 0; i < trials; ++i) {
-        float ms = time_ms_once(fn, stream, warmup, iters);
-        stats.best_ms = std::min(stats.best_ms, ms);
-        stats.avg_ms += ms;
-    }
-    stats.avg_ms /= static_cast<float>(trials);
-    return stats;
-}
 
 std::vector<int> token_counts_up_to(int max_tokens) {
     std::vector<int> counts;
@@ -101,7 +47,7 @@ int main(int argc, char** argv) {
     }
 
     cudaStream_t stream = nullptr;
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    GEMMA4_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
     __nv_bfloat16* d_embeddings = nullptr;
     __nv_bfloat16* d_out = nullptr;
@@ -115,19 +61,19 @@ int main(int argc, char** argv) {
     const size_t out_elems = static_cast<size_t>(max_tokens) * hidden_size;
     const size_t out_bytes = out_elems * sizeof(__nv_bfloat16);
 
-    CUDA_CHECK(cudaMalloc(&d_embeddings, embedding_bytes));
-    CUDA_CHECK(cudaMalloc(&d_out, out_bytes));
-    CUDA_CHECK(cudaMalloc(&d_token_ids, static_cast<size_t>(max_tokens) * sizeof(int32_t)));
-    CUDA_CHECK(cudaMemsetAsync(d_embeddings, 0, embedding_bytes, stream));
-    CUDA_CHECK(cudaMemsetAsync(d_out, 0, out_bytes, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    GEMMA4_CUDA_CHECK(cudaMalloc(&d_embeddings, embedding_bytes));
+    GEMMA4_CUDA_CHECK(cudaMalloc(&d_out, out_bytes));
+    GEMMA4_CUDA_CHECK(cudaMalloc(&d_token_ids, static_cast<size_t>(max_tokens) * sizeof(int32_t)));
+    GEMMA4_CUDA_CHECK(cudaMemsetAsync(d_embeddings, 0, embedding_bytes, stream));
+    GEMMA4_CUDA_CHECK(cudaMemsetAsync(d_out, 0, out_bytes, stream));
+    GEMMA4_CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<int32_t> h_token_ids(max_tokens);
 
     int device = 0;
     cudaDeviceProp prop{};
-    CUDA_CHECK(cudaGetDevice(&device));
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+    GEMMA4_CUDA_CHECK(cudaGetDevice(&device));
+    GEMMA4_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
     std::printf("device=%s\n", prop.name);
     std::printf("shape=hidden%d,vocab%d,embedding_bytes=%zu,out_max_tokens=%d\n",
@@ -137,20 +83,20 @@ int main(int argc, char** argv) {
 
     for (int token_count : token_counts_up_to(max_tokens)) {
         fill_token_ids(h_token_ids, token_count, vocab_size);
-        CUDA_CHECK(cudaMemcpyAsync(d_token_ids, h_token_ids.data(),
+        GEMMA4_CUDA_CHECK(cudaMemcpyAsync(d_token_ids, h_token_ids.data(),
                                    static_cast<size_t>(token_count) * sizeof(int32_t),
                                    cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        GEMMA4_CUDA_CHECK(cudaStreamSynchronize(stream));
 
         auto run_gather = [&]() {
-            CUDA_CHECK(gemma4_embedding_gather_bf16(
+            GEMMA4_CUDA_CHECK(gemma4_embedding_gather_bf16(
                 d_out, d_token_ids, d_embeddings, token_count, hidden_size, vocab_size, stream));
         };
 
         run_gather();
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        GEMMA4_CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        TimingStats stats = time_ms(run_gather, stream, warmup, iters, trials);
+        Gemma4TimingStats stats = gemma4_time_ms(run_gather, stream, warmup, iters, trials);
         const double moved_bytes =
             2.0 * static_cast<double>(token_count) * hidden_size * sizeof(__nv_bfloat16);
         const double moved_gib = moved_bytes / (1024.0 * 1024.0 * 1024.0);
@@ -162,9 +108,9 @@ int main(int argc, char** argv) {
                     token_count, stats.best_ms, stats.avg_ms, best_gib_s, avg_gib_s, moved_mib);
     }
 
-    CUDA_CHECK(cudaFree(d_embeddings));
-    CUDA_CHECK(cudaFree(d_out));
-    CUDA_CHECK(cudaFree(d_token_ids));
-    CUDA_CHECK(cudaStreamDestroy(stream));
+    GEMMA4_CUDA_CHECK(cudaFree(d_embeddings));
+    GEMMA4_CUDA_CHECK(cudaFree(d_out));
+    GEMMA4_CUDA_CHECK(cudaFree(d_token_ids));
+    GEMMA4_CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;
 }
