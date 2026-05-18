@@ -87,6 +87,84 @@ TimingStats time_ms(Fn &&fn, cudaStream_t stream, int warmup, int iters,
   return stats;
 }
 
+template <typename Fn>
+float time_ms_graph_once(Fn &&fn, cudaStream_t stream, int warmup, int iters) {
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t graph_exec = nullptr;
+  bool capturing = false;
+
+  try {
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    capturing = true;
+    for (int i = 0; i < iters; ++i) {
+      fn();
+    }
+    CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+    capturing = false;
+
+    CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+    for (int i = 0; i < warmup; ++i) {
+      CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    CUDA_CHECK(cudaEventRecord(start, stream));
+    CUDA_CHECK(cudaGraphLaunch(graph_exec, stream));
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float total_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+    CUDA_CHECK(cudaGraphExecDestroy(graph_exec));
+    CUDA_CHECK(cudaGraphDestroy(graph));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    return total_ms / static_cast<float>(iters);
+  } catch (...) {
+    if (capturing) {
+      cudaGraph_t failed_graph = nullptr;
+      cudaStreamEndCapture(stream, &failed_graph);
+      if (failed_graph != nullptr) {
+        cudaGraphDestroy(failed_graph);
+      }
+    }
+    if (graph_exec != nullptr) {
+      cudaGraphExecDestroy(graph_exec);
+    }
+    if (graph != nullptr) {
+      cudaGraphDestroy(graph);
+    }
+    if (start != nullptr) {
+      cudaEventDestroy(start);
+    }
+    if (stop != nullptr) {
+      cudaEventDestroy(stop);
+    }
+    throw;
+  }
+}
+
+template <typename Fn>
+TimingStats time_ms_graph(Fn &&fn, cudaStream_t stream, int warmup, int iters,
+                          int trials) {
+  TimingStats stats;
+  stats.best_ms = 1.0e30f;
+  for (int i = 0; i < trials; ++i) {
+    const float ms = time_ms_graph_once(fn, stream, warmup, iters);
+    stats.best_ms = std::min(stats.best_ms, ms);
+    stats.avg_ms += ms;
+  }
+  stats.avg_ms /= static_cast<float>(trials);
+  return stats;
+}
+
 inline DiffStats diff_stats_bf16(const __nv_bfloat16 *lhs,
                                  const __nv_bfloat16 *rhs, int count) {
   std::vector<__nv_bfloat16> h_lhs(count);

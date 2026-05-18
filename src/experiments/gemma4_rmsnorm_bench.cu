@@ -264,7 +264,7 @@ int main(int argc, char **argv) {
               "not_compiled"
 #endif
   );
-  std::printf("rows,rms_ms,rms_gib_s,cudnn_ms,cudnn_gib_s,cudnn_max_abs,cudnn_rstd_max_abs,residual_ms,fused_ms,split_ms,fused_vs_split\n");
+  std::printf("rows,rms_ms,rms_gib_s,rms_graph_ms,rms_graph_gib_s,cudnn_ms,cudnn_gib_s,cudnn_graph_ms,cudnn_graph_gib_s,cudnn_max_abs,cudnn_rstd_max_abs,residual_ms,fused_ms,split_ms,fused_vs_split\n");
 
   for (int rows : row_counts_up_to(max_rows)) {
     const int count = rows * width;
@@ -315,8 +315,23 @@ int main(int argc, char **argv) {
     TimingStats split_stats =
         time_ms(run_split, stream, warmup, iters, trials);
 
+    float rms_graph_ms = -1.0f;
+    double rms_graph_gib_s = 0.0;
+    try {
+      TimingStats rms_graph_stats =
+          time_ms_graph(run_rms, stream, warmup, iters, trials);
+      rms_graph_ms = rms_graph_stats.best_ms;
+      rms_graph_gib_s = gib_per_second(rms_bytes, rms_graph_ms);
+    } catch (const std::exception &e) {
+      std::fprintf(stderr,
+                   "custom RMSNorm CUDA graph timing unavailable for rows=%d: %s\n",
+                   rows, e.what());
+    }
+
     float cudnn_ms = -1.0f;
     double cudnn_gib_s = 0.0;
+    float cudnn_graph_ms = -1.0f;
+    double cudnn_graph_gib_s = 0.0;
     float cudnn_max_abs = -1.0f;
     float cudnn_rstd_max_abs = -1.0f;
 
@@ -332,6 +347,17 @@ int main(int argc, char **argv) {
           time_ms(run_cudnn, stream, warmup, iters, trials);
       cudnn_ms = cudnn_stats.best_ms;
       cudnn_gib_s = gib_per_second(rms_bytes, cudnn_ms);
+
+      try {
+        TimingStats cudnn_graph_stats =
+            time_ms_graph(run_cudnn, stream, warmup, iters, trials);
+        cudnn_graph_ms = cudnn_graph_stats.best_ms;
+        cudnn_graph_gib_s = gib_per_second(rms_bytes, cudnn_graph_ms);
+      } catch (const std::exception &e) {
+        std::fprintf(stderr,
+                     "cuDNN RMSNorm CUDA graph timing unavailable for rows=%d: %s\n",
+                     rows, e.what());
+      }
 
       DiffStats out_diff =
           diff_stats_bf16(d_rms_out, d_rms_cudnn_out, count);
@@ -356,10 +382,11 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    std::printf("%d,%.6f,%.3f,%.6f,%.3f,%.6g,%.6g,%.6f,%.6f,%.6f,%.3f\n",
+    std::printf("%d,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6g,%.6g,%.6f,%.6f,%.6f,%.3f\n",
                 rows, rms_stats.best_ms,
-                gib_per_second(rms_bytes, rms_stats.best_ms), cudnn_ms,
-                cudnn_gib_s, cudnn_max_abs, cudnn_rstd_max_abs,
+                gib_per_second(rms_bytes, rms_stats.best_ms), rms_graph_ms,
+                rms_graph_gib_s, cudnn_ms, cudnn_gib_s, cudnn_graph_ms,
+                cudnn_graph_gib_s, cudnn_max_abs, cudnn_rstd_max_abs,
                 residual_stats.best_ms, fused_stats.best_ms,
                 split_stats.best_ms, split_stats.best_ms / fused_stats.best_ms);
   }
