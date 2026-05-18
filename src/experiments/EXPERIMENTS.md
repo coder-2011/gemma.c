@@ -701,3 +701,45 @@ Full smoke observations:
 CUDA guide note:
 
 - `$cuda-programming-guide` was queried for BF16 support. The local guide states that `__nv_bfloat16` is available through `<cuda_bf16.h>` and requires compute capability 8.0 or higher, and that BF16 WMMA/Tensor Core paths support BF16 inputs with FP32 accumulation.
+
+## 2026-05-18 - Matmul prefill wrapper benchmark coverage
+
+Runtime file: `src/gemma4_matmul_kernels.cu`
+
+Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+
+Change:
+
+- Validated the existing cuBLAS BF16 prefill wrappers for the same fixed dense projection shapes that already have decode entry points:
+  - `ffn_gate_up`: `K=5376, N=43008`
+  - `ffn_down`: `K=21504, N=5376`
+  - `sliding_qkv`: `K=5376, N=16384`
+  - `sliding_o`: `K=8192, N=5376`
+  - `global_q`: `K=5376, N=16384`
+  - `global_k`: `K=5376, N=2048`
+  - `global_o`: `K=16384, N=5376`
+  - `final_logits`: `K=5376, N=262144`
+- All wrappers share one helper that computes row-major `Y[M, N] = X[M, K] * W[K, N]` through cuBLAS as column-major `Y^T[N, M] = W^T[N, K] * X^T[K, M]`.
+- Extended `gemma4_decode_bench` so each op also calls its prefill wrapper with `M=1`. This keeps the benchmark decode-focused while still validating that the prefill wrapper table links and produces the same BF16-scale output as the existing cuBLAS references.
+
+Build:
+
+```bash
+make decode-bench cuda-kernels
+```
+
+Smoke validation:
+
+```bash
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 1 0 1
+```
+
+Result:
+
+- Completed all eight projection shapes.
+- Every `cublas_bf16_prefill_m1_*_diff` line matched the same BF16-scale behavior as the existing GEMV/GEMM references.
+- This was a one-iteration smoke pass, not a tuning run. Do not use the timings for performance conclusions.
+
+CUDA guide note:
+
+- `$cuda-programming-guide` was queried for the relevant CUDA-X/cuBLAS and matrix-layout context. The guide recommends using CUDA-X libraries such as cuBLAS for Tensor Core acceleration on supported hardware, and its memory-layout examples define column-major leading dimension as the number of rows.
