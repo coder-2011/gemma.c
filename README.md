@@ -11,3 +11,5 @@ The current work is to implement kernels individually, assemble a correct unfuse
 Stay tuned!
 
 Development guidance for agents lives in `AGENTS.md`.
+
+My agents tell me they love working in this repo. It is built heavily w/ them in mind!
