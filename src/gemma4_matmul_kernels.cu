@@ -101,7 +101,7 @@ gemma4_decode_gemv_fixed4_kernel(const __nv_bfloat16 *__restrict__ x,
                 "fixed decode GEMV thread count must be whole warps");
 
   constexpr int warps = div_up(Threads, WARP_SIZE);
-  __shared__ float warp_sums[warps][4];
+  __shared__ float warp_sums[4][warps];
 
   const int col0 = blockIdx.x * 4;
   const int lane = threadIdx.x & (WARP_SIZE - 1);
@@ -123,17 +123,17 @@ gemma4_decode_gemv_fixed4_kernel(const __nv_bfloat16 *__restrict__ x,
   }
 
   if (lane == 0) {
-    warp_sums[warp][0] = sum0;
-    warp_sums[warp][1] = sum1;
-    warp_sums[warp][2] = sum2;
-    warp_sums[warp][3] = sum3;
+    warp_sums[0][warp] = sum0;
+    warp_sums[1][warp] = sum1;
+    warp_sums[2][warp] = sum2;
+    warp_sums[3][warp] = sum3;
   }
   __syncthreads();
 
-  sum0 = threadIdx.x < warp_count ? warp_sums[lane][0] : 0.0f;
-  sum1 = threadIdx.x < warp_count ? warp_sums[lane][1] : 0.0f;
-  sum2 = threadIdx.x < warp_count ? warp_sums[lane][2] : 0.0f;
-  sum3 = threadIdx.x < warp_count ? warp_sums[lane][3] : 0.0f;
+  sum0 = threadIdx.x < warp_count ? warp_sums[0][lane] : 0.0f;
+  sum1 = threadIdx.x < warp_count ? warp_sums[1][lane] : 0.0f;
+  sum2 = threadIdx.x < warp_count ? warp_sums[2][lane] : 0.0f;
+  sum3 = threadIdx.x < warp_count ? warp_sums[3][lane] : 0.0f;
 
   if (warp == 0) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
@@ -191,7 +191,7 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
 
   constexpr int warps =
       div_up(kGemma4DecodeThreads, WARP_SIZE);
-  __shared__ float warp_sums[warps][ColsPerBlock];
+  __shared__ float warp_sums[ColsPerBlock][warps];
 
   const int col0 = blockIdx.x * ColsPerBlock;
   const int lane = threadIdx.x & (WARP_SIZE - 1);
@@ -212,14 +212,14 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   if (lane == 0) {
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      warp_sums[warp][col] = sums[col];
+      warp_sums[col][warp] = sums[col];
     }
   }
   __syncthreads();
 
 #pragma unroll
   for (int col = 0; col < ColsPerBlock; ++col) {
-    sums[col] = threadIdx.x < warp_count ? warp_sums[lane][col] : 0.0f;
+    sums[col] = threadIdx.x < warp_count ? warp_sums[col][lane] : 0.0f;
   }
 
   if (warp == 0) {
