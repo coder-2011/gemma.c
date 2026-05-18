@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 
-static constexpr int GEMMA4_WARP_SIZE = 32;
+static constexpr int WARP_SIZE = 32;
 
 using floatX = __nv_bfloat16;
 
@@ -17,7 +17,7 @@ __host__ __device__ constexpr auto div_up(T n, U d)
   return (n + d - 1) / d;
 }
 
-inline bool gemma4_is_aligned_16(const void *ptr) {
+inline bool is_aligned_16(const void *ptr) {
   return (reinterpret_cast<uintptr_t>(ptr) & 0xfu) == 0;
 }
 
@@ -50,26 +50,33 @@ struct alignas(16) Packed128 {
 
 template <typename ElementType>
 __device__ __forceinline__ Packed128<ElementType>
-gemma4_load128(const ElementType *address) {
+load128(const ElementType *address) {
   return Packed128<ElementType>{*reinterpret_cast<const int4 *>(address)};
 }
 
 template <typename ElementType>
 __device__ __forceinline__ Packed128<ElementType>
-gemma4_load128cs(const ElementType *address) {
+load128cs(const ElementType *address) {
   return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4 *>(address))};
 }
 
 template <typename ElementType>
-__device__ __forceinline__ void gemma4_store128(
+__device__ __forceinline__ void store128(
     ElementType *address, Packed128<ElementType> value) {
   *reinterpret_cast<int4 *>(address) = value.bits();
 }
 
 template <typename ElementType>
-__device__ __forceinline__ void gemma4_store128cs(
+__device__ __forceinline__ void store128cs(
     ElementType *address, Packed128<ElementType> value) {
   __stcs(reinterpret_cast<int4 *>(address), value.bits());
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float value) {
+  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+    value += __shfl_xor_sync(0xffffffffu, value, offset);
+  }
+  return value;
 }
 
 #endif

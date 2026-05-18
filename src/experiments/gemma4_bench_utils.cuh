@@ -11,8 +11,8 @@
 #include <string>
 #include <vector>
 
-inline void gemma4_cuda_check(cudaError_t status, const char *expr,
-                              const char *file, int line) {
+inline void cuda_check(cudaError_t status, const char *expr, const char *file,
+                       int line) {
   if (status != cudaSuccess) {
     throw std::runtime_error(std::string(file) + ":" +
                              std::to_string(line) +
@@ -21,11 +21,11 @@ inline void gemma4_cuda_check(cudaError_t status, const char *expr,
   }
 }
 
-#define GEMMA4_CUDA_CHECK(expr)                                                \
-  gemma4_cuda_check((expr), #expr, __FILE__, __LINE__)
+#define CUDA_CHECK(expr)                                                        \
+  cuda_check((expr), #expr, __FILE__, __LINE__)
 
-inline void gemma4_cublas_check(cublasStatus_t status, const char *expr,
-                                const char *file, int line) {
+inline void cublas_check(cublasStatus_t status, const char *expr,
+                         const char *file, int line) {
   if (status != CUBLAS_STATUS_SUCCESS) {
     throw std::runtime_error(std::string(file) + ":" +
                              std::to_string(line) +
@@ -34,52 +34,52 @@ inline void gemma4_cublas_check(cublasStatus_t status, const char *expr,
   }
 }
 
-#define GEMMA4_CUBLAS_CHECK(expr)                                              \
-  gemma4_cublas_check((expr), #expr, __FILE__, __LINE__)
+#define CUBLAS_CHECK(expr)                                                      \
+  cublas_check((expr), #expr, __FILE__, __LINE__)
 
-struct Gemma4TimingStats {
+struct TimingStats {
   float best_ms = 0.0f;
   float avg_ms = 0.0f;
 };
 
-struct Gemma4DiffStats {
+struct DiffStats {
   float max_abs = 0.0f;
   float mean_abs = 0.0f;
   float max_rel = 0.0f;
 };
 
 template <typename Fn>
-float gemma4_time_ms_once(Fn &&fn, cudaStream_t stream, int warmup, int iters) {
+float time_ms_once(Fn &&fn, cudaStream_t stream, int warmup, int iters) {
   for (int i = 0; i < warmup; ++i) {
     fn();
   }
-  GEMMA4_CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
-  GEMMA4_CUDA_CHECK(cudaEventCreate(&start));
-  GEMMA4_CUDA_CHECK(cudaEventCreate(&stop));
-  GEMMA4_CUDA_CHECK(cudaEventRecord(start, stream));
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventRecord(start, stream));
   for (int i = 0; i < iters; ++i) {
     fn();
   }
-  GEMMA4_CUDA_CHECK(cudaEventRecord(stop, stream));
-  GEMMA4_CUDA_CHECK(cudaEventSynchronize(stop));
+  CUDA_CHECK(cudaEventRecord(stop, stream));
+  CUDA_CHECK(cudaEventSynchronize(stop));
 
   float total_ms = 0.0f;
-  GEMMA4_CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
-  GEMMA4_CUDA_CHECK(cudaEventDestroy(start));
-  GEMMA4_CUDA_CHECK(cudaEventDestroy(stop));
+  CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
   return total_ms / static_cast<float>(iters);
 }
 
 template <typename Fn>
-Gemma4TimingStats gemma4_time_ms(Fn &&fn, cudaStream_t stream, int warmup,
-                                 int iters, int trials) {
-  Gemma4TimingStats stats;
+TimingStats time_ms(Fn &&fn, cudaStream_t stream, int warmup, int iters,
+                    int trials) {
+  TimingStats stats;
   stats.best_ms = 1.0e30f;
   for (int i = 0; i < trials; ++i) {
-    const float ms = gemma4_time_ms_once(fn, stream, warmup, iters);
+    const float ms = time_ms_once(fn, stream, warmup, iters);
     stats.best_ms = std::min(stats.best_ms, ms);
     stats.avg_ms += ms;
   }
@@ -87,19 +87,16 @@ Gemma4TimingStats gemma4_time_ms(Fn &&fn, cudaStream_t stream, int warmup,
   return stats;
 }
 
-inline Gemma4DiffStats gemma4_diff_stats_bf16(const __nv_bfloat16 *lhs,
-                                              const __nv_bfloat16 *rhs,
-                                              int count) {
+inline DiffStats diff_stats_bf16(const __nv_bfloat16 *lhs,
+                                 const __nv_bfloat16 *rhs, int count) {
   std::vector<__nv_bfloat16> h_lhs(count);
   std::vector<__nv_bfloat16> h_rhs(count);
-  GEMMA4_CUDA_CHECK(cudaMemcpy(h_lhs.data(), lhs,
-                               count * sizeof(__nv_bfloat16),
-                               cudaMemcpyDeviceToHost));
-  GEMMA4_CUDA_CHECK(cudaMemcpy(h_rhs.data(), rhs,
-                               count * sizeof(__nv_bfloat16),
-                               cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_lhs.data(), lhs, count * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_rhs.data(), rhs, count * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost));
 
-  Gemma4DiffStats stats;
+  DiffStats stats;
   double sum_abs = 0.0;
   for (int i = 0; i < count; ++i) {
     const float a = __bfloat162float(h_lhs[i]);

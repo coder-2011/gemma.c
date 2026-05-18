@@ -12,7 +12,7 @@
 static constexpr int kGemma4DecodeThreads = 256;
 static constexpr int kGemma4DecodeColsPerBlock = 4;
 static constexpr int kGemma4DecodeMinBlocksPerSM = 2;
-static_assert((kGemma4DecodeThreads % GEMMA4_WARP_SIZE) == 0,
+static_assert((kGemma4DecodeThreads % WARP_SIZE) == 0,
               "decode thread count must be a whole number of warps");
 
 using Gemma4Bf16Pack = Packed128<__nv_bfloat16>;
@@ -59,7 +59,7 @@ __device__ __forceinline__ void gemma4_decode_gemv_fixed4_dot_device(
     float &sum0, float &sum1, float &sum2, float &sum3) {
   static_assert((K % kGemma4Bf16PerPack) == 0,
                 "decode GEMV K must be divisible by Packed128 bf16 width");
-  static_assert((Threads % GEMMA4_WARP_SIZE) == 0,
+  static_assert((Threads % WARP_SIZE) == 0,
                 "decode thread count must be a whole number of warps");
 
   sum0 = 0.0f;
@@ -77,11 +77,11 @@ __device__ __forceinline__ void gemma4_decode_gemv_fixed4_dot_device(
   for (int pack_idx = thread_idx; pack_idx < packs_per_col;
        pack_idx += Threads) {
     const int element_idx = pack_idx * kGemma4Bf16PerPack;
-    const Gemma4Bf16Pack x_pack = gemma4_load128(x + element_idx);
-    const Gemma4Bf16Pack w_pack0 = gemma4_load128cs(w_col0 + element_idx);
-    const Gemma4Bf16Pack w_pack1 = gemma4_load128cs(w_col1 + element_idx);
-    const Gemma4Bf16Pack w_pack2 = gemma4_load128cs(w_col2 + element_idx);
-    const Gemma4Bf16Pack w_pack3 = gemma4_load128cs(w_col3 + element_idx);
+    const Gemma4Bf16Pack x_pack = load128(x + element_idx);
+    const Gemma4Bf16Pack w_pack0 = load128cs(w_col0 + element_idx);
+    const Gemma4Bf16Pack w_pack1 = load128cs(w_col1 + element_idx);
+    const Gemma4Bf16Pack w_pack2 = load128cs(w_col2 + element_idx);
+    const Gemma4Bf16Pack w_pack3 = load128cs(w_col3 + element_idx);
 
     gemma4_accumulate_bf16_pack(x_pack, w_pack0, sum0);
     gemma4_accumulate_bf16_pack(x_pack, w_pack1, sum1);
@@ -97,16 +97,16 @@ gemma4_decode_gemv_fixed4_kernel(const __nv_bfloat16 *__restrict__ x,
                                  __nv_bfloat16 *__restrict__ y) {
   static_assert((N % 4) == 0,
                 "fixed decode GEMV N must be divisible by four columns");
-  static_assert((Threads % GEMMA4_WARP_SIZE) == 0,
+  static_assert((Threads % WARP_SIZE) == 0,
                 "fixed decode GEMV thread count must be whole warps");
 
-  constexpr int warps = div_up(Threads, GEMMA4_WARP_SIZE);
+  constexpr int warps = div_up(Threads, WARP_SIZE);
   __shared__ float warp_sums[warps][4];
 
   const int col0 = blockIdx.x * 4;
-  const int lane = threadIdx.x & (GEMMA4_WARP_SIZE - 1);
-  const int warp = threadIdx.x / GEMMA4_WARP_SIZE;
-  const int warp_count = div_up(blockDim.x, GEMMA4_WARP_SIZE);
+  const int lane = threadIdx.x & (WARP_SIZE - 1);
+  const int warp = threadIdx.x / WARP_SIZE;
+  const int warp_count = div_up(blockDim.x, WARP_SIZE);
 
   float sum0;
   float sum1;
@@ -115,7 +115,7 @@ gemma4_decode_gemv_fixed4_kernel(const __nv_bfloat16 *__restrict__ x,
   gemma4_decode_gemv_fixed4_dot_device<K, Threads>(
       x, w_col_major, col0, threadIdx.x, sum0, sum1, sum2, sum3);
 
-  for (int offset = GEMMA4_WARP_SIZE / 2; offset > 0; offset >>= 1) {
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
     sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
     sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
     sum2 += __shfl_down_sync(0xffffffffu, sum2, offset);
@@ -136,7 +136,7 @@ gemma4_decode_gemv_fixed4_kernel(const __nv_bfloat16 *__restrict__ x,
   sum3 = threadIdx.x < warp_count ? warp_sums[lane][3] : 0.0f;
 
   if (warp == 0) {
-    for (int offset = GEMMA4_WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
       sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
       sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
       sum2 += __shfl_down_sync(0xffffffffu, sum2, offset);
@@ -156,7 +156,7 @@ __device__ __forceinline__ void gemma4_decode_gemv_cols_dot_device(
     float (&sums)[ColsPerBlock]) {
   static_assert((K % kGemma4Bf16PerPack) == 0,
                 "decode GEMV K must be divisible by Packed128 bf16 width");
-  static_assert((Threads % GEMMA4_WARP_SIZE) == 0,
+  static_assert((Threads % WARP_SIZE) == 0,
                 "decode thread count must be a whole number of warps");
 
 #pragma unroll
@@ -170,11 +170,11 @@ __device__ __forceinline__ void gemma4_decode_gemv_cols_dot_device(
   for (int pack_idx = thread_idx; pack_idx < packs_per_col;
        pack_idx += Threads) {
     const int element_idx = pack_idx * kGemma4Bf16PerPack;
-    const Gemma4Bf16Pack x_pack = gemma4_load128(x + element_idx);
+    const Gemma4Bf16Pack x_pack = load128(x + element_idx);
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
       const Gemma4Bf16Pack w_pack =
-          gemma4_load128cs(w_col_major + (col0 + col) * K + element_idx);
+          load128cs(w_col_major + (col0 + col) * K + element_idx);
       gemma4_accumulate_bf16_pack(x_pack, w_pack, sums[col]);
     }
   }
@@ -190,19 +190,19 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
                 "decode GEMV N must be divisible by columns per block");
 
   constexpr int warps =
-      div_up(kGemma4DecodeThreads, GEMMA4_WARP_SIZE);
+      div_up(kGemma4DecodeThreads, WARP_SIZE);
   __shared__ float warp_sums[warps][ColsPerBlock];
 
   const int col0 = blockIdx.x * ColsPerBlock;
-  const int lane = threadIdx.x & (GEMMA4_WARP_SIZE - 1);
-  const int warp = threadIdx.x / GEMMA4_WARP_SIZE;
-  const int warp_count = div_up(blockDim.x, GEMMA4_WARP_SIZE);
+  const int lane = threadIdx.x & (WARP_SIZE - 1);
+  const int warp = threadIdx.x / WARP_SIZE;
+  const int warp_count = div_up(blockDim.x, WARP_SIZE);
 
   float sums[ColsPerBlock];
   gemma4_decode_gemv_cols_dot_device<K, ColsPerBlock, kGemma4DecodeThreads>(
       x, w_col_major, col0, threadIdx.x, sums);
 
-  for (int offset = GEMMA4_WARP_SIZE / 2; offset > 0; offset >>= 1) {
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
       sums[col] += __shfl_down_sync(0xffffffffu, sums[col], offset);
@@ -223,7 +223,7 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   }
 
   if (warp == 0) {
-    for (int offset = GEMMA4_WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
 #pragma unroll
       for (int col = 0; col < ColsPerBlock; ++col) {
         sums[col] += __shfl_down_sync(0xffffffffu, sums[col], offset);

@@ -89,16 +89,16 @@ static void fill_random_bf16(__nv_bfloat16 *ptr, size_t count, uint64_t seed,
   const int blocks = int((count + threads - 1) / threads);
   gemma4_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(ptr, count,
                                                                  seed, scale);
-  GEMMA4_CUDA_CHECK(cudaGetLastError());
+  CUDA_CHECK(cudaGetLastError());
 }
 
 struct CublasDecode {
   cublasHandle_t handle = nullptr;
 
   explicit CublasDecode(cudaStream_t stream) {
-    GEMMA4_CUBLAS_CHECK(cublasCreate(&handle));
-    GEMMA4_CUBLAS_CHECK(cublasSetStream(handle, stream));
-    GEMMA4_CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
   }
 
   ~CublasDecode() {
@@ -111,7 +111,7 @@ struct CublasDecode {
             __nv_bfloat16 *y, int k, int n) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    GEMMA4_CUBLAS_CHECK(cublasTSTgemvStridedBatched(
+    CUBLAS_CHECK(cublasTSTgemvStridedBatched(
         handle, CUBLAS_OP_T, k, n, &alpha, w_col_major, k, 0, x, 1, 0, &beta,
         y, 1, 0, 1));
   }
@@ -120,7 +120,7 @@ struct CublasDecode {
                __nv_bfloat16 *y, int k, int n) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    GEMMA4_CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, 1, k,
+    CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, 1, k,
                               &alpha, w_col_major, CUDA_R_16BF, k, x,
                               CUDA_R_16BF, k, &beta, y, CUDA_R_16BF, n,
                               CUBLAS_COMPUTE_32F,
@@ -144,11 +144,11 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   const size_t w_count = size_t(op.n) * size_t(op.k);
   const size_t y_count = size_t(op.n);
 
-  GEMMA4_CUDA_CHECK(cudaMalloc(&x, x_count * sizeof(__nv_bfloat16)));
-  GEMMA4_CUDA_CHECK(cudaMalloc(&w, w_count * sizeof(__nv_bfloat16)));
-  GEMMA4_CUDA_CHECK(cudaMalloc(&custom_y, y_count * sizeof(__nv_bfloat16)));
-  GEMMA4_CUDA_CHECK(cudaMalloc(&gemv_y, y_count * sizeof(__nv_bfloat16)));
-  GEMMA4_CUDA_CHECK(cudaMalloc(&gemm_y, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&x, x_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&w, w_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&custom_y, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&gemv_y, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&gemm_y, y_count * sizeof(__nv_bfloat16)));
 
   const uint64_t x_seed = base_seed ^ (uint64_t(op.k) << 32) ^ uint64_t(op.n);
   const uint64_t w_seed =
@@ -158,26 +158,26 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   constexpr float kWeightScale = 0.5f;
   fill_random_bf16(x, x_count, x_seed, kInputScale, stream);
   fill_random_bf16(w, w_count, w_seed, kWeightScale, stream);
-  GEMMA4_CUDA_CHECK(cudaMemsetAsync(custom_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  GEMMA4_CUDA_CHECK(cudaMemsetAsync(gemv_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  GEMMA4_CUDA_CHECK(cudaMemsetAsync(gemm_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  GEMMA4_CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaMemsetAsync(custom_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+  CUDA_CHECK(cudaMemsetAsync(gemv_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+  CUDA_CHECK(cudaMemsetAsync(gemm_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  auto run_custom = [&]() { GEMMA4_CUDA_CHECK(op.launch(x, w, custom_y, stream)); };
+  auto run_custom = [&]() { CUDA_CHECK(op.launch(x, w, custom_y, stream)); };
   auto run_gemv = [&]() { cublas.gemv(x, w, gemv_y, op.k, op.n); };
   auto run_gemm = [&]() { cublas.gemm_m1(x, w, gemm_y, op.k, op.n); };
 
   run_custom();
   run_gemv();
   run_gemm();
-  GEMMA4_CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  const Gemma4DiffStats gemv_diff = gemma4_diff_stats_bf16(custom_y, gemv_y, op.n);
-  const Gemma4DiffStats gemm_diff = gemma4_diff_stats_bf16(custom_y, gemm_y, op.n);
+  const DiffStats gemv_diff = diff_stats_bf16(custom_y, gemv_y, op.n);
+  const DiffStats gemm_diff = diff_stats_bf16(custom_y, gemm_y, op.n);
 
-  const Gemma4TimingStats custom = gemma4_time_ms(run_custom, stream, warmup, iters, trials);
-  const Gemma4TimingStats gemv = gemma4_time_ms(run_gemv, stream, warmup, iters, trials);
-  const Gemma4TimingStats gemm = gemma4_time_ms(run_gemm, stream, warmup, iters, trials);
+  const TimingStats custom = time_ms(run_custom, stream, warmup, iters, trials);
+  const TimingStats gemv = time_ms(run_gemv, stream, warmup, iters, trials);
+  const TimingStats gemm = time_ms(run_gemm, stream, warmup, iters, trials);
   const double bytes = double(op.n) * double(op.k) * sizeof(__nv_bfloat16);
   const double per_token_gb = bytes * double(op.layers_per_token) / 1.0e9;
 
@@ -202,11 +202,11 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   std::printf("cublas_bf16_gemm_m1_max_abs_diff=%.6g,cublas_bf16_gemm_m1_mean_abs_diff=%.6g,cublas_bf16_gemm_m1_max_rel_diff=%.6g\n\n",
               gemm_diff.max_abs, gemm_diff.mean_abs, gemm_diff.max_rel);
 
-  GEMMA4_CUDA_CHECK(cudaFree(x));
-  GEMMA4_CUDA_CHECK(cudaFree(w));
-  GEMMA4_CUDA_CHECK(cudaFree(custom_y));
-  GEMMA4_CUDA_CHECK(cudaFree(gemv_y));
-  GEMMA4_CUDA_CHECK(cudaFree(gemm_y));
+  CUDA_CHECK(cudaFree(x));
+  CUDA_CHECK(cudaFree(w));
+  CUDA_CHECK(cudaFree(custom_y));
+  CUDA_CHECK(cudaFree(gemv_y));
+  CUDA_CHECK(cudaFree(gemm_y));
 }
 
 int main(int argc, char **argv) {
@@ -221,7 +221,7 @@ int main(int argc, char **argv) {
   const int trials = argc > trials_arg ? std::atoi(argv[trials_arg]) : 2;
 
   cudaStream_t stream = nullptr;
-  GEMMA4_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   CublasDecode cublas(stream);
   const uint64_t seed = make_seed();
 
@@ -244,6 +244,6 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  GEMMA4_CUDA_CHECK(cudaStreamDestroy(stream));
+  CUDA_CHECK(cudaStreamDestroy(stream));
   return 0;
 }
