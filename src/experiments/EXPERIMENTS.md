@@ -788,3 +788,89 @@ Interpretation:
 CUDA guide notes:
 
 - `$cuda-programming-guide` was queried for coalesced global memory, L2 streaming/persisting cache policy, `#pragma unroll`, low-level load functions, and `__restrict__` optimizer behavior. Relevant local guide pages included 60-61, 352-354, 519, 562, and 566.
+
+## 2026-05-18 - RMSNorm and fused residual RMSNorm from llm.c layernorm
+
+Runtime files:
+
+- `src/gemma4_rmsnorm.cu`
+- `src/gemma4_rmsnorm.cuh`
+- `tests/test_rmsnorm.cu`
+- `src/experiments/gemma4_rmsnorm_bench.cu`
+
+Reason:
+
+- The next documented baseline kernel after embedding gather is RMSNorm width `5376`.
+- The first useful fusion target is the llm.c-style residual add plus normalization pattern.
+- Gemma uses RMSNorm rather than LayerNorm, so the llm.c structure was kept while changing the math to remove mean subtraction and bias.
+
+Implementation:
+
+- Started by copying `llm.c/llmc/layernorm.cuh` to `src/gemma4_rmsnorm.cu`, then reduced it to inference-only forward kernels.
+- Standalone RMSNorm computes `x * rsqrt(mean(x*x) + eps) * weight`.
+- Fused residual RMSNorm writes the BF16 residual and normalizes that rounded residual value, matching the standalone `residual_add` followed by `rmsnorm` path.
+- Kept the llm.c execution structure:
+  - one warp owns one row;
+  - fallback warp kernels do not require dynamic shared memory;
+  - fast kernels cache the shared weight vector and one row per warp in dynamic shared memory;
+  - launcher falls back when opt-in dynamic shared memory is not available.
+- Added standalone `gemma4_residual_add_bf16` because the fused path needs a direct split baseline.
+- Added a cuDNN frontend comparison path in `gemma4_rmsnorm_bench.cu` using `graph.rmsnorm` when `cudnn_frontend.h` is available. The default include path is `/tmp/cudnn-frontend/include`.
+
+Research notes:
+
+- PyTorch RMSNorm docs and the RMSNorm paper use the same core method: normalize by root mean square of the last dimension and apply a learned scale.
+- The installed cuDNN 9 headers expose `CUDNN_RMS_NORM` and document backend norm forward support for both training and inference.
+- NVIDIA's `cudnn-frontend` sample `samples/cpp/norm/rmsnorm.cpp` shows the C++ graph frontend path used by the benchmark.
+- `$cuda-programming-guide` was queried for cuDNN/frontend benchmarking context, but the local guide mostly returned CUDA Graph sections rather than cuDNN norm guidance. The useful cuDNN evidence came from installed headers and NVIDIA frontend samples.
+- `$exa-search` was attempted, but `EXA_API_KEY` was not visible in the tool environment. Browser search and the cloned NVIDIA `cudnn-frontend` repo were used instead.
+
+Build and correctness:
+
+```bash
+make test-rmsnorm
+make rmsnorm-bench
+make cuda-kernels test-embedding-gather test-rmsnorm
+```
+
+Results:
+
+- `rmsnorm tests passed`
+- `embedding gather tests passed`
+
+Primary benchmark command:
+
+```bash
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 50 10 3 4096
+```
+
+Representative `width=5376` results on RTX A6000:
+
+| Rows | RMSNorm ms | RMSNorm GiB/s | cuDNN RMSNorm ms | cuDNN GiB/s | cuDNN max abs | Residual ms | Fused residual+RMS ms | Split residual+RMS ms | Split/Fused |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.020845 | 1.441 | 12.067860 | 0.002 | 0 | 0.014512 | 0.023012 | 0.034068 | 1.480 |
+| 4 | 0.026762 | 4.491 | 10.980160 | 0.011 | 0 | 0.010392 | 0.021272 | 0.043290 | 2.035 |
+| 16 | 0.018671 | 25.746 | 11.996526 | 0.040 | 0 | 0.008806 | 0.013852 | 0.025149 | 1.816 |
+| 64 | 0.025356 | 75.833 | 11.558676 | 0.166 | 0.000488281 | 0.016013 | 0.023057 | 0.032451 | 1.407 |
+| 256 | 0.015133 | 508.238 | 11.656405 | 0.660 | 0.00390625 | 0.012454 | 0.024473 | 0.021196 | 0.866 |
+| 1024 | 0.036369 | 845.936 | 13.003598 | 2.366 | 0.00390625 | 0.050689 | 0.069214 | 0.080882 | 1.169 |
+| 4096 | 0.133018 | 925.157 | 12.982645 | 9.479 | 0.00390625 | 0.195166 | 0.266606 | 0.326477 | 1.225 |
+
+Larger sweep command:
+
+```bash
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 30 5 2 8192
+```
+
+Additional `8192 x 5376` result:
+
+| Rows | RMSNorm ms | RMSNorm GiB/s | cuDNN RMSNorm ms | cuDNN GiB/s | cuDNN max abs | Fused residual+RMS ms | Split residual+RMS ms | Split/Fused |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8192 | 0.262535 | 937.490 | 12.506362 | 19.680 | 0.00390625 | 0.523484 | 0.648212 | 1.238 |
+
+Interpretation:
+
+- The custom standalone RMSNorm reaches about `925-937 GiB/s` at 4096-8192 rows with this logical byte model.
+- cuDNN frontend RMSNorm numerically matches the custom output within BF16 rounding, but this setup has a large fixed execution overhead on A6000 for these shapes.
+- Fused residual+RMSNorm is generally faster than launching residual add then standalone RMSNorm once rows are large enough, saving the separate residual reread.
+- The `rows=256` split/fused anomaly is measurement noise or launch/occupancy crossover territory; the larger rows show the expected fused win.
