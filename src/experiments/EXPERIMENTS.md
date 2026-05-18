@@ -701,3 +701,90 @@ Full smoke observations:
 CUDA guide note:
 
 - `$cuda-programming-guide` was queried for BF16 support. The local guide states that `__nv_bfloat16` is available through `<cuda_bf16.h>` and requires compute capability 8.0 or higher, and that BF16 WMMA/Tensor Core paths support BF16 inputs with FP32 accumulation.
+
+## 2026-05-18 - Decode GEMV Packed128 streaming-load pass
+
+Runtime file: `src/gemma4_matmul_kernels.cu`
+
+Reason:
+
+- The decode GEMV kernels were still loading one BF16 pair per instruction through `__nv_bfloat162`.
+- The input vector is small and reused by every CTA, while projection weights are large one-pass streams.
+- This pass keeps normal cached loads for the reused input vector and marks the weight stream with the existing `Packed128` + `gemma4_load128cs` helper.
+
+Implementation:
+
+- Changed the fixed-four decode dot helper from half2-style 32-bit loads to `Packed128<__nv_bfloat16>` loads.
+- Each load now covers 8 BF16 values per thread.
+- Weight row loads use `gemma4_load128cs`, which SASS emits as `LDG.E.EF.128` on this build.
+- Input-vector loads use `gemma4_load128`, which SASS emits as `LDG.E.128.CONSTANT` on this build.
+- Packed the four BF16 outputs into one 64-bit store in the fixed-four path.
+- Templated the dot helper on `Threads` so the packed loop can use the compile-time stride.
+- Added `__restrict__` on kernel/device pointer parameters.
+
+Build/resource check:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc -Xptxas=-v \
+  -c src/gemma4_matmul_kernels.cu \
+  -o /tmp/gemma4_matmul_kernels_packed128.o
+```
+
+`ptxas` result for all instantiated decode GEMV kernels:
+
+- Registers: `40`
+- Static spills: `0 bytes`
+- Shared memory: `128` or `256` bytes depending on thread count
+- Barriers: `1`
+
+SASS spot-check:
+
+```bash
+cuobjdump --dump-sass /tmp/gemma4_matmul_kernels_packed128.o | rg "LDG|STG"
+```
+
+Confirmed:
+
+- `LDG.E.128.CONSTANT` for input-vector packed loads
+- `LDG.E.EF.128` for weight packed loads
+- `STG.E.64` for fixed-four output stores
+
+Benchmark command:
+
+```bash
+make decode-bench
+./build/experiments/gemma4_decode_bench all 20 5 2
+```
+
+Representative results:
+
+| Op | Custom best ms | Custom weight GB/s | BF16 cuBLAS GEMV best ms | Speedup vs GEMV | Max abs diff vs GEMV |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.651875 | 709.372 | 3.528619 | 5.413029 | 0.25 |
+| `ffn_down` | 0.328534 | 703.765 | 0.331218 | 1.008167 | 0.0625 |
+| `sliding_qkv` | 0.250694 | 702.691 | 2.499530 | 9.970425 | 0.25 |
+| `sliding_o` | 0.127248 | 692.195 | 3.325871 | 26.136917 | 0.25 |
+| `global_q` | 0.250746 | 702.548 | 2.684933 | 10.707796 | 0.25 |
+| `global_k` | 0.034682 | 634.922 | 3.032374 | 87.434677 | 0.25 |
+| `global_o` | 0.250725 | 702.606 | 0.253286 | 1.010217 | 0 |
+| `final_logits` | 3.956539 | 712.383 | 3.967304 | 1.002721 | 0.125 |
+
+Verification:
+
+```bash
+make cuda-kernels
+make test-embedding-gather
+```
+
+`test-embedding-gather` still passed.
+
+Interpretation:
+
+- The source-level vectorization worked: SASS now has 128-bit loads and 64-bit stores in the target path.
+- Register usage increased from the earlier `~25` register shape to `40`, but there are still no spills.
+- Performance stayed near the prior DRAM-streaming roofline band. The clearest win in this short run was `global_k`, while the already roofline-limited large streams were essentially flat.
+- Nonzero BF16 differences are expected from the changed FP32 reduction order before BF16 output rounding; mean errors remained small in the benchmark output.
+
+CUDA guide notes:
+
+- `$cuda-programming-guide` was queried for coalesced global memory, L2 streaming/persisting cache policy, `#pragma unroll`, low-level load functions, and `__restrict__` optimizer behavior. Relevant local guide pages included 60-61, 352-354, 519, 562, and 566.
