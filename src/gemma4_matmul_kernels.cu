@@ -1,5 +1,5 @@
 #include <cublas_v2.h>
-#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 // Gemma 4 31B dense projection kernels.
@@ -37,17 +37,20 @@ static_assert((kGemma4DecodeThreads % 32) == 0,
 
 template <int K>
 __device__ __forceinline__ void gemma4_decode_dot4_device(
-    const half *x, const half *w_col_major, int col0, int thread_idx,
-    int thread_count, float &sum0, float &sum1, float &sum2, float &sum3) {
-  static_assert((K % 2) == 0, "decode GEMV K must be even for half2 loads");
+    const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major, int col0,
+    int thread_idx, int thread_count, float &sum0, float &sum1, float &sum2,
+    float &sum3) {
+  static_assert((K % 2) == 0,
+                "decode GEMV K must be even for __nv_bfloat162 loads");
 
   sum0 = 0.0f;
   sum1 = 0.0f;
   sum2 = 0.0f;
   sum3 = 0.0f;
 
-  const half2 *x2 = reinterpret_cast<const half2 *>(x);
-  const half2 *w2 = reinterpret_cast<const half2 *>(w_col_major);
+  const __nv_bfloat162 *x2 = reinterpret_cast<const __nv_bfloat162 *>(x);
+  const __nv_bfloat162 *w2 =
+      reinterpret_cast<const __nv_bfloat162 *>(w_col_major);
   constexpr int k_half2 = K / 2;
   const int w_col0 = (col0 + 0) * k_half2;
   const int w_col1 = (col0 + 1) * k_half2;
@@ -56,11 +59,11 @@ __device__ __forceinline__ void gemma4_decode_dot4_device(
 
 #pragma unroll 4
   for (int k2 = thread_idx; k2 < k_half2; k2 += thread_count) {
-    const float2 xv = __half22float2(x2[k2]);
-    const float2 wv0 = __half22float2(w2[w_col0 + k2]);
-    const float2 wv1 = __half22float2(w2[w_col1 + k2]);
-    const float2 wv2 = __half22float2(w2[w_col2 + k2]);
-    const float2 wv3 = __half22float2(w2[w_col3 + k2]);
+    const float2 xv = __bfloat1622float2(x2[k2]);
+    const float2 wv0 = __bfloat1622float2(w2[w_col0 + k2]);
+    const float2 wv1 = __bfloat1622float2(w2[w_col1 + k2]);
+    const float2 wv2 = __bfloat1622float2(w2[w_col2 + k2]);
+    const float2 wv3 = __bfloat1622float2(w2[w_col3 + k2]);
 
     sum0 = fmaf(xv.x, wv0.x, sum0);
     sum0 = fmaf(xv.y, wv0.y, sum0);
@@ -75,8 +78,9 @@ __device__ __forceinline__ void gemma4_decode_dot4_device(
 
 template <int K, int N, int Threads, int MinBlocksPerSm>
 __global__ __launch_bounds__(Threads, MinBlocksPerSm) void
-gemma4_decode_gemv4_kernel_fixed4_tuned(const half *x,
-                                        const half *w_col_major, half *y) {
+gemma4_decode_gemv4_kernel_fixed4_tuned(const __nv_bfloat16 *x,
+                                        const __nv_bfloat16 *w_col_major,
+                                        __nv_bfloat16 *y) {
   static_assert((N % 4) == 0,
                 "fixed decode GEMV N must be divisible by four columns");
   static_assert((Threads % 32) == 0,
@@ -127,34 +131,36 @@ gemma4_decode_gemv4_kernel_fixed4_tuned(const half *x,
   }
 
   if (threadIdx.x == 0) {
-    y[col0 + 0] = __float2half_rn(sum0);
-    y[col0 + 1] = __float2half_rn(sum1);
-    y[col0 + 2] = __float2half_rn(sum2);
-    y[col0 + 3] = __float2half_rn(sum3);
+    y[col0 + 0] = __float2bfloat16_rn(sum0);
+    y[col0 + 1] = __float2bfloat16_rn(sum1);
+    y[col0 + 2] = __float2bfloat16_rn(sum2);
+    y[col0 + 3] = __float2bfloat16_rn(sum3);
   }
 }
 
 template <int K, int ColsPerBlock>
 __device__ __forceinline__ void gemma4_decode_dot_device(
-    const half *x, const half *w_col_major, int col0, int thread_idx,
-    int thread_count, float (&sums)[ColsPerBlock]) {
-  static_assert((K % 2) == 0, "decode GEMV K must be even for half2 loads");
+    const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major, int col0,
+    int thread_idx, int thread_count, float (&sums)[ColsPerBlock]) {
+  static_assert((K % 2) == 0,
+                "decode GEMV K must be even for __nv_bfloat162 loads");
 
 #pragma unroll
   for (int col = 0; col < ColsPerBlock; ++col) {
     sums[col] = 0.0f;
   }
 
-  const half2 *x2 = reinterpret_cast<const half2 *>(x);
-  const half2 *w2 = reinterpret_cast<const half2 *>(w_col_major);
+  const __nv_bfloat162 *x2 = reinterpret_cast<const __nv_bfloat162 *>(x);
+  const __nv_bfloat162 *w2 =
+      reinterpret_cast<const __nv_bfloat162 *>(w_col_major);
   constexpr int k_half2 = K / 2;
 
 #pragma unroll 4
   for (int k2 = thread_idx; k2 < k_half2; k2 += thread_count) {
-    const float2 xv = __half22float2(x2[k2]);
+    const float2 xv = __bfloat1622float2(x2[k2]);
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      const float2 wv = __half22float2(w2[(col0 + col) * k_half2 + k2]);
+      const float2 wv = __bfloat1622float2(w2[(col0 + col) * k_half2 + k2]);
       sums[col] = fmaf(xv.x, wv.x, sums[col]);
       sums[col] = fmaf(xv.y, wv.y, sums[col]);
     }
@@ -164,7 +170,9 @@ __device__ __forceinline__ void gemma4_decode_dot_device(
 template <int K, int N, int ColsPerBlock>
 __global__ __launch_bounds__(kGemma4DecodeThreads,
                              kGemma4DecodeMinBlocksPerSm) void
-gemma4_decode_gemv4_kernel(const half *x, const half *w_col_major, half *y) {
+gemma4_decode_gemv4_kernel(const __nv_bfloat16 *x,
+                           const __nv_bfloat16 *w_col_major,
+                           __nv_bfloat16 *y) {
   static_assert((N % ColsPerBlock) == 0,
                 "decode GEMV N must be divisible by columns per block");
 
@@ -212,14 +220,15 @@ gemma4_decode_gemv4_kernel(const half *x, const half *w_col_major, half *y) {
   if (threadIdx.x == 0) {
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      y[col0 + col] = __float2half_rn(sums[col]);
+      y[col0 + col] = __float2bfloat16_rn(sums[col]);
     }
   }
 }
 
 template <int K, int N>
-cudaError_t gemma4_decode_gemv4(const half *x, const half *w_col_major, half *y,
-                                cudaStream_t stream) {
+cudaError_t gemma4_decode_gemv4(const __nv_bfloat16 *x,
+                                const __nv_bfloat16 *w_col_major,
+                                __nv_bfloat16 *y, cudaStream_t stream) {
   constexpr int blocks = N / kGemma4DecodeColsPerBlock;
   if constexpr (kGemma4DecodeColsPerBlock == 4) {
     gemma4_decode_gemv4_kernel_fixed4_tuned<
@@ -233,8 +242,9 @@ cudaError_t gemma4_decode_gemv4(const half *x, const half *w_col_major, half *y,
 }
 
 template <int K, int N, int Threads, int MinBlocksPerSm>
-cudaError_t gemma4_decode_gemv4_fixed4_tuned(const half *x,
-                                             const half *w_col_major, half *y,
+cudaError_t gemma4_decode_gemv4_fixed4_tuned(const __nv_bfloat16 *x,
+                                             const __nv_bfloat16 *w_col_major,
+                                             __nv_bfloat16 *y,
                                              cudaStream_t stream) {
   constexpr int blocks = N / 4;
   gemma4_decode_gemv4_kernel_fixed4_tuned<K, N, Threads, MinBlocksPerSm>
@@ -243,8 +253,9 @@ cudaError_t gemma4_decode_gemv4_fixed4_tuned(const half *x,
 }
 
 extern "C" cublasStatus_t gemma4_ffn_gate_up_prefill(
-    cublasHandle_t handle, const half *x, const half *w_col_major, half *y,
-    int m, cudaStream_t stream) {
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
   if (m <= 0) {
     return CUBLAS_STATUS_SUCCESS;
   }
@@ -261,69 +272,73 @@ extern "C" cublasStatus_t gemma4_ffn_gate_up_prefill(
   // Y[M, N] = X[M, K] * W[K, N] as:
   // Y^T[N, M] = W^T[N, K] * X^T[K, M].
   return cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, kGemma4PackedFfn, m,
-                      kGemma4Hidden, &alpha, w_col_major, CUDA_R_16F,
-                      kGemma4Hidden, x, CUDA_R_16F, kGemma4Hidden, &beta, y,
-                      CUDA_R_16F, kGemma4PackedFfn, CUBLAS_COMPUTE_32F,
+                      kGemma4Hidden, &alpha, w_col_major, CUDA_R_16BF,
+                      kGemma4Hidden, x, CUDA_R_16BF, kGemma4Hidden, &beta, y,
+                      CUDA_R_16BF, kGemma4PackedFfn, CUBLAS_COMPUTE_32F,
                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-extern "C" cudaError_t gemma4_ffn_gate_up_decode(const half *x,
-                                                  const half *w_col_major,
-                                                  half *y,
+extern "C" cudaError_t gemma4_ffn_gate_up_decode(const __nv_bfloat16 *x,
+                                                  const __nv_bfloat16 *w_col_major,
+                                                  __nv_bfloat16 *y,
                                                   cudaStream_t stream) {
   return gemma4_decode_gemv4<kGemma4Hidden, kGemma4PackedFfn>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_ffn_down_decode(const half *x,
-                                               const half *w_col_major, half *y,
+extern "C" cudaError_t gemma4_ffn_down_decode(const __nv_bfloat16 *x,
+                                               const __nv_bfloat16 *w_col_major,
+                                               __nv_bfloat16 *y,
                                                cudaStream_t stream) {
   return gemma4_decode_gemv4_fixed4_tuned<kGemma4FfnIntermediate,
                                           kGemma4Hidden, 256, 4>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_sliding_qkv_decode(const half *x,
-                                                  const half *w_col_major,
-                                                  half *y,
+extern "C" cudaError_t gemma4_sliding_qkv_decode(const __nv_bfloat16 *x,
+                                                  const __nv_bfloat16 *w_col_major,
+                                                  __nv_bfloat16 *y,
                                                   cudaStream_t stream) {
   return gemma4_decode_gemv4<kGemma4Hidden, kGemma4SlidingQkv>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_sliding_o_decode(const half *x,
-                                                const half *w_col_major,
-                                                half *y,
+extern "C" cudaError_t gemma4_sliding_o_decode(const __nv_bfloat16 *x,
+                                                const __nv_bfloat16 *w_col_major,
+                                                __nv_bfloat16 *y,
                                                 cudaStream_t stream) {
   return gemma4_decode_gemv4<kGemma4SlidingAttentionOut, kGemma4Hidden>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_global_q_decode(const half *x,
-                                               const half *w_col_major, half *y,
+extern "C" cudaError_t gemma4_global_q_decode(const __nv_bfloat16 *x,
+                                               const __nv_bfloat16 *w_col_major,
+                                               __nv_bfloat16 *y,
                                                cudaStream_t stream) {
   return gemma4_decode_gemv4<kGemma4Hidden, kGemma4GlobalQ>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_global_k_decode(const half *x,
-                                               const half *w_col_major, half *y,
+extern "C" cudaError_t gemma4_global_k_decode(const __nv_bfloat16 *x,
+                                               const __nv_bfloat16 *w_col_major,
+                                               __nv_bfloat16 *y,
                                                cudaStream_t stream) {
   return gemma4_decode_gemv4<kGemma4Hidden, kGemma4GlobalK>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_global_o_decode(const half *x,
-                                               const half *w_col_major, half *y,
+extern "C" cudaError_t gemma4_global_o_decode(const __nv_bfloat16 *x,
+                                               const __nv_bfloat16 *w_col_major,
+                                               __nv_bfloat16 *y,
                                                cudaStream_t stream) {
   return gemma4_decode_gemv4_fixed4_tuned<kGemma4GlobalAttentionOut,
                                           kGemma4Hidden, 512, 1>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_final_logits_decode(const half *x,
-                                                   const half *w_col_major,
-                                                   half *y,
+extern "C" cudaError_t gemma4_final_logits_decode(const __nv_bfloat16 *x,
+                                                   const __nv_bfloat16 *w_col_major,
+                                                   __nv_bfloat16 *y,
                                                    cudaStream_t stream) {
   return gemma4_decode_gemv4_fixed4_tuned<kGemma4Hidden, kGemma4Vocab, 512, 2>(
       x, w_col_major, y, stream);
