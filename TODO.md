@@ -1,5 +1,7 @@
 # TODO
 
+*Agent maintained, quite messy. They never listen to me when I tell them to keep it clean...*
+
 ## High-Priority Kernel Work
 
 - Write a hyperoptimized CUDA kernel path for the Gemma 4 31B FFN matmuls, the dominant total-FLOP workload:
