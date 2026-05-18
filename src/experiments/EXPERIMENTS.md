@@ -885,14 +885,14 @@ Reason:
 Implementation:
 
 - Added `time_ms_graph` in `src/experiments/gemma4_bench_utils.cuh`.
-- The helper stream-captures `iters` repeats of the target operation into a CUDA graph, instantiates it once, warms up graph replay, then records CUDA events around one graph replay and divides by the captured repeat count.
+- The helper stream-captures `iters` repeats of the target operation into a CUDA graph, instantiates it once, warms up graph replay, then records CUDA events around one graph replay and divides by the captured repeat count. This replaces per-call frontend/API overhead with one graph launch amortized over `iters`.
 - `src/experiments/gemma4_rmsnorm_bench.cu` now reports both the original stream-loop timings and raw graph-captured timings:
   - `rms_ms` / `cudnn_ms`: repeated host/API execute path.
-  - `rms_graph_ms` / `cudnn_graph_ms`: graph replay timing of already-captured device work.
+  - `rms_graph_kernel_ms` / `cudnn_graph_kernel_ms`: graph replay timing of already-captured device work.
 
 Guide note:
 
-- `$cuda-programming-guide` was queried for CUDA graph benchmarking context. The relevant local guide page was 179: CUDA Graphs define work separately from execution and can be launched repeatedly, reducing CPU launch costs versus piecewise stream submission.
+- `$cuda-programming-guide` was queried for CUDA event and graph benchmarking context. The relevant local guide result was page 76, which describes using CUDA events in streams to time stream work including kernels. CUDA Graph results also reinforce separating graph setup from repeated execution.
 
 Verification:
 
@@ -903,27 +903,46 @@ make test-rmsnorm
 
 `test-rmsnorm` passed.
 
+Custom graph introspection from a one-off `cudaGraphGetNodes` checker:
+
+| Rows | Captured nodes | Node type | Grid | Block | Dynamic smem |
+| ---: | ---: | --- | --- | --- | ---: |
+| 1 | 1 | kernel | `(1,1,1)` | `(32,8,1)` | `96768` |
+| 4096 | 1 | kernel | `(512,1,1)` | `(32,8,1)` | `96768` |
+
 Benchmark command:
 
 ```bash
-GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 50 5 2 4096
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 50 10 3 4096
 ```
 
 Representative `width=5376` results on RTX A6000:
 
-| Rows | Custom stream ms | Custom graph ms | cuDNN stream ms | cuDNN graph ms |
+| Rows | Custom stream ms | Custom graph-kernel ms | cuDNN stream ms | cuDNN graph-kernel ms |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.016801 | 0.004355 | 10.985970 | 0.002543 |
-| 4 | 0.026281 | 0.004684 | 10.217015 | 0.002616 |
-| 16 | 0.038589 | 0.005536 | 11.036615 | 0.002752 |
-| 64 | 0.020952 | 0.005702 | 10.399049 | 0.003699 |
-| 256 | 0.018068 | 0.007768 | 10.425945 | 0.006093 |
-| 1024 | 0.036233 | 0.035096 | 10.995692 | 0.035505 |
-| 4096 | 0.132836 | 0.132105 | 10.672603 | 0.133035 |
+| 1 | 0.023225 | 0.004400 | 7.370522 | 0.002634 |
+| 4 | 0.017364 | 0.004716 | 6.371414 | 0.002625 |
+| 16 | 0.025805 | 0.005671 | 7.226905 | 0.002726 |
+| 64 | 0.019809 | 0.005693 | 7.759317 | 0.003723 |
+| 256 | 0.024250 | 0.007769 | 6.857354 | 0.006050 |
+| 1024 | 0.036131 | 0.035123 | 6.592338 | 0.035253 |
+| 4096 | 0.132870 | 0.131937 | 6.518328 | 0.133100 |
+
+Larger sweep:
+
+```bash
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 30 5 2 8192
+```
+
+Largest-row result:
+
+| Rows | Custom stream ms | Custom graph-kernel ms | cuDNN stream ms | cuDNN graph-kernel ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 8192 | 0.262535 | 0.261745 | 11.022665 | 0.262959 |
 
 Interpretation:
 
-- The old `~10-13 ms` cuDNN RMSNorm result was dominated by frontend/API submission overhead, not device work.
-- For larger row counts, the raw graph-captured GPU times are effectively tied: custom `0.132105 ms` vs cuDNN `0.133035 ms` at `4096 x 5376`.
+- The old multi-millisecond cuDNN RMSNorm result was dominated by frontend/API submission overhead, not device work.
+- For larger row counts, the raw graph-captured GPU times are effectively tied: custom `0.131937 ms` vs cuDNN `0.133100 ms` at `4096 x 5376`, and custom `0.261745 ms` vs cuDNN `0.262959 ms` at `8192 x 5376`.
 - For small rows, cuDNN's captured device work is faster than the current custom kernel, but that advantage is completely hidden by frontend execute overhead outside graph replay.
-- Going forward, use `*_graph_ms` when discussing raw GPU speed and `*_ms` when discussing integrated host/API cost.
+- Going forward, use `*_graph_kernel_ms` when discussing raw GPU speed and `*_ms` when discussing integrated host/API cost.
