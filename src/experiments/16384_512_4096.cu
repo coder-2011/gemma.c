@@ -17,9 +17,9 @@ template <typename T, int BM, int BN, int BK, int kStage, typename TiledMMA,
           typename SmemLayoutB, typename SmemLayoutC, typename S2RCopyAtomA,
           typename S2RCopyAtomB, typename R2SCopyAtomC, typename S2GCopyAtomC,
           typename S2GCopyC, const bool BlockSwizzle>
-__global__ void cuda_l2_3090_fp32_kernel(T *Aptr, T *Bptr,
-                                                  T *Dptr, int m,
-                                                  int n, int k) {
+__global__ void gemma4_experiment_hgemm_tn_cute_kernel(T *Aptr, T *Bptr,
+                                                       T *Dptr, int m, int n,
+                                                       int k) {
   using namespace cute;
   extern __shared__ T shm_data[];
 
@@ -271,13 +271,13 @@ void launch_hgemm_mma_stages_block_swizzle_tn_cute(T *a, T *b, T *c, int M,
   int shm_size = kShmSize;
 
   cudaFuncSetAttribute(
-      cuda_l2_3090_fp32_kernel<
+      gemma4_experiment_hgemm_tn_cute_kernel<
           T, BM, BN, BK, KStage, MMA, G2SCopyA, G2SCopyB, SmemLayoutA,
           SmemLayoutB, SmemLayoutC, S2RCopyAtomA, S2RCopyAtomB, R2SCopyAtomC,
           S2GCopyAtomC, S2GCopyC, BlockSwizzle>,
       cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
 
-  cuda_l2_3090_fp32_kernel<
+  gemma4_experiment_hgemm_tn_cute_kernel<
       T, BM, BN, BK, KStage, MMA, G2SCopyA, G2SCopyB, SmemLayoutA, SmemLayoutB,
       SmemLayoutC, S2RCopyAtomA, S2RCopyAtomB, R2SCopyAtomC, S2GCopyAtomC,
       S2GCopyC, BlockSwizzle><<<grid, block, shm_size, stream>>>(a, b, c, M, N,
@@ -305,7 +305,8 @@ void launch_hgemm_mma_stages_block_swizzle_tn_cute(T *a, T *b, T *c, int M,
     }                                                                          \
   } while (0)
 
-__global__ void fill_half_kernel(half *ptr, size_t n, int seed) {
+__global__ void gemma4_experiment_fill_half_kernel(half *ptr, size_t n,
+                                                   int seed) {
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) {
     int v = static_cast<int>((i * 17 + seed * 13) % 31) - 15;
@@ -313,8 +314,9 @@ __global__ void fill_half_kernel(half *ptr, size_t n, int seed) {
   }
 }
 
-__global__ void max_abs_diff_kernel(const half *a, const half *b, float *out,
-                                    size_t n) {
+__global__ void gemma4_experiment_max_abs_diff_kernel(const half *a,
+                                                      const half *b,
+                                                      float *out, size_t n) {
   __shared__ float smem[256];
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   float value = 0.0f;
@@ -370,7 +372,8 @@ static float max_abs_diff(const half *a, const half *b, size_t n,
   int blocks = static_cast<int>((n + threads - 1) / threads);
   float *d_blocks = nullptr;
   CUDA_CHECK(cudaMalloc(&d_blocks, static_cast<size_t>(blocks) * sizeof(float)));
-  max_abs_diff_kernel<<<blocks, threads, 0, stream>>>(a, b, d_blocks, n);
+  gemma4_experiment_max_abs_diff_kernel<<<blocks, threads, 0, stream>>>(
+      a, b, d_blocks, n);
   CUDA_CHECK(cudaGetLastError());
   std::vector<float> h_blocks(blocks);
   CUDA_CHECK(cudaMemcpyAsync(h_blocks.data(), d_blocks,
@@ -415,10 +418,11 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaMalloc(&cublas_c, c_elems * sizeof(half)));
 
   int threads = 256;
-  fill_half_kernel<<<(a_elems + threads - 1) / threads, threads, 0, stream>>>(
-      a, a_elems, 1);
-  fill_half_kernel<<<(b_elems + threads - 1) / threads, threads, 0, stream>>>(
-      b_col_major, b_elems, 2);
+  gemma4_experiment_fill_half_kernel<<<(a_elems + threads - 1) / threads,
+                                       threads, 0, stream>>>(a, a_elems, 1);
+  gemma4_experiment_fill_half_kernel<<<(b_elems + threads - 1) / threads,
+                                       threads, 0, stream>>>(b_col_major,
+                                                             b_elems, 2);
   CUDA_CHECK(cudaMemsetAsync(custom_c, 0, c_elems * sizeof(half), stream));
   CUDA_CHECK(cudaMemsetAsync(cublas_c, 0, c_elems * sizeof(half), stream));
   CUDA_CHECK(cudaGetLastError());

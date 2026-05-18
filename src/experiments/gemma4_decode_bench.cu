@@ -45,7 +45,7 @@ static const DecodeOp kDecodeOps[] = {
      gemma4_final_logits_decode},
 };
 
-__device__ uint32_t mix_u32(uint32_t x) {
+__device__ uint32_t gemma4_mix_u32_device(uint32_t x) {
   x ^= x >> 16;
   x *= 0x7feb352du;
   x ^= x >> 15;
@@ -54,8 +54,9 @@ __device__ uint32_t mix_u32(uint32_t x) {
   return x;
 }
 
-__global__ void fill_random_bf16_kernel(__nv_bfloat16 *ptr, size_t count,
-                                        uint64_t seed, float scale) {
+__global__ void gemma4_fill_random_bf16_kernel(__nv_bfloat16 *ptr,
+                                               size_t count, uint64_t seed,
+                                               float scale) {
   size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (i >= count) {
     return;
@@ -63,7 +64,7 @@ __global__ void fill_random_bf16_kernel(__nv_bfloat16 *ptr, size_t count,
 
   uint32_t x = uint32_t(i) ^ uint32_t(i >> 32) ^ uint32_t(seed) ^
                uint32_t(seed >> 32);
-  x = mix_u32(x);
+  x = gemma4_mix_u32_device(x);
   const float u = float(x >> 8) * (1.0f / 16777216.0f);
   ptr[i] = __float2bfloat16_rn((u * 2.0f - 1.0f) * scale);
 }
@@ -86,8 +87,8 @@ static void fill_random_bf16(__nv_bfloat16 *ptr, size_t count, uint64_t seed,
                              float scale, cudaStream_t stream) {
   const int threads = 256;
   const int blocks = int((count + threads - 1) / threads);
-  fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(ptr, count, seed,
-                                                          scale);
+  gemma4_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(ptr, count,
+                                                                 seed, scale);
   GEMMA4_CUDA_CHECK(cudaGetLastError());
 }
 

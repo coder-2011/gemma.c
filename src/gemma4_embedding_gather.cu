@@ -8,7 +8,7 @@ namespace {
 using EmbeddingPack = Packed128<floatX>;
 constexpr int kFloatXPerPack = EmbeddingPack::size;
 
-__global__ void embedding_gather_bf16_warp_kernel(
+__global__ void gemma4_embedding_gather_bf16_warp_kernel(
     __nv_bfloat16* out,
     const int32_t* token_ids,
     const __nv_bfloat16* embeddings,
@@ -65,7 +65,7 @@ cudaError_t gemma4_embedding_gather_bf16(
         return cudaErrorInvalidValue;
     }
 
-    embedding_gather_bf16_warp_kernel<<<num_tokens, GEMMA4_WARP_SIZE, 0, stream>>>(
+    gemma4_embedding_gather_bf16_warp_kernel<<<num_tokens, GEMMA4_WARP_SIZE, 0, stream>>>(
         out, token_ids, embeddings, num_tokens, hidden_size, vocab_size);
     return cudaGetLastError();
 }
