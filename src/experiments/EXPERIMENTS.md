@@ -885,7 +885,7 @@ Reason:
 Implementation:
 
 - Added `time_ms_graph` in `src/experiments/gemma4_bench_utils.cuh`.
-- The helper stream-captures `iters` repeats of the target operation into a CUDA graph, instantiates it once, warms up graph replay, then records CUDA events around one graph replay and divides by the captured repeat count. This replaces per-call frontend/API overhead with one graph launch amortized over `iters`.
+- The helper stream-captures `iters` repeats of the target operation into a CUDA graph, instantiates it once, warms up graph replay, then records CUDA events around one graph replay and divides by the captured repeat count. This excludes CUDA graph capture, graph instantiation, warmup launches, and per-call host/API submission from the returned graph timing.
 - `src/experiments/gemma4_rmsnorm_bench.cu` now reports both the original stream-loop timings and raw graph-captured timings:
   - `rms_ms` / `cudnn_ms`: repeated host/API execute path.
   - `rms_graph_kernel_ms` / `cudnn_graph_kernel_ms`: graph replay timing of already-captured device work.
@@ -893,6 +893,7 @@ Implementation:
 Guide note:
 
 - `$cuda-programming-guide` was queried for CUDA event and graph benchmarking context. The relevant local guide result was page 76, which describes using CUDA events in streams to time stream work including kernels. CUDA Graph results also reinforce separating graph setup from repeated execution.
+- The Gemma 4 architecture doc was checked for production dimensions. The 31B dense target uses `hidden_size=5376`, batch-1 serving, `sliding_window=1024`, and a 256K context family. The compiled config uses `GEMMA4_MAX_POSITION_EMBEDDINGS=262144`, so full-context RMSNorm was tested as `262144 x 5376`.
 
 Verification:
 
@@ -940,9 +941,167 @@ Largest-row result:
 | ---: | ---: | ---: | ---: | ---: |
 | 8192 | 0.262535 | 0.261745 | 11.022665 | 0.262959 |
 
+Production-size sweep:
+
+```bash
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 5 2 1 262144
+```
+
+Production-shape results:
+
+| Rows | Meaning | Custom stream ms | Custom graph-kernel ms | cuDNN stream ms | cuDNN graph-kernel ms |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | batch-1 decode token | 0.018899 | 0.005536 | 5.503744 | 0.003507 |
+| 1024 | 31B sliding-window-sized prefill chunk | 0.042483 | 0.035629 | 6.324723 | 0.036326 |
+| 262144 | compiled max-position full-context pass | 8.297798 | 8.291284 | 9.805408 | 8.304595 |
+
 Interpretation:
 
 - The old multi-millisecond cuDNN RMSNorm result was dominated by frontend/API submission overhead, not device work.
 - For larger row counts, the raw graph-captured GPU times are effectively tied: custom `0.131937 ms` vs cuDNN `0.133100 ms` at `4096 x 5376`, and custom `0.261745 ms` vs cuDNN `0.262959 ms` at `8192 x 5376`.
+- At the compiled full-context production ceiling (`262144 x 5376`), the graph-captured GPU times remain effectively tied: custom `8.291284 ms` vs cuDNN `8.304595 ms`.
 - For small rows, cuDNN's captured device work is faster than the current custom kernel, but that advantage is completely hidden by frontend execute overhead outside graph replay.
 - Going forward, use `*_graph_kernel_ms` when discussing raw GPU speed and `*_ms` when discussing integrated host/API cost.
+
+## 2026-05-18 - Decode production GEMV vs cuDNN BF16 1x1 conv
+
+Reason:
+
+- The active decode benchmark compared custom BF16 GEMV against cuBLAS GEMV/GEMM, but the current tuning gate asks whether the production decode matmul path beats cuDNN by at least `5%`.
+- cuDNN backend matmul is not the clean matmul baseline here, so the benchmark restores the earlier mathematically equivalent 1x1 convolution comparator for the physical `[N, K]` weight layout.
+
+Implementation:
+
+- Added a BF16 cuDNN 1x1 convolution comparator to `src/experiments/gemma4_decode_bench.cu` for every production decode projection.
+- Updated `make decode-bench` to link `-lcudnn`.
+- Kept the production decode GEMV kernel unchanged after testing narrow warp-owned-column and column-grouping variants; those variants did not improve the tight `ffn_gate_up` case enough to keep.
+
+Verification:
+
+```bash
+make decode-bench
+make cuda-kernels
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+```
+
+Production decode projection results on RTX A6000:
+
+| Op | K | N | Layers/token | Custom ms | cuDNN ms | Custom vs cuDNN |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 5376 | 43008 | 60 | 0.650958 | 0.656280 | 1.008176 |
+| `ffn_down` | 21504 | 5376 | 60 | 0.327823 | 0.331135 | 1.010103 |
+| `sliding_qkv` | 5376 | 16384 | 50 | 0.249854 | 0.270535 | 1.082772 |
+| `sliding_o` | 8192 | 5376 | 50 | 0.126481 | 0.148044 | 1.170484 |
+| `global_q` | 5376 | 16384 | 10 | 0.249905 | 0.281123 | 1.124916 |
+| `global_k` | 5376 | 2048 | 10 | 0.034093 | 0.701345 | 20.571634 |
+| `global_o` | 16384 | 5376 | 10 | 0.250122 | 0.255940 | 1.023262 |
+| `final_logits` | 5376 | 262144 | 1 | 3.955549 | 3.964382 | 1.002233 |
+
+Weighted by production layer counts:
+
+| Path | Weighted decode projection ms |
+| --- | ---: |
+| Custom decode GEMV | 86.840359 |
+| cuDNN BF16 1x1 conv | 96.522312 |
+
+Interpretation:
+
+- The production decode projection mix is `1.111491x` faster than cuDNN, an `11.15%` weighted win, clearing the `5%` gate.
+- The largest bandwidth-saturated projections are much tighter individually, especially `ffn_gate_up`, `ffn_down`, `global_o`, and `final_logits`.
+- Narrow warp-tiling and column-grouping tests did not improve `ffn_gate_up`; the current custom kernel is already near the cuDNN 1x1-conv bandwidth roofline for that shape.
+
+## 2026-05-18 - Decode GEMV post-gate tuning sweep
+
+Reason:
+
+- After clearing the `5%` production-weighted cuDNN gate, continue tuning until the obvious decode GEMV thread/column-route variants stop producing production-speed wins.
+- Focus on the actual decode projection mix, not a single synthetic shape.
+
+Method:
+
+```bash
+make decode-bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench <op> 30 5 2
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 100 20 5
+make cuda-kernels
+git diff --check
+```
+
+Screened variants:
+
+| # | Variant | Screened custom result | Decision |
+| ---: | --- | --- | --- |
+| 1 | generic `threads=128, cols=4` | `ffn_gate_up 0.651714`, `sliding_o 0.126844`, `global_k 0.033860` | Rejected; high-weight ops slower. |
+| 2 | generic `threads=512, cols=4` | `ffn_gate_up 0.650739`, `sliding_o 0.126753`, `global_k 0.034049` | Rejected; not a production win. |
+| 3 | generic `threads=256, cols=8` | `ffn_gate_up 0.651315`, `sliding_o 0.127519`, `global_k 0.035267` | Rejected. |
+| 4 | generic `threads=256, cols=2` | `ffn_gate_up 0.650470`, `sliding_o 0.126437`, `global_k 0.033897` | Candidate, later beaten. |
+| 5 | generic `threads=128, cols=8` | `ffn_gate_up 0.651994`, `sliding_o 0.127132`, `global_k 0.034060` | Rejected. |
+| 6 | generic `threads=512, cols=8` | `ffn_gate_up 0.651111`, `sliding_o 0.127395`, `global_k 0.034473` | Rejected. |
+| 7 | generic `threads=128, cols=2` | `ffn_gate_up 0.650998`, `sliding_o 0.126688`, `global_k 0.034905` | Rejected. |
+| 8 | generic `threads=512, cols=2` | `ffn_gate_up 0.650105`, `sliding_o 0.126433`, `global_k 0.033567` | Kept; best generic route. |
+| 9 | `ffn_down fixed4<128,4>` | `ffn_down 0.328463` | Rejected. |
+| 10 | `ffn_down fixed4<512,1>` | `ffn_down 0.327438` | Candidate, later beaten. |
+| 11 | `ffn_down fixed4<512,2>` | `ffn_down 0.327405` | Candidate, later beaten. |
+| 12 | `global_o fixed4<256,2>` | `global_o 0.250242` | Rejected. |
+| 13 | `global_o fixed4<256,4>` | `global_o 0.250467` | Rejected. |
+| 14 | `global_o fixed4<128,4>` | `global_o 0.250861` | Rejected. |
+| 15 | `final_logits fixed4<256,4>` | `final_logits 3.957258` | Rejected. |
+| 16 | generic `threads=1024, cols=2` | `ffn_gate_up 0.650092`, `sliding_qkv 0.250277`, `sliding_o 0.126439`, `global_k 0.034306`; ptxas ignored `.minnctapersm` | Rejected. |
+| 17 | generic `threads=768, cols=2` | `ffn_gate_up 0.650050`, `sliding_qkv 0.249568`, `sliding_o 0.126182`, `global_k 0.033888` | Rejected; mixed and not better weighted. |
+| 18 | generic `threads=640, cols=2` | `ffn_gate_up 0.650382`, `sliding_qkv 0.250560`, `sliding_o 0.126318`, `global_k 0.034333` | Rejected. |
+| 19 | generic `threads=512, cols=1` | `ffn_gate_up 0.649681`, `sliding_qkv 0.249843`, `sliding_o 0.126537`, `global_k 0.034037` | Rejected; helps `ffn_gate_up` but loses weighted mix. |
+| 20 | generic `threads=512, cols=16` | `ffn_gate_up 0.653839`, `sliding_qkv 0.254826`, `sliding_o 0.128980`, `global_k 0.035023` | Rejected. |
+| 21 | `ffn_down fixed4<1024,1>` | `ffn_down 0.327121` | Kept; best `ffn_down` route. |
+| 22 | `ffn_down fixed4<1024,2>` | `ffn_down 0.327613`; ptxas ignored `.minnctapersm` | Rejected. |
+| 23 | `ffn_down fixed4<768,1>` | `ffn_down 0.327362` | Rejected. |
+| 24 | `final_logits fixed4<1024,1>` | `final_logits 3.951809` | Kept; best `final_logits` route. |
+| 25 | `final_logits fixed4<768,1>` | `final_logits 3.954659` | Rejected. |
+| 26 | `final_logits fixed4<512,1>` | `final_logits 3.955488` | Rejected. |
+| 27 | `global_o fixed4<1024,1>` | `global_o 0.250594` | Rejected. |
+| 28 | `final_logits fixed4<896,1>` | `final_logits 3.952104` | Rejected. |
+| 29 | `final_logits fixed4<640,1>` | `final_logits 3.954255` | Rejected. |
+| 30 | `final_logits fixed4<1024,2>` | `final_logits 3.951425`; ptxas ignored `.minnctapersm` | Rejected. |
+| 31 | `ffn_down fixed4<896,1>` | `ffn_down 0.327773` | Rejected. |
+| 32 | `ffn_down fixed4<640,1>` | `ffn_down 0.327632` | Rejected. |
+| 33 | `ffn_down fixed4<384,1>` | `ffn_down 0.327397` | Rejected. |
+| 34 | `global_o fixed4<768,1>` | `global_o 0.250193` | Rejected. |
+| 35 | `global_o fixed4<640,1>` | `global_o 0.250218` | Rejected. |
+| 36 | `global_o fixed4<384,1>` | `global_o 0.250167` | Rejected. |
+| 37 | generic `threads=384, cols=2` | `ffn_gate_up 0.651110`, `sliding_qkv 0.250326`, `sliding_o 0.126726`, `global_k 0.034033` | Rejected. |
+| 38 | generic `threads=896, cols=2` | `ffn_gate_up 0.650482`, `sliding_qkv 0.250063`, `sliding_o 0.127317`, `global_k 0.034405`; ptxas ignored `.minnctapersm` | Rejected. |
+| 39 | generic `threads=512, cols=32` | `ffn_gate_up 0.672537`, `sliding_qkv 0.268206`, `sliding_o 0.136106`, `global_k 0.037322` | Rejected. |
+
+Retained source settings:
+
+- Generic decode GEMV route: `threads=512`, `cols_per_block=2`.
+- `ffn_down`: `gemma4_decode_gemv_fixed4<GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE, 1024, 1>`.
+- `global_o`: restored to `512,1`.
+- `final_logits`: `gemma4_decode_gemv_fixed4<GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE, 1024, 1>`.
+
+Final confirmation, `iters=100`, `warmup=20`, `trials=5`:
+
+| Op | K | N | Layers/token | Custom ms | cuDNN ms | Custom vs cuDNN |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 5376 | 43008 | 60 | 0.649589 | 0.655538 | 1.009157 |
+| `ffn_down` | 21504 | 5376 | 60 | 0.326650 | 0.330976 | 1.013242 |
+| `sliding_qkv` | 5376 | 16384 | 50 | 0.249276 | 0.271879 | 1.090673 |
+| `sliding_o` | 8192 | 5376 | 50 | 0.125808 | 0.142452 | 1.132293 |
+| `global_q` | 5376 | 16384 | 10 | 0.249468 | 0.270730 | 1.085232 |
+| `global_k` | 5376 | 2048 | 10 | 0.033313 | 0.817800 | 24.549238 |
+| `global_o` | 16384 | 5376 | 10 | 0.249828 | 0.255338 | 1.022057 |
+| `final_logits` | 5376 | 262144 | 1 | 3.950665 | 3.964759 | 1.003567 |
+
+Weighted by production layer counts:
+
+| Path | Weighted decode projection ms |
+| --- | ---: |
+| Previous custom decode GEMV | 86.840359 |
+| Tuned custom decode GEMV | 86.605295 |
+| cuDNN BF16 1x1 conv in confirmation run | 97.310829 |
+
+Interpretation:
+
+- The retained tuning is a small additional production win: `0.235064 ms` weighted, or about `0.27%` beyond the previous custom decode GEMV result.
+- The tuned production decode projection mix is `1.123607x` faster than cuDNN in the longer confirmation run, a `12.36%` weighted win.
+- After the final retained win (`final_logits fixed4<1024,1>`), variants 25-39 formed a 15-test no-win tail. Those variants either regressed high-weight projections, emitted invalid launch-bound warnings, or only helped one op while losing the weighted production mix.
