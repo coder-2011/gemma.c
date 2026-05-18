@@ -293,3 +293,79 @@ Comparison:
 Tooling/source notes:
 
 - `$cuda-programming-guide` was queried again for CUDA-X/cuBLAS/Tensor Core guidance and GEMV/memory-access considerations. The local guide points to CUDA-X libraries such as cuBLAS as the recommended library path for Tensor Core operations on supported hardware, and reiterates coalesced memory access as a first-order concern.
+
+## 2026-05-18 - Decode GEMV coverage for main dense projections
+
+Runtime file: `src/gemma4_matmul_kernels.cu`
+
+Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+
+Change:
+
+- Generalized the one-off packed FFN gate+up decode kernel into a templated fixed-shape decode GEMV kernel.
+- Added decode entry points for:
+  - `ffn_gate_up`: `x[5376] -> gate_up[43008]`
+  - `ffn_down`: `ffn_hidden[21504] -> hidden[5376]`
+  - `sliding_qkv`: `x[5376] -> qkv[16384]`
+  - `sliding_o`: `attn_out[8192] -> hidden[5376]`
+  - `global_q`: `x[5376] -> q[16384]`
+  - `global_k`: `x[5376] -> k[2048]`
+  - `global_o`: `attn_out[16384] -> hidden[5376]`
+  - `final_logits`: `hidden[5376] -> logits[262144]`
+- Kept the same physical weight layout as the original gate/up kernel: `[N, K]` row-major half, so each output dot product reads a contiguous weight row.
+- Simplified the benchmark to compare against direct cuBLAS GEMV (`cublasHSHgemvStridedBatched`) and M=1 `cublasGemmEx`. Removed the cuDNN 1x1 convolution baseline from this benchmark because it is no longer the relevant comparison.
+
+Build:
+
+```bash
+make decode-bench
+make cuda-kernels
+```
+
+Smoke timing command:
+
+```bash
+./build/experiments/gemma4_decode_bench all 2 1 1
+```
+
+Smoke results from the first low-iteration run:
+
+| Op | K | N | Custom best ms | cuBLAS GEMV best ms | cuBLAS GEMM M=1 best ms | Max diff vs GEMV |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 5376 | 43008 | 0.660864 | 3.579680 | 3.446096 | 0.03125 |
+| `ffn_down` | 21504 | 5376 | 0.341408 | 0.340816 | 0.340544 | 0 |
+| `sliding_qkv` | 5376 | 16384 | 0.264544 | 2.905792 | 2.898672 | 0 |
+| `sliding_o` | 8192 | 5376 | 0.133952 | 2.978928 | 2.423568 | 0.03125 |
+| `global_q` | 5376 | 16384 | 0.266848 | 2.411344 | 2.354640 | 0 |
+| `global_k` | 5376 | 2048 | 0.042096 | 2.560576 | 3.245296 | 0 |
+| `global_o` | 16384 | 5376 | 0.265968 | 0.263088 | 0.263392 | 0 |
+| `final_logits` | 5376 | 262144 | 3.979248 | 3.997824 | 3.980464 | 0 |
+
+Notes:
+
+- This is a low-iteration smoke pass, not a stable tuning run.
+- Some outputs differ from cuBLAS by `0.03125`, which is one half-scale step for this deterministic input pattern and is expected from different FP32 reduction orders before FP16 output rounding.
+- The current generic kernel is already very strong when cuBLAS dispatch overhead/layout choices dominate smaller decode shapes, but it is only at parity for `ffn_down`, `global_o`, and `final_logits`. Those need actual tuning before claiming a win.
+
+Sequential stability check:
+
+```bash
+./build/experiments/gemma4_decode_bench all 50 10 3
+```
+
+| Op | Custom best ms | cuBLAS GEMV best ms | cuBLAS GEMM M=1 best ms | Best custom speedup vs GEMV |
+| --- | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.652664 | 3.096099 | 3.124034 | 4.743790 |
+| `ffn_down` | 0.327303 | 0.330160 | 0.330163 | 1.008729 |
+| `sliding_qkv` | 0.250743 | 2.808276 | 2.542720 | 11.199816 |
+| `sliding_o` | 0.127187 | 3.486035 | 3.434500 | 27.408831 |
+| `global_q` | 0.251055 | 2.511043 | 2.200656 | 10.001947 |
+| `global_k` | 0.036893 | 2.202849 | 2.701255 | 59.709446 |
+| `global_o` | 0.250511 | 0.252756 | 0.252499 | 1.008960 |
+| `final_logits` | 3.961647 | 3.965804 | 3.965508 | 1.001049 |
+
+Interpretation:
+
+- The large wins are credible for this exact benchmark setup because the run is sequential, warm, and uses the same physical `[N, K]` half weight layout for custom and cuBLAS.
+- These are still only baseline comparisons against simple cuBLAS GEMV/GEMM calls, not proof that the kernels beat every possible library/layout path.
+- `ffn_down`, `global_o`, and `final_logits` are effectively parity with cuBLAS. Treat them as coverage/correctness baselines, not optimized wins.
