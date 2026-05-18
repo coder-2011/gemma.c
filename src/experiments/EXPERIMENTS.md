@@ -180,3 +180,116 @@ Change:
 CUDA guide note:
 
 - CUDA execution-space rules mean cuDNN/cuBLAS frontend calls belong in host code, not `__device__` functions. The device side is therefore limited to the custom decode matvec primitive.
+
+## 2026-05-18 - M=1 decode vs cuDNN baseline
+
+Runtime file: `src/gemma4_matmul_kernels.cu`
+
+Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+
+Target:
+
+- Decode-only packed FFN gate+up projection.
+- Shape: `M=1, K=5376, N=43008`.
+- Custom weight layout: `[43008, 5376]` row-major half, so each output column/dot product is contiguous.
+- cuDNN baseline: equivalent 1x1 convolution with input `[1, 5376, 1, 1]`, filter `[43008, 5376, 1, 1]`, output `[1, 43008, 1, 1]`.
+
+Why cuDNN convolution baseline:
+
+- cuDNN backend matmul descriptors for the same operation finalized, but heuristics returned zero usable engine configs for both transposed-stride and contiguous B descriptor attempts.
+- The 1x1 convolution formulation is the same decode math and uses the same physical `[N, K]` weight layout as the custom kernel.
+
+Build:
+
+```bash
+make decode-bench
+```
+
+Final timing command:
+
+```bash
+./build/experiments/gemma4_decode_bench both 200 30
+```
+
+Final CUDA-event timing results:
+
+| Kernel | Avg ms | Weight GB/s |
+| --- | ---: | ---: |
+| Custom decode | 0.652241 | 708.974 |
+| cuDNN 1x1 conv | 3.191969 | 144.870 |
+
+Comparison:
+
+- `custom_vs_cudnn_speedup = 4.893846`
+- Custom is about `387%` faster than cuDNN on this M=1 decode benchmark.
+- Correctness check: `max_abs_diff = 0`.
+- cuDNN selected convolution algo `1` with `172160` bytes of workspace.
+- Device: NVIDIA RTX A6000, compute capability 8.6, driver `580.126.16`.
+
+Tuning/resource notes:
+
+- Kept 4 output columns per CTA using `half2` loads. This reduces grid size and reuses each loaded input element across four output dots.
+- Thread-count sweep:
+  - `GEMMA4_DECODE_THREADS=128`: `0.652592 ms`
+  - `GEMMA4_DECODE_THREADS=256`: `0.652398 ms`
+  - `GEMMA4_DECODE_THREADS=512`: `0.680386 ms`
+- Kept 256 threads per CTA.
+- Added `__launch_bounds__(256, 2)` and moved thread-index ownership out of the reusable `__device__` helper to match the repo CUDA kernel-structure rule.
+- Final `ptxas -v` resource data:
+  - Registers: `25`
+  - Static spills: `0 bytes`
+  - Shared memory: `128 bytes`
+  - Barriers: `1`
+  - Constant memory: `376 bytes cmem[0]`
+- Theoretical occupancy estimate on SM 8.6: 256 threads/CTA gives 8 warps/CTA; the 1536-thread/48-warp SM limit allows 6 CTAs/SM, so the kernel can reach 48 active warps/SM before register or shared-memory limits bind.
+
+Profiler status:
+
+- `ncu --set full --target-processes all --kernel-name regex:gemma4_ffn_gate_up_decode_kernel --launch-count 1 ./build/experiments/gemma4_decode_bench custom 1 0` fails in this Thunder Compute environment with an internal unsupported-library assertion before producing metrics.
+- `nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt --stats=true -o build/experiments/gemma4_decode_bench_nsys ./build/experiments/gemma4_decode_bench both 10 2` completes and writes `.nsys-rep`/`.sqlite`, but the generated sqlite contains no CUDA trace, kernel, or GPU memory data.
+- `nvprof ./build/experiments/gemma4_decode_bench custom 5 1` is unavailable for this GPU class; it reports that `nvprof` is not supported on compute capability 8.0 and higher.
+- Because profiler CUDA data is blocked here, the reliable evidence for this entry is CUDA-event timing, exact-output comparison against cuDNN, `ptxas` resource data, and the explicit profiler failure output.
+
+Tooling/source notes:
+
+- `$cuda-programming-guide` was queried for coalesced memory access, occupancy/resource constraints, launch bounds, shared-memory/bank-conflict considerations, and profiler/occupancy interpretation. Relevant guide pages returned included 60-61, 67, 70-71, 119, 130, 445, and 526.
+- `$exa-search` could not run because `EXA_API_KEY` is not set in this environment.
+
+## 2026-05-18 - M=1 decode vs cuBLAS GEMM/GEMV baselines
+
+Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+
+Reason:
+
+- The cuDNN 1x1 convolution baseline is mathematically equivalent, but it is not the cleanest library matmul baseline.
+- The lean baseline for this decode matmul is `cublasGemmEx`, using the existing `[N, K]` weight layout as a column-major `[K, N]` matrix and computing `Y^T[N, 1] = W^T[N, K] * X^T[K, 1]`.
+- Because M=1 is also a matrix-vector operation, the benchmark now also includes `cublasHSHgemvStridedBatched` with `batchCount=1`.
+- cuBLASLt was briefly wired in, but removed from the benchmark because the simple cuBLAS GEMM/GEMV calls are the correct small baselines for this question.
+
+Command:
+
+```bash
+./build/experiments/gemma4_decode_bench both 50 10 3
+```
+
+Results:
+
+| Kernel | Best ms | Avg ms | Best weight GB/s |
+| --- | ---: | ---: | ---: |
+| Custom decode | 0.652367 | 0.652407 | 708.838 |
+| cuBLAS `cublasGemmEx` | 3.333772 | 3.486190 | 138.708 |
+| cuBLAS `cublasHSHgemvStridedBatched` | 3.413318 | 3.593821 | 135.476 |
+| cuDNN 1x1 conv | 3.138264 | 3.222237 | 147.350 |
+
+Comparison:
+
+- `custom_vs_cublas_gemmex_speedup = 5.110273`
+- `custom_vs_cublas_hshgemv_strided_batched_speedup = 5.232207`
+- `custom_vs_cudnn_speedup = 4.810584`
+- Correctness check: `cublas_gemmex_max_abs_diff = 0`.
+- Correctness check: `cublas_hshgemv_strided_batched_max_abs_diff = 0`.
+- The cuBLAS GEMM/GEMV baselines are more credible library comparisons than cuDNN convolution for the M=1 decode matmul, and they are still far behind the custom contiguous-weight matvec kernel.
+
+Tooling/source notes:
+
+- `$cuda-programming-guide` was queried again for CUDA-X/cuBLAS/Tensor Core guidance and GEMV/memory-access considerations. The local guide points to CUDA-X libraries such as cuBLAS as the recommended library path for Tensor Core operations on supported hardware, and reiterates coalesced memory access as a first-order concern.
