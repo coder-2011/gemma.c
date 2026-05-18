@@ -14,3 +14,5 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 - Matmul kernels have been finished, code quality has to be improved, and I think there's a couple of issues with cache hints. Unfortunately, I'm not running on bare metal GPUs, so I cannot use _nsys_, but hopefully if I get my hands on some baremetal A6000s, I can run nsys and check for issues. All the bells and whistles are implemented.
 
 - For the RMS-norm, I pretty much ported llm.c's RMSNorm, and worked off that. it was really cleanly implemented so there is no need to rewrite it. Ofc, adjustments have to be made since we use RMS instead of LayerNorm.
+
+- Back to matmul, playing around w/ warptiling to torture the chip into giving me all its FLOPs. Benchmarks had to be fixed a bit too, bc it didnt fully account for overhead from cuDNN. I used cuDNN backend API anyways to minimize ovehead.
