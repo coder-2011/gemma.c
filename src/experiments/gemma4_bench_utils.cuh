@@ -101,6 +101,9 @@ float time_ms_graph_once(Fn &&fn, cudaStream_t stream, int warmup, int iters) {
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
+    // Capture and instantiate outside the measured region. The timed replay
+    // replaces per-call CPU enqueue overhead with one graph launch amortized
+    // over the captured iteration count.
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     capturing = true;
     for (int i = 0; i < iters; ++i) {
