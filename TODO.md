@@ -12,3 +12,39 @@
 - Fuse token embedding gather with the first matrix multiplication in the language path once the unfused baseline is correct.
   - Avoid materializing the initial `[M, 5376]` hidden buffer when the first projection can consume embedding rows directly.
   - Benchmark against the standalone embedding gather plus cuBLAS/cuBLASLt baseline before keeping the fusion.
+
+## Decode GEMV Priority Order
+
+1. FFN gate+up GEMV
+   - Shape: `x[5376] -> gate_up[43008]`
+   - Estimated weight traffic: `~27.7 GB/token` across 60 layers.
+   - Already started.
+   - Biggest fixed-shape decode target.
+
+2. FFN down GEMV
+   - Shape: `ffn_hidden[21504] -> hidden[5376]`
+   - Estimated weight traffic: `~13.9 GB/token`.
+   - Next target.
+   - Same every layer, huge, clean.
+
+3. Sliding QKV packed GEMV
+   - Shape: `x[5376] -> qkv[16384]`
+   - Estimated weight traffic: `~8.8 GB/token` across 50 sliding layers.
+   - Do not optimize sliding Q/K/V separately if we can avoid it.
+   - Pack as `Q 8192 + K 4096 + V 4096 = 16384`.
+
+4. Sliding O GEMV
+   - Shape: `attn_out[8192] -> hidden[5376]`
+   - Estimated weight traffic: `~4.4 GB/token`.
+   - Repeated across 50 sliding layers.
+
+5. Final vocab/logits GEMV
+   - Shape: `hidden[5376] -> logits[262144]`
+   - Estimated weight traffic: `~2.8 GB/token`.
+   - Huge single kernel.
+   - High value if fused with softcap/top-k/argmax, but only runs once per token.
+
+6. Global Q/O GEMVs
+   - Global Q shape: `x[5376] -> q[16384]`
+   - Global O shape: `attn_out[16384] -> hidden[5376]`
+   - Estimated weight traffic: `~1.76 GB/token` each.
