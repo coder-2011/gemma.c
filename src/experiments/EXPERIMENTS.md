@@ -535,6 +535,7 @@ Target:
 - Gemma 4 31B dense token embedding gather.
 - Shape: token id -> hidden row `[5376]`.
 - Vocabulary: `262144`.
+- Benchmark dimensions are read from `gemma4_config` in `src/gemma4.c`.
 - Embedding table allocation: `2818572288` bytes.
 - Kernel: one warp per token, 16-byte `int4` vectorized BF16 row copy.
 - Effective bandwidth below counts embedding reads plus output writes:
