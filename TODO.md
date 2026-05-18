@@ -15,6 +15,17 @@
 
 ## Decode GEMV Priority Order
 
+## Decode GEMV Kernel-Shape Experiments
+
+- Benchmark warp-tiled GEMV variants against the current CTA-cooperative baseline.
+  - Current baseline: one CTA computes four output columns, with all CTA threads reducing the same four dots.
+  - Variant A: one warp owns one output column.
+  - Variant B: one warp owns two output columns.
+  - Variant C: two warps own one output column for large-`K` shapes.
+  - Keep `Packed128` loads and streaming weight-load hints in each variant.
+  - Compare first on `global_k`, `sliding_o`, `sliding_qkv`, and `global_q`, where reduction overhead may matter most.
+  - Preserve the existing CTA-reduction kernel as the baseline and only replace it after correctness and CUDA-event timings clearly improve.
+
 1. FFN gate+up GEMV
    - Shape: `x[5376] -> gate_up[43008]`
    - Estimated weight traffic: `~27.7 GB/token` across 60 layers.
