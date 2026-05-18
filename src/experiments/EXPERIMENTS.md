@@ -369,3 +369,151 @@ Interpretation:
 - The large wins are credible for this exact benchmark setup because the run is sequential, warm, and uses the same physical `[N, K]` half weight layout for custom and cuBLAS.
 - These are still only baseline comparisons against simple cuBLAS GEMV/GEMM calls, not proof that the kernels beat every possible library/layout path.
 - `ffn_down`, `global_o`, and `final_logits` are effectively parity with cuBLAS. Treat them as coverage/correctness baselines, not optimized wins.
+
+## 2026-05-18 - Decode parity-kernel tuning: theoretical max and plan
+
+Runtime file: `src/gemma4_matmul_kernels.cu`
+
+Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+
+Goal:
+
+- Tune the three decode GEMV kernels that are currently only at cuBLAS parity:
+  - `ffn_down`: `K=21504, N=5376`
+  - `global_o`: `K=16384, N=5376`
+  - `final_logits`: `K=5376, N=262144`
+- Keep changes small: thread count, columns per CTA, launch bounds, reduction shape, and similarly local kernel-architecture changes.
+- Stop a kernel only after a clear flat line: seven tried variants without a better result.
+
+Theoretical memory roofline:
+
+- Device: NVIDIA RTX A6000, compute capability 8.6.
+- CUDA-reported properties from PyTorch:
+  - `memory_clock_rate = 8001000 kHz`
+  - `memory_bus_width = 384 bits`
+  - `multi_processor_count = 84`
+  - `max_threads_per_multi_processor = 1536`
+- Peak theoretical DRAM bandwidth: `8001000 kHz * 1000 * 2 * (384 / 8) = 768.096 GB/s`.
+- These M=1 decode kernels are weight-streaming GEMVs. The absolute lower bound below counts weight bytes only, `N * K * sizeof(half)`. Input and output traffic are tiny by comparison for these shapes, and repeated input reads make this an optimistic lower bound.
+
+| Op | K | N | Weight GB | Theoretical min ms @ 768.096 GB/s | Current best ms | Current weight GB/s | Peak % |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ffn_down` | 21504 | 5376 | 0.231211 | 0.301018 | 0.327303 | 706.413 | 91.97% |
+| `global_o` | 16384 | 5376 | 0.176161 | 0.229347 | 0.250511 | 703.206 | 91.55% |
+| `final_logits` | 5376 | 262144 | 2.818572 | 3.669557 | 3.961647 | 711.465 | 92.63% |
+
+Interpretation before tuning:
+
+- The three parity kernels are already around `91.5-92.6%` of the simple theoretical DRAM bandwidth roofline by the benchmark's weight-GB/s metric.
+- A "much faster than baseline" result may be mathematically limited unless the baseline comparison changes or the kernel reduces real traffic beyond the current one-pass contiguous weight stream.
+- Tuning should still probe whether the last `7-8%` gap is launch/reduction overhead, instruction mix, occupancy, or memory-transaction inefficiency.
+
+Compile resource check:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas -v \
+  -c src/gemma4_matmul_kernels.cu \
+  -o /tmp/gemma4_matmul_kernels_review.o
+```
+
+`ptxas` reported the same resource usage for every instantiated decode GEMV kernel:
+
+- Registers: `24`
+- Static spills: `0 bytes`
+- Shared memory: `128 bytes`
+- Barriers: `1`
+- Constant memory: `376 bytes cmem[0]`
+
+Covered instantiations:
+
+| K | N | Cols/block |
+| ---: | ---: | ---: |
+| 5376 | 262144 | 4 |
+| 16384 | 5376 | 4 |
+| 5376 | 2048 | 4 |
+| 8192 | 5376 | 4 |
+| 5376 | 16384 | 4 |
+| 21504 | 5376 | 4 |
+| 5376 | 43008 | 4 |
+
+## 2026-05-18 - Token embedding gather CUDA-event timing
+
+Runtime file: `src/gemma4_embedding_gather.cu`
+
+Benchmark file: `src/experiments/gemma4_embedding_gather_bench.cu`
+
+Target:
+
+- Gemma 4 31B dense token embedding gather.
+- Shape: token id -> hidden row `[5376]`.
+- Vocabulary: `262144`.
+- Embedding table allocation: `2818572288` bytes.
+- Kernel: one warp per token, 16-byte `int4` vectorized BF16 row copy.
+- Effective bandwidth below counts embedding reads plus output writes:
+  `2 * num_tokens * hidden_size * sizeof(bfloat16)`.
+
+Build:
+
+```bash
+make embedding-gather-bench
+```
+
+Correctness:
+
+```bash
+make test-embedding-gather
+```
+
+Result: `embedding gather tests passed`.
+
+Timing command:
+
+```bash
+./build/experiments/gemma4_embedding_gather_bench 200 30 5 4096
+```
+
+CUDA-event timing results:
+
+| Tokens | Best ms | Avg ms | Best effective GiB/s | Effective MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.009801 | 0.010901 | 2.043 | 0.021 |
+| 4 | 0.009879 | 0.011773 | 8.109 | 0.082 |
+| 16 | 0.009604 | 0.010351 | 33.366 | 0.328 |
+| 64 | 0.009106 | 0.009389 | 140.756 | 1.312 |
+| 256 | 0.010201 | 0.010393 | 502.579 | 5.250 |
+| 1024 | 0.036632 | 0.036661 | 559.828 | 21.000 |
+| 4096 | 0.135603 | 0.135637 | 604.939 | 84.000 |
+
+Larger sweep command:
+
+```bash
+./build/experiments/gemma4_embedding_gather_bench 100 20 3 8192
+```
+
+Largest result:
+
+| Tokens | Best ms | Avg ms | Best effective GiB/s | Effective MiB |
+| ---: | ---: | ---: | ---: | ---: |
+| 8192 | 0.265483 | 0.265529 | 617.978 | 168.000 |
+
+Compile resource check:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc -Xptxas=-v \
+  -c src/gemma4_embedding_gather.cu \
+  -o /tmp/gemma4_embedding_gather_ptxas.o
+```
+
+`ptxas` resource data:
+
+- Registers: `32`
+- Static spills: `0 bytes`
+- Barriers: `0`
+- Constant memory: `388 bytes cmem[0]`
+
+Interpretation:
+
+- Small token counts are launch-latency dominated in this environment.
+- Bandwidth becomes meaningful by `256` tokens and plateaus around `605-618 GiB/s` effective read+write bandwidth by `4096-8192` tokens.
+- The A6000 theoretical DRAM peak is about `768 GB/s`, so the large-token result is roughly `86%` of peak if converted to decimal GB/s (`617.978 GiB/s = 663.6 GB/s`).
+- Nsight Compute and Nsight Systems CUDA metrics remain blocked in this Thunder-mediated container; these results are CUDA-event timings only.
