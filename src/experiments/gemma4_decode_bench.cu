@@ -2,6 +2,7 @@
 #include "gemma4_bench_utils.cuh"
 #include "gemma4.h"
 
+#include <cudnn.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <random>
 #include <string>
+#include <vector>
 
 using DecodeLaunch = cudaError_t (*)(const __nv_bfloat16 *,
                                      const __nv_bfloat16 *, __nv_bfloat16 *,
@@ -128,6 +130,106 @@ struct CublasDecode {
   }
 };
 
+inline void cudnn_check(cudnnStatus_t status, const char *expr,
+                        const char *file, int line) {
+  if (status != CUDNN_STATUS_SUCCESS) {
+    throw std::runtime_error(std::string(file) + ":" +
+                             std::to_string(line) +
+                             ": cuDNN error for " + expr + ": " +
+                             cudnnGetErrorString(status));
+  }
+}
+
+#define CUDNN_CHECK(expr)                                                      \
+  cudnn_check((expr), #expr, __FILE__, __LINE__)
+
+struct CudnnDecodeConv {
+  cudnnHandle_t handle = nullptr;
+  cudnnTensorDescriptor_t x_desc = nullptr;
+  cudnnFilterDescriptor_t w_desc = nullptr;
+  cudnnConvolutionDescriptor_t conv_desc = nullptr;
+  cudnnTensorDescriptor_t y_desc = nullptr;
+  cudnnConvolutionFwdAlgo_t algo = CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM;
+  void *workspace = nullptr;
+  size_t workspace_bytes = 0;
+
+  CudnnDecodeConv(cudaStream_t stream, int k, int n) {
+    CUDNN_CHECK(cudnnCreate(&handle));
+    CUDNN_CHECK(cudnnSetStream(handle, stream));
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&x_desc));
+    CUDNN_CHECK(cudnnCreateFilterDescriptor(&w_desc));
+    CUDNN_CHECK(cudnnCreateConvolutionDescriptor(&conv_desc));
+    CUDNN_CHECK(cudnnCreateTensorDescriptor(&y_desc));
+
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(x_desc, CUDNN_TENSOR_NCHW,
+                                           CUDNN_DATA_BFLOAT16, 1, k, 1, 1));
+    CUDNN_CHECK(cudnnSetFilter4dDescriptor(w_desc, CUDNN_DATA_BFLOAT16,
+                                           CUDNN_TENSOR_NCHW, n, k, 1, 1));
+    CUDNN_CHECK(cudnnSetConvolution2dDescriptor(
+        conv_desc, 0, 0, 1, 1, 1, 1, CUDNN_CROSS_CORRELATION,
+        CUDNN_DATA_FLOAT));
+    CUDNN_CHECK(cudnnSetConvolutionMathType(conv_desc, CUDNN_TENSOR_OP_MATH));
+    CUDNN_CHECK(cudnnSetTensor4dDescriptor(y_desc, CUDNN_TENSOR_NCHW,
+                                           CUDNN_DATA_BFLOAT16, 1, n, 1, 1));
+
+    int max_count = 0;
+    CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithmMaxCount(handle, &max_count));
+    std::vector<cudnnConvolutionFwdAlgoPerf_t> perf(max_count);
+    int returned = 0;
+    CUDNN_CHECK(cudnnGetConvolutionForwardAlgorithm_v7(
+        handle, x_desc, w_desc, conv_desc, y_desc, max_count, &returned,
+        perf.data()));
+
+    bool found = false;
+    for (int i = 0; i < returned; ++i) {
+      if (perf[i].status == CUDNN_STATUS_SUCCESS) {
+        algo = perf[i].algo;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      throw std::runtime_error("cuDNN did not return a valid convolution algo");
+    }
+
+    CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(
+        handle, x_desc, w_desc, conv_desc, y_desc, algo, &workspace_bytes));
+    if (workspace_bytes > 0) {
+      CUDA_CHECK(cudaMalloc(&workspace, workspace_bytes));
+    }
+  }
+
+  ~CudnnDecodeConv() {
+    if (workspace != nullptr) {
+      cudaFree(workspace);
+    }
+    if (y_desc != nullptr) {
+      cudnnDestroyTensorDescriptor(y_desc);
+    }
+    if (conv_desc != nullptr) {
+      cudnnDestroyConvolutionDescriptor(conv_desc);
+    }
+    if (w_desc != nullptr) {
+      cudnnDestroyFilterDescriptor(w_desc);
+    }
+    if (x_desc != nullptr) {
+      cudnnDestroyTensorDescriptor(x_desc);
+    }
+    if (handle != nullptr) {
+      cudnnDestroy(handle);
+    }
+  }
+
+  void conv(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
+            __nv_bfloat16 *y) {
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    CUDNN_CHECK(cudnnConvolutionForward(handle, &alpha, x_desc, x, w_desc, w,
+                                        conv_desc, algo, workspace,
+                                        workspace_bytes, &beta, y_desc, y));
+  }
+};
+
 static bool should_run_op(const std::string &selected, const DecodeOp &op) {
   return selected == "all" || selected == op.name;
 }
@@ -140,6 +242,7 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   __nv_bfloat16 *custom_y = nullptr;
   __nv_bfloat16 *gemv_y = nullptr;
   __nv_bfloat16 *gemm_y = nullptr;
+  __nv_bfloat16 *cudnn_y = nullptr;
   const size_t x_count = size_t(op.k);
   const size_t w_count = size_t(op.n) * size_t(op.k);
   const size_t y_count = size_t(op.n);
@@ -149,6 +252,7 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   CUDA_CHECK(cudaMalloc(&custom_y, y_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&gemv_y, y_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&gemm_y, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&cudnn_y, y_count * sizeof(__nv_bfloat16)));
 
   const uint64_t x_seed = base_seed ^ (uint64_t(op.k) << 32) ^ uint64_t(op.n);
   const uint64_t w_seed =
@@ -161,6 +265,7 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   CUDA_CHECK(cudaMemsetAsync(custom_y, 0, y_count * sizeof(__nv_bfloat16), stream));
   CUDA_CHECK(cudaMemsetAsync(gemv_y, 0, y_count * sizeof(__nv_bfloat16), stream));
   CUDA_CHECK(cudaMemsetAsync(gemm_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+  CUDA_CHECK(cudaMemsetAsync(cudnn_y, 0, y_count * sizeof(__nv_bfloat16), stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   auto run_custom = [&]() { CUDA_CHECK(op.launch(x, w, custom_y, stream)); };
@@ -181,6 +286,37 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   const double bytes = double(op.n) * double(op.k) * sizeof(__nv_bfloat16);
   const double per_token_gb = bytes * double(op.layers_per_token) / 1.0e9;
 
+  float cudnn_best_ms = -1.0f;
+  float cudnn_avg_ms = -1.0f;
+  double cudnn_gbps = 0.0;
+  float cudnn_speedup = -1.0f;
+  float cudnn_max_abs = -1.0f;
+  float cudnn_mean_abs = -1.0f;
+  float cudnn_max_rel = -1.0f;
+  int cudnn_algo = -1;
+  size_t cudnn_workspace_bytes = 0;
+  try {
+    CudnnDecodeConv cudnn(stream, op.k, op.n);
+    auto run_cudnn = [&]() { cudnn.conv(x, w, cudnn_y); };
+    run_cudnn();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const DiffStats cudnn_diff = diff_stats_bf16(custom_y, cudnn_y, op.n);
+    const TimingStats cudnn_stats =
+        time_ms(run_cudnn, stream, warmup, iters, trials);
+    cudnn_best_ms = cudnn_stats.best_ms;
+    cudnn_avg_ms = cudnn_stats.avg_ms;
+    cudnn_gbps = bytes / (cudnn_best_ms * 1.0e6);
+    cudnn_speedup = cudnn_best_ms / custom.best_ms;
+    cudnn_max_abs = cudnn_diff.max_abs;
+    cudnn_mean_abs = cudnn_diff.mean_abs;
+    cudnn_max_rel = cudnn_diff.max_rel;
+    cudnn_algo = int(cudnn.algo);
+    cudnn_workspace_bytes = cudnn.workspace_bytes;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "cuDNN 1x1 conv unavailable for op=%s: %s\n",
+                 op.name, e.what());
+  }
+
   std::printf("op=%s,K=%d,N=%d,layers_per_token=%d,weight_gb_per_token=%.3f\n",
               op.name, op.k, op.n, op.layers_per_token, per_token_gb);
   std::printf("dtype=bf16,input_seed=%llu,weight_seed=%llu,input_scale=%.3f,weight_scale=%.3f\n",
@@ -193,20 +329,28 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
               gemv.best_ms, gemv.avg_ms, bytes / (gemv.best_ms * 1.0e6));
   std::printf("cublas_bf16_gemm_m1_best_ms=%.6f,cublas_bf16_gemm_m1_avg_ms=%.6f,cublas_bf16_gemm_m1_best_weight_gbps=%.3f\n",
               gemm.best_ms, gemm.avg_ms, bytes / (gemm.best_ms * 1.0e6));
+  std::printf("cudnn_bf16_conv1x1_best_ms=%.6f,cudnn_bf16_conv1x1_avg_ms=%.6f,cudnn_bf16_conv1x1_best_weight_gbps=%.3f\n",
+              cudnn_best_ms, cudnn_avg_ms, cudnn_gbps);
   std::printf("custom_vs_cublas_gemv_speedup=%.6f\n",
               gemv.best_ms / custom.best_ms);
   std::printf("custom_vs_cublas_gemm_m1_speedup=%.6f\n",
               gemm.best_ms / custom.best_ms);
+  std::printf("custom_vs_cudnn_conv1x1_speedup=%.6f\n", cudnn_speedup);
   std::printf("cublas_bf16_gemv_max_abs_diff=%.6g,cublas_bf16_gemv_mean_abs_diff=%.6g,cublas_bf16_gemv_max_rel_diff=%.6g\n",
               gemv_diff.max_abs, gemv_diff.mean_abs, gemv_diff.max_rel);
-  std::printf("cublas_bf16_gemm_m1_max_abs_diff=%.6g,cublas_bf16_gemm_m1_mean_abs_diff=%.6g,cublas_bf16_gemm_m1_max_rel_diff=%.6g\n\n",
+  std::printf("cublas_bf16_gemm_m1_max_abs_diff=%.6g,cublas_bf16_gemm_m1_mean_abs_diff=%.6g,cublas_bf16_gemm_m1_max_rel_diff=%.6g\n",
               gemm_diff.max_abs, gemm_diff.mean_abs, gemm_diff.max_rel);
+  std::printf("cudnn_bf16_conv1x1_max_abs_diff=%.6g,cudnn_bf16_conv1x1_mean_abs_diff=%.6g,cudnn_bf16_conv1x1_max_rel_diff=%.6g\n",
+              cudnn_max_abs, cudnn_mean_abs, cudnn_max_rel);
+  std::printf("cudnn_bf16_conv1x1_algo=%d,cudnn_bf16_conv1x1_workspace_bytes=%zu\n\n",
+              cudnn_algo, cudnn_workspace_bytes);
 
   CUDA_CHECK(cudaFree(x));
   CUDA_CHECK(cudaFree(w));
   CUDA_CHECK(cudaFree(custom_y));
   CUDA_CHECK(cudaFree(gemv_y));
   CUDA_CHECK(cudaFree(gemm_y));
+  CUDA_CHECK(cudaFree(cudnn_y));
 }
 
 int main(int argc, char **argv) {
