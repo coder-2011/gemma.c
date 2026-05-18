@@ -22,7 +22,8 @@ const Gemma4DenseConfig gemma4_config = {
 };
 
 bool gemma4_is_global_layer(int32_t layer_index) {
-    return layer_index == gemma4_config.num_layers - 1 || (layer_index + 1) % 6 == 0;
+    return layer_index == gemma4_config.num_layers - 1 ||
+           (layer_index + 1) % GEMMA4_GLOBAL_LAYER_PERIOD == 0;
 }
 
 Gemma4AttentionSpec gemma4_attention_spec(int32_t layer_index) {
