@@ -1,89 +1,138 @@
-// Gemma 4 31B matmul kernel planning notes.
+#include <cublas_v2.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+// Gemma 4 31B dense FFN packed gate+up projection:
+//   X[M, 5376] * W[5376, 43008] -> Y[M, 43008]
 //
-// This file is intentionally comment-only for now. Do not add executable CUDA
-// code here until the target matmul shapes and validation path are agreed.
-//
-// Fallback library note:
-// - For GEMM fallback, prefer cuBLAS/cuBLASLt. cuDNN is not the usual direct
-//   library boundary for standalone transformer matmuls.
-//
-// Sizing assumptions:
-// - Model: Gemma 4 31B dense text stack.
-// - Dtype: BF16 weights and activations.
-// - hidden_size = 5376
-// - intermediate_size = 21504
-// - layers = 60
-// - sliding layers = 50
-// - full/global layers = 10
-// - sliding attention: 32 Q heads, 16 KV heads, head_dim 256.
-// - global attention: 32 Q heads, 4 KV heads, head_dim 512, K=V projection.
-//
-// Accounting method:
-// - Per-token decode GEMM cost is estimated as 2 * K * N FLOPs for
-//   [M, K] x [K, N], with M left symbolic.
-// - BF16 weight traffic is estimated as K * N * 2 bytes per matrix use.
-// - For M=1 decode, these large projections are weight-bandwidth dominated.
-//   Larger batch/prefill M increases arithmetic intensity through weight reuse.
-// - The rank below uses total repeated work across the full text stack, not
-//   only the size of a single layer's matrix.
-//
-// CUDA optimization reminders from the CUDA Programming Guide:
-// - Coalesced global memory access is a first-order requirement for bandwidth
-//   efficiency (guide page 60).
-// - Shared memory tiling must avoid bank conflicts where practical
-//   (guide page 67).
-// - Async copies can overlap data movement with computation on modern CUDA
-//   GPUs (guide page 130).
-//
-// Top 3 custom matmul kernel priorities:
-//
-// 1. FFN gate+up packed projection
-//    Shape: [M, 5376] x [5376, 43008]
-//    Equivalent separate shapes:
-//      gate: [M, 5376] x [5376, 21504]
-//      up:   [M, 5376] x [5376, 21504]
-//    Per layer: 462.4M FLOPs per decoded token, about 462.4 MB of BF16 weights.
-//    Full stack: 27.75G FLOPs per decoded token, about 27.75 GB of BF16
-//    weight reads if streamed once per layer.
-//    Why custom first: this is the largest repeated projection family and it
-//    feeds the GELU-gated FFN path. A packed kernel can share the input load
-//    for gate and up, improve scheduling locality, and set up later fusion
-//    with GELU and elementwise multiply.
-//
-// 2. FFN down projection
-//    Shape: [M, 21504] x [21504, 5376]
-//    Per layer: 231.2M FLOPs per decoded token, about 231.2 MB of BF16 weights.
-//    Full stack: 13.87G FLOPs per decoded token, about 13.87 GB of BF16
-//    weight reads if streamed once per layer.
-//    Why custom second: same total math as either individual gate or up
-//    projection, but it consumes the wide FFN activation and sits directly
-//    before the residual path. It is a high-value target after gate+up because
-//    every layer pays for it.
-//
-// 3. Sliding-attention packed QKV projection
-//    Shape: [M, 5376] x [5376, 16384]
-//    Output width breakdown:
-//      Q: 32 * 256 = 8192
-//      K: 16 * 256 = 4096
-//      V: 16 * 256 = 4096
-//    Per sliding layer: 176.2M FLOPs per decoded token, about 176.2 MB of BF16
-//    weights.
-//    Full sliding stack: 8.81G FLOPs per decoded token, about 8.81 GB of BF16
-//    weight reads across the 50 sliding layers.
-//    Why custom third: it is the next largest repeated matmul family after the
-//    FFN projections. It also has a stable shape and obvious packing boundary,
-//    but it is less important than FFN because its total stack cost is lower.
-//
-// FFN-only interpretation:
-// - If the immediate scope is strictly "only FFN matmuls", then the top three
-//   mathematical matmuls are gate, up, and down. Gate and up should still be
-//   treated as one packed implementation target unless profiling shows a clear
-//   reason to keep them separate.
-//
-// Lower-priority matmul families for library fallback initially:
-// - Sliding O projection: [M, 8192] x [8192, 5376], 4.40G FLOPs/token stack.
-// - LM head: [M, 5376] x [5376, 262144], 2.82G FLOPs/token, used once per
-//   decoded token. This is large but not repeated per layer; it may deserve a
-//   later specialized top-k/logit path instead of a plain GEMM.
-// - Global Q+K projection: [M, 5376] x [5376, 18432], 1.98G FLOPs/token stack.
-// - Global O projection: [M, 16384] x [16384, 5376], 1.76G FLOPs/token stack.
+// Prefill stays on a host-side library GEMM. CUDA library frontends are not
+// callable from __device__ code, so the custom device path is decode-only.
+static constexpr int kGemma4Hidden = 5376;
+static constexpr int kGemma4HiddenHalf2 = kGemma4Hidden / 2;
+static constexpr int kGemma4PackedFfn = 43008;
+static constexpr int kGemma4DecodeThreads = 256;
+static constexpr int kGemma4DecodeColsPerBlock = 4;
+
+__device__ __forceinline__ void gemma4_decode_dot4_device(
+    const half *x, const half *w_col_major, int col0, float &sum0,
+    float &sum1, float &sum2, float &sum3) {
+  __shared__ float warp_sums[8][kGemma4DecodeColsPerBlock];
+
+  sum0 = 0.0f;
+  sum1 = 0.0f;
+  sum2 = 0.0f;
+  sum3 = 0.0f;
+
+  const half2 *x2 = reinterpret_cast<const half2 *>(x);
+  const half2 *w2 = reinterpret_cast<const half2 *>(w_col_major);
+  const int w_col0 = (col0 + 0) * kGemma4HiddenHalf2;
+  const int w_col1 = (col0 + 1) * kGemma4HiddenHalf2;
+  const int w_col2 = (col0 + 2) * kGemma4HiddenHalf2;
+  const int w_col3 = (col0 + 3) * kGemma4HiddenHalf2;
+
+#pragma unroll 4
+  for (int k2 = threadIdx.x; k2 < kGemma4HiddenHalf2; k2 += blockDim.x) {
+    const float2 xv = __half22float2(x2[k2]);
+    const float2 wv0 = __half22float2(w2[w_col0 + k2]);
+    const float2 wv1 = __half22float2(w2[w_col1 + k2]);
+    const float2 wv2 = __half22float2(w2[w_col2 + k2]);
+    const float2 wv3 = __half22float2(w2[w_col3 + k2]);
+
+    sum0 = fmaf(xv.x, wv0.x, sum0);
+    sum0 = fmaf(xv.y, wv0.y, sum0);
+    sum1 = fmaf(xv.x, wv1.x, sum1);
+    sum1 = fmaf(xv.y, wv1.y, sum1);
+    sum2 = fmaf(xv.x, wv2.x, sum2);
+    sum2 = fmaf(xv.y, wv2.y, sum2);
+    sum3 = fmaf(xv.x, wv3.x, sum3);
+    sum3 = fmaf(xv.y, wv3.y, sum3);
+  }
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+    sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+    sum2 += __shfl_down_sync(0xffffffffu, sum2, offset);
+    sum3 += __shfl_down_sync(0xffffffffu, sum3, offset);
+  }
+
+  if (lane == 0) {
+    warp_sums[warp][0] = sum0;
+    warp_sums[warp][1] = sum1;
+    warp_sums[warp][2] = sum2;
+    warp_sums[warp][3] = sum3;
+  }
+  __syncthreads();
+
+  const int warp_count = (blockDim.x + 31) / 32;
+  sum0 = threadIdx.x < warp_count ? warp_sums[lane][0] : 0.0f;
+  sum1 = threadIdx.x < warp_count ? warp_sums[lane][1] : 0.0f;
+  sum2 = threadIdx.x < warp_count ? warp_sums[lane][2] : 0.0f;
+  sum3 = threadIdx.x < warp_count ? warp_sums[lane][3] : 0.0f;
+
+  if (warp == 0) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
+      sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
+      sum2 += __shfl_down_sync(0xffffffffu, sum2, offset);
+      sum3 += __shfl_down_sync(0xffffffffu, sum3, offset);
+    }
+  }
+}
+
+__global__ void gemma4_ffn_gate_up_decode_kernel(const half *x,
+                                                 const half *w_col_major,
+                                                 half *y) {
+  const int col0 = blockIdx.x * kGemma4DecodeColsPerBlock;
+
+  float sum0;
+  float sum1;
+  float sum2;
+  float sum3;
+  gemma4_decode_dot4_device(x, w_col_major, col0, sum0, sum1, sum2, sum3);
+
+  if (threadIdx.x == 0) {
+    y[col0 + 0] = __float2half_rn(sum0);
+    y[col0 + 1] = __float2half_rn(sum1);
+    y[col0 + 2] = __float2half_rn(sum2);
+    y[col0 + 3] = __float2half_rn(sum3);
+  }
+}
+
+extern "C" cublasStatus_t gemma4_ffn_gate_up_prefill(
+    cublasHandle_t handle, const half *x, const half *w_col_major, half *y,
+    int m, cudaStream_t stream) {
+  if (m <= 0) {
+    return CUBLAS_STATUS_SUCCESS;
+  }
+
+  cublasStatus_t status = cublasSetStream(handle, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return status;
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+
+  // cuBLAS is column-major. This computes the row-major result
+  // Y[M, N] = X[M, K] * W[K, N] as:
+  // Y^T[N, M] = W^T[N, K] * X^T[K, M].
+  return cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, kGemma4PackedFfn, m,
+                      kGemma4Hidden, &alpha, w_col_major, CUDA_R_16F,
+                      kGemma4Hidden, x, CUDA_R_16F, kGemma4Hidden, &beta, y,
+                      CUDA_R_16F, kGemma4PackedFfn, CUBLAS_COMPUTE_32F,
+                      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+}
+
+extern "C" cudaError_t gemma4_ffn_gate_up_decode(const half *x,
+                                                  const half *w_col_major,
+                                                  half *y,
+                                                  cudaStream_t stream) {
+  constexpr int blocks =
+      kGemma4PackedFfn / kGemma4DecodeColsPerBlock;
+  gemma4_ffn_gate_up_decode_kernel<<<blocks, kGemma4DecodeThreads, 0, stream>>>(
+      x, w_col_major, y);
+  return cudaGetLastError();
+}
