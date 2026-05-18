@@ -9,8 +9,8 @@
 //
 // Prefill stays on a host-side library GEMM. CUDA library frontends are not
 // callable from __device__ code, so the custom device path is decode-only.
-static constexpr int kGemma4DecodeThreads = 256;
-static constexpr int kGemma4DecodeColsPerBlock = 4;
+static constexpr int kGemma4DecodeThreads = 512;
+static constexpr int kGemma4DecodeColsPerBlock = 2;
 static constexpr int kGemma4DecodeMinBlocksPerSM = 2;
 static_assert((kGemma4DecodeThreads % WARP_SIZE) == 0,
               "decode thread count must be a whole number of warps");
@@ -376,7 +376,7 @@ extern "C" cudaError_t gemma4_ffn_down_decode(const __nv_bfloat16 *x,
                                                __nv_bfloat16 *y,
                                                cudaStream_t stream) {
   return gemma4_decode_gemv_fixed4<GEMMA4_INTERMEDIATE_SIZE,
-                                   GEMMA4_HIDDEN_SIZE, 256, 4>(
+                                   GEMMA4_HIDDEN_SIZE, 1024, 1>(
       x, w_col_major, y, stream);
 }
 
@@ -426,6 +426,6 @@ extern "C" cudaError_t gemma4_final_logits_decode(const __nv_bfloat16 *x,
                                                    __nv_bfloat16 *y,
                                                    cudaStream_t stream) {
   return gemma4_decode_gemv_fixed4<GEMMA4_HIDDEN_SIZE,
-                                   GEMMA4_VOCAB_SIZE, 512, 2>(
+                                   GEMMA4_VOCAB_SIZE, 1024, 1>(
       x, w_col_major, y, stream);
 }
