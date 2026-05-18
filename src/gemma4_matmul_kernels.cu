@@ -10,14 +10,17 @@
 static constexpr int kGemma4Hidden = 5376;
 static constexpr int kGemma4HiddenHalf2 = kGemma4Hidden / 2;
 static constexpr int kGemma4PackedFfn = 43008;
-static constexpr int kGemma4DecodeThreads = 256;
 static constexpr int kGemma4DecodeColsPerBlock = 4;
 
-__device__ __forceinline__ void gemma4_decode_dot4_device(
-    const half *x, const half *w_col_major, int col0, float &sum0,
-    float &sum1, float &sum2, float &sum3) {
-  __shared__ float warp_sums[8][kGemma4DecodeColsPerBlock];
+#ifndef GEMMA4_DECODE_THREADS
+#define GEMMA4_DECODE_THREADS 256
+#endif
 
+static constexpr int kGemma4DecodeThreads = GEMMA4_DECODE_THREADS;
+
+__device__ __forceinline__ void gemma4_decode_dot4_device(
+    const half *x, const half *w_col_major, int col0, int thread_idx,
+    int thread_count, float &sum0, float &sum1, float &sum2, float &sum3) {
   sum0 = 0.0f;
   sum1 = 0.0f;
   sum2 = 0.0f;
@@ -31,7 +34,7 @@ __device__ __forceinline__ void gemma4_decode_dot4_device(
   const int w_col3 = (col0 + 3) * kGemma4HiddenHalf2;
 
 #pragma unroll 4
-  for (int k2 = threadIdx.x; k2 < kGemma4HiddenHalf2; k2 += blockDim.x) {
+  for (int k2 = thread_idx; k2 < kGemma4HiddenHalf2; k2 += thread_count) {
     const float2 xv = __half22float2(x2[k2]);
     const float2 wv0 = __half22float2(w2[w_col0 + k2]);
     const float2 wv1 = __half22float2(w2[w_col1 + k2]);
@@ -47,9 +50,24 @@ __device__ __forceinline__ void gemma4_decode_dot4_device(
     sum3 = fmaf(xv.x, wv3.x, sum3);
     sum3 = fmaf(xv.y, wv3.y, sum3);
   }
+}
 
+__global__ __launch_bounds__(kGemma4DecodeThreads, 2) void
+gemma4_ffn_gate_up_decode_kernel(const half *x, const half *w_col_major,
+                                 half *y) {
+  __shared__ float warp_sums[8][kGemma4DecodeColsPerBlock];
+
+  const int col0 = blockIdx.x * kGemma4DecodeColsPerBlock;
   const int lane = threadIdx.x & 31;
   const int warp = threadIdx.x >> 5;
+  const int warp_count = (blockDim.x + 31) / 32;
+
+  float sum0;
+  float sum1;
+  float sum2;
+  float sum3;
+  gemma4_decode_dot4_device(x, w_col_major, col0, threadIdx.x, blockDim.x,
+                            sum0, sum1, sum2, sum3);
 
   for (int offset = 16; offset > 0; offset >>= 1) {
     sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
@@ -66,7 +84,6 @@ __device__ __forceinline__ void gemma4_decode_dot4_device(
   }
   __syncthreads();
 
-  const int warp_count = (blockDim.x + 31) / 32;
   sum0 = threadIdx.x < warp_count ? warp_sums[lane][0] : 0.0f;
   sum1 = threadIdx.x < warp_count ? warp_sums[lane][1] : 0.0f;
   sum2 = threadIdx.x < warp_count ? warp_sums[lane][2] : 0.0f;
@@ -80,18 +97,6 @@ __device__ __forceinline__ void gemma4_decode_dot4_device(
       sum3 += __shfl_down_sync(0xffffffffu, sum3, offset);
     }
   }
-}
-
-__global__ void gemma4_ffn_gate_up_decode_kernel(const half *x,
-                                                 const half *w_col_major,
-                                                 half *y) {
-  const int col0 = blockIdx.x * kGemma4DecodeColsPerBlock;
-
-  float sum0;
-  float sum1;
-  float sum2;
-  float sum3;
-  gemma4_decode_dot4_device(x, w_col_major, col0, sum0, sum1, sum2, sum3);
 
   if (threadIdx.x == 0) {
     y[col0 + 0] = __float2half_rn(sum0);
