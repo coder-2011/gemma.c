@@ -21,7 +21,7 @@ $(BUILD_DIR):
 $(BUILD_DIR)/gemma4.o: src/gemma4.c src/gemma4.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/gemma4.c -o $@
 
-$(BUILD_DIR)/gemma4_matmul_kernels.o: src/gemma4_matmul_kernels.cu | $(BUILD_DIR)
+$(BUILD_DIR)/gemma4_matmul_kernels.o: src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -c src/gemma4_matmul_kernels.cu -o $@
 
 $(BUILD_DIR)/experiments:
@@ -30,8 +30,8 @@ $(BUILD_DIR)/experiments:
 $(BUILD_DIR)/tests:
 	mkdir -p $(BUILD_DIR)/tests
 
-$(BUILD_DIR)/experiments/gemma4_decode_bench: src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $^ -lcudnn -lcublas -o $@
+$(BUILD_DIR)/experiments/gemma4_decode_bench: src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh | $(BUILD_DIR)/experiments
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu -lcublas -o $@
 
 $(BUILD_DIR)/tests/test_embedding_gather: tests/test_embedding_gather.cu src/gemma4_embedding_gather.cu src/gemma4_embedding_gather.cuh | $(BUILD_DIR)/tests
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_embedding_gather.cu src/gemma4_embedding_gather.cu -o $@
