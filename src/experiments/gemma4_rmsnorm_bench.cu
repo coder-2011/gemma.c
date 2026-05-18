@@ -264,7 +264,7 @@ int main(int argc, char **argv) {
               "not_compiled"
 #endif
   );
-  std::printf("rows,rms_ms,rms_gib_s,rms_graph_ms,rms_graph_gib_s,cudnn_ms,cudnn_gib_s,cudnn_graph_ms,cudnn_graph_gib_s,cudnn_max_abs,cudnn_rstd_max_abs,residual_ms,fused_ms,split_ms,fused_vs_split\n");
+  std::printf("rows,rms_ms,rms_gib_s,rms_graph_kernel_ms,rms_graph_kernel_gib_s,cudnn_ms,cudnn_gib_s,cudnn_graph_kernel_ms,cudnn_graph_kernel_gib_s,cudnn_max_abs,cudnn_rstd_max_abs,residual_ms,fused_ms,split_ms,fused_vs_split\n");
 
   for (int rows : row_counts_up_to(max_rows)) {
     const int count = rows * width;
