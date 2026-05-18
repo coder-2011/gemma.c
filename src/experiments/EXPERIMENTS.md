@@ -408,6 +408,94 @@ Interpretation before tuning:
 - A "much faster than baseline" result may be mathematically limited unless the baseline comparison changes or the kernel reduces real traffic beyond the current one-pass contiguous weight stream.
 - Tuning should still probe whether the last `7-8%` gap is launch/reduction overhead, instruction mix, occupancy, or memory-transaction inefficiency.
 
+Tuning implementation:
+
+- Added compile-time knobs for:
+  - `GEMMA4_DECODE_COLS_PER_BLOCK`
+  - `GEMMA4_DECODE_MIN_BLOCKS_PER_SM`
+- Kept the original hand-written fixed-four-column path for default `ColsPerBlock=4`.
+- Added a templated fixed-four launcher so individual decode projections can use a different thread count or launch-bound min-block setting without moving every projection off the known-good default.
+- Final selected specializations:
+  - `ffn_down`: `Threads=256`, `MinBlocksPerSm=4`
+  - `global_o`: `Threads=512`, `MinBlocksPerSm=1`
+  - `final_logits`: `Threads=512`, `MinBlocksPerSm=2`
+
+Fresh baseline before tuning:
+
+```bash
+make decode-bench
+./build/experiments/gemma4_decode_bench ffn_down 80 20 5
+./build/experiments/gemma4_decode_bench global_o 80 20 5
+./build/experiments/gemma4_decode_bench final_logits 40 10 3
+```
+
+| Op | Custom best ms | cuBLAS GEMV best ms | Custom weight GB/s | Speedup vs GEMV |
+| --- | ---: | ---: | ---: | ---: |
+| `ffn_down` | 0.327326 | 0.330148 | 706.364 | 1.008623 |
+| `global_o` | 0.250404 | 0.252554 | 703.507 | 1.008589 |
+| `final_logits` | 3.961670 | 3.965620 | 711.461 | 1.000997 |
+
+Sweep notes:
+
+- `ffn_down`:
+  - Tried `ColsPerBlock={1,2,4,8}` crossed with `Threads={128,256,512}`.
+  - Tried `MinBlocksPerSm={1,2,3,4,6}` at the default fixed-four shape.
+  - The column/thread sweep did not beat the original default. Best non-default grouping was `ColsPerBlock=2, Threads=512` at `0.327899 ms`, still slower than the fresh baseline.
+  - `MinBlocksPerSm=4` produced a repeatable tiny improvement: `0.327280 ms` in the verification run.
+  - This is effectively flat after more than seven variants; the selected specialization is only a small compiler launch-bound gain.
+- `global_o`:
+  - Tried `ColsPerBlock={1,2,4,8}` crossed with `Threads={128,256,512}`.
+  - Tried `Threads=512` with `MinBlocksPerSm={1,2,3}`.
+  - Wider/narrower grouping was mostly worse. The repeatable winner was the fixed-four shape with `Threads=512, MinBlocksPerSm=1`.
+  - Verification run reached `0.250226 ms`.
+  - This also flat-lined after more than seven variants; the selected specialization is a small occupancy/compiler scheduling adjustment.
+- `final_logits`:
+  - Tried `ColsPerBlock={1,2,4,8,16}` crossed with `Threads={128,256,512}`.
+  - Tried `Threads=512` with `MinBlocksPerSm={1,2,3}`.
+  - `Threads=512` was the only consistently useful knob. The best stable shape was fixed-four columns with `MinBlocksPerSm=2`.
+  - Verification runs were around `3.9566-3.9567 ms`.
+  - `ColsPerBlock=8` and `16` lost bandwidth, likely because larger per-CTA work reduced useful scheduling parallelism/register behavior more than it helped input reuse.
+
+Final verification:
+
+```bash
+rm -f build/experiments/gemma4_decode_bench build/gemma4_matmul_kernels.o
+make decode-bench cuda-kernels
+./build/experiments/gemma4_decode_bench ffn_down 100 25 5
+./build/experiments/gemma4_decode_bench global_o 100 25 5
+./build/experiments/gemma4_decode_bench final_logits 50 12 5
+```
+
+| Op | Final custom best ms | cuBLAS GEMV best ms | Custom weight GB/s | Peak % | Speedup vs GEMV | Gain vs fresh custom |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ffn_down` | 0.327243 | 0.330212 | 706.543 | 91.99% | 1.009074 | 0.025% |
+| `global_o` | 0.250207 | 0.252314 | 704.061 | 91.66% | 1.008423 | 0.079% |
+| `final_logits` | 3.956729 | 3.965828 | 712.349 | 92.74% | 1.002300 | 0.125% |
+
+Correctness:
+
+- `cublas_gemv_max_abs_diff = 0` for all three final target runs.
+- `cublas_gemm_m1_max_abs_diff = 0` for all three final target runs.
+
+Resource data:
+
+```bash
+rm -f build/gemma4_matmul_kernels.o
+make cuda-kernels NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v"
+```
+
+| Kernel specialization | Registers | Static spills | Shared memory | Barriers |
+| --- | ---: | ---: | ---: | ---: |
+| `ffn_down` fixed4 `K=21504,N=5376,Threads=256,MinBlocks=4` | 25 | 0 bytes | 128 bytes | 1 |
+| `global_o` fixed4 `K=16384,N=5376,Threads=512,MinBlocks=1` | 25 | 0 bytes | 256 bytes | 1 |
+| `final_logits` fixed4 `K=5376,N=262144,Threads=512,MinBlocks=2` | 25 | 0 bytes | 256 bytes | 1 |
+
+Conclusion:
+
+- The target kernels are already close to a one-pass DRAM streaming roofline. The tuning sweeps produced only small gains, not a large breakout.
+- The flat-line condition is satisfied for all three target kernels: each had at least seven variants tried without material improvement beyond tiny launch-bound/thread-count effects.
+- Further large wins probably require a different baseline comparison, a different data type/layout, fusing the producer/consumer around these GEMVs to remove memory traffic, or changing the math approach rather than local GEMV launch tuning.
+
 Compile resource check:
 
 ```bash
@@ -476,13 +564,13 @@ CUDA-event timing results:
 
 | Tokens | Best ms | Avg ms | Best effective GiB/s | Effective MiB |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 0.009801 | 0.010901 | 2.043 | 0.021 |
-| 4 | 0.009879 | 0.011773 | 8.109 | 0.082 |
-| 16 | 0.009604 | 0.010351 | 33.366 | 0.328 |
-| 64 | 0.009106 | 0.009389 | 140.756 | 1.312 |
-| 256 | 0.010201 | 0.010393 | 502.579 | 5.250 |
-| 1024 | 0.036632 | 0.036661 | 559.828 | 21.000 |
-| 4096 | 0.135603 | 0.135637 | 604.939 | 84.000 |
+| 1 | 0.014669 | 0.015762 | 1.365 | 0.021 |
+| 4 | 0.014482 | 0.015113 | 5.532 | 0.082 |
+| 16 | 0.012178 | 0.014270 | 26.312 | 0.328 |
+| 64 | 0.012052 | 0.016656 | 106.348 | 1.312 |
+| 256 | 0.011847 | 0.013527 | 432.751 | 5.250 |
+| 1024 | 0.036626 | 0.036687 | 559.931 | 21.000 |
+| 4096 | 0.135538 | 0.135624 | 605.226 | 84.000 |
 
 Larger sweep command:
 
@@ -490,11 +578,39 @@ Larger sweep command:
 ./build/experiments/gemma4_embedding_gather_bench 100 20 3 8192
 ```
 
-Largest result:
+Extended sweep results:
 
 | Tokens | Best ms | Avg ms | Best effective GiB/s | Effective MiB |
 | ---: | ---: | ---: | ---: | ---: |
-| 8192 | 0.265483 | 0.265529 | 617.978 | 168.000 |
+| 1 | 0.013832 | 0.014062 | 1.448 | 0.021 |
+| 4 | 0.013962 | 0.014258 | 5.738 | 0.082 |
+| 16 | 0.014069 | 0.014502 | 22.775 | 0.328 |
+| 64 | 0.013707 | 0.013958 | 93.513 | 1.312 |
+| 256 | 0.013732 | 0.014498 | 373.354 | 5.250 |
+| 1024 | 0.036742 | 0.036783 | 558.151 | 21.000 |
+| 4096 | 0.135601 | 0.135702 | 604.945 | 84.000 |
+| 8192 | 0.265173 | 0.265315 | 618.700 | 168.000 |
+
+Theoretical memory roofline:
+
+- A6000 max memory clock from `nvidia-smi -q -d CLOCK`: `8001 MHz`.
+- A6000 memory bus width: `384 bits`.
+- GDDR6 is DDR, so the peak byte rate is:
+  `8001000 kHz * 1000 * 2 * (384 / 8) = 768096000000 bytes/s`.
+- Decimal peak: `768.096 GB/s`.
+- Binary peak: `715.345 GiB/s`.
+- The benchmark reports GiB/s, so compare measured bandwidth against `715.345 GiB/s`.
+
+| Tokens | Effective MiB | Theoretical min ms | Best ms | Best GiB/s | Peak % |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.021 | 0.000029 | 0.013832 | 1.448 | 0.20% |
+| 4 | 0.082 | 0.000112 | 0.013962 | 5.738 | 0.80% |
+| 16 | 0.328 | 0.000448 | 0.014069 | 22.775 | 3.18% |
+| 64 | 1.312 | 0.001791 | 0.013707 | 93.513 | 13.07% |
+| 256 | 5.250 | 0.007167 | 0.013732 | 373.354 | 52.19% |
+| 1024 | 21.000 | 0.028668 | 0.036742 | 558.151 | 78.03% |
+| 4096 | 84.000 | 0.114674 | 0.135601 | 604.945 | 84.57% |
+| 8192 | 168.000 | 0.229347 | 0.265173 | 618.700 | 86.49% |
 
 Compile resource check:
 
@@ -513,7 +629,74 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Isrc -Xptxas=-v \
 
 Interpretation:
 
-- Small token counts are launch-latency dominated in this environment.
-- Bandwidth becomes meaningful by `256` tokens and plateaus around `605-618 GiB/s` effective read+write bandwidth by `4096-8192` tokens.
-- The A6000 theoretical DRAM peak is about `768 GB/s`, so the large-token result is roughly `86%` of peak if converted to decimal GB/s (`617.978 GiB/s = 663.6 GB/s`).
+- Small token counts are launch-latency dominated in this environment, so their percent of peak is not a useful kernel-quality signal.
+- Bandwidth becomes meaningful by `256` tokens and plateaus around `605-619 GiB/s` effective read+write bandwidth by `4096-8192` tokens.
+- The best measured large-token case is `618.700 GiB/s`, which is `86.49%` of the A6000 theoretical DRAM roofline by this benchmark's read+write byte model.
+- At `4096` tokens, `604.945 GiB/s` is `84.57%` of theoretical peak.
+- This is good for a simple one-warp-per-token baseline. The remaining raw-memory roofline headroom is about `15%`, and some of that is not realistically recoverable because the measured kernel still pays launch overhead, token-id reads, address computation, control flow, and cache/transaction inefficiency.
+- Optimization focus: improve small-token decode/prompt latency through batching or fusion; for large prefill gathers, this baseline is already close to the memory-bound roofline.
 - Nsight Compute and Nsight Systems CUDA metrics remain blocked in this Thunder-mediated container; these results are CUDA-event timings only.
+
+## 2026-05-18 - Decode GEMV BF16 randomized validation cleanup
+
+Runtime file: `src/gemma4_matmul_kernels.cu`
+
+Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+
+Reason:
+
+- The decode benchmark was still using FP16 custom/cuBLAS paths and a deterministic tiny integer pattern.
+- That was acceptable for early smoke tests, but it is not representative of the Gemma 4 BF16 inference path.
+- The benchmark now validates BF16 custom kernels against BF16 cuBLAS references with randomized BF16 inputs and weights.
+
+Implementation:
+
+- Changed the decode projection API and kernels from `half` to `__nv_bfloat16`.
+- Changed vectorized loads from `half2` to `__nv_bfloat162`.
+- Custom kernels still accumulate in FP32 and round output to BF16.
+- Prefill and M=1 cuBLAS GEMM baselines now use `CUDA_R_16BF` inputs/outputs with `CUBLAS_COMPUTE_32F`.
+- GEMV baseline now uses `cublasTSTgemvStridedBatched`, which takes BF16 input/output and FP32 scalar parameters.
+- Replaced the deterministic small fill pattern with a runtime-seeded GPU hash fill:
+  - default seed comes from `std::random_device` and high-resolution clock
+  - set `GEMMA4_DECODE_BENCH_SEED=<seed>` to reproduce a run
+  - input scale: `1.0`
+  - weight scale: `0.5`
+- Correctness reporting now prints max absolute, mean absolute, and relative difference against each BF16 cuBLAS reference instead of expecting exact output.
+
+Build:
+
+```bash
+rm -f build/experiments/gemma4_decode_bench build/gemma4_matmul_kernels.o
+make decode-bench cuda-kernels
+```
+
+Representative BF16 randomized checks:
+
+```bash
+./build/experiments/gemma4_decode_bench ffn_down 10 3 2
+./build/experiments/gemma4_decode_bench final_logits 5 2 1
+./build/experiments/gemma4_decode_bench all 2 1 1
+```
+
+`ffn_down` result:
+
+| Op | Custom best ms | BF16 cuBLAS GEMV best ms | BF16 cuBLAS GEMM M=1 best ms | Max abs diff vs GEMV | Mean abs diff vs GEMV |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `ffn_down` | 0.328960 | 0.331690 | 0.331952 | 0 | 0 |
+
+`final_logits` result:
+
+| Op | Custom best ms | BF16 cuBLAS GEMV best ms | BF16 cuBLAS GEMM M=1 best ms | Max abs diff vs GEMV | Mean abs diff vs GEMV |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `final_logits` | 3.963251 | 3.970521 | 3.971814 | 0.03125 | 6.06194e-07 |
+
+Full smoke observations:
+
+- `./build/experiments/gemma4_decode_bench all 2 1 1` completed for all decode projection shapes.
+- BF16 cuBLAS GEMV/GEMM agree with each other for the reported differences.
+- Some shapes now show BF16-scale nonzero differences, which is expected from different FP32 reduction orders before BF16 output rounding.
+- The old exact `max_abs_diff = 0` expectation is no longer the right acceptance signal for randomized BF16 validation.
+
+CUDA guide note:
+
+- `$cuda-programming-guide` was queried for BF16 support. The local guide states that `__nv_bfloat16` is available through `<cuda_bf16.h>` and requires compute capability 8.0 or higher, and that BF16 WMMA/Tensor Core paths support BF16 inputs with FP32 accumulation.
