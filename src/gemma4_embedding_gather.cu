@@ -1,11 +1,12 @@
 #include "gemma4_embedding_gather.cuh"
+#include "gemma4_cuda_utils.cuh"
 
 #include <stdint.h>
 
 namespace {
 
-constexpr int kWarpSize = 32;
-constexpr int kBf16PerInt4 = sizeof(int4) / sizeof(__nv_bfloat16);
+using EmbeddingPack = Packed128<floatX>;
+constexpr int kFloatXPerPack = EmbeddingPack::size;
 
 __global__ void embedding_gather_bf16_warp_kernel(
     __nv_bfloat16* out,
@@ -17,7 +18,7 @@ __global__ void embedding_gather_bf16_warp_kernel(
     int32_t token_idx = blockIdx.x;
     int32_t lane = threadIdx.x;
 
-    if (token_idx >= num_tokens || lane >= kWarpSize) {
+    if (token_idx >= num_tokens || lane >= GEMMA4_WARP_SIZE) {
         return;
     }
 
@@ -26,18 +27,16 @@ __global__ void embedding_gather_bf16_warp_kernel(
         return;
     }
 
-    int32_t vectors_per_row = hidden_size / kBf16PerInt4;
-    const int4* embedding_row =
-        reinterpret_cast<const int4*>(embeddings + (int64_t)token_id * hidden_size);
-    int4* out_row = reinterpret_cast<int4*>(out + (int64_t)token_idx * hidden_size);
+    int32_t packs_per_row = hidden_size / kFloatXPerPack;
+    const floatX* embedding_row = embeddings + (int64_t)token_id * hidden_size;
+    floatX* out_row = out + (int64_t)token_idx * hidden_size;
 
-    for (int32_t vec = lane; vec < vectors_per_row; vec += kWarpSize) {
-        out_row[vec] = __ldcs(embedding_row + vec);
+    for (int32_t pack_idx = lane; pack_idx < packs_per_row;
+         pack_idx += GEMMA4_WARP_SIZE) {
+        EmbeddingPack pack =
+            gemma4_load128cs(embedding_row + pack_idx * kFloatXPerPack);
+        gemma4_store128(out_row + pack_idx * kFloatXPerPack, pack);
     }
-}
-
-bool is_aligned_16(const void* ptr) {
-    return (reinterpret_cast<uintptr_t>(ptr) & 0xfu) == 0;
 }
 
 }  // namespace
@@ -59,14 +58,14 @@ cudaError_t gemma4_embedding_gather_bf16(
     if (out == nullptr || token_ids == nullptr || embeddings == nullptr) {
         return cudaErrorInvalidValue;
     }
-    if ((hidden_size % kBf16PerInt4) != 0) {
+    if ((hidden_size % kFloatXPerPack) != 0) {
         return cudaErrorInvalidValue;
     }
-    if (!is_aligned_16(out) || !is_aligned_16(embeddings)) {
+    if (!gemma4_is_aligned_16(out) || !gemma4_is_aligned_16(embeddings)) {
         return cudaErrorInvalidValue;
     }
 
-    embedding_gather_bf16_warp_kernel<<<num_tokens, kWarpSize, 0, stream>>>(
+    embedding_gather_bf16_warp_kernel<<<num_tokens, GEMMA4_WARP_SIZE, 0, stream>>>(
         out, token_ids, embeddings, num_tokens, hidden_size, vocab_size);
     return cudaGetLastError();
 }

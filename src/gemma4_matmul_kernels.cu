@@ -1,4 +1,5 @@
 #include "gemma4.h"
+#include "gemma4_cuda_utils.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -8,24 +9,10 @@
 //
 // Prefill stays on a host-side library GEMM. CUDA library frontends are not
 // callable from __device__ code, so the custom device path is decode-only.
-#ifndef GEMMA4_DECODE_THREADS
-#define GEMMA4_DECODE_THREADS 256
-#endif
-
-#ifndef GEMMA4_DECODE_COLS_PER_BLOCK
-#define GEMMA4_DECODE_COLS_PER_BLOCK 4
-#endif
-
-#ifndef GEMMA4_DECODE_MIN_BLOCKS_PER_SM
-#define GEMMA4_DECODE_MIN_BLOCKS_PER_SM 2
-#endif
-
-static constexpr int kGemma4DecodeThreads = GEMMA4_DECODE_THREADS;
-static constexpr int kGemma4DecodeColsPerBlock =
-    GEMMA4_DECODE_COLS_PER_BLOCK;
-static constexpr int kGemma4DecodeMinBlocksPerSm =
-    GEMMA4_DECODE_MIN_BLOCKS_PER_SM;
-static_assert((kGemma4DecodeThreads % 32) == 0,
+static constexpr int kGemma4DecodeThreads = 256;
+static constexpr int kGemma4DecodeColsPerBlock = 4;
+static constexpr int kGemma4DecodeMinBlocksPerSm = 2;
+static_assert((kGemma4DecodeThreads % GEMMA4_WARP_SIZE) == 0,
               "decode thread count must be a whole number of warps");
 
 template <int K>
@@ -45,18 +32,18 @@ __device__ __forceinline__ void gemma4_decode_dot4_device(
   const __nv_bfloat162 *w2 =
       reinterpret_cast<const __nv_bfloat162 *>(w_col_major);
   constexpr int k_half2 = K / 2;
-  const int w_col0 = (col0 + 0) * k_half2;
-  const int w_col1 = (col0 + 1) * k_half2;
-  const int w_col2 = (col0 + 2) * k_half2;
-  const int w_col3 = (col0 + 3) * k_half2;
+  const __nv_bfloat162 *w_col0 = w2 + col0 * k_half2;
+  const __nv_bfloat162 *w_col1 = w_col0 + k_half2;
+  const __nv_bfloat162 *w_col2 = w_col1 + k_half2;
+  const __nv_bfloat162 *w_col3 = w_col2 + k_half2;
 
 #pragma unroll 4
   for (int k2 = thread_idx; k2 < k_half2; k2 += thread_count) {
     const float2 xv = __bfloat1622float2(x2[k2]);
-    const float2 wv0 = __bfloat1622float2(w2[w_col0 + k2]);
-    const float2 wv1 = __bfloat1622float2(w2[w_col1 + k2]);
-    const float2 wv2 = __bfloat1622float2(w2[w_col2 + k2]);
-    const float2 wv3 = __bfloat1622float2(w2[w_col3 + k2]);
+    const float2 wv0 = __bfloat1622float2(w_col0[k2]);
+    const float2 wv1 = __bfloat1622float2(w_col1[k2]);
+    const float2 wv2 = __bfloat1622float2(w_col2[k2]);
+    const float2 wv3 = __bfloat1622float2(w_col3[k2]);
 
     sum0 = fmaf(xv.x, wv0.x, sum0);
     sum0 = fmaf(xv.y, wv0.y, sum0);
@@ -76,16 +63,16 @@ gemma4_decode_gemv4_kernel_fixed4_tuned(const __nv_bfloat16 *x,
                                         __nv_bfloat16 *y) {
   static_assert((N % 4) == 0,
                 "fixed decode GEMV N must be divisible by four columns");
-  static_assert((Threads % 32) == 0,
+  static_assert((Threads % GEMMA4_WARP_SIZE) == 0,
                 "fixed decode GEMV thread count must be whole warps");
 
-  constexpr int warps = (Threads + 31) / 32;
+  constexpr int warps = gemma4_div_up(Threads, GEMMA4_WARP_SIZE);
   __shared__ float warp_sums[warps][4];
 
   const int col0 = blockIdx.x * 4;
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int warp_count = (blockDim.x + 31) / 32;
+  const int lane = threadIdx.x & (GEMMA4_WARP_SIZE - 1);
+  const int warp = threadIdx.x / GEMMA4_WARP_SIZE;
+  const int warp_count = gemma4_div_up(blockDim.x, GEMMA4_WARP_SIZE);
 
   float sum0;
   float sum1;
@@ -94,7 +81,7 @@ gemma4_decode_gemv4_kernel_fixed4_tuned(const __nv_bfloat16 *x,
   gemma4_decode_dot4_device<K>(x, w_col_major, col0, threadIdx.x, blockDim.x,
                                sum0, sum1, sum2, sum3);
 
-  for (int offset = 16; offset > 0; offset >>= 1) {
+  for (int offset = GEMMA4_WARP_SIZE / 2; offset > 0; offset >>= 1) {
     sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
     sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
     sum2 += __shfl_down_sync(0xffffffffu, sum2, offset);
@@ -115,7 +102,7 @@ gemma4_decode_gemv4_kernel_fixed4_tuned(const __nv_bfloat16 *x,
   sum3 = threadIdx.x < warp_count ? warp_sums[lane][3] : 0.0f;
 
   if (warp == 0) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
+    for (int offset = GEMMA4_WARP_SIZE / 2; offset > 0; offset >>= 1) {
       sum0 += __shfl_down_sync(0xffffffffu, sum0, offset);
       sum1 += __shfl_down_sync(0xffffffffu, sum1, offset);
       sum2 += __shfl_down_sync(0xffffffffu, sum2, offset);
@@ -169,19 +156,20 @@ gemma4_decode_gemv4_kernel(const __nv_bfloat16 *x,
   static_assert((N % ColsPerBlock) == 0,
                 "decode GEMV N must be divisible by columns per block");
 
-  constexpr int warps = (kGemma4DecodeThreads + 31) / 32;
+  constexpr int warps =
+      gemma4_div_up(kGemma4DecodeThreads, GEMMA4_WARP_SIZE);
   __shared__ float warp_sums[warps][ColsPerBlock];
 
   const int col0 = blockIdx.x * ColsPerBlock;
-  const int lane = threadIdx.x & 31;
-  const int warp = threadIdx.x >> 5;
-  const int warp_count = (blockDim.x + 31) / 32;
+  const int lane = threadIdx.x & (GEMMA4_WARP_SIZE - 1);
+  const int warp = threadIdx.x / GEMMA4_WARP_SIZE;
+  const int warp_count = gemma4_div_up(blockDim.x, GEMMA4_WARP_SIZE);
 
   float sums[ColsPerBlock];
   gemma4_decode_dot_device<K, ColsPerBlock>(
       x, w_col_major, col0, threadIdx.x, blockDim.x, sums);
 
-  for (int offset = 16; offset > 0; offset >>= 1) {
+  for (int offset = GEMMA4_WARP_SIZE / 2; offset > 0; offset >>= 1) {
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
       sums[col] += __shfl_down_sync(0xffffffffu, sums[col], offset);
@@ -202,7 +190,7 @@ gemma4_decode_gemv4_kernel(const __nv_bfloat16 *x,
   }
 
   if (warp == 0) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
+    for (int offset = GEMMA4_WARP_SIZE / 2; offset > 0; offset >>= 1) {
 #pragma unroll
       for (int col = 0; col < ColsPerBlock; ++col) {
         sums[col] += __shfl_down_sync(0xffffffffu, sums[col], offset);
