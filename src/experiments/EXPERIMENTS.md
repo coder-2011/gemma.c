@@ -710,14 +710,14 @@ Reason:
 
 - The decode GEMV kernels were still loading one BF16 pair per instruction through `__nv_bfloat162`.
 - The input vector is small and reused by every CTA, while projection weights are large one-pass streams.
-- This pass keeps normal cached loads for the reused input vector and marks the weight stream with the existing `Packed128` + `gemma4_load128cs` helper.
+- This pass keeps normal cached loads for the reused input vector and marks the weight stream with the existing `Packed128` + `load128cs` helper.
 
 Implementation:
 
 - Changed the fixed-four decode dot helper from half2-style 32-bit loads to `Packed128<__nv_bfloat16>` loads.
 - Each load now covers 8 BF16 values per thread.
-- Weight row loads use `gemma4_load128cs`, which SASS emits as `LDG.E.EF.128` on this build.
-- Input-vector loads use `gemma4_load128`, which SASS emits as `LDG.E.128.CONSTANT` on this build.
+- Weight row loads use `load128cs`, which SASS emits as `LDG.E.EF.128` on this build.
+- Input-vector loads use `load128`, which SASS emits as `LDG.E.128.CONSTANT` on this build.
 - Packed the four BF16 outputs into one 64-bit store in the fixed-four path.
 - Templated the dot helper on `Threads` so the packed loop can use the compile-time stride.
 - Added `__restrict__` on kernel/device pointer parameters.
