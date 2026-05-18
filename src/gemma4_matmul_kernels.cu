@@ -1,3 +1,5 @@
+#include "gemma4.h"
+
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -6,15 +8,6 @@
 //
 // Prefill stays on a host-side library GEMM. CUDA library frontends are not
 // callable from __device__ code, so the custom device path is decode-only.
-static constexpr int kGemma4Hidden = 5376;
-static constexpr int kGemma4FfnIntermediate = 21504;
-static constexpr int kGemma4PackedFfn = 43008;
-static constexpr int kGemma4SlidingQkv = 16384;
-static constexpr int kGemma4SlidingAttentionOut = 8192;
-static constexpr int kGemma4GlobalQ = 16384;
-static constexpr int kGemma4GlobalK = 2048;
-static constexpr int kGemma4GlobalAttentionOut = 16384;
-static constexpr int kGemma4Vocab = 262144;
 #ifndef GEMMA4_DECODE_THREADS
 #define GEMMA4_DECODE_THREADS 256
 #endif
@@ -271,10 +264,11 @@ extern "C" cublasStatus_t gemma4_ffn_gate_up_prefill(
   // cuBLAS is column-major. This computes the row-major result
   // Y[M, N] = X[M, K] * W[K, N] as:
   // Y^T[N, M] = W^T[N, K] * X^T[K, M].
-  return cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, kGemma4PackedFfn, m,
-                      kGemma4Hidden, &alpha, w_col_major, CUDA_R_16BF,
-                      kGemma4Hidden, x, CUDA_R_16BF, kGemma4Hidden, &beta, y,
-                      CUDA_R_16BF, kGemma4PackedFfn, CUBLAS_COMPUTE_32F,
+  return cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                      GEMMA4_PACKED_FFN_SIZE, m, GEMMA4_HIDDEN_SIZE, &alpha,
+                      w_col_major, CUDA_R_16BF, GEMMA4_HIDDEN_SIZE, x,
+                      CUDA_R_16BF, GEMMA4_HIDDEN_SIZE, &beta, y, CUDA_R_16BF,
+                      GEMMA4_PACKED_FFN_SIZE, CUBLAS_COMPUTE_32F,
                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
@@ -282,7 +276,7 @@ extern "C" cudaError_t gemma4_ffn_gate_up_decode(const __nv_bfloat16 *x,
                                                   const __nv_bfloat16 *w_col_major,
                                                   __nv_bfloat16 *y,
                                                   cudaStream_t stream) {
-  return gemma4_decode_gemv4<kGemma4Hidden, kGemma4PackedFfn>(
+  return gemma4_decode_gemv4<GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE>(
       x, w_col_major, y, stream);
 }
 
@@ -290,8 +284,8 @@ extern "C" cudaError_t gemma4_ffn_down_decode(const __nv_bfloat16 *x,
                                                const __nv_bfloat16 *w_col_major,
                                                __nv_bfloat16 *y,
                                                cudaStream_t stream) {
-  return gemma4_decode_gemv4_fixed4_tuned<kGemma4FfnIntermediate,
-                                          kGemma4Hidden, 256, 4>(
+  return gemma4_decode_gemv4_fixed4_tuned<GEMMA4_INTERMEDIATE_SIZE,
+                                          GEMMA4_HIDDEN_SIZE, 256, 4>(
       x, w_col_major, y, stream);
 }
 
@@ -299,7 +293,7 @@ extern "C" cudaError_t gemma4_sliding_qkv_decode(const __nv_bfloat16 *x,
                                                   const __nv_bfloat16 *w_col_major,
                                                   __nv_bfloat16 *y,
                                                   cudaStream_t stream) {
-  return gemma4_decode_gemv4<kGemma4Hidden, kGemma4SlidingQkv>(
+  return gemma4_decode_gemv4<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE>(
       x, w_col_major, y, stream);
 }
 
@@ -307,15 +301,15 @@ extern "C" cudaError_t gemma4_sliding_o_decode(const __nv_bfloat16 *x,
                                                 const __nv_bfloat16 *w_col_major,
                                                 __nv_bfloat16 *y,
                                                 cudaStream_t stream) {
-  return gemma4_decode_gemv4<kGemma4SlidingAttentionOut, kGemma4Hidden>(
-      x, w_col_major, y, stream);
+  return gemma4_decode_gemv4<GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
+                             GEMMA4_HIDDEN_SIZE>(x, w_col_major, y, stream);
 }
 
 extern "C" cudaError_t gemma4_global_q_decode(const __nv_bfloat16 *x,
                                                const __nv_bfloat16 *w_col_major,
                                                __nv_bfloat16 *y,
                                                cudaStream_t stream) {
-  return gemma4_decode_gemv4<kGemma4Hidden, kGemma4GlobalQ>(
+  return gemma4_decode_gemv4<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE>(
       x, w_col_major, y, stream);
 }
 
@@ -323,7 +317,7 @@ extern "C" cudaError_t gemma4_global_k_decode(const __nv_bfloat16 *x,
                                                const __nv_bfloat16 *w_col_major,
                                                __nv_bfloat16 *y,
                                                cudaStream_t stream) {
-  return gemma4_decode_gemv4<kGemma4Hidden, kGemma4GlobalK>(
+  return gemma4_decode_gemv4<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE>(
       x, w_col_major, y, stream);
 }
 
@@ -331,8 +325,8 @@ extern "C" cudaError_t gemma4_global_o_decode(const __nv_bfloat16 *x,
                                                const __nv_bfloat16 *w_col_major,
                                                __nv_bfloat16 *y,
                                                cudaStream_t stream) {
-  return gemma4_decode_gemv4_fixed4_tuned<kGemma4GlobalAttentionOut,
-                                          kGemma4Hidden, 512, 1>(
+  return gemma4_decode_gemv4_fixed4_tuned<GEMMA4_GLOBAL_ATTENTION_OUT_SIZE,
+                                          GEMMA4_HIDDEN_SIZE, 512, 1>(
       x, w_col_major, y, stream);
 }
 
@@ -340,6 +334,7 @@ extern "C" cudaError_t gemma4_final_logits_decode(const __nv_bfloat16 *x,
                                                    const __nv_bfloat16 *w_col_major,
                                                    __nv_bfloat16 *y,
                                                    cudaStream_t stream) {
-  return gemma4_decode_gemv4_fixed4_tuned<kGemma4Hidden, kGemma4Vocab, 512, 2>(
+  return gemma4_decode_gemv4_fixed4_tuned<GEMMA4_HIDDEN_SIZE,
+                                          GEMMA4_VOCAB_SIZE, 512, 2>(
       x, w_col_major, y, stream);
 }

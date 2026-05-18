@@ -107,8 +107,8 @@ int main(int argc, char** argv) {
     __nv_bfloat16* d_out = nullptr;
     int32_t* d_token_ids = nullptr;
 
-    const int hidden_size = gemma4_config.hidden_size;
-    const int vocab_size = gemma4_config.vocab_size;
+    const int hidden_size = GEMMA4_HIDDEN_SIZE;
+    const int vocab_size = GEMMA4_VOCAB_SIZE;
 
     const size_t embedding_elems = static_cast<size_t>(vocab_size) * hidden_size;
     const size_t embedding_bytes = embedding_elems * sizeof(__nv_bfloat16);

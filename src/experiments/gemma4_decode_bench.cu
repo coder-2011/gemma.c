@@ -1,4 +1,5 @@
 #include "gemma4_matmul_kernels.cuh"
+#include "gemma4.h"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
@@ -29,14 +30,22 @@ struct DecodeOp {
 };
 
 static const DecodeOp kDecodeOps[] = {
-    {"ffn_gate_up", 5376, 43008, 60, gemma4_ffn_gate_up_decode},
-    {"ffn_down", 21504, 5376, 60, gemma4_ffn_down_decode},
-    {"sliding_qkv", 5376, 16384, 50, gemma4_sliding_qkv_decode},
-    {"sliding_o", 8192, 5376, 50, gemma4_sliding_o_decode},
-    {"global_q", 5376, 16384, 10, gemma4_global_q_decode},
-    {"global_k", 5376, 2048, 10, gemma4_global_k_decode},
-    {"global_o", 16384, 5376, 10, gemma4_global_o_decode},
-    {"final_logits", 5376, 262144, 1, gemma4_final_logits_decode},
+    {"ffn_gate_up", GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE,
+     GEMMA4_NUM_LAYERS, gemma4_ffn_gate_up_decode},
+    {"ffn_down", GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_NUM_LAYERS, gemma4_ffn_down_decode},
+    {"sliding_qkv", GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE,
+     GEMMA4_SLIDING_LAYER_COUNT, gemma4_sliding_qkv_decode},
+    {"sliding_o", GEMMA4_SLIDING_ATTENTION_OUT_SIZE, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_SLIDING_LAYER_COUNT, gemma4_sliding_o_decode},
+    {"global_q", GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE,
+     GEMMA4_GLOBAL_LAYER_COUNT, gemma4_global_q_decode},
+    {"global_k", GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
+     GEMMA4_GLOBAL_LAYER_COUNT, gemma4_global_k_decode},
+    {"global_o", GEMMA4_GLOBAL_ATTENTION_OUT_SIZE, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_GLOBAL_LAYER_COUNT, gemma4_global_o_decode},
+    {"final_logits", GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE, 1,
+     gemma4_final_logits_decode},
 };
 
 #define CUDA_CHECK(expr)                                                       \
