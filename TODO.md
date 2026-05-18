@@ -18,13 +18,13 @@
 1. FFN gate+up GEMV
    - Shape: `x[5376] -> gate_up[43008]`
    - Estimated weight traffic: `~27.7 GB/token` across 60 layers.
-   - Already started.
+   - Baseline custom decode GEMV exists.
    - Biggest fixed-shape decode target.
 
 2. FFN down GEMV
    - Shape: `ffn_hidden[21504] -> hidden[5376]`
    - Estimated weight traffic: `~13.9 GB/token`.
-   - Next target.
+   - Baseline custom decode GEMV exists; needs tuning.
    - Same every layer, huge, clean.
 
 3. Sliding QKV packed GEMV
@@ -32,19 +32,23 @@
    - Estimated weight traffic: `~8.8 GB/token` across 50 sliding layers.
    - Do not optimize sliding Q/K/V separately if we can avoid it.
    - Pack as `Q 8192 + K 4096 + V 4096 = 16384`.
+   - Baseline custom decode GEMV exists; needs tuning.
 
 4. Sliding O GEMV
    - Shape: `attn_out[8192] -> hidden[5376]`
    - Estimated weight traffic: `~4.4 GB/token`.
    - Repeated across 50 sliding layers.
+   - Baseline custom decode GEMV exists; needs tuning.
 
 5. Final vocab/logits GEMV
    - Shape: `hidden[5376] -> logits[262144]`
    - Estimated weight traffic: `~2.8 GB/token`.
    - Huge single kernel.
    - High value if fused with softcap/top-k/argmax, but only runs once per token.
+   - Baseline custom decode GEMV exists; needs fusion with softcap/sampling.
 
 6. Global Q/O GEMVs
    - Global Q shape: `x[5376] -> q[16384]`
    - Global O shape: `attn_out[16384] -> hidden[5376]`
    - Estimated weight traffic: `~1.76 GB/token` each.
+   - Baseline custom decode GEMVs exist for global Q, K, and O; Q/O need tuning.
