@@ -1,5 +1,5 @@
-#ifndef GEMMA4_CUDA_UTILS_CUH
-#define GEMMA4_CUDA_UTILS_CUH
+#ifndef CUDA_UTILS_CUH
+#define CUDA_UTILS_CUH
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

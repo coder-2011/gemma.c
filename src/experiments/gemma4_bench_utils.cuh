@@ -1,5 +1,5 @@
-#ifndef GEMMA4_BENCH_UTILS_CUH
-#define GEMMA4_BENCH_UTILS_CUH
+#ifndef BENCH_UTILS_CUH
+#define BENCH_UTILS_CUH
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
