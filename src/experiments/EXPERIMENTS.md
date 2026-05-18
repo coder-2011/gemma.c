@@ -81,3 +81,102 @@ Tooling/source notes:
 - `$cuda-programming-guide` was used to check CUDA event timing and error-checking guidance.
 - `$exa-search` could not run because `EXA_API_KEY` is not set in this environment.
 - Official NVIDIA cuDNN frontend/backend docs confirm matmul is graph/backend-descriptor based, which is why cuDNN was dropped as the "simple" baseline for this experiment.
+
+## 2026-05-17 - Gemma 4 gate+up packed matmul tuning
+
+Experiment file: `src/matmul.cu` at the time of the experiment. That runtime
+copy has since been removed; the active decode implementation is now in
+`src/gemma4_matmul_kernels.cu`.
+
+Target:
+
+- Packed FFN gate+up projection for Gemma 4 dense 31B.
+- A: `[M, 5376]`, row-major half.
+- B storage: `[43008, 5376]`, row-major half, equivalent to transposed `[5376, 43008]`.
+- C: `[M, 43008]`, row-major half.
+- Current specialized default: `M=512`.
+
+Build:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_STANDALONE_BENCH \
+  -I/tmp/cutlass/include -I/tmp/cutlass/tools/util/include \
+  src/matmul.cu -lcublas -o build/matmul_bench
+```
+
+Best source configuration so far:
+
+- CTA tile: `BM=128, BN=128, BK=32`
+- Pipeline stages: `4`
+- Tensor core op: `SM80_16x8x16_F32F16F16F32_TN`
+- Baseline: `cublasGemmEx`, FP16 inputs, FP32 accumulation, tensor-op path.
+
+Final default timing command:
+
+```bash
+./build/matmul_bench both 100 20
+```
+
+CUDA-event timing results at `M=512`:
+
+| Kernel | Avg ms | TFLOP/s |
+| --- | ---: | ---: |
+| Custom CUTE kernel | 1.87 | 126.61 |
+| cuBLAS `cublasGemmEx` | 2.03743 | 116.205 |
+
+Comparison:
+
+- `custom_vs_cublas_speedup = 1.08954`
+- Custom is about `9.0%` faster than cuBLAS for this specialized `M=512` packed gate+up shape.
+- Correctness check: `max_abs_diff = 0`.
+
+Tuning sweep notes:
+
+- Initial copied tile retargeted to `[M,5376] x [5376,43008]` with `BM=128, BN=64, BK=64, Stages=2` was much slower: at `M=1024`, custom `4.9356 ms` vs cuBLAS `3.71269 ms`.
+- `BM=128, BN=128, BK=64, Stages=2` improved to near parity: custom `3.94334 ms` vs cuBLAS `3.86984 ms` at `M=1024`.
+- `BM=128, BN=128, BK=64, Stages=3` beat cuBLAS in a short run, but not enough.
+- `BM=128, BN=128, BK=32, Stages=4` is the best tested source shape so far.
+- `BM=64, BN=128, BK=64, Stages=3` was bad.
+- `BM=128, BN=256, BK=64, Stages=2` was extremely bad.
+- `BM=256, BN=128, BK=32, Stages=4` was extremely bad.
+- L2 persisting-cache hints for the B/weight matrix hurt performance and were removed.
+- Register capping with `--maxrregcount=192` caused spills and badly hurt performance.
+
+M sensitivity:
+
+- `M=512`: stable win, `1.08954x` over cuBLAS on the final 100-iteration run.
+- `M=1024`: borderline; one 50-iteration run reached `1.07005x`, but a 100-iteration run was only `1.06442x`.
+- `M=1536` and `M=2048`: custom lost to cuBLAS.
+
+Resource data from `ptxas -v` for the current custom kernel:
+
+- Registers: `230`
+- Static spills: `0 bytes`
+- Barriers: `1`
+- Constant memory: `388 bytes cmem[0]`
+
+Profiler status:
+
+- `ncu --section SpeedOfLight --section MemoryWorkloadAnalysis` still fails on this Thunder Compute instance with an internal Thunder runtime assertion before producing kernel metrics.
+- Because `ncu` is blocked here, the trustworthy evidence for this entry is CUDA-event timing, exact-output comparison against cuBLAS, and `ptxas` resource data.
+
+Tooling/source notes:
+
+- `$cuda-programming-guide` was used repeatedly for SM 8.6 resource constraints, occupancy/register/shared-memory tradeoffs, async copy guidance, shared-memory bank conflict concerns, and L2 persisting cache semantics.
+- `$exa-search` could not run because `EXA_API_KEY` is not set in this environment.
+
+## 2026-05-17 - Matmul runtime skeleton simplification
+
+Runtime file: `src/gemma4_matmul_kernels.cu`
+
+Change:
+
+- Replaced the copied CUTE benchmark implementation with a small runtime-facing skeleton in `src/gemma4_matmul_kernels.cu`.
+- Prefill now routes through a host-side library GEMM wrapper for the fixed packed FFN gate+up shape.
+- Decode now has a custom M=1 kernel that calls a single `__device__` dot-product primitive.
+- The decode kernel computes four output columns per CTA and uses `half2` loads to reduce launch-grid size and reuse the M=1 input vector across four dot products.
+- Kept the tuned CUTE result above as experiment history instead of carrying that complexity in the runtime path.
+
+CUDA guide note:
+
+- CUDA execution-space rules mean cuDNN/cuBLAS frontend calls belong in host code, not `__device__` functions. The device side is therefore limited to the custom decode matvec primitive.
