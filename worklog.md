@@ -15,4 +15,4 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 
 - For the RMS-norm, I pretty much ported llm.c's RMSNorm, and worked off that. it was really cleanly implemented so there is no need to rewrite it. Ofc, adjustments have to be made since we use RMS instead of LayerNorm.
 
-- Back to matmul, playing around w/ warptiling to torture the chip into giving me all its FLOPs. Benchmarks had to be fixed a bit too, bc it didnt fully account for overhead from cuDNN. I used cuDNN backend API anyways to minimize ovehead.
+- Back to matmul, playing around w/ warptiling to torture the chip into giving me all its FLOPs. Benchmarks had to be fixed a bit too, bc it didnt fully account for overhead from cuDNN. I used cuDNN backend API anyways to minimize ovehead. Added double buffering bc memory was a huge bottleneck. its GEMV, so mem constraints will not let us speed up any more than this.
