@@ -1677,3 +1677,108 @@ Conclusion:
 - The current access pattern already has coalesced 128-bit streaming weight loads and enough resident warps to hide latency; extra prefetch instructions mostly add overhead.
 - Shared-memory double buffering is not attractive for this mapping because the weight packs are one-use data with no cross-thread reuse, and `x` is already loaded once per thread and reused across all eight columns.
 - A useful async-copy/double-buffer design likely needs a different tile mapping where staged data is reused by multiple consumers.
+
+## 2026-05-19 - Decode GEMV shared-memory double-buffer test
+
+Runtime file tested: `src/gemma4_matmul_kernels.cu`
+
+Question:
+
+- Implement a real shared-memory double-buffer variant, not only L2 prefetching, and benchmark it.
+
+CUDA guide notes:
+
+- The CUDA guide describes pipelines as the mechanism for double- or multi-buffering producer-consumer patterns (p. 129).
+- `memcpy_async` is global-to-shared and is intended to overlap data movement with computation when staged shared-memory data is consumed later (p. 244).
+- The guide's pipeline examples schedule multiple async-copy stages, wait for the current batch, compute it, and schedule the next batch (pp. 295, 312-313).
+
+Implementation shape tested:
+
+- The impossible full-buffer design would stage two copies of all eight columns for every CTA thread:
+  `2 stages * Threads * 8 columns * 16B`.
+  - For `Threads=512`: about `128 KiB` before reductions.
+  - For `Threads=1024`: about `256 KiB` before reductions.
+  - This does not fit the sm_86 shared-memory budget for this kernel.
+- The tested feasible design stages one weight column at a time:
+  `2 stages * Threads * 16B`.
+  - For `Threads=512`: `16,896B` total shared memory including existing warp reductions.
+  - For `Threads=1024`: `33,792B` total shared memory including existing warp reductions.
+- For each K-pack handled by a thread:
+  - Load `x_pack` into a register.
+  - Async copy column 0's 128-bit weight pack from global memory to shared stage 0.
+  - Wait for stage 0.
+  - For each column:
+    - Async copy the next column's weight pack into the other shared stage.
+    - Compute the current column from the current shared stage.
+    - Wait for the next stage and swap.
+
+Representative code shape:
+
+```cuda
+__pipeline_memcpy_async(&w_stage[0][threadIdx.x],
+                        w_col_major + col0 * K + element_idx,
+                        sizeof(Gemma4Bf16Pack));
+__pipeline_commit();
+__pipeline_wait_prior(0);
+
+int stage = 0;
+#pragma unroll
+for (int col = 0; col < ColsPerBlock; ++col) {
+  const int next_col = col + 1;
+  const int next_stage = stage ^ 1;
+  if (next_col < ColsPerBlock) {
+    __pipeline_memcpy_async(&w_stage[next_stage][threadIdx.x],
+                            w_col_major + (col0 + next_col) * K + element_idx,
+                            sizeof(Gemma4Bf16Pack));
+    __pipeline_commit();
+  }
+
+  gemma4_accumulate_bf16_pack(x_pack, w_stage[stage][threadIdx.x], sums[col]);
+
+  if (next_col < ColsPerBlock) {
+    __pipeline_wait_prior(0);
+    stage = next_stage;
+  }
+}
+```
+
+Commands:
+
+```bash
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v -DGEMMA4_DECODE_DOUBLE_BUFFER_WEIGHT_COLS=1"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+```
+
+Resource result:
+
+- Baseline: `64` registers, existing reduction shared memory only, `0` spills.
+- Double buffer:
+  - `60` regs for most instantiations, `55` regs for `global_o`, `0` spills.
+  - Shared memory rose to `16,896B` for `512`-thread kernels and `33,792B` for `1024`-thread kernels.
+
+Timing:
+
+| Op | Baseline ms | Double-buffer ms | Decision |
+| --- | ---: | ---: | --- |
+| `ffn_gate_up` | 0.650769 | 0.654609 | Reject; slower. |
+| `ffn_down` | 0.327995 | 0.329315 | Reject; slower. |
+| `sliding_qkv` | 0.249914 | 0.253850 | Reject; slower. |
+| `sliding_o` | 0.126680 | 0.127734 | Reject; slower. |
+| `global_q` | 0.249910 | 0.254698 | Reject; slower. |
+| `global_k` | 0.034218 | 0.036264 | Reject; slower. |
+| `global_o` | 0.250586 | 0.251602 | Reject; slower. |
+| `final_logits` | 3.954963 | 3.958124 | Reject; slower. |
+
+Weighted decode projection total:
+
+| Variant | Weighted decode projection ms |
+| --- | ---: |
+| Baseline | 86.858 |
+| Shared-memory double buffer | 87.498 |
+
+Conclusion:
+
+- The real shared-memory double-buffer variant is correct but slower.
+- It reduced register use, but that did not compensate for the extra async-copy instructions, shared-memory traffic, wait operations, and increased shared-memory footprint.
+- Do not keep this implementation in the runtime path.
+- Shared-memory async copy may become useful only after changing the mapping so staged data is reused by multiple threads or multiple output columns instead of being consumed once by the same thread that loaded it.
