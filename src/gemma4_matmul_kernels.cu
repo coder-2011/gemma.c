@@ -82,22 +82,48 @@ __device__ __forceinline__ void gemma4_store_bf16_cols(
   }
 }
 
-#if defined(GEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER)
+#if defined(GEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER) ||                          \
+    defined(GEMMA4_DECODE_SHARED_STAGE_LOAD128) ||                             \
+    defined(GEMMA4_DECODE_SHARED_STAGE_LOAD128CS)
+#define GEMMA4_DECODE_SHARED_STAGE_WEIGHT_PACKS 1
+#endif
+
+#if defined(GEMMA4_DECODE_SHARED_STAGE_WEIGHT_PACKS)
 template <int K>
 __device__ __forceinline__ void
-gemma4_cp_async_weight_pack(Gemma4Bf16Pack *dst_shared,
-                            const __nv_bfloat16 *__restrict__ w_col_major,
-                            int col, int element_idx) {
+gemma4_stage_weight_pack(Gemma4Bf16Pack *dst_shared,
+                         const __nv_bfloat16 *__restrict__ w_col_major,
+                         int col, int element_idx) {
   static_assert(sizeof(Gemma4Bf16Pack) == 16,
-                "cp.async path requires one 16-byte weight pack");
+                "shared-stage path requires one 16-byte weight pack");
+#if defined(GEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER)
   __pipeline_memcpy_async(
       dst_shared, w_col_major + gemma4_weight_pack_offset<K>(col, element_idx),
       sizeof(Gemma4Bf16Pack));
+#elif defined(GEMMA4_DECODE_SHARED_STAGE_LOAD128CS)
+  *dst_shared =
+      gemma4_load_streaming_weight_pack<K>(w_col_major, col, element_idx);
+#else
+  *dst_shared =
+      load128(w_col_major + gemma4_weight_pack_offset<K>(col, element_idx));
+#endif
+}
+
+__device__ __forceinline__ void gemma4_commit_staged_weight_pack() {
+#if defined(GEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER)
+  __pipeline_commit();
+#endif
+}
+
+__device__ __forceinline__ void gemma4_wait_for_staged_weight_pack() {
+#if defined(GEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER)
+  __pipeline_wait_prior(0);
+#endif
 }
 
 template <int K, int ColsPerBlock, int Threads>
 __device__ __forceinline__ void
-gemma4_decode_gemv_cols_dot_cp_async_device(
+gemma4_decode_gemv_cols_dot_shared_staged_device(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major, int col0, int thread_idx,
     Gemma4Bf16Pack (&weight_stages)[2][Threads],
@@ -117,10 +143,10 @@ gemma4_decode_gemv_cols_dot_cp_async_device(
     const Gemma4Bf16Pack x_pack = gemma4_load_activation_pack(x, element_idx);
     int stage = 0;
 
-    gemma4_cp_async_weight_pack<K>(&weight_stages[stage][thread_idx],
-                                   w_col_major, col0, element_idx);
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
+    gemma4_stage_weight_pack<K>(&weight_stages[stage][thread_idx], w_col_major,
+                                col0, element_idx);
+    gemma4_commit_staged_weight_pack();
+    gemma4_wait_for_staged_weight_pack();
 
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
@@ -128,10 +154,10 @@ gemma4_decode_gemv_cols_dot_cp_async_device(
       const int next_stage = stage ^ 1;
       if constexpr (ColsPerBlock > 1) {
         if (next_col < ColsPerBlock) {
-          gemma4_cp_async_weight_pack<K>(&weight_stages[next_stage][thread_idx],
-                                         w_col_major, col0 + next_col,
-                                         element_idx);
-          __pipeline_commit();
+          gemma4_stage_weight_pack<K>(&weight_stages[next_stage][thread_idx],
+                                      w_col_major, col0 + next_col,
+                                      element_idx);
+          gemma4_commit_staged_weight_pack();
         }
       }
 
@@ -140,7 +166,7 @@ gemma4_decode_gemv_cols_dot_cp_async_device(
 
       if constexpr (ColsPerBlock > 1) {
         if (next_col < ColsPerBlock) {
-          __pipeline_wait_prior(0);
+          gemma4_wait_for_staged_weight_pack();
           stage = next_stage;
         }
       }
@@ -188,9 +214,9 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   const int warp = threadIdx.x / WARP_SIZE;
 
   float sums[ColsPerBlock] = {};
-#if defined(GEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER)
+#if defined(GEMMA4_DECODE_SHARED_STAGE_WEIGHT_PACKS)
   __shared__ Gemma4Bf16Pack weight_stages[2][Threads];
-  gemma4_decode_gemv_cols_dot_cp_async_device<K, ColsPerBlock, Threads>(
+  gemma4_decode_gemv_cols_dot_shared_staged_device<K, ColsPerBlock, Threads>(
       x, w_col_major, col0, threadIdx.x, weight_stages, sums);
 #else
   gemma4_decode_gemv_cols_dot_device<K, ColsPerBlock, Threads>(
