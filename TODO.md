@@ -22,7 +22,7 @@
 ## Decode GEMV Kernel-Shape Experiments
 
 - Benchmark warp-tiled GEMV variants against the current CTA-cooperative baseline.
-  - Current baseline: one CTA computes four output columns, with all CTA threads reducing the same four dots.
+  - Current baseline: one CTA computes eight output columns, with all CTA threads reducing the same eight dots.
   - Variant A: one warp owns one output column.
   - Variant B: one warp owns two output columns.
   - Variant C: two warps own one output column for large-`K` shapes.

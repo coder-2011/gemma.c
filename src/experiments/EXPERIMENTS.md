@@ -1209,7 +1209,7 @@ Decode GEMV implementation conclusions:
 - The input vector load remains normally cached, because the same input row is reused across output columns.
 - Broad L2 persisting-cache windows or persisting hints for the B/weight matrix were tried and removed because they hurt performance.
 - There is no broad persisting L2 policy currently retained for decode GEMV.
-- Output writes are vectorized where the fixed4 path can pack four BF16 outputs with `gemma4_store_bf16x4`.
+- Output writes are vectorized on the current eight-column path as one 128-bit store for eight BF16 outputs.
 
 Warp tiling and reduction conclusions:
 
@@ -1245,13 +1245,13 @@ Tensor-core conclusions:
 - For single-token low-latency decode, tensor-core use is not automatically a win because the matrix has `M=1` and reductions/global memory movement dominate.
 - Prefill is different: prefill has real matrix sizes, so cuBLAS/cuBLASLt should be the tensor-core path there.
 
-Previous retained decode GEMV tuning before the 2026-05-19 8-column pass:
+Current decode GEMV source routing after the 2026-05-19 8-column pass:
 
-- Generic decode GEMV route: `threads=512`, `cols_per_block=2`.
-- `ffn_down`: fixed4 specialization with `1024` threads and `1` column per block.
-- `global_o`: `512` threads and `1` column per block.
-- `final_logits`: fixed4 specialization with `1024` threads and `1` column per block.
-- Final long confirmation weighted production decode projection result:
+- Generic decode GEMV route after the later eight-column store pass: `threads=512`, `cols_per_block=8`.
+- `ffn_down`: fixed8 specialization with `1024` threads and `1` eight-column group per block.
+- `global_o`: fixed8 specialization with `512` threads and `1` eight-column group per block.
+- `final_logits`: fixed8 specialization with `1024` threads and `1` eight-column group per block.
+- Earlier long confirmation weighted production decode projection result before the 8-column output-store pass:
 
 | Path | Weighted decode projection ms |
 | --- | ---: |
@@ -1498,3 +1498,182 @@ Conclusion:
 - Direct indexed `__shfl_sync` adds source-lane/conditional logic and raised register use for at least one instantiation.
 - Do not keep accumulator-splitting variants unless a future mapping changes the register/occupancy balance.
 - Better next candidates are structural: warp-owned output columns, different columns-per-CTA by shape, CUDA graph replay timing for decode GEMV, or producer/consumer fusion after the unfused path is correct.
+
+## 2026-05-19 - Decode GEMV pack-local ILP retest
+
+Runtime file tested: `src/gemma4_matmul_kernels.cu`
+
+Change tested:
+
+- Replaced recursive pair accumulation inside one `Packed128<__nv_bfloat16>` with four independent pair-local partial sums:
+  - `s0 = dot(pair 0)`
+  - `s1 = dot(pair 1)`
+  - `s2 = dot(pair 2)`
+  - `s3 = dot(pair 3)`
+  - `sum += (s0 + s1) + (s2 + s3)`
+- This tests instruction-level parallelism inside one 128-bit BF16 pack without changing the thread/block mapping or warp/block reductions.
+
+Commands:
+
+```bash
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 80 20 5
+```
+
+Resource result:
+
+- Baseline: `64` registers, `0` spills for decode GEMV instantiations.
+- ILP variant: no spills; most instantiations used `63` registers, but `global_o` rose to `70` registers.
+
+Timing:
+
+| Op | Baseline best ms | ILP best ms | Decision |
+| --- | ---: | ---: | --- |
+| `ffn_gate_up` | 0.650792 | 0.650826 | Tie/no win. |
+| `ffn_down` | 0.327714 | 0.327387 | Tiny win. |
+| `sliding_qkv` | 0.250011 | 0.249998 | Tie/no win. |
+| `sliding_o` | 0.126681 | 0.126778 | Tiny loss. |
+| `global_q` | 0.250040 | 0.250148 | Tiny loss. |
+| `global_k` | 0.033776 | 0.034112 | Loss. |
+| `global_o` | 0.250428 | 0.250979 | Loss with higher registers. |
+| `final_logits` | 3.954785 | 3.954022 | Tiny win. |
+
+Weighted decode projection total:
+
+| Variant | Weighted decode projection ms |
+| --- | ---: |
+| Baseline recursive pair accumulation | 86.842 |
+| Pack-local ILP accumulation | 86.838 |
+
+Conclusion:
+
+- The weighted difference was about `0.004 ms`, which is noise-level for this benchmark.
+- The ILP helper also changed FP32 accumulation order and increased register use for `global_o`.
+- Reverted the ILP helper. Keep the current recursive compile-time pair accumulation until a larger mapping change creates enough K work per thread to justify a different local accumulator shape.
+
+## 2026-05-19 - Decode GEMV bound check without Nsight Systems
+
+Question:
+
+- Determine whether the decode GEMV kernel is memory-bound without using `nsys`.
+- Working hypothesis: the kernel is memory-bound, so pack-local ILP should not help much.
+
+Profiler attempt:
+
+```bash
+env GEMMA4_DECODE_BENCH_SEED=0x1234 \
+  ncu --target-processes all --set speedOfLight \
+  --kernel-name "regex:gemma4_decode_gemv_cols_kernel" \
+  --launch-count 1 \
+  ./build/experiments/gemma4_decode_bench ffn_gate_up 1 0 1
+```
+
+- `ncu` is installed (`2025.2.1.0`), but the benchmark process aborted under the Thunder runtime with an unsupported-library/internal-assertion failure.
+- No Nsight Compute hardware-counter result was usable in this environment.
+
+Roofline-style check from benchmark timings:
+
+- The custom benchmark already prints effective weight-streaming throughput:
+
+```bash
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 80 20 3
+```
+
+| Op | Best ms | Weight GB/s | FP32 TFLOP/s from `2*K*N` |
+| --- | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.650852 | 710.487 | 0.710 |
+| `ffn_down` | 0.327798 | 705.347 | 0.705 |
+| `sliding_qkv` | 0.250012 | 704.608 | 0.705 |
+| `sliding_o` | 0.126658 | 695.421 | 0.695 |
+| `global_q` | 0.250019 | 704.589 | 0.704 |
+| `global_k` | 0.033932 | 648.955 | 0.649 |
+| `global_o` | 0.250604 | 702.946 | 0.703 |
+| `final_logits` | 3.954875 | 712.683 | 0.713 |
+
+Arithmetic intensity:
+
+- Weight bytes are `2*K*N`.
+- FP32 scalar dot work is also `2*K*N` FLOP if each FMA is counted as two FLOPs.
+- So the optimistic arithmetic intensity using weight traffic only is about `1.0 FLOP/byte`.
+- Input `x` and output `y` traffic make the true DRAM arithmetic intensity lower unless `x` is served from cache. Since `x` is tiny relative to weights and reused across many column blocks, weight traffic remains the useful lower-bound stream.
+
+Interpretation:
+
+- The kernel reaches roughly `649-713 GB/s` on weight traffic alone.
+- It only reaches roughly `0.65-0.71 FP32 TFLOP/s`, far below RTX A6000-class FP32 peak.
+- With arithmetic intensity around `1 FLOP/byte`, a bandwidth roof near the high hundreds of GB/s predicts a compute rate in the same `~0.7 TFLOP/s` band observed here.
+- This explains why adding local ILP inside one BF16 pack did not help: the kernel is already dominated by streaming the weight matrix, not by FP32 FMA issue throughput.
+
+Conclusion:
+
+- Treat the current decode GEMV as memory-bandwidth-bound.
+- Local arithmetic ILP is unlikely to matter unless it also improves memory behavior or reduces overhead without increasing register pressure.
+- Better next levers are memory/layout/mapping changes: improve weight-load efficiency, tune columns per CTA by shape, use cache/read-only policies carefully, or change the warp/block ownership model.
+
+## 2026-05-19 - Decode GEMV prefetch and cache-policy sweep
+
+Runtime file tested: `src/gemma4_matmul_kernels.cu`
+
+Question:
+
+- Try explicit data prefetching or a related cache-policy change for the memory-bound decode GEMV.
+- Consider whether shared-memory double buffering is worth implementing.
+
+CUDA guide notes:
+
+- `cooperative_groups::memcpy_async` / asynchronous data movement is global-to-shared and is described as useful when copies can overlap with computation and staged data is consumed from shared memory.
+- The lower-level LDGSTS async-copy path can prefetch future iterations into shared memory and may increase bytes in flight.
+- For this decode GEMV, the dominant weight data is consumed once by the same thread that loads it. Staging that data through shared memory would add shared-memory traffic and synchronization without cross-thread reuse.
+
+Commands:
+
+```bash
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v <variant macro>"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+```
+
+Variants tested:
+
+- Baseline: current `load128cs` streaming weight loads.
+- `prefetch_next_iter`: inline `prefetch.global.L2` for the next K-stride `x` pack and all eight next K-stride weight packs.
+- `prefetch_next_col`: inline `prefetch.global.L2` for the next output column's weight pack before loading/computing the current column.
+- `normal_weight_load`: replace streaming `load128cs` weight loads with normal `load128` weight loads.
+
+Resource result:
+
+| Variant | Register result | Spills |
+| --- | --- | --- |
+| Baseline | `64` regs for decode GEMV instantiations | `0` |
+| `prefetch_next_iter` | mostly `56` regs, but `global_o` rose to `74` regs | `0` |
+| `prefetch_next_col` | mostly `64` regs, but `global_o` rose to `72` regs | `0` |
+| `normal_weight_load` | `60` regs for decode GEMV instantiations | `0` |
+
+Timing:
+
+| Op | Baseline ms | Next-iter prefetch ms | Next-col prefetch ms | Normal load ms |
+| --- | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.650769 | 0.652039 | 0.651096 | 0.652257 |
+| `ffn_down` | 0.327995 | 0.334938 | 0.328007 | 0.328684 |
+| `sliding_qkv` | 0.249914 | 0.250089 | 0.250109 | 0.250370 |
+| `sliding_o` | 0.126680 | 0.128577 | 0.126916 | 0.127416 |
+| `global_q` | 0.249910 | 0.250213 | 0.250189 | 0.250563 |
+| `global_k` | 0.034218 | 0.034480 | 0.034090 | 0.034455 |
+| `global_o` | 0.250586 | 0.252122 | 0.250829 | 0.251311 |
+| `final_logits` | 3.954963 | 3.955522 | 3.956603 | 3.955877 |
+
+Weighted decode projection total:
+
+| Variant | Weighted decode projection ms |
+| --- | ---: |
+| Baseline | 86.858 |
+| `prefetch_next_iter` | 87.476 |
+| `prefetch_next_col` | 86.905 |
+| `normal_weight_load` | 87.065 |
+
+Conclusion:
+
+- Do not keep explicit L2 prefetching in this kernel.
+- Do not switch the weight loads from streaming `load128cs` to normal `load128`.
+- The current access pattern already has coalesced 128-bit streaming weight loads and enough resident warps to hide latency; extra prefetch instructions mostly add overhead.
+- Shared-memory double buffering is not attractive for this mapping because the weight packs are one-use data with no cross-thread reuse, and `x` is already loaded once per thread and reused across all eight columns.
+- A useful async-copy/double-buffer design likely needs a different tile mapping where staged data is reused by multiple consumers.
