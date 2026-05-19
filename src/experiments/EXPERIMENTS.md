@@ -1334,3 +1334,167 @@ Interpretation:
 - The requested 8-column grouping and 128-bit output-store route compiles and passes the decode benchmark correctness checks against cuBLAS/cuDNN comparators.
 - The main generic route remains in the same performance band as the previous 8-column smoke tests, with `ffn_gate_up` roughly tied with cuDNN 1x1 and much faster than the cuBLAS GEMV comparator in this run.
 - The fixed output routes are now also using the 8-column/128-bit-store path. `ffn_down`, `global_o`, and `final_logits` are effectively tied with cuBLAS and cuDNN on the large memory-streaming shapes in this short run.
+
+## 2026-05-19 - Decode GEMV accumulator and shuffle-reduction sweep
+
+Runtime file: `src/gemma4_matmul_kernels.cu`
+
+Reason:
+
+- The decode GEMV inner loop has two reduction-like pieces:
+  - per-thread dot accumulation into one `sums[col]` value per output column;
+  - cross-thread warp/block reduction of those per-thread partials.
+- The concern was that the per-thread accumulation may be too sequential and that the warp reduction mode might matter.
+- `$cuda-programming-guide` was queried for shuffle/reduction behavior. Relevant local guide pages:
+  - p. 550: `__shfl_sync`, `__shfl_down_sync`, and `__shfl_xor_sync` exchange values between non-exited warp threads without shared memory.
+  - p. 551: `__shfl_xor_sync` uses bitwise-XOR lane addressing and is used in tree reduction and broadcast patterns.
+  - p. 552: shuffle intrinsics do not imply a memory barrier or memory ordering.
+  - p. 555: the guide shows a full-warp butterfly reduction with `__shfl_xor_sync`.
+- `$exa-search` returned relevant external references including a NVFP4 GEMV writeup, NVIDIA CUTLASS efficient GEMM documentation, CUTLASS reduction-fusion example code, and GEMM optimization writeups. They did not change the measured decision below.
+
+Helper cleanup retained:
+
+- The BF16 pair helper chain was simplified from four helpers into two helpers:
+  - `gemma4_accumulate_bf16_pairs<Pair = 0>(...)`
+  - `gemma4_accumulate_bf16_pack(...)`
+- This keeps pair indices compile-time constants and keeps the call site unchanged.
+- Added/kept compile-time contracts for packed BF16 pair width and alignment.
+- Verified with:
+
+```bash
+make cuda-kernels
+make decode-bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 3 1 1
+git diff --check
+```
+
+Quantization/order check:
+
+- Active runtime code is still BF16 storage with FP32 arithmetic, not SFP8/Q4.
+- Decode GEMV order remains:
+  `BF16 input/weight -> FP32 FMA accumulation -> BF16 output store`.
+- Prefill cuBLAS order remains:
+  `CUDA_R_16BF` inputs/outputs with `CUBLAS_COMPUTE_32F`.
+- RMSNorm order remains:
+  `BF16 input -> FP32 sumsq/scale/multiply -> BF16 output`.
+- Fused residual+RMSNorm intentionally rounds the residual to BF16 before normalizing it, matching standalone `residual_add_bf16` followed by `rmsnorm_bf16`.
+
+Baseline timing before accumulator variants:
+
+```bash
+make decode-bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench <op> 80 20 3
+```
+
+| Op | Baseline custom best ms |
+| --- | ---: |
+| `ffn_gate_up` | 0.650572 |
+| `ffn_down` | 0.327785 |
+| `sliding_qkv` | 0.250094 |
+| `global_k` | 0.034028 |
+
+Accumulator variant A: four independent accumulators kept live across the K loop:
+
+- Implemented four per-column partial accumulators across `pack_idx`, then horizontally reduced them before the warp reduction.
+- This created too much register pressure.
+- `ptxas -v` showed most instantiated decode kernels using `64` registers plus `88 bytes` of spill stores and `88 bytes` of spill loads.
+
+| Op | Baseline ms | 4-way cross-K accum ms | Decision |
+| --- | ---: | ---: | --- |
+| `ffn_gate_up` | 0.650572 | 0.894991 | Reject; large regression. |
+| `ffn_down` | 0.327785 | 0.442062 | Reject; large regression. |
+| `sliding_qkv` | 0.250094 | 0.346468 | Reject; large regression. |
+| `global_k` | 0.034028 | 0.046345 | Reject; large regression. |
+
+Accumulator variant B: two independent accumulators kept live across the K loop:
+
+- Reduced the cross-K partials from four to two.
+- `ptxas -v` showed no spills, but register usage stayed around `64` registers for most kernels.
+- Timing was effectively tied on the large shapes and slightly worse on `global_k`.
+
+| Op | Baseline ms | 2-way cross-K accum ms | Decision |
+| --- | ---: | ---: | --- |
+| `ffn_gate_up` | 0.650572 | 0.651055 | Reject; no win. |
+| `ffn_down` | 0.327785 | 0.327732 | Reject; noise-level change. |
+| `sliding_qkv` | 0.250094 | 0.250204 | Reject; no win. |
+| `global_k` | 0.034028 | 0.034216 | Reject; slightly slower. |
+
+Accumulator variant C: four independent accumulators local to one 128-bit pack:
+
+- This variant is different from variant A: it split only the eight BF16 lanes inside a single `Packed128`, then folded back into `sum` before the next `pack_idx`.
+- It avoided spills and mostly reduced register use by one register, but `global_o` rose to `71` registers.
+- Timing was still noise-level and inconsistent.
+
+| Op | Baseline/reference ms | Pack-local split ms | Decision |
+| --- | ---: | ---: | --- |
+| `ffn_gate_up` | 0.650572 | 0.650773 | Reject; tiny loss. |
+| `ffn_down` | 0.327785 | 0.327668 | Reject; tiny gain only. |
+| `sliding_qkv` | 0.250094 | 0.250071 | Reject; tiny gain only. |
+| `global_k` | 0.034028 | 0.034070 | Reject; tiny loss. |
+| `global_o` | 0.250931 | 0.251125 | Reject; tiny loss and higher regs. |
+| `final_logits` | 3.954915 | 3.953999 | Reject; tiny gain only. |
+
+Interpretation for accumulator variants:
+
+- The per-thread accumulation is not as obviously bad as it looks because the current kernel already has `ColsPerBlock=8`, so each thread carries eight independent column accumulators.
+- For common shapes, per-thread K work is small:
+  - `K=5376, Threads=512`: about one or two 128-bit packs per thread.
+  - `K=21504, Threads=1024`: about two or three 128-bit packs per thread.
+- Additional independent accumulators increase register pressure and did not produce a measured win.
+
+Shuffle-reduction variants:
+
+- Temporarily added `GEMMA4_SHUFFLE_REDUCE_MODE`:
+  - `0`: `__shfl_down_sync`
+  - `1`: `__shfl_xor_sync`
+  - `2`: direct indexed `__shfl_sync`
+- Built each mode with:
+
+```bash
+rm -f build/experiments/gemma4_decode_bench
+make decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v -DGEMMA4_SHUFFLE_REDUCE_MODE=<mode>"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+```
+
+Resource observations:
+
+- Mode `0` (`__shfl_down_sync`): `64` registers, `0` spills for all decode GEMV instantiations.
+- Mode `1` (`__shfl_xor_sync`): `64` registers, `0` spills for all decode GEMV instantiations.
+- Mode `2` (direct `__shfl_sync`): mostly `64` registers and `0` spills, but `global_o` rose to `78` registers.
+
+Timing:
+
+| Op | `down` ms | `xor` ms | direct `shfl_sync` ms |
+| --- | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.650925 | 0.650830 | 0.651079 |
+| `ffn_down` | 0.328040 | 0.328142 | 0.327603 |
+| `sliding_qkv` | 0.250172 | 0.249986 | 0.250122 |
+| `sliding_o` | 0.126863 | 0.126801 | 0.127135 |
+| `global_q` | 0.250284 | 0.250235 | 0.250271 |
+| `global_k` | 0.034077 | 0.034140 | 0.034198 |
+| `global_o` | 0.250931 | 0.250852 | 0.251219 |
+| `final_logits` | 3.954915 | 3.955053 | 3.954971 |
+
+Weighted decode projection totals:
+
+| Reduction mode | Weighted decode projection ms |
+| --- | ---: |
+| `__shfl_down_sync` | 86.897 |
+| `__shfl_xor_sync` | 86.885 |
+| direct `__shfl_sync` | 86.895 |
+
+Correctness:
+
+- All shuffle modes stayed within the same comparator ranges as the baseline.
+- Representative max-abs diff ranges remained:
+  - `0.25` for most cuBLAS GEMV/GEMM comparisons on projection outputs with reduction-order differences.
+  - `0` for `ffn_down` and `global_o` versus cuBLAS.
+  - `0.125` to `0.25` versus cuDNN 1x1 conv depending on op.
+
+Conclusion:
+
+- Keep the current `__shfl_down_sync` reduction.
+- `__shfl_xor_sync` is effectively tied, but it makes every lane carry the final reduction value while the current kernel only needs lane 0 to write the warp partial.
+- Direct indexed `__shfl_sync` adds source-lane/conditional logic and raised register use for at least one instantiation.
+- Do not keep accumulator-splitting variants unless a future mapping changes the register/occupancy balance.
+- Better next candidates are structural: warp-owned output columns, different columns-per-CTA by shape, CUDA graph replay timing for decode GEMV, or producer/consumer fusion after the unfused path is correct.
