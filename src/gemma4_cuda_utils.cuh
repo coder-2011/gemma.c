@@ -79,4 +79,15 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
   return value;
 }
 
+template <int Count>
+__device__ __forceinline__ void warp_reduce_sum_to_lane0(
+    float (&values)[Count]) {
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+#pragma unroll
+    for (int i = 0; i < Count; ++i) {
+      values[i] += __shfl_down_sync(0xffffffffu, values[i], offset);
+    }
+  }
+}
+
 #endif

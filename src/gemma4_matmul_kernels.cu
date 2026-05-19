@@ -16,8 +16,32 @@ using Gemma4Bf16Pack = Packed128<__nv_bfloat16>;
 
 static constexpr int kGemma4Bf16PerPack = Gemma4Bf16Pack::size;
 static constexpr int kGemma4Bf16PairsPerPack = kGemma4Bf16PerPack / 2;
+static_assert(sizeof(Gemma4Bf16Pack) == sizeof(int4) && alignof(Gemma4Bf16Pack) >= alignof(int4), "Packed128 bf16 must map to one aligned int4 load");
 static_assert((kGemma4Bf16PerPack % 2) == 0, "Packed128 bf16 width must contain whole bf16 pairs");
 static_assert(alignof(Gemma4Bf16Pack) >= alignof(__nv_bfloat162), "Packed128 bf16 payload must be aligned for bf16x2 access");
+
+__device__ __forceinline__ int gemma4_bf16_pack_element_index(int pack_idx) {
+  return pack_idx * kGemma4Bf16PerPack;
+}
+
+template <int K>
+__device__ __forceinline__ int gemma4_weight_pack_offset(int col,
+                                                        int element_idx) {
+  return col * K + element_idx;
+}
+
+__device__ __forceinline__ Gemma4Bf16Pack
+gemma4_load_activation_pack(const __nv_bfloat16 *__restrict__ x,
+                            int element_idx) {
+  return load128(x + element_idx);
+}
+
+template <int K>
+__device__ __forceinline__ Gemma4Bf16Pack
+gemma4_load_streaming_weight_pack(
+    const __nv_bfloat16 *__restrict__ w_col_major, int col, int element_idx) {
+  return load128cs(w_col_major + gemma4_weight_pack_offset<K>(col, element_idx));
+}
 
 template <int Pair = 0>
 __device__ __forceinline__ void gemma4_accumulate_bf16_pairs(
@@ -65,22 +89,17 @@ __device__ __forceinline__ void gemma4_decode_gemv_cols_dot_device(
   static_assert((K % kGemma4Bf16PerPack) == 0, "decode GEMV K must be divisible by Packed128 bf16 width");
   static_assert((Threads % WARP_SIZE) == 0, "decode thread count must be a whole number of warps");
 
-#pragma unroll
-  for (int col = 0; col < ColsPerBlock; ++col) {
-    sums[col] = 0.0f;
-  }
-
   constexpr int packs_per_col = K / kGemma4Bf16PerPack;
 
 #pragma unroll
   for (int pack_idx = thread_idx; pack_idx < packs_per_col;
        pack_idx += Threads) {
-    const int element_idx = pack_idx * kGemma4Bf16PerPack;
-    const Gemma4Bf16Pack x_pack = load128(x + element_idx);
+    const int element_idx = gemma4_bf16_pack_element_index(pack_idx);
+    const Gemma4Bf16Pack x_pack = gemma4_load_activation_pack(x, element_idx);
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      const Gemma4Bf16Pack w_pack =
-          load128cs(w_col_major + (col0 + col) * K + element_idx);
+      const Gemma4Bf16Pack w_pack = gemma4_load_streaming_weight_pack<K>(
+          w_col_major, col0 + col, element_idx);
       gemma4_accumulate_bf16_pack(x_pack, w_pack, sums[col]);
     }
   }
@@ -99,18 +118,12 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   const int col0 = blockIdx.x * ColsPerBlock;
   const int lane = threadIdx.x & (WARP_SIZE - 1);
   const int warp = threadIdx.x / WARP_SIZE;
-  const int warp_count = div_up(blockDim.x, WARP_SIZE);
 
-  float sums[ColsPerBlock];
+  float sums[ColsPerBlock] = {};
   gemma4_decode_gemv_cols_dot_device<K, ColsPerBlock, Threads>(
       x, w_col_major, col0, threadIdx.x, sums);
 
-  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      sums[col] += __shfl_down_sync(0xffffffffu, sums[col], offset);
-    }
-  }
+  warp_reduce_sum_to_lane0(sums);
 
   if (lane == 0) {
 #pragma unroll
@@ -122,16 +135,11 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
 
 #pragma unroll
   for (int col = 0; col < ColsPerBlock; ++col) {
-    sums[col] = threadIdx.x < warp_count ? warp_sums[col][lane] : 0.0f;
+    sums[col] = threadIdx.x < warps ? warp_sums[col][lane] : 0.0f;
   }
 
   if (warp == 0) {
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-#pragma unroll
-      for (int col = 0; col < ColsPerBlock; ++col) {
-        sums[col] += __shfl_down_sync(0xffffffffu, sums[col], offset);
-      }
-    }
+    warp_reduce_sum_to_lane0(sums);
   }
 
   if (threadIdx.x == 0) {
@@ -139,10 +147,26 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   }
 }
 
+static cudaError_t gemma4_check_decode_gemv_args(
+    const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
+    const __nv_bfloat16 *y) {
+  if (!x || !w_col_major || !y || !is_aligned_16(x) ||
+      !is_aligned_16(w_col_major) || !is_aligned_16(y)) {
+    return cudaErrorInvalidValue;
+  }
+  return cudaSuccess;
+}
+
 template <int K, int N>
 cudaError_t gemma4_decode_gemv(const __nv_bfloat16 *x,
                                const __nv_bfloat16 *w_col_major,
                                __nv_bfloat16 *y, cudaStream_t stream) {
+  const cudaError_t arg_status =
+      gemma4_check_decode_gemv_args(x, w_col_major, y);
+  if (arg_status != cudaSuccess) {
+    return arg_status;
+  }
+
   constexpr int blocks = N / kGemma4DecodeColsPerBlock;
   gemma4_decode_gemv_cols_kernel<K, N, kGemma4DecodeColsPerBlock,
                                  kGemma4DecodeThreads,
@@ -156,8 +180,15 @@ cudaError_t gemma4_decode_gemv_fixed8(const __nv_bfloat16 *x,
                                       const __nv_bfloat16 *w_col_major,
                                       __nv_bfloat16 *y,
                                       cudaStream_t stream) {
-  constexpr int blocks = N / 8;
-  gemma4_decode_gemv_cols_kernel<K, N, 8, Threads, MinBlocksPerSM>
+  const cudaError_t arg_status =
+      gemma4_check_decode_gemv_args(x, w_col_major, y);
+  if (arg_status != cudaSuccess) {
+    return arg_status;
+  }
+
+  constexpr int cols_per_block = 8;
+  constexpr int blocks = N / cols_per_block;
+  gemma4_decode_gemv_cols_kernel<K, N, cols_per_block, Threads, MinBlocksPerSM>
       <<<blocks, Threads, 0, stream>>>(x, w_col_major, y);
   return cudaGetLastError();
 }
@@ -187,141 +218,167 @@ static cublasStatus_t gemma4_bf16_prefill_gemm(
                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-extern "C" cublasStatus_t gemma4_ffn_gate_up_prefill(
+template <int K, int N>
+static cublasStatus_t gemma4_prefill_projection(
     cublasHandle_t handle, const __nv_bfloat16 *x,
     const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
     cudaStream_t stream) {
-  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
-                                  GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE,
-                                  stream);
+  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m, K, N, stream);
 }
 
-extern "C" cublasStatus_t gemma4_ffn_down_prefill(
-    cublasHandle_t handle, const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
-    cudaStream_t stream) {
-  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
-                                  GEMMA4_INTERMEDIATE_SIZE,
-                                  GEMMA4_HIDDEN_SIZE, stream);
+template <int K, int N>
+static cudaError_t gemma4_decode_projection(
+    const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
+    __nv_bfloat16 *y, cudaStream_t stream) {
+  return gemma4_decode_gemv<K, N>(x, w_col_major, y, stream);
 }
 
-extern "C" cublasStatus_t gemma4_sliding_qkv_prefill(
-    cublasHandle_t handle, const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
-    cudaStream_t stream) {
-  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
-                                  GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE,
-                                  stream);
-}
-
-extern "C" cublasStatus_t gemma4_sliding_o_prefill(
-    cublasHandle_t handle, const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
-    cudaStream_t stream) {
-  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
-                                  GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
-                                  GEMMA4_HIDDEN_SIZE, stream);
-}
-
-extern "C" cublasStatus_t gemma4_global_q_prefill(
-    cublasHandle_t handle, const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
-    cudaStream_t stream) {
-  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
-                                  GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE,
-                                  stream);
-}
-
-extern "C" cublasStatus_t gemma4_global_k_prefill(
-    cublasHandle_t handle, const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
-    cudaStream_t stream) {
-  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
-                                  GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
-                                  stream);
-}
-
-extern "C" cublasStatus_t gemma4_global_o_prefill(
-    cublasHandle_t handle, const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
-    cudaStream_t stream) {
-  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
-                                  GEMMA4_GLOBAL_ATTENTION_OUT_SIZE,
-                                  GEMMA4_HIDDEN_SIZE, stream);
-}
-
-extern "C" cublasStatus_t gemma4_final_logits_prefill(
-    cublasHandle_t handle, const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
-    cudaStream_t stream) {
-  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m,
-                                  GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE,
-                                  stream);
-}
-
-extern "C" cudaError_t gemma4_ffn_gate_up_decode(const __nv_bfloat16 *x,
-                                                  const __nv_bfloat16 *w_col_major,
-                                                  __nv_bfloat16 *y,
-                                                  cudaStream_t stream) {
-  return gemma4_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE>(
+template <int K, int N, int Threads, int MinBlocksPerSM>
+static cudaError_t gemma4_decode_projection_fixed8(
+    const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
+    __nv_bfloat16 *y, cudaStream_t stream) {
+  return gemma4_decode_gemv_fixed8<K, N, Threads, MinBlocksPerSM>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_ffn_down_decode(const __nv_bfloat16 *x,
-                                               const __nv_bfloat16 *w_col_major,
-                                               __nv_bfloat16 *y,
-                                               cudaStream_t stream) {
-  return gemma4_decode_gemv_fixed8<GEMMA4_INTERMEDIATE_SIZE,
-                                   GEMMA4_HIDDEN_SIZE, 1024, 1>(
+extern "C" {
+
+cublasStatus_t gemma4_ffn_gate_up_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_prefill_projection<GEMMA4_HIDDEN_SIZE,
+                                   GEMMA4_PACKED_FFN_SIZE>(
+      handle, x, w_col_major, y, m, stream);
+}
+
+cublasStatus_t gemma4_ffn_down_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_prefill_projection<GEMMA4_INTERMEDIATE_SIZE,
+                                   GEMMA4_HIDDEN_SIZE>(
+      handle, x, w_col_major, y, m, stream);
+}
+
+cublasStatus_t gemma4_sliding_qkv_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_prefill_projection<GEMMA4_HIDDEN_SIZE,
+                                   GEMMA4_SLIDING_QKV_SIZE>(
+      handle, x, w_col_major, y, m, stream);
+}
+
+cublasStatus_t gemma4_sliding_o_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_prefill_projection<GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
+                                   GEMMA4_HIDDEN_SIZE>(
+      handle, x, w_col_major, y, m, stream);
+}
+
+cublasStatus_t gemma4_global_q_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_prefill_projection<GEMMA4_HIDDEN_SIZE,
+                                   GEMMA4_GLOBAL_Q_PROJ_SIZE>(
+      handle, x, w_col_major, y, m, stream);
+}
+
+cublasStatus_t gemma4_global_k_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_prefill_projection<GEMMA4_HIDDEN_SIZE,
+                                   GEMMA4_GLOBAL_K_PROJ_SIZE>(
+      handle, x, w_col_major, y, m, stream);
+}
+
+cublasStatus_t gemma4_global_o_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_prefill_projection<GEMMA4_GLOBAL_ATTENTION_OUT_SIZE,
+                                   GEMMA4_HIDDEN_SIZE>(
+      handle, x, w_col_major, y, m, stream);
+}
+
+cublasStatus_t gemma4_final_logits_prefill(
+    cublasHandle_t handle, const __nv_bfloat16 *x,
+    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m,
+    cudaStream_t stream) {
+  return gemma4_prefill_projection<GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE>(
+      handle, x, w_col_major, y, m, stream);
+}
+
+cudaError_t gemma4_ffn_gate_up_decode(const __nv_bfloat16 *x,
+                                      const __nv_bfloat16 *w_col_major,
+                                      __nv_bfloat16 *y,
+                                      cudaStream_t stream) {
+  return gemma4_decode_projection<GEMMA4_HIDDEN_SIZE,
+                                  GEMMA4_PACKED_FFN_SIZE>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_sliding_qkv_decode(const __nv_bfloat16 *x,
-                                                  const __nv_bfloat16 *w_col_major,
-                                                  __nv_bfloat16 *y,
-                                                  cudaStream_t stream) {
-  return gemma4_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE>(
+cudaError_t gemma4_ffn_down_decode(const __nv_bfloat16 *x,
+                                   const __nv_bfloat16 *w_col_major,
+                                   __nv_bfloat16 *y, cudaStream_t stream) {
+  return gemma4_decode_projection_fixed8<GEMMA4_INTERMEDIATE_SIZE,
+                                         GEMMA4_HIDDEN_SIZE, 1024, 1>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_sliding_o_decode(const __nv_bfloat16 *x,
-                                                const __nv_bfloat16 *w_col_major,
-                                                __nv_bfloat16 *y,
-                                                cudaStream_t stream) {
-  return gemma4_decode_gemv<GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
-                            GEMMA4_HIDDEN_SIZE>(x, w_col_major, y, stream);
-}
-
-extern "C" cudaError_t gemma4_global_q_decode(const __nv_bfloat16 *x,
-                                               const __nv_bfloat16 *w_col_major,
-                                               __nv_bfloat16 *y,
-                                               cudaStream_t stream) {
-  return gemma4_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE>(
+cudaError_t gemma4_sliding_qkv_decode(const __nv_bfloat16 *x,
+                                      const __nv_bfloat16 *w_col_major,
+                                      __nv_bfloat16 *y,
+                                      cudaStream_t stream) {
+  return gemma4_decode_projection<GEMMA4_HIDDEN_SIZE,
+                                  GEMMA4_SLIDING_QKV_SIZE>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_global_k_decode(const __nv_bfloat16 *x,
-                                               const __nv_bfloat16 *w_col_major,
-                                               __nv_bfloat16 *y,
-                                               cudaStream_t stream) {
-  return gemma4_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE>(
+cudaError_t gemma4_sliding_o_decode(const __nv_bfloat16 *x,
+                                    const __nv_bfloat16 *w_col_major,
+                                    __nv_bfloat16 *y, cudaStream_t stream) {
+  return gemma4_decode_projection<GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
+                                  GEMMA4_HIDDEN_SIZE>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_global_o_decode(const __nv_bfloat16 *x,
-                                               const __nv_bfloat16 *w_col_major,
-                                               __nv_bfloat16 *y,
-                                               cudaStream_t stream) {
-  return gemma4_decode_gemv_fixed8<GEMMA4_GLOBAL_ATTENTION_OUT_SIZE,
-                                   GEMMA4_HIDDEN_SIZE, 512, 1>(
+cudaError_t gemma4_global_q_decode(const __nv_bfloat16 *x,
+                                   const __nv_bfloat16 *w_col_major,
+                                   __nv_bfloat16 *y, cudaStream_t stream) {
+  return gemma4_decode_projection<GEMMA4_HIDDEN_SIZE,
+                                  GEMMA4_GLOBAL_Q_PROJ_SIZE>(
       x, w_col_major, y, stream);
 }
 
-extern "C" cudaError_t gemma4_final_logits_decode(const __nv_bfloat16 *x,
-                                                   const __nv_bfloat16 *w_col_major,
-                                                   __nv_bfloat16 *y,
-                                                   cudaStream_t stream) {
-  return gemma4_decode_gemv_fixed8<GEMMA4_HIDDEN_SIZE,
-                                   GEMMA4_VOCAB_SIZE, 1024, 1>(
+cudaError_t gemma4_global_k_decode(const __nv_bfloat16 *x,
+                                   const __nv_bfloat16 *w_col_major,
+                                   __nv_bfloat16 *y, cudaStream_t stream) {
+  return gemma4_decode_projection<GEMMA4_HIDDEN_SIZE,
+                                  GEMMA4_GLOBAL_K_PROJ_SIZE>(
       x, w_col_major, y, stream);
+}
+
+cudaError_t gemma4_global_o_decode(const __nv_bfloat16 *x,
+                                   const __nv_bfloat16 *w_col_major,
+                                   __nv_bfloat16 *y, cudaStream_t stream) {
+  return gemma4_decode_projection_fixed8<GEMMA4_GLOBAL_ATTENTION_OUT_SIZE,
+                                         GEMMA4_HIDDEN_SIZE, 512, 1>(
+      x, w_col_major, y, stream);
+}
+
+cudaError_t gemma4_final_logits_decode(const __nv_bfloat16 *x,
+                                       const __nv_bfloat16 *w_col_major,
+                                       __nv_bfloat16 *y,
+                                       cudaStream_t stream) {
+  return gemma4_decode_projection_fixed8<GEMMA4_HIDDEN_SIZE,
+                                         GEMMA4_VOCAB_SIZE, 1024, 1>(
+      x, w_col_major, y, stream);
+}
+
 }
