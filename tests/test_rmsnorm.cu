@@ -104,7 +104,7 @@ void compare_float(const std::vector<float> &actual,
 }
 
 void run_rmsnorm_case(int rows, int width) {
-  const size_t elems = static_cast<size_t>(rows) * width;
+  const int elems = rows * width;
   std::vector<__nv_bfloat16> inp(elems);
   std::vector<__nv_bfloat16> weight(width);
   std::vector<__nv_bfloat16> actual(elems);
@@ -112,7 +112,7 @@ void run_rmsnorm_case(int rows, int width) {
   std::vector<float> actual_rstd(rows);
   std::vector<float> expected_rstd(rows);
 
-  for (size_t i = 0; i < elems; ++i) {
+  for (int i = 0; i < elems; ++i) {
     inp[i] = make_input_value(static_cast<int>(i));
   }
   for (int c = 0; c < width; ++c) {
@@ -153,13 +153,13 @@ void run_rmsnorm_case(int rows, int width) {
 }
 
 void run_residual_add_case(int rows, int width) {
-  const size_t elems = static_cast<size_t>(rows) * width;
+  const int elems = rows * width;
   std::vector<__nv_bfloat16> inp1(elems);
   std::vector<__nv_bfloat16> inp2(elems);
   std::vector<__nv_bfloat16> actual(elems);
   std::vector<__nv_bfloat16> expected(elems);
 
-  for (size_t i = 0; i < elems; ++i) {
+  for (int i = 0; i < elems; ++i) {
     inp1[i] = make_input_value(static_cast<int>(i));
     inp2[i] = make_residual_value(static_cast<int>(i));
     expected[i] = __float2bfloat16(bf16_to_float(inp1[i]) + bf16_to_float(inp2[i]));
@@ -188,7 +188,7 @@ void run_residual_add_case(int rows, int width) {
 }
 
 void run_fused_case(int rows, int width) {
-  const size_t elems = static_cast<size_t>(rows) * width;
+  const int elems = rows * width;
   std::vector<__nv_bfloat16> inp1(elems);
   std::vector<__nv_bfloat16> inp2(elems);
   std::vector<__nv_bfloat16> weight(width);
@@ -199,7 +199,7 @@ void run_fused_case(int rows, int width) {
   std::vector<float> actual_rstd(rows);
   std::vector<float> expected_rstd(rows);
 
-  for (size_t i = 0; i < elems; ++i) {
+  for (int i = 0; i < elems; ++i) {
     inp1[i] = make_input_value(static_cast<int>(i));
     inp2[i] = make_residual_value(static_cast<int>(i));
     expected_residual[i] =
