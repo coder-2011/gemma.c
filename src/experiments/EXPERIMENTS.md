@@ -1856,3 +1856,160 @@ Conclusion:
 - Keep this shape. The helper split makes the intended memory policy explicit without changing the generated load instructions.
 - The tiny timing delta is noise-level against the prior direct-load baseline.
 - This reinforces the current decision: use `load128` for reused activation packs, `load128cs` for streaming weight packs, and avoid shared-memory async copy until the GEMV mapping has real staged-data reuse.
+
+## 2026-05-19 - Decode GEMV register double-buffer cleanup and bench
+
+Runtime file tested: `src/gemma4_matmul_kernels.cu`
+
+Question:
+
+- Replace the existing `GEMMA4_DECODE_REGISTER_DOUBLE_BUFFER` implementation with a clearer register-prefetch variant and check whether it is correct and faster.
+
+Research notes:
+
+- NVIDIA's CUDA prefetching guidance says register prefetching can help when profiling shows memory stalls and bandwidth is not saturated, but it spends extra registers and must be verified with profiling/benchmarks.
+- The CUDA guide occupancy sections are relevant because register count and shared-memory use limit resident warps/blocks, which are the normal latency-hiding mechanism for memory-bound kernels.
+- For this decode GEMV mapping, the register double buffer only changes instruction timing: it preloads the next column's one-use weight pack before accumulating the current column's pack. It does not reduce total DRAM traffic.
+
+Implementation:
+
+- Removed the old `gemma4_accumulate_bf16_cols_register_buffered` helper.
+- Added a separate compile-time double-buffer path:
+  - `gemma4_decode_gemv_cols_dot_register_double_buffered_device(...)`
+  - `gemma4_accumulate_prefetched_weight_cols(...)`
+- Kept the default direct-load path separate, so the register-prefetch path is enabled only with `-DGEMMA4_DECODE_REGISTER_DOUBLE_BUFFER`.
+
+Commands:
+
+```bash
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_REGISTER_DOUBLE_BUFFER"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 2 1 1
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_REGISTER_DOUBLE_BUFFER -Xptxas=-v -Isrc -c src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_register_double_buffer.o
+
+make -B decode-bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+```
+
+Correctness:
+
+- The smoke run completed for all decode projection shapes.
+- BF16 reference diffs stayed in the same expected range as the direct-load path; largest max absolute difference was `0.25` versus BF16 cuBLAS/cuDNN references.
+- Exact-zero diffs versus cuBLAS remained for `ffn_down` and `global_o`.
+
+Resource result for `GEMMA4_DECODE_REGISTER_DOUBLE_BUFFER`:
+
+- `0` stack frame bytes.
+- `0` spill stores and `0` spill loads for all instantiated decode GEMV kernels.
+- `63` registers for all instantiations except `global_o`.
+- `72` registers for `global_o`.
+- Shared memory stayed at the existing warp-reduction scratch size: `512B` or `1024B` depending on thread count.
+
+Timing, seeded `all 50 10 3`:
+
+| Op | Direct-load best ms | Register double-buffer best ms |
+| --- | ---: | ---: |
+| `ffn_gate_up` | 0.651085 | 0.651015 |
+| `ffn_down` | 0.328530 | 0.328137 |
+| `sliding_qkv` | 0.250395 | 0.250356 |
+| `sliding_o` | 0.127427 | 0.127486 |
+| `global_q` | 0.250749 | 0.250852 |
+| `global_k` | 0.034523 | 0.034418 |
+| `global_o` | 0.251091 | 0.250967 |
+| `final_logits` | 3.954532 | 3.954656 |
+
+Weighted decode projection total:
+
+| Variant | Weighted decode projection ms |
+| --- | ---: |
+| Direct-load | 86.986 |
+| Register double buffer | 86.958 |
+
+Conclusion:
+
+- The cleaned-up register double-buffer path appears correct.
+- The timing difference is noise-level: about `0.03 ms` on an `~87 ms` weighted decode projection total.
+- Do not enable it by default yet. Keep it as a compile-time experiment path unless repeated profiling shows a real stall/bandwidth reason to prefer it.
+
+## 2026-05-19 - Decode GEMV cp.async double-buffer implementation
+
+Runtime file tested: `src/gemma4_matmul_kernels.cu`
+
+Question:
+
+- Replace the register-prefetch experiment path with real cp.async global-to-shared staging.
+
+Research notes:
+
+- The CUDA guide describes pipelines as the mechanism for staging work and coordinating double- or multi-buffer producer-consumer patterns.
+- The primitives API supports `__pipeline_memcpy_async`, `__pipeline_commit`, and `__pipeline_wait_prior(N)` for global-to-shared asynchronous copies.
+- The primitive requirements match this kernel's pack shape: destination is shared memory, source is global memory, and `size_and_align` must be `4`, `8`, or `16`. `Gemma4Bf16Pack` is a 16-byte aligned pack.
+- The guide also warns not to read the shared-memory destination before waiting for the async copy to complete.
+
+Implementation:
+
+- Removed the `GEMMA4_DECODE_REGISTER_DOUBLE_BUFFER` source path.
+- Added `GEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER`.
+- Each participating thread copies one 16-byte weight pack into `__shared__ Gemma4Bf16Pack weight_stages[2][Threads]`.
+- The inner column loop alternates two stages:
+  - issue cp.async for the next column,
+  - accumulate the current column from the waited-on shared stage,
+  - wait for the next stage before consuming it.
+- The default direct global-to-register path remains unchanged unless the cp.async macro is defined.
+
+Commands:
+
+```bash
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 2 1 1
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER -Xptxas=-v -Isrc -c src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_cp_async.o
+nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER -Isrc --ptx src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_cp_async.ptx
+
+make -B decode-bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+```
+
+PTX/resource result:
+
+- PTX contains `cp.async.cg.shared.global`, `cp.async.commit_group`, and `cp.async.wait_group`.
+- `0` stack frame bytes.
+- `0` spill stores and `0` spill loads for all instantiated decode GEMV kernels.
+- Registers:
+  - `55` for all cp.async instantiations except `global_o`.
+  - `54` for `global_o`.
+- Shared memory:
+  - `16896B` for 512-thread kernels.
+  - `33792B` for 1024-thread kernels.
+
+Correctness:
+
+- The smoke run completed for all decode projection shapes.
+- BF16 reference diffs stayed in the same expected range as the direct-load path; largest max absolute difference was `0.25` versus BF16 cuBLAS/cuDNN references.
+- Exact-zero diffs versus cuBLAS remained for `ffn_down` and `global_o`.
+
+Timing, seeded `all 50 10 3`:
+
+| Op | Direct-load best ms | cp.async best ms |
+| --- | ---: | ---: |
+| `ffn_gate_up` | 0.651042 | 0.654468 |
+| `ffn_down` | 0.328219 | 0.328632 |
+| `sliding_qkv` | 0.250456 | 0.253651 |
+| `sliding_o` | 0.127536 | 0.127636 |
+| `global_q` | 0.250470 | 0.254575 |
+| `global_k` | 0.034400 | 0.036015 |
+| `global_o` | 0.250852 | 0.251440 |
+| `final_logits` | 3.954719 | 3.957656 |
+
+Weighted decode projection total:
+
+| Variant | Weighted decode projection ms |
+| --- | ---: |
+| Direct-load | 86.967 |
+| cp.async double buffer | 87.428 |
+
+Conclusion:
+
+- The cp.async path is correct and actually emits cp.async instructions, but it is slower for this GEMV mapping.
+- The slowdown is expected: each weight pack is still one-use data, so shared-memory staging adds async-copy, commit/wait, and shared-load overhead without reducing DRAM traffic.
+- Keep cp.async as a compile-time experiment path only. The runtime default should remain the direct `load128`/`load128cs` path.
