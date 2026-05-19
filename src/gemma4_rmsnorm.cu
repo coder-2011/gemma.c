@@ -1,13 +1,4 @@
-/*
- * Adapted from llm.c/llmc/layernorm.cuh.
- *
- * The structure intentionally mirrors llm.c's forward LayerNorm and fused
- * residual+LayerNorm kernels, but the math is Gemma RMSNorm:
- *
- *   y = x * rsqrt(mean(x * x) + eps) * weight
- *
- * Gemma uses RMSNorm without a bias term and without mean subtraction.
- */
+// Gemma RMSNorm: y = x * rsqrt(mean(x * x) + eps) * weight.
 
 #include "gemma4_rmsnorm.cuh"
 #include "gemma4_cuda_utils.cuh"
