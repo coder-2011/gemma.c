@@ -16,16 +16,13 @@ using Gemma4Bf16Pack = Packed128<__nv_bfloat16>;
 
 static constexpr int kGemma4Bf16PerPack = Gemma4Bf16Pack::size;
 static constexpr int kGemma4Bf16PairsPerPack = kGemma4Bf16PerPack / 2;
-static_assert((kGemma4Bf16PerPack % 2) == 0,
-              "Packed128 bf16 width must contain whole bf16 pairs");
-static_assert(alignof(Gemma4Bf16Pack) >= alignof(__nv_bfloat162),
-              "Packed128 bf16 payload must be aligned for bf16x2 access");
+static_assert((kGemma4Bf16PerPack % 2) == 0, "Packed128 bf16 width must contain whole bf16 pairs");
+static_assert(alignof(Gemma4Bf16Pack) >= alignof(__nv_bfloat162), "Packed128 bf16 payload must be aligned for bf16x2 access");
 
 template <int Pair>
 __device__ __forceinline__ __nv_bfloat162
 gemma4_bf16_pack_pair(const Gemma4Bf16Pack &pack) {
-  static_assert(Pair >= 0 && Pair < kGemma4Bf16PairsPerPack,
-                "bf16 pair index is out of range");
+  static_assert(Pair >= 0 && Pair < kGemma4Bf16PairsPerPack, "bf16 pair index is out of range");
   const __nv_bfloat162 *pairs =
       reinterpret_cast<const __nv_bfloat162 *>(pack.payload);
   return pairs[Pair];
@@ -77,10 +74,8 @@ __device__ __forceinline__ void gemma4_decode_gemv_cols_dot_device(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major, int col0, int thread_idx,
     float (&sums)[ColsPerBlock]) {
-  static_assert((K % kGemma4Bf16PerPack) == 0,
-                "decode GEMV K must be divisible by Packed128 bf16 width");
-  static_assert((Threads % WARP_SIZE) == 0,
-                "decode thread count must be a whole number of warps");
+  static_assert((K % kGemma4Bf16PerPack) == 0, "decode GEMV K must be divisible by Packed128 bf16 width");
+  static_assert((Threads % WARP_SIZE) == 0, "decode thread count must be a whole number of warps");
 
 #pragma unroll
   for (int col = 0; col < ColsPerBlock; ++col) {
@@ -108,8 +103,7 @@ __global__ __launch_bounds__(Threads, MinBlocksPerSM) void
 gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
                                const __nv_bfloat16 *__restrict__ w_col_major,
                                __nv_bfloat16 *__restrict__ y) {
-  static_assert((N % ColsPerBlock) == 0,
-                "decode GEMV N must be divisible by columns per block");
+  static_assert((N % ColsPerBlock) == 0, "decode GEMV N must be divisible by columns per block");
 
   constexpr int warps = div_up(Threads, WARP_SIZE);
   __shared__ float warp_sums[ColsPerBlock][warps];
