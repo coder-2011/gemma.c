@@ -19,36 +19,24 @@ static constexpr int kGemma4Bf16PairsPerPack = kGemma4Bf16PerPack / 2;
 static_assert((kGemma4Bf16PerPack % 2) == 0, "Packed128 bf16 width must contain whole bf16 pairs");
 static_assert(alignof(Gemma4Bf16Pack) >= alignof(__nv_bfloat162), "Packed128 bf16 payload must be aligned for bf16x2 access");
 
-template <int Pair>
-__device__ __forceinline__ __nv_bfloat162
-gemma4_bf16_pack_pair(const Gemma4Bf16Pack &pack) {
-  static_assert(Pair >= 0 && Pair < kGemma4Bf16PairsPerPack, "bf16 pair index is out of range");
-  const __nv_bfloat162 *pairs =
-      reinterpret_cast<const __nv_bfloat162 *>(pack.payload);
-  return pairs[Pair];
-}
-
-template <int Pair>
-__device__ __forceinline__ void gemma4_accumulate_bf16_pack_pair(
-    const Gemma4Bf16Pack &x_pack, const Gemma4Bf16Pack &w_pack, float &sum) {
-  const float2 xv = __bfloat1622float2(gemma4_bf16_pack_pair<Pair>(x_pack));
-  const float2 wv = __bfloat1622float2(gemma4_bf16_pack_pair<Pair>(w_pack));
-  sum = fmaf(xv.x, wv.x, sum);
-  sum = fmaf(xv.y, wv.y, sum);
-}
-
-template <int Pair>
-__device__ __forceinline__ void gemma4_accumulate_bf16_pack_pairs(
-    const Gemma4Bf16Pack &x_pack, const Gemma4Bf16Pack &w_pack, float &sum) {
+template <int Pair = 0>
+__device__ __forceinline__ void gemma4_accumulate_bf16_pairs(
+    const __nv_bfloat162 *x_pairs, const __nv_bfloat162 *w_pairs, float &sum) {
+  static_assert(Pair >= 0 && Pair <= kGemma4Bf16PairsPerPack, "bf16 pair index is out of range");
   if constexpr (Pair < kGemma4Bf16PairsPerPack) {
-    gemma4_accumulate_bf16_pack_pair<Pair>(x_pack, w_pack, sum);
-    gemma4_accumulate_bf16_pack_pairs<Pair + 1>(x_pack, w_pack, sum);
+    const float2 xv = __bfloat1622float2(x_pairs[Pair]);
+    const float2 wv = __bfloat1622float2(w_pairs[Pair]);
+    sum = fmaf(xv.x, wv.x, sum);
+    sum = fmaf(xv.y, wv.y, sum);
+    gemma4_accumulate_bf16_pairs<Pair + 1>(x_pairs, w_pairs, sum);
   }
 }
 
 __device__ __forceinline__ void gemma4_accumulate_bf16_pack(
     const Gemma4Bf16Pack &x_pack, const Gemma4Bf16Pack &w_pack, float &sum) {
-  gemma4_accumulate_bf16_pack_pairs<0>(x_pack, w_pack, sum);
+  const auto *x_pairs = reinterpret_cast<const __nv_bfloat162 *>(x_pack.payload);
+  const auto *w_pairs = reinterpret_cast<const __nv_bfloat162 *>(w_pack.payload);
+  gemma4_accumulate_bf16_pairs<>(x_pairs, w_pairs, sum);
 }
 
 template <int ColsPerBlock>
