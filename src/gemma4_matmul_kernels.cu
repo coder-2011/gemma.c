@@ -6,35 +6,52 @@
 #include <cuda_runtime.h>
 
 // Gemma 4 31B dense projection kernels.
-//
-// Prefill stays on a host-side library GEMM. CUDA library frontends are not
-// callable from __device__ code, so the custom device path is decode-only.
+
 static constexpr int kGemma4DecodeThreads = 512;
 static constexpr int kGemma4DecodeColsPerBlock = 8;
 static constexpr int kGemma4DecodeMinBlocksPerSM = 2;
-static_assert((kGemma4DecodeThreads % WARP_SIZE) == 0,
-              "decode thread count must be a whole number of warps");
+static_assert((kGemma4DecodeThreads % WARP_SIZE) == 0, "decode thread count must be a whole number of warps");
 
 using Gemma4Bf16Pack = Packed128<__nv_bfloat16>;
+
 static constexpr int kGemma4Bf16PerPack = Gemma4Bf16Pack::size;
 static constexpr int kGemma4Bf16PairsPerPack = kGemma4Bf16PerPack / 2;
+static_assert((kGemma4Bf16PerPack % 2) == 0,
+              "Packed128 bf16 width must contain whole bf16 pairs");
+static_assert(alignof(Gemma4Bf16Pack) >= alignof(__nv_bfloat162),
+              "Packed128 bf16 payload must be aligned for bf16x2 access");
 
+template <int Pair>
 __device__ __forceinline__ __nv_bfloat162
-gemma4_bf16_pack_pair(const Gemma4Bf16Pack &pack, int pair) {
+gemma4_bf16_pack_pair(const Gemma4Bf16Pack &pack) {
+  static_assert(Pair >= 0 && Pair < kGemma4Bf16PairsPerPack,
+                "bf16 pair index is out of range");
   const __nv_bfloat162 *pairs =
       reinterpret_cast<const __nv_bfloat162 *>(pack.payload);
-  return pairs[pair];
+  return pairs[Pair];
+}
+
+template <int Pair>
+__device__ __forceinline__ void gemma4_accumulate_bf16_pack_pair(
+    const Gemma4Bf16Pack &x_pack, const Gemma4Bf16Pack &w_pack, float &sum) {
+  const float2 xv = __bfloat1622float2(gemma4_bf16_pack_pair<Pair>(x_pack));
+  const float2 wv = __bfloat1622float2(gemma4_bf16_pack_pair<Pair>(w_pack));
+  sum = fmaf(xv.x, wv.x, sum);
+  sum = fmaf(xv.y, wv.y, sum);
+}
+
+template <int Pair>
+__device__ __forceinline__ void gemma4_accumulate_bf16_pack_pairs(
+    const Gemma4Bf16Pack &x_pack, const Gemma4Bf16Pack &w_pack, float &sum) {
+  if constexpr (Pair < kGemma4Bf16PairsPerPack) {
+    gemma4_accumulate_bf16_pack_pair<Pair>(x_pack, w_pack, sum);
+    gemma4_accumulate_bf16_pack_pairs<Pair + 1>(x_pack, w_pack, sum);
+  }
 }
 
 __device__ __forceinline__ void gemma4_accumulate_bf16_pack(
     const Gemma4Bf16Pack &x_pack, const Gemma4Bf16Pack &w_pack, float &sum) {
-#pragma unroll
-  for (int pair = 0; pair < kGemma4Bf16PairsPerPack; ++pair) {
-    const float2 xv = __bfloat1622float2(gemma4_bf16_pack_pair(x_pack, pair));
-    const float2 wv = __bfloat1622float2(gemma4_bf16_pack_pair(w_pack, pair));
-    sum = fmaf(xv.x, wv.x, sum);
-    sum = fmaf(xv.y, wv.y, sum);
-  }
+  gemma4_accumulate_bf16_pack_pairs<0>(x_pack, w_pack, sum);
 }
 
 template <int ColsPerBlock>
