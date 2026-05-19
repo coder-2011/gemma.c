@@ -2013,3 +2013,173 @@ Conclusion:
 - The cp.async path is correct and actually emits cp.async instructions, but it is slower for this GEMV mapping.
 - The slowdown is expected: each weight pack is still one-use data, so shared-memory staging adds async-copy, commit/wait, and shared-load overhead without reducing DRAM traffic.
 - Keep cp.async as a compile-time experiment path only. The runtime default should remain the direct `load128`/`load128cs` path.
+
+## 2026-05-19 - Nsight Compute counter profiling attempt for decode GEMV
+
+Runtime files tested:
+
+- `src/gemma4_matmul_kernels.cu`
+- Temporary CUDA-only harness: `/tmp/gemma4_decode_ncu_harness.cu`
+
+Question:
+
+- Collect hardware counters for the direct-load decode GEMV and the cp.async variant rather than reasoning only from source and CUDA-event timing.
+
+Requested metrics:
+
+```bash
+gpu__time_duration.sum
+l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum
+lts__t_bytes.sum
+dram__bytes.sum
+l1tex__t_sector_hit_rate.pct
+lts__t_sector_hit_rate.pct
+smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct
+smsp__warp_issue_stalled_mio_throttle_per_warp_active.pct
+smsp__warps_active.avg.pct_of_peak_sustained_active
+```
+
+Setup:
+
+- Verified Nsight Compute is installed: `ncu 2025.2.1.0`.
+- Verified the machine reports `NVIDIA RTX A6000`, driver `580.126.16`.
+- Queried GA102 metric names with:
+
+```bash
+ncu --query-metrics --chips ga102
+```
+
+- First attempted profiling the existing `gemma4_decode_bench` with a kernel filter:
+
+```bash
+GEMMA4_DECODE_BENCH_SEED=0x1234 ncu \
+  --target-processes all \
+  --kernel-name regex:gemma4_decode_gemv_cols_kernel \
+  --launch-count 1 \
+  --metrics <requested metrics> \
+  --csv \
+  /tmp/gemma4_decode_bench_direct ffn_gate_up 1 0 1
+```
+
+Result:
+
+- Thunder aborted before counters were collected:
+
+```text
+Your program encountered a fatal error likely caused by a Thunder Compute runtime issue:
+  Your program uses a library that is not yet supported on Thunder.
+```
+
+Follow-up isolation:
+
+- Built `/tmp/gemma4_decode_ncu_harness.cu`, a CUDA-only standalone harness for the same `ffn_gate_up` decode GEMV mapping:
+  - no cuBLAS
+  - no cuDNN
+  - direct-load binary: `/tmp/gemma4_decode_ncu_direct`
+  - cp.async binary: `/tmp/gemma4_decode_ncu_cp_async`
+- Both harness binaries run normally outside `ncu`.
+
+Standalone `ncu` command:
+
+```bash
+ncu \
+  --target-processes all \
+  --kernel-name regex:decode_kernel \
+  --launch-count 1 \
+  --metrics gpu__time_duration.sum,dram__bytes.sum \
+  --csv \
+  /tmp/gemma4_decode_ncu_direct 1
+```
+
+Result:
+
+- Thunder still aborted under Nsight Compute injection, even without cuBLAS/cuDNN.
+- Captured process state showed:
+
+```text
+abortMessage="Unimplemented CUDA export table function: Table=cupti_device_query, Index=7"
+lastErrorUser="Your program uses a library that is not yet supported on Thunder."
+```
+
+Conclusion:
+
+- Nsight Compute hardware-counter profiling is blocked on this Thunder instance by missing CUPTI support in Thunder's CUDA export table.
+- This is not a benchmark-code or cuBLAS/cuDNN issue; it reproduces with a CUDA-only harness.
+- No reliable hardware-counter conclusion can be drawn from this environment. To answer the bandwidth-vs-latency question properly, rerun the same `ncu` commands on a production instance or another host where CUPTI/Nsight Compute profiling is supported.
+
+## 2026-05-19 - Decode GEMV cp.async debug with load128/load128cs staging
+
+Runtime file tested: `src/gemma4_matmul_kernels.cu`
+
+Question:
+
+- The cp.async double buffer should plausibly be faster, so isolate whether the slowdown comes from shared-memory staging itself or from cp.async commit/wait mechanics.
+
+Implementation:
+
+- Kept the same two-stage shared-memory layout used by the cp.async path:
+  `Gemma4Bf16Pack weight_stages[2][Threads]`.
+- Added two compile-time sibling variants:
+  - `GEMMA4_DECODE_SHARED_STAGE_LOAD128`
+  - `GEMMA4_DECODE_SHARED_STAGE_LOAD128CS`
+- Both variants use the same shared-stage consume path as cp.async, but stage data with normal global loads instead of `__pipeline_memcpy_async`.
+- The direct default path remains unchanged.
+
+Commands:
+
+```bash
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_LOAD128"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_LOAD128CS"
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+```
+
+Timing, seeded `all 50 10 3`:
+
+| Op | Direct | cp.async | Shared `load128` | Shared `load128cs` |
+| --- | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.651158 | 0.654705 | 0.652065 | 0.651222 |
+| `ffn_down` | 0.328492 | 0.329076 | 0.329271 | 0.328312 |
+| `sliding_qkv` | 0.250387 | 0.253834 | 0.250493 | 0.250413 |
+| `sliding_o` | 0.127457 | 0.127696 | 0.127501 | 0.127295 |
+| `global_q` | 0.250526 | 0.254549 | 0.250682 | 0.250627 |
+| `global_k` | 0.034491 | 0.035948 | 0.034846 | 0.034957 |
+| `global_o` | 0.251147 | 0.251456 | 0.251411 | 0.251354 |
+| `final_logits` | 3.954678 | 3.957649 | 3.955973 | 3.955886 |
+
+Weighted decode projection total:
+
+| Variant | Weighted decode projection ms |
+| --- | ---: |
+| Direct | 86.988 |
+| cp.async | 87.481 |
+| Shared `load128` | 87.105 |
+| Shared `load128cs` | 86.983 |
+
+PTX/resource check:
+
+| Variant | Registers | Shared memory | Spills | PTX evidence |
+| --- | --- | --- | --- | --- |
+| Direct | `63`, `72` | `512B`, `1024B` | `0/0` | `ld.global.cs=56`, `ld.global.nc=7` |
+| cp.async | `54`, `55` | `16896B`, `33792B` | `0/0` | `cp.async.cg.shared.global=56`, `commit_group=56`, `wait_group=56` |
+| Shared `load128` | `59`, `60` | `16896B`, `33792B` | `0/0` | `ld.global.nc=63`, no cp.async |
+| Shared `load128cs` | `64` | `16896B`, `33792B` | `0/0` | `ld.global.cs=56`, `ld.global.nc=7`, no cp.async |
+
+Interpretation:
+
+- Shared-memory staging itself is not the issue. Shared `load128cs` is essentially tied with direct.
+- The weight load policy matters: shared `load128cs` beats shared `load128`, matching the direct path's streaming-weight policy.
+- The cp.async-specific overhead is the likely issue in this mapping: the compiler emits one `cp.async`, one commit, and one wait group per staged weight pack group in the unrolled column loop.
+- The work between issuing the next stage and waiting for it is only one 16-byte-pack BF16 dot contribution, so there is not enough independent compute to amortize commit/wait overhead.
+
+Conclusion:
+
+- Do not enable cp.async for this current per-thread/per-column GEMV mapping.
+- If cp.async is revisited, change the tiling so each async-staged payload is reused more, or group larger batches per wait. A same-thread one-use 16-byte pack is too fine-grained for this pipeline structure.
