@@ -17,4 +17,4 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 
 - Back to matmul, playing around w/ warptiling to torture the chip into giving me all its FLOPs. Benchmarks had to be fixed a bit too, bc it didnt fully account for overhead from cuDNN. I used cuDNN backend API anyways to minimize ovehead. Added double buffering bc memory was a huge bottleneck. its GEMV, so mem constraints will not let us speed up any more than this.
 
-- buffering and fancy memory techniques [[AGENTS, choose worked or not worked]], bc [[AGENTS, give a really rock sold explanation here]]
+- Buffering and fancy memory tricks have mostly not helped the M=1 decode GEMV path. The direct `load128cs` path is already a near-roofline DRAM streamer, and `cp.async` adds shared-memory staging plus commit/wait overhead without reducing bytes or creating reuse. If this is revisited, use a different tiling strategy where staged data is reused; don't just pipeline one-use 16-byte packs. `ncu` profiling is blocked on Thunder/CUPTI for now, so this is based on timing and PTX/resource checks.
