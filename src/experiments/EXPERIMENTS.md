@@ -1782,3 +1782,77 @@ Conclusion:
 - It reduced register use, but that did not compensate for the extra async-copy instructions, shared-memory traffic, wait operations, and increased shared-memory footprint.
 - Do not keep this implementation in the runtime path.
 - Shared-memory async copy may become useful only after changing the mapping so staged data is reused by multiple threads or multiple output columns instead of being consumed once by the same thread that loaded it.
+
+## 2026-05-19 - Decode GEMV explicit 128-bit load policy
+
+Runtime file tested: `src/gemma4_matmul_kernels.cu`
+
+Question:
+
+- Keep the direct global-to-register GEMV path, but make the intended load policy explicit:
+  normal 128-bit loads for reused activation packs and streaming 128-bit loads for one-use weight packs.
+
+Implementation:
+
+- Added inlined decode load helpers:
+  - `gemma4_load_activation_pack(...)` uses `load128(...)`.
+  - `gemma4_load_streaming_weight_pack<K>(...)` uses `load128cs(...)`.
+- Added a compile-time contract that `Gemma4Bf16Pack` maps to one aligned `int4` load.
+- Added a host-side decode pointer guard for non-null, 16-byte-aligned `x`, `w_col_major`, and `y`.
+- Kept the runtime path as global memory -> registers -> ALUs; no shared-memory staging.
+
+Commands:
+
+```bash
+make cuda-kernels decode-bench
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc --ptx src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_kernels_load_policy.ptx
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc -c src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_kernels_load_policy.o
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc /tmp/gemma4_decode_arg_guard_test.cu src/gemma4_matmul_kernels.cu -lcublas -lcudnn -o /tmp/gemma4_decode_arg_guard_test
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 2 1 1
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+```
+
+PTX/resource result:
+
+- PTX load mix:
+  - `ld.global.nc.v4.u32`: `7`
+  - `ld.global.cs.v4.s32`: `56`
+  - `prefetch`: `0`
+  - `cp.async`: `0`
+- ptxas resource use:
+  - `63` registers for all decode GEMV instantiations except `global_o`.
+  - `72` registers for `global_o`.
+  - `0` spill stores and `0` spill loads.
+  - Shared memory remains only the warp-reduction scratch: `512B` or `1024B` depending on thread count.
+
+Correctness:
+
+- `all 2 1 1` completed for all decode projection shapes.
+- BF16 reference diffs stayed in the same expected range as prior runs; largest max absolute difference was `0.25` versus BF16 cuBLAS/cuDNN references.
+- Temporary arg-guard test returned `cudaErrorInvalidValue` for null decode pointers before launching a kernel.
+
+Timing:
+
+| Op | Custom best ms |
+| --- | ---: |
+| `ffn_gate_up` | 0.651138 |
+| `ffn_down` | 0.328560 |
+| `sliding_qkv` | 0.250545 |
+| `sliding_o` | 0.127626 |
+| `global_q` | 0.250479 |
+| `global_k` | 0.034163 |
+| `global_o` | 0.250664 |
+| `final_logits` | 3.954700 |
+
+Weighted decode projection total:
+
+| Variant | Weighted decode projection ms |
+| --- | ---: |
+| Prior direct-load baseline | 86.858 |
+| Explicit load-policy helpers | 86.998 |
+
+Conclusion:
+
+- Keep this shape. The helper split makes the intended memory policy explicit without changing the generated load instructions.
+- The tiny timing delta is noise-level against the prior direct-load baseline.
+- This reinforces the current decision: use `load128` for reused activation packs, `load128cs` for streaming weight packs, and avoid shared-memory async copy until the GEMV mapping has real staged-data reuse.
