@@ -12,6 +12,10 @@
 - Fuse token embedding gather with the first matrix multiplication in the language path once the unfused baseline is correct.
   - Avoid materializing the initial `[M, 5376]` hidden buffer when the first projection can consume embedding rows directly.
   - Benchmark against the standalone embedding gather plus cuBLAS/cuBLASLt baseline before keeping the fusion.
+- Split the RMSNorm kernels into separate decode and prefill paths.
+  - Decode path should optimize for one row/token and low launch/device overhead.
+  - Prefill path should optimize for many rows and sustained memory bandwidth.
+  - Keep the existing shared implementation as the correctness baseline until both specialized paths pass tests and benchmarks.
 
 ## Decode GEMV Priority Order
 
