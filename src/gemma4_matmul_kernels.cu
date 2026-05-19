@@ -3,6 +3,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
+#include <cuda_pipeline_primitives.h>
 #include <cuda_runtime.h>
 
 // Gemma 4 31B dense projection kernels.
@@ -63,27 +64,6 @@ __device__ __forceinline__ void gemma4_accumulate_bf16_pack(
   gemma4_accumulate_bf16_pairs<>(x_pairs, w_pairs, sum);
 }
 
-#if defined(GEMMA4_DECODE_REGISTER_DOUBLE_BUFFER)
-template <int Col, int K, int ColsPerBlock>
-__device__ __forceinline__ void gemma4_accumulate_bf16_cols_register_buffered(
-    const Gemma4Bf16Pack &x_pack,
-    const __nv_bfloat16 *__restrict__ w_col_major, int col0, int element_idx,
-    const Gemma4Bf16Pack &w_pack, float (&sums)[ColsPerBlock]) {
-  if constexpr (Col < ColsPerBlock) {
-    if constexpr ((Col + 1) < ColsPerBlock) {
-      const Gemma4Bf16Pack w_next =
-          gemma4_load_streaming_weight_pack<K>(w_col_major, col0 + Col + 1,
-                                               element_idx);
-      gemma4_accumulate_bf16_pack(x_pack, w_pack, sums[Col]);
-      gemma4_accumulate_bf16_cols_register_buffered<Col + 1, K, ColsPerBlock>(
-          x_pack, w_col_major, col0, element_idx, w_next, sums);
-    } else {
-      gemma4_accumulate_bf16_pack(x_pack, w_pack, sums[Col]);
-    }
-  }
-}
-#endif
-
 template <int ColsPerBlock>
 __device__ __forceinline__ void gemma4_store_bf16_cols(
     __nv_bfloat16 *__restrict__ dst, const float (&sums)[ColsPerBlock]) {
@@ -102,6 +82,73 @@ __device__ __forceinline__ void gemma4_store_bf16_cols(
   }
 }
 
+#if defined(GEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER)
+template <int K>
+__device__ __forceinline__ void
+gemma4_cp_async_weight_pack(Gemma4Bf16Pack *dst_shared,
+                            const __nv_bfloat16 *__restrict__ w_col_major,
+                            int col, int element_idx) {
+  static_assert(sizeof(Gemma4Bf16Pack) == 16,
+                "cp.async path requires one 16-byte weight pack");
+  __pipeline_memcpy_async(
+      dst_shared, w_col_major + gemma4_weight_pack_offset<K>(col, element_idx),
+      sizeof(Gemma4Bf16Pack));
+}
+
+template <int K, int ColsPerBlock, int Threads>
+__device__ __forceinline__ void
+gemma4_decode_gemv_cols_dot_cp_async_device(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major, int col0, int thread_idx,
+    Gemma4Bf16Pack (&weight_stages)[2][Threads],
+    float (&sums)[ColsPerBlock]) {
+  static_assert((K % kGemma4Bf16PerPack) == 0,
+                "decode GEMV K must be divisible by Packed128 bf16 width");
+  static_assert((Threads % WARP_SIZE) == 0,
+                "decode thread count must be a whole number of warps");
+  static_assert(ColsPerBlock > 0, "decode GEMV must compute at least one column");
+
+  constexpr int packs_per_col = K / kGemma4Bf16PerPack;
+
+#pragma unroll
+  for (int pack_idx = thread_idx; pack_idx < packs_per_col;
+       pack_idx += Threads) {
+    const int element_idx = gemma4_bf16_pack_element_index(pack_idx);
+    const Gemma4Bf16Pack x_pack = gemma4_load_activation_pack(x, element_idx);
+    int stage = 0;
+
+    gemma4_cp_async_weight_pack<K>(&weight_stages[stage][thread_idx],
+                                   w_col_major, col0, element_idx);
+    __pipeline_commit();
+    __pipeline_wait_prior(0);
+
+#pragma unroll
+    for (int col = 0; col < ColsPerBlock; ++col) {
+      const int next_col = col + 1;
+      const int next_stage = stage ^ 1;
+      if constexpr (ColsPerBlock > 1) {
+        if (next_col < ColsPerBlock) {
+          gemma4_cp_async_weight_pack<K>(&weight_stages[next_stage][thread_idx],
+                                         w_col_major, col0 + next_col,
+                                         element_idx);
+          __pipeline_commit();
+        }
+      }
+
+      const Gemma4Bf16Pack w_pack = weight_stages[stage][thread_idx];
+      gemma4_accumulate_bf16_pack(x_pack, w_pack, sums[col]);
+
+      if constexpr (ColsPerBlock > 1) {
+        if (next_col < ColsPerBlock) {
+          __pipeline_wait_prior(0);
+          stage = next_stage;
+        }
+      }
+    }
+  }
+}
+#endif
+
 template <int K, int ColsPerBlock, int Threads>
 __device__ __forceinline__ void gemma4_decode_gemv_cols_dot_device(
     const __nv_bfloat16 *__restrict__ x,
@@ -117,19 +164,12 @@ __device__ __forceinline__ void gemma4_decode_gemv_cols_dot_device(
        pack_idx += Threads) {
     const int element_idx = gemma4_bf16_pack_element_index(pack_idx);
     const Gemma4Bf16Pack x_pack = gemma4_load_activation_pack(x, element_idx);
-#if defined(GEMMA4_DECODE_REGISTER_DOUBLE_BUFFER)
-    const Gemma4Bf16Pack w_pack =
-        gemma4_load_streaming_weight_pack<K>(w_col_major, col0, element_idx);
-    gemma4_accumulate_bf16_cols_register_buffered<0, K, ColsPerBlock>(
-        x_pack, w_col_major, col0, element_idx, w_pack, sums);
-#else
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
       const Gemma4Bf16Pack w_pack = gemma4_load_streaming_weight_pack<K>(
           w_col_major, col0 + col, element_idx);
       gemma4_accumulate_bf16_pack(x_pack, w_pack, sums[col]);
     }
-#endif
   }
 }
 
@@ -148,8 +188,14 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   const int warp = threadIdx.x / WARP_SIZE;
 
   float sums[ColsPerBlock] = {};
+#if defined(GEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER)
+  __shared__ Gemma4Bf16Pack weight_stages[2][Threads];
+  gemma4_decode_gemv_cols_dot_cp_async_device<K, ColsPerBlock, Threads>(
+      x, w_col_major, col0, threadIdx.x, weight_stages, sums);
+#else
   gemma4_decode_gemv_cols_dot_device<K, ColsPerBlock, Threads>(
       x, w_col_major, col0, threadIdx.x, sums);
+#endif
 
   warp_reduce_sum_to_lane0(sums);
 
