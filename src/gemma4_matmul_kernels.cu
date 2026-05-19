@@ -63,6 +63,27 @@ __device__ __forceinline__ void gemma4_accumulate_bf16_pack(
   gemma4_accumulate_bf16_pairs<>(x_pairs, w_pairs, sum);
 }
 
+#if defined(GEMMA4_DECODE_REGISTER_DOUBLE_BUFFER)
+template <int Col, int K, int ColsPerBlock>
+__device__ __forceinline__ void gemma4_accumulate_bf16_cols_register_buffered(
+    const Gemma4Bf16Pack &x_pack,
+    const __nv_bfloat16 *__restrict__ w_col_major, int col0, int element_idx,
+    const Gemma4Bf16Pack &w_pack, float (&sums)[ColsPerBlock]) {
+  if constexpr (Col < ColsPerBlock) {
+    if constexpr ((Col + 1) < ColsPerBlock) {
+      const Gemma4Bf16Pack w_next =
+          gemma4_load_streaming_weight_pack<K>(w_col_major, col0 + Col + 1,
+                                               element_idx);
+      gemma4_accumulate_bf16_pack(x_pack, w_pack, sums[Col]);
+      gemma4_accumulate_bf16_cols_register_buffered<Col + 1, K, ColsPerBlock>(
+          x_pack, w_col_major, col0, element_idx, w_next, sums);
+    } else {
+      gemma4_accumulate_bf16_pack(x_pack, w_pack, sums[Col]);
+    }
+  }
+}
+#endif
+
 template <int ColsPerBlock>
 __device__ __forceinline__ void gemma4_store_bf16_cols(
     __nv_bfloat16 *__restrict__ dst, const float (&sums)[ColsPerBlock]) {
@@ -96,12 +117,19 @@ __device__ __forceinline__ void gemma4_decode_gemv_cols_dot_device(
        pack_idx += Threads) {
     const int element_idx = gemma4_bf16_pack_element_index(pack_idx);
     const Gemma4Bf16Pack x_pack = gemma4_load_activation_pack(x, element_idx);
+#if defined(GEMMA4_DECODE_REGISTER_DOUBLE_BUFFER)
+    const Gemma4Bf16Pack w_pack =
+        gemma4_load_streaming_weight_pack<K>(w_col_major, col0, element_idx);
+    gemma4_accumulate_bf16_cols_register_buffered<0, K, ColsPerBlock>(
+        x_pack, w_col_major, col0, element_idx, w_pack, sums);
+#else
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
       const Gemma4Bf16Pack w_pack = gemma4_load_streaming_weight_pack<K>(
           w_col_major, col0 + col, element_idx);
       gemma4_accumulate_bf16_pack(x_pack, w_pack, sums[col]);
     }
+#endif
   }
 }
 
