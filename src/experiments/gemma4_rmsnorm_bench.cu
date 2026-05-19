@@ -264,7 +264,7 @@ int main(int argc, char **argv) {
               "not_compiled"
 #endif
   );
-  std::printf("rows,rms_ms,rms_gib_s,rms_graph_kernel_ms,rms_graph_kernel_gib_s,cudnn_ms,cudnn_gib_s,cudnn_graph_kernel_ms,cudnn_graph_kernel_gib_s,cudnn_max_abs,cudnn_rstd_max_abs,residual_ms,fused_ms,split_ms,fused_vs_split\n");
+  std::printf("rows,rms_ms,rms_gib_s,rms_graph_kernel_ms,rms_graph_kernel_gib_s,cudnn_ms,cudnn_gib_s,cudnn_graph_kernel_ms,cudnn_graph_kernel_gib_s,cudnn_max_abs,cudnn_rstd_max_abs,residual_ms,fused_ms,split_ms,fused_vs_split,fused_graph_kernel_ms,split_graph_kernel_ms,fused_graph_vs_split_graph\n");
 
   for (int rows : row_counts_up_to(max_rows)) {
     const int count = rows * width;
@@ -314,6 +314,27 @@ int main(int argc, char **argv) {
         time_ms(run_fused, stream, warmup, iters, trials);
     TimingStats split_stats =
         time_ms(run_split, stream, warmup, iters, trials);
+
+    float fused_graph_ms = -1.0f;
+    float split_graph_ms = -1.0f;
+    try {
+      TimingStats fused_graph_stats =
+          time_ms_graph(run_fused, stream, warmup, iters, trials);
+      fused_graph_ms = fused_graph_stats.best_ms;
+    } catch (const std::exception &e) {
+      std::fprintf(stderr,
+                   "fused residual+RMSNorm CUDA graph timing unavailable for rows=%d: %s\n",
+                   rows, e.what());
+    }
+    try {
+      TimingStats split_graph_stats =
+          time_ms_graph(run_split, stream, warmup, iters, trials);
+      split_graph_ms = split_graph_stats.best_ms;
+    } catch (const std::exception &e) {
+      std::fprintf(stderr,
+                   "split residual+RMSNorm CUDA graph timing unavailable for rows=%d: %s\n",
+                   rows, e.what());
+    }
 
     float rms_graph_ms = -1.0f;
     double rms_graph_gib_s = 0.0;
@@ -382,13 +403,18 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    std::printf("%d,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6g,%.6g,%.6f,%.6f,%.6f,%.3f\n",
+    float fused_graph_vs_split_graph =
+        (fused_graph_ms > 0.0f && split_graph_ms > 0.0f)
+            ? split_graph_ms / fused_graph_ms
+            : -1.0f;
+    std::printf("%d,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6g,%.6g,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.3f\n",
                 rows, rms_stats.best_ms,
                 gib_per_second(rms_bytes, rms_stats.best_ms), rms_graph_ms,
                 rms_graph_gib_s, cudnn_ms, cudnn_gib_s, cudnn_graph_ms,
                 cudnn_graph_gib_s, cudnn_max_abs, cudnn_rstd_max_abs,
                 residual_stats.best_ms, fused_stats.best_ms,
-                split_stats.best_ms, split_stats.best_ms / fused_stats.best_ms);
+                split_stats.best_ms, split_stats.best_ms / fused_stats.best_ms,
+                fused_graph_ms, split_graph_ms, fused_graph_vs_split_graph);
   }
 
   CUDA_CHECK(cudaFree(d_inp1));

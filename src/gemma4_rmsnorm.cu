@@ -11,6 +11,7 @@
 
 #include "gemma4_rmsnorm.cuh"
 #include "gemma4_cuda_utils.cuh"
+#include "gemma4.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -19,6 +20,139 @@ namespace {
 
 using RmsnormPack = Packed128<floatX>;
 constexpr int kFloatXPerPack = RmsnormPack::size;
+constexpr int kDecodeRmsnormThreads = 768;
+constexpr int kDecodeFusedThreads = 1024;
+constexpr int kDecodePacks = GEMMA4_HIDDEN_SIZE / kFloatXPerPack;
+
+template <int Threads>
+__device__ __forceinline__ float gemma4_block_reduce_sum(float value) {
+  static_assert((Threads % WARP_SIZE) == 0,
+                "block reduction requires whole warps");
+  constexpr int warps = Threads / WARP_SIZE;
+  __shared__ float warp_sums[warps];
+  const int lane = threadIdx.x & (WARP_SIZE - 1);
+  const int warp = threadIdx.x / WARP_SIZE;
+
+  value = warp_reduce_sum(value);
+  if (lane == 0) {
+    warp_sums[warp] = value;
+  }
+  __syncthreads();
+
+  value = threadIdx.x < warps ? warp_sums[lane] : 0.0f;
+  if (warp == 0) {
+    value = warp_reduce_sum(value);
+  }
+  return value;
+}
+
+template <int Threads>
+__global__ __launch_bounds__(Threads, 1) void
+gemma4_rmsnorm_bf16_decode_kernel(floatX *out,
+                                  float *rstd,
+                                  const floatX *inp,
+                                  const floatX *weight,
+                                  float eps) {
+  static_assert((GEMMA4_HIDDEN_SIZE % kFloatXPerPack) == 0,
+                "decode RMSNorm width must be divisible by Packed128 width");
+  __shared__ RmsnormPack s_in[kDecodePacks];
+  __shared__ float s_scale;
+
+  float sum_sq = 0.0f;
+  for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
+    RmsnormPack values =
+        load128cs(inp + static_cast<int64_t>(pack) * kFloatXPerPack);
+    s_in[pack] = values;
+#pragma unroll
+    for (int k = 0; k < kFloatXPerPack; ++k) {
+      float value = static_cast<float>(values[k]);
+      sum_sq += value * value;
+    }
+  }
+
+  float block_sum = gemma4_block_reduce_sum<Threads>(sum_sq);
+  if (threadIdx.x == 0) {
+    float scale =
+        rsqrtf(block_sum / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
+    s_scale = scale;
+    if (rstd != nullptr) {
+      rstd[0] = scale;
+    }
+  }
+  __syncthreads();
+
+  float scale = s_scale;
+  for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
+    RmsnormPack values = s_in[pack];
+    RmsnormPack gamma =
+        load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack result;
+#pragma unroll
+    for (int k = 0; k < kFloatXPerPack; ++k) {
+      result[k] = static_cast<floatX>(
+          static_cast<float>(values[k]) * scale * static_cast<float>(gamma[k]));
+    }
+    store128(out + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+  }
+}
+
+template <int Threads>
+__global__ __launch_bounds__(Threads, 1) void
+gemma4_residual_add_rmsnorm_bf16_decode_kernel(floatX *residual,
+                                               floatX *normed,
+                                               float *rstd,
+                                               const floatX *inp1,
+                                               const floatX *inp2,
+                                               const floatX *weight,
+                                               float eps) {
+  static_assert((GEMMA4_HIDDEN_SIZE % kFloatXPerPack) == 0,
+                "decode RMSNorm width must be divisible by Packed128 width");
+  __shared__ RmsnormPack s_res[kDecodePacks];
+  __shared__ float s_scale;
+
+  float sum_sq = 0.0f;
+  for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
+    RmsnormPack a =
+        load128cs(inp1 + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack b =
+        load128cs(inp2 + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack result;
+#pragma unroll
+    for (int k = 0; k < kFloatXPerPack; ++k) {
+      float value = static_cast<float>(a[k]) + static_cast<float>(b[k]);
+      result[k] = static_cast<floatX>(value);
+      float rounded = static_cast<float>(result[k]);
+      sum_sq += rounded * rounded;
+    }
+    s_res[pack] = result;
+    store128(residual + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+  }
+
+  float block_sum = gemma4_block_reduce_sum<Threads>(sum_sq);
+  if (threadIdx.x == 0) {
+    float scale =
+        rsqrtf(block_sum / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
+    s_scale = scale;
+    if (rstd != nullptr) {
+      rstd[0] = scale;
+    }
+  }
+  __syncthreads();
+
+  float scale = s_scale;
+  for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
+    RmsnormPack values = s_res[pack];
+    RmsnormPack gamma =
+        load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack result;
+#pragma unroll
+    for (int k = 0; k < kFloatXPerPack; ++k) {
+      result[k] = static_cast<floatX>(
+          static_cast<float>(values[k]) * scale * static_cast<float>(gamma[k]));
+    }
+    store128(normed + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+  }
+}
 
 __global__ void gemma4_rmsnorm_bf16_warp_kernel(
     floatX *out,
@@ -300,6 +434,12 @@ cudaError_t gemma4_rmsnorm_bf16(floatX *out,
   if (rows == 0) {
     return cudaSuccess;
   }
+  if (rows == 1 && width == GEMMA4_HIDDEN_SIZE) {
+    gemma4_rmsnorm_bf16_decode_kernel<kDecodeRmsnormThreads>
+        <<<1, kDecodeRmsnormThreads, 0, stream>>>(
+            out, rstd, inp, weight, eps);
+    return cudaGetLastError();
+  }
 
   constexpr int block_size = 256;
   constexpr int block_y = block_size / WARP_SIZE;
@@ -372,6 +512,12 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16(floatX *residual,
   }
   if (!is_aligned_16(residual) || !is_aligned_16(inp2)) {
     return cudaErrorInvalidValue;
+  }
+  if (rows == 1 && width == GEMMA4_HIDDEN_SIZE) {
+    gemma4_residual_add_rmsnorm_bf16_decode_kernel<kDecodeFusedThreads>
+        <<<1, kDecodeFusedThreads, 0, stream>>>(
+            residual, normed, rstd, inp1, inp2, weight, eps);
+    return cudaGetLastError();
   }
 
   constexpr int block_size = 256;
