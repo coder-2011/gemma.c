@@ -1105,3 +1105,232 @@ Interpretation:
 - The retained tuning is a small additional production win: `0.235064 ms` weighted, or about `0.27%` beyond the previous custom decode GEMV result.
 - The tuned production decode projection mix is `1.123607x` faster than cuDNN in the longer confirmation run, a `12.36%` weighted win.
 - After the final retained win (`final_logits fixed4<1024,1>`), variants 25-39 formed a 15-test no-win tail. Those variants either regressed high-weight projections, emitted invalid launch-bound warnings, or only helped one op while losing the weighted production mix.
+
+## 2026-05-18 - Decode RMSNorm production-shape tuning vs cuDNN graph
+
+Reason:
+
+- The production decode RMSNorm shape is one token row by Gemma 4 31B hidden width: `rows=1`, `width=5376`, `eps=1e-6`.
+- The previous shared-memory RMSNorm path was optimized around multiple rows per CTA. At `rows=1`, only one warp did row math after the CTA-wide shared preload, which left most of the CTA idle.
+- The fair raw-GPU comparator is the graph-captured cuDNN RMSNorm timing, not the cuDNN stream timing, because cuDNN frontend execution has large host/API cost outside graph replay.
+
+Implementation:
+
+- Added decode-specialized `rows=1,width=5376` kernels in `src/gemma4_rmsnorm.cu`.
+- Kept the existing multi-row shared/warp paths unchanged.
+- Added graph timings for fused residual+RMSNorm and split residual-add-plus-RMSNorm in `src/experiments/gemma4_rmsnorm_bench.cu`.
+- Retained settings:
+  - standalone decode RMSNorm: `768` threads.
+  - fused decode residual+RMSNorm: `1024` threads.
+
+Commands:
+
+```bash
+make test-rmsnorm rmsnorm-bench
+./build/tests/test_rmsnorm
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 400 50 7 1
+make cuda-kernels
+git diff --check
+```
+
+Screened decode variants, all on `rows=1,width=5376`:
+
+| Variant | RMS graph ms | cuDNN graph ms | Fused graph ms | Decision |
+| --- | ---: | ---: | ---: | --- |
+| Previous shared path | 0.003918 | 0.002507 | n/a | Failed gate. |
+| Decode shared, RMS `256`, fused `256` | 0.002733 | 0.002489 | n/a | Faster, still failed gate. |
+| Decode shared, RMS `512`, fused `512` | 0.002455 | 0.002481 | n/a | Slight RMS win, below 5% gate. |
+| Decode shared, RMS `1024`, fused `1024` | 0.002096 | 0.002475 | n/a | Cleared RMS gate; fused stream regressed. |
+| RMS `1024`, fused `256` | 0.001931 | 0.002484 | 0.002979 | Good RMS, fused graph not best. |
+| RMS `1024` no shared input cache, fused `256` | 0.001985 | 0.002460 | 0.002918 | Rejected; shared input cache was faster. |
+| RMS `1024`, fused `512` | 0.002035 | 0.002521 | 0.002666 | Fused improved, RMS still passes. |
+| RMS `1024`, fused `1024` | 0.001991 | 0.002500 | 0.002488 | Good balanced candidate. |
+| RMS `1024`, fused `768` | 0.001986 | 0.002472 | 0.002526 | Rejected; fused worse than `1024`. |
+| RMS `768`, fused `1024` | 0.001968 | 0.002481 | 0.002413 | Best short-run balance; kept for confirmation. |
+| RMS `896`, fused `1024` | 0.002018 | 0.002480 | 0.002413 | Rejected; RMS worse than `768`. |
+| RMS `640`, fused `1024` | 0.002342 | 0.002474 | 0.002486 | Rejected. |
+
+Final confirmation, `iters=400`, `warmup=50`, `trials=7`:
+
+| Rows | Width | RMS graph ms | cuDNN graph ms | Custom vs cuDNN | Fused graph ms | Split graph ms | Fused vs split |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 5376 | 0.001986 | 0.002606 | 1.312185 | 0.002236 | 0.003095 | 1.384 |
+
+Interpretation:
+
+- The tuned standalone decode RMSNorm is `1.312185x` faster than cuDNN graph timing, a `23.79%` lower-latency raw GPU win, clearing the `5%` gate.
+- The tuned fused residual+RMSNorm decode kernel is `1.384x` faster than split residual add plus RMSNorm under graph timing.
+- Stream timings also improved materially for decode: RMSNorm went from `0.015677 ms` to `0.010656 ms`, and fused residual+RMSNorm went from `0.026772 ms` to `0.012544 ms`.
+
+## 2026-05-19 - Consolidated decode optimization findings from chat
+
+Reason:
+
+- This entry collects the main decisions, answers, and follow-up work from the decode GEMV, cache-hint, tensor-core, async-loading, cuDNN-comparison, warp-tiling, and RMSNorm discussion.
+- The goal is to make the chat conclusions durable without requiring future agents to recover them from conversation context.
+
+Production decode shape context:
+
+- Target remains Gemma 4 dense inference, with the 31B dense path as the main optimization target.
+- Steady-state decode is `M=1`, or one token row at a time.
+- Hidden width is `5376`; production RMSNorm uses `rows=1,width=5376,eps=1e-6`.
+- The dense text path has `60` layers: `50` sliding layers and `10` global layers.
+- Decode projection shapes used for weighted production comparisons:
+
+| Op | K | N | Layers/token |
+| --- | ---: | ---: | ---: |
+| `ffn_gate_up` | 5376 | 43008 | 60 |
+| `ffn_down` | 21504 | 5376 | 60 |
+| `sliding_qkv` | 5376 | 16384 | 50 |
+| `sliding_o` | 8192 | 5376 | 50 |
+| `global_q` | 5376 | 16384 | 10 |
+| `global_k` | 5376 | 2048 | 10 |
+| `global_o` | 16384 | 5376 | 10 |
+| `final_logits` | 5376 | 262144 | 1 |
+
+Benchmarking and fairness conclusions:
+
+- For raw GPU speed, prefer CUDA graph replay timings such as `*_graph_kernel_ms`, or Nsight Compute kernel duration, over host-side stream/API timings.
+- Stream-loop timing can include frontend/API costs, CPU launch overhead, or stream starvation effects. It is still useful for end-to-end host-visible behavior, but it is not the cleanest raw-kernel comparator.
+- The decode GEMV benchmark currently uses CUDA events around stream loops. It excludes allocations, setup, descriptor construction, random fill, and correctness checks from the timed region, but it is not CUDA graph replay.
+- The cuDNN decode GEMV comparator intentionally skips handle, descriptor, plan, and workspace setup in the timed region. The timed section measures the GPU work that cuDNN enqueues between CUDA events.
+- The available cuDNN decode comparator is BF16 1x1 convolution. The cuDNN backend matmul path was not a clean usable comparator for these shapes.
+- cuDNN frontend overhead made RMSNorm stream timing misleading. Graph replay timing is the fair raw-GPU comparison for RMSNorm.
+- If we need stricter API-free decode GEMV comparison, add graph replay timing to the decode GEMV benchmark as was done for RMSNorm.
+
+Decode GEMV implementation conclusions:
+
+- The custom decode GEMV kernels do not use tensor cores.
+- For strict `M=1` GEMV, the work is dominated by global memory traffic, vector loads, and reductions. It does not naturally map to tensor-core matrix tiles without batching or grouping multiple rows/tokens.
+- Prefill dense GEMMs should use cuBLAS or cuBLASLt. Those library GEMMs can use tensor cores automatically for BF16 tensor-op math when the library selects a tensor-core algorithm.
+- cuBLAS and cuDNN are host APIs. They cannot be called from inside a device-side fused kernel.
+- `Packed128` is already implemented and retained. Decode GEMV uses 128-bit BF16 packed loads instead of the older 32-bit half2-style BF16 pair load pattern.
+- The useful retained cache hint is streaming global load for weights through `load128cs`, because weights are streamed through the decode GEMV.
+- The input vector load remains normally cached, because the same input row is reused across output columns.
+- Broad L2 persisting-cache windows or persisting hints for the B/weight matrix were tried and removed because they hurt performance.
+- There is no broad persisting L2 policy currently retained for decode GEMV.
+- Output writes are vectorized where the fixed4 path can pack four BF16 outputs with `gemma4_store_bf16x4`.
+
+Warp tiling and reduction conclusions:
+
+- Current production decode GEMV is still CTA-cooperative over reductions and output columns.
+- Local thread-count and column-count tuning produced the retained production settings, but most later variants after the retained win did not improve the weighted production mix.
+- Warp-owned output-column mappings remain plausible benchmark candidates, not proven wins.
+- The warp-tiling TODO should benchmark:
+  - `1` warp -> `1` output column.
+  - `1` warp -> `2` output columns.
+  - `2` warps -> `1` output column for larger `K`.
+  - The current CTA-reduction baseline.
+- The point of those variants is to attack reduction overhead in `global_k`, `sliding_o`, `qkv`, and other decode GEMV shapes without assuming the mapping is better before measurement.
+
+Shared-memory and banking conclusions:
+
+- The current decode GEMV path does not stage bulk weight or activation tiles through shared memory.
+- Decode GEMV uses only small shared-memory reductions for warp or block partial sums, so shared-memory bank conflicts and shared-memory data-mover pressure are not a primary current bottleneck.
+- RMSNorm has shared caching in the multi-row path and a decode-specialized cache for the single-row path, but no evidence currently points to shared-memory banking as the limiting factor.
+- Because decode GEMV mostly streams from global memory and reduces, moving more data into shared memory is not automatically beneficial. It should be justified by reuse and measured with Nsight Compute.
+
+Async load and double-buffering conclusions:
+
+- The current decode GEMV and RMSNorm kernels do not use `cp.async` or explicit double buffering.
+- `cp.async` is most useful when staging global memory tiles into shared memory and reusing those tiles enough to hide latency.
+- For the current strict `M=1` GEMV, weights are streamed once and not staged through shared memory, so async copy is not obviously faster.
+- Async loading may become useful in a future tiled kernel, batched decode kernel, or attention-style kernel with real shared-memory tile reuse.
+- More promising near-term fusion work is producer/consumer fusion: merge adjacent memory-bound operations so an intermediate does not have to be written to global memory and then read back by the next kernel.
+
+Tensor-core conclusions:
+
+- Tensor cores are not used by the custom decode GEMV kernels today.
+- A tensor-core decode path would require reformulating the work into matrix tiles, most likely by batching multiple tokens, grouping independent rows, or accepting a different latency/throughput tradeoff.
+- For single-token low-latency decode, tensor-core use is not automatically a win because the matrix has `M=1` and reductions/global memory movement dominate.
+- Prefill is different: prefill has real matrix sizes, so cuBLAS/cuBLASLt should be the tensor-core path there.
+
+Previous retained decode GEMV tuning before the 2026-05-19 8-column pass:
+
+- Generic decode GEMV route: `threads=512`, `cols_per_block=2`.
+- `ffn_down`: fixed4 specialization with `1024` threads and `1` column per block.
+- `global_o`: `512` threads and `1` column per block.
+- `final_logits`: fixed4 specialization with `1024` threads and `1` column per block.
+- Final long confirmation weighted production decode projection result:
+
+| Path | Weighted decode projection ms |
+| --- | ---: |
+| Tuned custom decode GEMV | 86.605295 |
+| cuDNN BF16 1x1 conv | 97.310829 |
+
+Interpretation:
+
+- The retained tuned custom decode GEMV mix is `1.123607x` faster than the cuDNN BF16 1x1 convolution comparator, a `12.36%` weighted win.
+- The final retained GEMV win was small beyond the earlier Packed128/custom baseline, and the later 15-test no-win tail suggests further local tuning has diminishing returns without a larger structural change.
+
+Retained decode RMSNorm tuning:
+
+- The old multi-row shared RMSNorm path was the wrong shape for decode. At `rows=1`, most of the CTA was idle after a CTA-wide preload.
+- The decode-specialized RMSNorm path now cooperates across the single row with a block-wide reduction.
+- Retained settings:
+  - Standalone decode RMSNorm: `768` threads.
+  - Fused decode residual+RMSNorm: `1024` threads.
+- Final graph replay result:
+
+| Rows | Width | RMS graph ms | cuDNN graph ms | Custom vs cuDNN | Fused graph ms | Split graph ms | Fused vs split |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 5376 | 0.001986 | 0.002606 | 1.312185 | 0.002236 | 0.003095 | 1.384 |
+
+Interpretation:
+
+- The tuned standalone decode RMSNorm is `23.79%` lower latency than cuDNN graph replay for this production shape.
+- The fused decode residual+RMSNorm kernel is `1.384x` faster than split residual add followed by RMSNorm under graph replay timing.
+
+Follow-up work:
+
+- Add CUDA graph replay timing to the decode GEMV benchmark if we need the same API-free raw-GPU comparison style used for RMSNorm.
+- Run Nsight Compute on the retained decode GEMV and RMSNorm kernels to verify memory throughput, cache behavior, occupancy, stalls, instruction mix, shared-memory transactions, and achieved occupancy.
+- Keep the warp-tiled GEMV TODO and benchmark it directly against the retained CTA-reduction baseline before changing production routing.
+- If tensor cores are revisited, test batched decode or grouped multi-token decode, not strict `M=1` decode first.
+- Consider producer/consumer fusion only after the unfused path is correct and measured. Likely candidates remain residual+RMSNorm, activation handling, softcap/sampling, and attention-output direct layout.
+- Avoid broad cache-hint changes without profiling. The retained useful cache behavior is normal cached input reuse plus streaming loads for weights.
+
+## 2026-05-19 - Decode GEMV 8-column 128-bit output stores
+
+Change:
+
+- Updated the generic decode GEMV route from `cols_per_block=2` to `cols_per_block=8`.
+- Added an eight-BF16 output store helper so an eight-column block writes its result with one 128-bit store.
+- Changed the fixed decode output paths for `ffn_down`, `global_o`, and `final_logits` from the old four-column store path to the same eight-column kernel route.
+- Removed the now-unused fixed4 helper/kernel code so the matmul source no longer has a 64-bit BF16 output-store path.
+
+Build and SASS checks:
+
+```bash
+make cuda-kernels decode-bench
+cuobjdump --dump-sass build/gemma4_matmul_kernels.o | rg "LDG\.E|STG\.E"
+```
+
+SASS evidence:
+
+- Input and weight traffic still uses 128-bit loads, including `LDG.E.128.CONSTANT` and streaming `LDG.E.EF.128`.
+- Output stores for the compiled decode GEMV kernels show `STG.E.128`.
+- The previous filtered `STG.E.64` line is no longer present after moving the fixed output paths to eight columns.
+
+Correctness and timing smoke test:
+
+```bash
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 3 1 1
+```
+
+| Op | Custom ms | Custom GB/s | cuBLAS GEMV ms | cuDNN conv1x1 ms | Max abs diff vs cuBLAS GEMV |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.655093 | 705.887 | 2.593568 | 0.661675 | 0.25 |
+| `ffn_down` | 0.333333 | 693.633 | 0.334560 | 0.337685 | 0 |
+| `sliding_qkv` | 0.255147 | 690.429 | 1.773760 | 0.275808 | 0.25 |
+| `sliding_o` | 0.132693 | 663.789 | 2.324064 | 0.203061 | 0.25 |
+| `global_q` | 0.256949 | 685.586 | 2.417675 | 0.279477 | 0.25 |
+| `global_k` | 0.037152 | 592.703 | 1.288171 | 0.959061 | 0.25 |
+| `global_o` | 0.256256 | 687.441 | 0.255104 | 0.259637 | 0 |
+| `final_logits` | 3.963936 | 711.054 | 3.970923 | 3.970005 | 0.125 |
+
+Interpretation:
+
+- The requested 8-column grouping and 128-bit output-store route compiles and passes the decode benchmark correctness checks against cuBLAS/cuDNN comparators.
+- The main generic route remains in the same performance band as the previous 8-column smoke tests, with `ffn_gate_up` roughly tied with cuDNN 1x1 and much faster than the cuBLAS GEMV comparator in this run.
+- The fixed output routes are now also using the 8-column/128-bit-store path. `ffn_down`, `global_o`, and `final_logits` are effectively tied with cuBLAS and cuDNN on the large memory-streaming shapes in this short run.
