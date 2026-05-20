@@ -1,0 +1,8 @@
+backend,cublas_backend,cublas_algo,op,m,k,n,route,config,chosen_ms,cublas_ms,custom_ms,speedup,weight
+sgemm-bf16,lt,h32,ffn_down,8,21504,5376,cublas,bf16_cutlass_64x128x64,0.3299,0.3299,0.3498,1.0,60
+sgemm-bf16,lt,h32,ffn_down,16,21504,5376,cublas,bf16_auto_ffn_down,0.3304,0.3304,0.3508,1.0,60
+sgemm-bf16,lt,h32,ffn_down,32,21504,5376,cublas,bf16_auto_ffn_down,0.3327,0.3327,0.3515,1.0,60
+sgemm-bf16,lt,h32,ffn_down,64,21504,5376,cublas,bf16_cutlass_64x128x64,0.3421,0.3421,0.3553,1.0,60
+sgemm-bf16,lt,h32,ffn_down,96,21504,5376,cublas,bf16_cutlass_64x128x64,0.3743,0.3743,0.3601,1.0,60
+sgemm-bf16,lt,h32,ffn_down,128,21504,5376,cublas,bf16_cutlass_64x128x64,0.3801,0.3801,0.3691,1.0,60
+sgemm-bf16,lt,h32,ffn_down,256,21504,5376,cublas,bf16_auto_ffn_down,0.4997,0.4997,0.5332,1.0,60

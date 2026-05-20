@@ -1,0 +1,9 @@
+backend,cublas_backend,cublas_algo,op,config,m,k,n,cublas_ms,custom_ms,speedup,custom_tflops,max_abs
+sgemm-bf16,lt,h32,ffn_down,bf16_auto_ffn_down,512,21504,5376,0.9517,0.9582,0.993,123.54,0.0
+sgemm-bf16,lt,h32,ffn_down,bf16_auto_ffn_down,1024,21504,5376,1.9368,2.02,0.959,117.21,0.03125
+sgemm-bf16,lt,h32,ffn_down,bf16_streamk_64x64x64,512,21504,5376,0.9221,1.7725,0.52,66.79,0.0
+sgemm-bf16,lt,h32,ffn_down,bf16_streamk_64x64x64,1024,21504,5376,1.9172,3.9083,0.491,60.58,0.03125
+sgemm-bf16,lt,h32,ffn_down,bf16_streamk_64x128x64,512,21504,5376,0.9061,1.3329,0.68,88.81,0.0
+sgemm-bf16,lt,h32,ffn_down,bf16_streamk_64x128x64,1024,21504,5376,1.8709,2.8211,0.663,83.92,0.03125
+sgemm-bf16,lt,h32,ffn_down,bf16_streamk_128x128x64,512,21504,5376,0.9133,0.9421,0.969,125.66,0.0
+sgemm-bf16,lt,h32,ffn_down,bf16_streamk_128x128x64,1024,21504,5376,1.9023,1.9429,0.979,121.86,0.03125
