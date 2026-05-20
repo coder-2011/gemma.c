@@ -1,41 +1,37 @@
 #include "gemma4_embedding_gather.cuh"
 #include "gemma4_cuda_utils.cuh"
+#include "gemma4.h"
 
 #include <stdint.h>
 
 namespace {
 
-using EmbeddingPack = Packed128<floatX>;
-constexpr int kFloatXPerPack = EmbeddingPack::size;
+constexpr int kGemma4EmbeddingPacks =
+    GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
+              "embedding width must be divisible by Packed128 bf16 width");
 
 __global__ void gemma4_embedding_gather_bf16_warp_kernel(
     __nv_bfloat16* out,
     const int32_t* token_ids,
-    const __nv_bfloat16* embeddings,
-    int32_t num_tokens,
-    int32_t hidden_size,
-    int32_t vocab_size) {
+    const __nv_bfloat16* embeddings) {
     int32_t token_idx = blockIdx.x;
     int32_t lane = threadIdx.x;
 
-    if (token_idx >= num_tokens || lane >= WARP_SIZE) {
-        return;
-    }
-
     int32_t token_id = token_ids[token_idx];
-    if (token_id < 0 || token_id >= vocab_size) {
+    if (token_id < 0 || token_id >= GEMMA4_VOCAB_SIZE) {
         return;
     }
 
-    int32_t packs_per_row = hidden_size / kFloatXPerPack;
-    const floatX* embedding_row = embeddings + (int64_t)token_id * hidden_size;
-    floatX* out_row = out + (int64_t)token_idx * hidden_size;
+    const __nv_bfloat16* embedding_row =
+        embeddings + (int64_t)token_id * GEMMA4_HIDDEN_SIZE;
+    __nv_bfloat16* out_row = out + (int64_t)token_idx * GEMMA4_HIDDEN_SIZE;
 
-    for (int32_t pack_idx = lane; pack_idx < packs_per_row;
+    for (int32_t pack_idx = lane; pack_idx < kGemma4EmbeddingPacks;
          pack_idx += WARP_SIZE) {
-        EmbeddingPack pack =
-            load128cs(embedding_row + pack_idx * kFloatXPerPack);
-        store128(out_row + pack_idx * kFloatXPerPack, pack);
+        Bf16Packed128 pack =
+            load128cs(embedding_row + pack_idx * kBf16Packed128Elements);
+        store128(out_row + pack_idx * kBf16Packed128Elements, pack);
     }
 }
 
@@ -46,10 +42,8 @@ cudaError_t gemma4_embedding_gather_bf16(
     const int32_t* token_ids,
     const __nv_bfloat16* embeddings,
     int32_t num_tokens,
-    int32_t hidden_size,
-    int32_t vocab_size,
     cudaStream_t stream) {
-    if (num_tokens < 0 || hidden_size <= 0 || vocab_size <= 0) {
+    if (num_tokens < 0) {
         return cudaErrorInvalidValue;
     }
     if (num_tokens == 0) {
@@ -58,14 +52,11 @@ cudaError_t gemma4_embedding_gather_bf16(
     if (out == nullptr || token_ids == nullptr || embeddings == nullptr) {
         return cudaErrorInvalidValue;
     }
-    if ((hidden_size % kFloatXPerPack) != 0) {
-        return cudaErrorInvalidValue;
-    }
     if (!is_aligned_16(out) || !is_aligned_16(embeddings)) {
         return cudaErrorInvalidValue;
     }
 
     gemma4_embedding_gather_bf16_warp_kernel<<<num_tokens, WARP_SIZE, 0, stream>>>(
-        out, token_ids, embeddings, num_tokens, hidden_size, vocab_size);
+        out, token_ids, embeddings);
     return cudaGetLastError();
 }

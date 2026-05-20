@@ -26,8 +26,9 @@ __nv_bfloat16 make_value(int token, int channel) {
     return __float2bfloat16(value);
 }
 
-void run_case(int vocab_size, int hidden_size, const std::vector<int32_t>& token_ids) {
+void run_case(int vocab_size, const std::vector<int32_t>& token_ids) {
     int num_tokens = static_cast<int>(token_ids.size());
+    constexpr int hidden_size = GEMMA4_HIDDEN_SIZE;
     std::vector<__nv_bfloat16> embeddings(static_cast<size_t>(vocab_size) * hidden_size);
     std::vector<__nv_bfloat16> out(static_cast<size_t>(num_tokens) * hidden_size);
 
@@ -53,7 +54,7 @@ void run_case(int vocab_size, int hidden_size, const std::vector<int32_t>& token
                           cudaMemcpyHostToDevice));
 
     CHECK_CUDA(gemma4_embedding_gather_bf16(
-        d_out, d_token_ids, d_embeddings, num_tokens, hidden_size, vocab_size, 0));
+        d_out, d_token_ids, d_embeddings, num_tokens, 0));
     CHECK_CUDA(cudaMemcpy(out.data(), d_out, out.size() * sizeof(__nv_bfloat16),
                           cudaMemcpyDeviceToHost));
 
@@ -81,12 +82,11 @@ void run_case(int vocab_size, int hidden_size, const std::vector<int32_t>& token
 }  // namespace
 
 int main() {
-    run_case(257, GEMMA4_HIDDEN_SIZE,
-             {0, 1, 42, 42, 128, 256, 7, 19, 0, 255, 3});
-    run_case(17, 256, {16, 0, 8, 8, 3});
+    run_case(257, {0, 1, 42, 42, 128, 256, 7, 19, 0, 255, 3});
+    run_case(17, {16, 0, 8, 8, 3});
 
     cudaError_t invalid = gemma4_embedding_gather_bf16(
-        nullptr, nullptr, nullptr, 1, GEMMA4_HIDDEN_SIZE + 1, 17, 0);
+        nullptr, nullptr, nullptr, 1, 0);
     if (invalid != cudaErrorInvalidValue) {
         std::fprintf(stderr, "expected cudaErrorInvalidValue for invalid arguments\n");
         return 1;

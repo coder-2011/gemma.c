@@ -10,8 +10,6 @@ cudaError_t gemma4_embedding_gather_bf16(
     const int32_t* token_ids,
     const __nv_bfloat16* embeddings,
     int32_t num_tokens,
-    int32_t hidden_size,
-    int32_t vocab_size,
     cudaStream_t stream);
 
 #endif

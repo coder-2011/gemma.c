@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
 
         auto run_gather = [&]() {
             CUDA_CHECK(gemma4_embedding_gather_bf16(
-                d_out, d_token_ids, d_embeddings, token_count, hidden_size, vocab_size, stream));
+                d_out, d_token_ids, d_embeddings, token_count, stream));
         };
 
         run_gather();
