@@ -4,6 +4,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+// If weight is nullptr, this computes scale-free RMSNorm:
+// y = x * rsqrt(mean(x * x) + eps).
 cudaError_t gemma4_rmsnorm_bf16(__nv_bfloat16 *out,
                                 float *__restrict__ rstd,
                                 const __nv_bfloat16 *inp,
@@ -13,12 +15,21 @@ cudaError_t gemma4_rmsnorm_bf16(__nv_bfloat16 *out,
                                 float eps,
                                 cudaStream_t stream);
 
+cudaError_t gemma4_rmsnorm_scale_free_bf16(__nv_bfloat16 *out,
+                                           float *__restrict__ rstd,
+                                           const __nv_bfloat16 *inp,
+                                           int rows,
+                                           int width,
+                                           float eps,
+                                           cudaStream_t stream);
+
 cudaError_t gemma4_residual_add_bf16(__nv_bfloat16 *out,
                                      const __nv_bfloat16 *inp1,
                                      const __nv_bfloat16 *inp2,
                                      int count,
                                      cudaStream_t stream);
 
+// If weight is nullptr, the normalized residual uses scale-free RMSNorm.
 cudaError_t gemma4_residual_add_rmsnorm_bf16(__nv_bfloat16 *residual,
                                              __nv_bfloat16 *normed,
                                              float *__restrict__ rstd,
