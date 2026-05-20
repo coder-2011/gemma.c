@@ -2216,3 +2216,59 @@ make cuda-kernels test-rope
 Result:
 
 - `rope tests passed`
+
+## 2026-05-20 - RoPE CUDA vs cuDNN pointwise benchmark
+
+Runtime files:
+
+- `src/experiments/gemma4_rope_bench.cu`
+- `src/experiments/gemma4_bench_utils.cuh`
+- `src/gemma4_rope.cu`
+
+Reason:
+
+- Benchmark the standalone RoPE CUDA kernel against a cuDNN implementation while excluding compile time, cuDNN frontend/plan overhead, and per-call host launch overhead where possible.
+
+Implementation notes:
+
+- cuDNN does not expose a standalone RoPE primitive in the installed headers/docs.
+- A cuDNN frontend pointwise/concat graph and a pointwise-only graph were both tried first. Both failed plan creation on RTX A6000/cuDNN 9.22.
+- The benchmark therefore uses deprecated-but-available `cudnnOpTensor` pointwise calls for the cuDNN path. Setup, descriptor creation, table conversion, warmup, and CUDA graph capture/instantiate are outside the measured region.
+- The main comparison column is `*_graph_ms`: it captures repeated work once, instantiates outside timing, warms up, then records CUDA events around graph replay.
+- cuDNN `cudnnOpTensor` required BF16 cos/sin tables, so the cuDNN diff is expected to be about one BF16 step versus the custom CUDA path's FP32 table reads.
+
+Commands:
+
+```bash
+make rope-bench
+./build/experiments/gemma4_rope_bench 100 20 3 1024
+make test-rope
+```
+
+Environment:
+
+- Device: NVIDIA RTX A6000
+- Seed: `0xa5bcb03db46f9b6`
+- Iterations: `100`, warmup: `20`, trials: `3`, batch: `1`, cos batch: `1`
+
+CUDA graph replay timings:
+
+| Case | Seq | Custom ms | cuDNN ms | Custom GiB/s | cuDNN GiB/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| sliding | 1 | 0.001553 | 0.016028 | 58.954 | 5.712 |
+| sliding | 4 | 0.001557 | 0.015719 | 235.185 | 23.297 |
+| sliding | 16 | 0.001793 | 0.016584 | 816.852 | 88.327 |
+| sliding | 64 | 0.003277 | 0.023316 | 1788.139 | 251.308 |
+| sliding | 256 | 0.015829 | 0.078103 | 1480.627 | 300.083 |
+| sliding | 1024 | 0.074939 | 0.288012 | 1251.025 | 325.508 |
+| global | 1 | 0.001417 | 0.014462 | 24.235 | 2.374 |
+| global | 4 | 0.001425 | 0.015022 | 96.352 | 9.142 |
+| global | 16 | 0.001637 | 0.015486 | 335.473 | 35.472 |
+| global | 64 | 0.002676 | 0.017714 | 821.248 | 124.044 |
+| global | 256 | 0.006655 | 0.032649 | 1320.726 | 269.202 |
+| global | 1024 | 0.030191 | 0.116031 | 1164.472 | 302.989 |
+
+Correctness:
+
+- cuDNN max abs diff stayed at `0.0078125` for Q/K except one global seq-1 K case at `0.00390625`, consistent with BF16 table precision.
+- `make test-rope` passed after the benchmark changes.
