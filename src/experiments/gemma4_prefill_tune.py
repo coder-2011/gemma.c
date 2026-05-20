@@ -61,18 +61,41 @@ BACKENDS = {
         "make_target": "sgemm-bf16-prefill-bench",
         "binary": BUILD_DIR / "gemma4_sgemm_bf16_prefill_bench",
         "configs": [
+            "bf16_cutlass_64x64",
+            "bf16_cutlass_64x128",
+            "bf16_cutlass_64x128x64",
+            "bf16_cutlass_64x128_s2",
+            "bf16_cutlass_64x128_s4",
+            "bf16_cutlass_128x64",
+            "bf16_cutlass_128x64x64",
+            "bf16_cutlass_128x128",
+            "bf16_cutlass_128x128x64",
+            "bf16_cutlass_128x256",
+            "bf16_streamk_64x64x64",
+            "bf16_streamk_64x128x64",
+            "bf16_streamk_128x128x64",
+            "bf16_auto_ffn_down",
             "bf16_16x16",
             "bf16_16x32",
             "bf16_16x64",
             "bf16_16x128",
+            "bf16_16x256",
             "bf16_32x32",
             "bf16_32x64",
             "bf16_32x128",
+            "bf16_32x256",
             "bf16_64x64",
             "bf16_64x128",
             "bf16_128x64",
+            "bf16_256x32",
             "bf16_smem64_32x64",
             "bf16_smem64_64x64",
+            "bf16_smemA64_16x32",
+            "bf16_smemA64_16x64",
+            "bf16_smemA64_16x128",
+            "bf16_smemA128_16x32",
+            "bf16_smemA128_16x64",
+            "bf16_smemA128_16x128",
             "bf16_warp_16x32",
             "bf16_warp_16x64",
             "bf16_warp_16x128",
@@ -432,6 +455,7 @@ def add_tune_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--cublas-backend", choices=["gemmex", "lt"], default="gemmex")
     parser.add_argument("--cublas-algo", default="default_tensor")
+    parser.add_argument("--cublaslt-heuristics", type=int, default=1)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--skip-build", action="store_true")
 
@@ -452,6 +476,8 @@ def run_tune(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         parser.error("--iters must be positive and --warmup must be non-negative")
     if args.cublas_backend == "lt" and args.cublas_algo != "default_tensor":
         parser.error("--cublas-algo only applies to the gemmex cuBLAS backend")
+    if args.cublaslt_heuristics <= 0:
+        parser.error("--cublaslt-heuristics must be positive")
 
     if not args.skip_build:
         run_command(["make", str(backend_info["make_target"])])
@@ -462,7 +488,13 @@ def run_tune(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     benchmark_env = {
         "GEMMA4_PREFILL_CUBLAS_BACKEND": args.cublas_backend,
         "GEMMA4_PREFILL_CUBLAS_ALGO": args.cublas_algo,
+        "GEMMA4_PREFILL_CUBLASLT_HEURISTICS": str(args.cublaslt_heuristics),
     }
+    cublas_algo_label = (
+        f"h{args.cublaslt_heuristics}"
+        if args.cublas_backend == "lt"
+        else args.cublas_algo
+    )
     for op in ops:
         for config in configs:
             output = run_command(
@@ -470,7 +502,7 @@ def run_tune(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 env=benchmark_env,
             )
             parsed = parse_results(
-                args.backend, config, output, args.cublas_backend, args.cublas_algo
+                args.backend, config, output, args.cublas_backend, cublas_algo_label
             )
             if len(parsed) != len(m_values):
                 raise RuntimeError(

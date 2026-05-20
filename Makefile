@@ -4,6 +4,7 @@ CPPFLAGS ?= -Isrc
 NVCC ?= nvcc
 NVCCFLAGS ?= -std=c++17 -O3 -arch=sm_86
 CUDNN_FRONTEND_INCLUDE ?= /tmp/cudnn-frontend/include
+CUTLASS_INCLUDE ?= /tmp/cutlass/include
 
 BUILD_DIR := build
 
@@ -75,7 +76,7 @@ $(BUILD_DIR)/experiments/gemma4_sgemm_prefill_bench: experiments/sgemm.cu/gemma4
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -Iexperiments/sgemm.cu/src -Iexperiments/sgemm.cu/common -DGPUCC=86 experiments/sgemm.cu/gemma4_prefill_bench.cu -lcublas -o $@
 
 $(BUILD_DIR)/experiments/gemma4_sgemm_bf16_prefill_bench: experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu -lcublas -lcublasLt -o $@
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUTLASS_INCLUDE) experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu -lcublas -lcublasLt -o $@
 
 $(BUILD_DIR)/tests/test_embedding_gather: tests/test_embedding_gather.cu src/gemma4_embedding_gather.cu src/gemma4_embedding_gather.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_embedding_gather.cu src/gemma4_embedding_gather.cu -o $@
