@@ -30,8 +30,7 @@ __global__ void gemma4_experiment_hgemm_tn_cute_kernel(T *Aptr, T *Bptr,
   int ix = ((int)BlockSwizzle) * blockIdx.z * gridDim.x + blockIdx.x;
   int iy = blockIdx.y;
 
-  if (iy * BM >= m || ix * BN >= n)
-    return;
+  if (iy * BM >= m || ix * BN >= n) return;
 
   Tensor A = make_tensor(make_gmem_ptr(Aptr), make_shape(m, k),
                          make_stride(k, Int<1>{}));
@@ -280,8 +279,7 @@ void launch_hgemm_mma_stages_block_swizzle_tn_cute(T *a, T *b, T *c, int M,
   gemma4_experiment_hgemm_tn_cute_kernel<
       T, BM, BN, BK, KStage, MMA, G2SCopyA, G2SCopyB, SmemLayoutA, SmemLayoutB,
       SmemLayoutC, S2RCopyAtomA, S2RCopyAtomB, R2SCopyAtomC, S2GCopyAtomC,
-      S2GCopyC, BlockSwizzle><<<grid, block, shm_size, stream>>>(a, b, c, M, N,
-                                                                 K);
+      S2GCopyC, BlockSwizzle><<<grid, block, shm_size, stream>>>(a, b, c, M, N, K);
 }
 
 #ifdef GEMMA4_STANDALONE_BENCH
@@ -372,13 +370,10 @@ static float max_abs_diff(const half *a, const half *b, size_t n,
   int blocks = static_cast<int>((n + threads - 1) / threads);
   float *d_blocks = nullptr;
   CUDA_CHECK(cudaMalloc(&d_blocks, static_cast<size_t>(blocks) * sizeof(float)));
-  gemma4_experiment_max_abs_diff_kernel<<<blocks, threads, 0, stream>>>(
-      a, b, d_blocks, n);
+  gemma4_experiment_max_abs_diff_kernel<<<blocks, threads, 0, stream>>>(a, b, d_blocks, n);
   CUDA_CHECK(cudaGetLastError());
   std::vector<float> h_blocks(blocks);
-  CUDA_CHECK(cudaMemcpyAsync(h_blocks.data(), d_blocks,
-                             static_cast<size_t>(blocks) * sizeof(float),
-                             cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(h_blocks.data(), d_blocks, static_cast<size_t>(blocks) * sizeof(float), cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
   CUDA_CHECK(cudaFree(d_blocks));
   return *std::max_element(h_blocks.begin(), h_blocks.end());
@@ -418,11 +413,8 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaMalloc(&cublas_c, c_elems * sizeof(half)));
 
   int threads = 256;
-  gemma4_experiment_fill_half_kernel<<<(a_elems + threads - 1) / threads,
-                                       threads, 0, stream>>>(a, a_elems, 1);
-  gemma4_experiment_fill_half_kernel<<<(b_elems + threads - 1) / threads,
-                                       threads, 0, stream>>>(b_col_major,
-                                                             b_elems, 2);
+  gemma4_experiment_fill_half_kernel<<<(a_elems + threads - 1) / threads, threads, 0, stream>>>(a, a_elems, 1);
+  gemma4_experiment_fill_half_kernel<<<(b_elems + threads - 1) / threads, threads, 0, stream>>>(b_col_major, b_elems, 2);
   CUDA_CHECK(cudaMemsetAsync(custom_c, 0, c_elems * sizeof(half), stream));
   CUDA_CHECK(cudaMemsetAsync(cublas_c, 0, c_elems * sizeof(half), stream));
   CUDA_CHECK(cudaGetLastError());

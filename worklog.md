@@ -22,3 +22,5 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 -cleaned up everything for readability
 
 - exapted a boilerplate RoPE kernel. Considering how I an optimize it.
+
+- Benchmarked RoPE vs cuDNN pointwise decomposition. Custom kernel wins by a lot, roughly 2.4-3x at seq 4096 even after graph capture. Not worth using cuDNN here; next move is fuse Q/K norm + RoPE + KV write.

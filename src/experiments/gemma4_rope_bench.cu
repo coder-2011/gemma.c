@@ -110,8 +110,7 @@ void fill_random_bf16(__nv_bfloat16 *ptr,
                       cudaStream_t stream) {
   constexpr int threads = 256;
   int blocks = int((count + threads - 1) / threads);
-  fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(
-      ptr, count, seed, scale);
+  fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(ptr, count, seed, scale);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -125,8 +124,7 @@ void fill_unit_rope_table(float *cos,
   constexpr int threads = 256;
   size_t count = static_cast<size_t>(cos_batch_size) * seq_len * head_dim;
   int blocks = int((count + threads - 1) / threads);
-  fill_unit_rope_table_kernel<<<blocks, threads, 0, stream>>>(
-      cos, sin, count, seq_len, head_dim, seed);
+  fill_unit_rope_table_kernel<<<blocks, threads, 0, stream>>>(cos, sin, count, seq_len, head_dim, seed);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -365,10 +363,8 @@ struct CudnnRope {
            const __nv_bfloat16 *sin_in,
            __nv_bfloat16 *q_out,
            __nv_bfloat16 *k_out) {
-    run_branch(q_half_desc.desc, q_temp_desc.desc, q_in, cos_in, sin_in,
-               q_out);
-    run_branch(k_half_desc.desc, k_temp_desc.desc, k_in, cos_in, sin_in,
-               k_out);
+    run_branch(q_half_desc.desc, q_temp_desc.desc, q_in, cos_in, sin_in, q_out);
+    run_branch(k_half_desc.desc, k_temp_desc.desc, k_in, cos_in, sin_in, k_out);
   }
 };
 
@@ -384,8 +380,7 @@ int main(int argc, char **argv) {
   const int batch_size = argc > 5 ? std::atoi(argv[5]) : 1;
   const int cos_batch_size = argc > 6 ? std::atoi(argv[6]) : 1;
 
-  if (iters <= 0 || warmup < 0 || trials <= 0 || max_seq <= 0 ||
-      batch_size <= 0 || (cos_batch_size != 1 && cos_batch_size != batch_size)) {
+  if (iters <= 0 || warmup < 0 || trials <= 0 || max_seq <= 0 || batch_size <= 0 || (cos_batch_size != 1 && cos_batch_size != batch_size)) {
     std::fprintf(
         stderr,
         "usage: %s [iters=200] [warmup=30] [trials=5] [max_seq=1024] "
@@ -463,19 +458,12 @@ int main(int argc, char **argv) {
                            shape.head_dim, seed ^ 0x3333u, stream);
       float_to_bf16(d_cos, d_cos_bf16, table_elems, stream);
       float_to_bf16(d_sin, d_sin_bf16, table_elems, stream);
-      CUDA_CHECK(cudaMemcpyAsync(d_q_work, d_q_in,
-                                 q_elems * sizeof(__nv_bfloat16),
-                                 cudaMemcpyDeviceToDevice, stream));
-      CUDA_CHECK(cudaMemcpyAsync(d_k_work, d_k_in,
-                                 k_elems * sizeof(__nv_bfloat16),
-                                 cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(d_q_work, d_q_in, q_elems * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(d_k_work, d_k_in, k_elems * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
 
       auto run_custom = [&]() {
-        CUDA_CHECK(gemma4_rope_forward_bf16(
-            d_q_work, d_k_work, d_cos, d_sin, seq_len, batch_size,
-            cos_batch_size, shape.q_heads, shape.kv_heads, shape.head_dim,
-            shape.rotary_dim, stream));
+        CUDA_CHECK(gemma4_rope_forward_bf16(d_q_work, d_k_work, d_cos, d_sin, seq_len, batch_size, cos_batch_size, shape.q_heads, shape.kv_heads, shape.head_dim, shape.rotary_dim, stream));
       };
 
       run_custom();
@@ -509,22 +497,13 @@ int main(int argc, char **argv) {
                         shape.kv_heads, shape.head_dim, shape.rotary_dim,
                         stream);
         auto run_cudnn = [&]() {
-          cudnn.run(d_q_in, d_k_in, d_cos_bf16, d_sin_bf16, d_q_cudnn,
-                    d_k_cudnn);
+          cudnn.run(d_q_in, d_k_in, d_cos_bf16, d_sin_bf16, d_q_cudnn, d_k_cudnn);
         };
 
-        CUDA_CHECK(cudaMemcpyAsync(d_q_work, d_q_in,
-                                   q_elems * sizeof(__nv_bfloat16),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_k_work, d_k_in,
-                                   k_elems * sizeof(__nv_bfloat16),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_q_cudnn, d_q_in,
-                                   q_elems * sizeof(__nv_bfloat16),
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_k_cudnn, d_k_in,
-                                   k_elems * sizeof(__nv_bfloat16),
-                                   cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_q_work, d_q_in, q_elems * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_k_work, d_k_in, k_elems * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_q_cudnn, d_q_in, q_elems * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_k_cudnn, d_k_in, k_elems * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice, stream));
         run_custom();
         run_cudnn();
         CUDA_CHECK(cudaStreamSynchronize(stream));

@@ -3,6 +3,59 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-05-20 - Gemma 4 RoPE baseline vs cuDNN tensor ops
+
+Benchmark file: `src/experiments/gemma4_rope_bench.cu`
+
+Research notes:
+
+- cuDNN 9.22 still documents `cudnnOpTensor`, but marks it deprecated since cuDNN 9.0.
+- The modern cuDNN frontend exposes pointwise `mul` and `add`, but there is no single fused RoPE primitive; the available library baseline is therefore a pointwise decomposition.
+- The benchmark's cuDNN path applies RoPE through six `cudnnOpTensor` calls per Q/K branch group: two multiplies plus one add/sub for each output half.
+- CUDA-event timings are recorded on the same nonblocking stream as the benchmark work, matching CUDA stream timing guidance.
+
+Environment:
+
+- GPU: NVIDIA RTX A6000, 49140 MiB
+- Driver: 580.126.16
+- NVCC: CUDA 12.9, build `cuda_12.9.r12.9/compiler.36037853_0`
+- cuDNN headers/runtime: 9.22.0
+
+Build:
+
+```bash
+make rope-bench
+```
+
+Timing command:
+
+```bash
+GEMMA4_ROPE_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rope_bench 200 30 5 4096 1 1
+```
+
+Key CUDA-event timing results:
+
+| Case | Seq | Custom ms | cuDNN ms | Custom speedup | Custom graph ms | cuDNN graph ms | Graph speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sliding | 1 | 0.013840 | 0.189035 | 13.66x | 0.001602 | 0.014945 | 9.33x |
+| sliding | 1024 | 0.075738 | 0.305416 | 4.03x | 0.074725 | 0.287080 | 3.84x |
+| sliding | 4096 | 0.483672 | 1.145305 | 2.37x | 0.482928 | 1.126152 | 2.33x |
+| global | 1 | 0.020791 | 0.225866 | 10.86x | 0.001406 | 0.014736 | 10.48x |
+| global | 1024 | 0.030901 | 0.258333 | 8.36x | 0.030432 | 0.116004 | 3.81x |
+| global | 4096 | 0.147369 | 0.437539 | 2.97x | 0.145875 | 0.421499 | 2.89x |
+
+Accuracy check:
+
+- `cudnn_q_max_abs = 0.0078125`
+- `cudnn_k_max_abs = 0.0078125`
+- This compares custom RoPE using FP32 cosine/sine tables against the cuDNN baseline using BF16 cosine/sine tables, so the observed difference is consistent with table precision rather than a known indexing mismatch.
+
+Conclusion:
+
+- The custom RoPE kernel wins over the cuDNN tensor-op decomposition for every measured sequence length.
+- CUDA Graph capture makes short-sequence launch overhead much smaller, but cuDNN remains slower because RoPE is decomposed into multiple pointwise launches instead of one fused kernel.
+- Keep the custom RoPE baseline. Future optimization should focus on fusing Q/K RMSNorm, RoPE, and KV-cache write rather than replacing this path with cuDNN pointwise ops.
+
 ## 2026-05-17 - 16384x512x4096 CUTE matmul vs cuBLAS
 
 Experiment file: `src/experiments/16384_512_4096.cu`

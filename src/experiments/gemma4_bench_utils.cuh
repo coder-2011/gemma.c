@@ -11,26 +11,18 @@
 #include <string>
 #include <vector>
 
-inline void cuda_check(cudaError_t status, const char *expr, const char *file,
-                       int line) {
+inline void cuda_check(cudaError_t status, const char *expr, const char *file, int line) {
   if (status != cudaSuccess) {
-    throw std::runtime_error(std::string(file) + ":" +
-                             std::to_string(line) +
-                             ": CUDA error for " + expr + ": " +
-                             cudaGetErrorString(status));
+    throw std::runtime_error(std::string(file) + ":" + std::to_string(line) + ": CUDA error for " + expr + ": " + cudaGetErrorString(status));
   }
 }
 
 #define CUDA_CHECK(expr)                                                        \
   cuda_check((expr), #expr, __FILE__, __LINE__)
 
-inline void cublas_check(cublasStatus_t status, const char *expr,
-                         const char *file, int line) {
+inline void cublas_check(cublasStatus_t status, const char *expr, const char *file, int line) {
   if (status != CUBLAS_STATUS_SUCCESS) {
-    throw std::runtime_error(std::string(file) + ":" +
-                             std::to_string(line) +
-                             ": cuBLAS error for " + expr + ": " +
-                             std::to_string(status));
+    throw std::runtime_error(std::string(file) + ":" + std::to_string(line) + ": cuBLAS error for " + expr + ": " + std::to_string(status));
   }
 }
 
@@ -172,10 +164,8 @@ inline DiffStats diff_stats_bf16(const __nv_bfloat16 *lhs,
                                  const __nv_bfloat16 *rhs, int count) {
   std::vector<__nv_bfloat16> h_lhs(count);
   std::vector<__nv_bfloat16> h_rhs(count);
-  CUDA_CHECK(cudaMemcpy(h_lhs.data(), lhs, count * sizeof(__nv_bfloat16),
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(h_rhs.data(), rhs, count * sizeof(__nv_bfloat16),
-                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_lhs.data(), lhs, count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_rhs.data(), rhs, count * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
 
   DiffStats stats;
   double sum_abs = 0.0;

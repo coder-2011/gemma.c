@@ -87,8 +87,7 @@ static void fill_random_bf16(__nv_bfloat16 *ptr, size_t count, uint64_t seed,
                              float scale, cudaStream_t stream) {
   const int threads = 256;
   const int blocks = int((count + threads - 1) / threads);
-  gemma4_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(ptr, count,
-                                                                 seed, scale);
+  gemma4_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(ptr, count, seed, scale);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -267,8 +266,7 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   auto run_custom = [&]() {
-    CUDA_CHECK(
-        gemma4_projection_decode(op.projection, x, w, custom_y, stream));
+    CUDA_CHECK(gemma4_projection_decode(op.projection, x, w, custom_y, stream));
   };
   auto run_gemv = [&]() { cublas.gemv(x, w, gemv_y, op.k, op.n); };
   auto run_gemm = [&]() { cublas.gemm_m1(x, w, gemm_y, op.k, op.n); };

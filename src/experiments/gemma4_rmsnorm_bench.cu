@@ -76,8 +76,7 @@ void fill_random_bf16(__nv_bfloat16 *ptr,
                       cudaStream_t stream) {
   constexpr int threads = 256;
   int blocks = int((count + threads - 1) / threads);
-  gemma4_rmsnorm_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(
-      ptr, count, seed, scale);
+  gemma4_rmsnorm_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(ptr, count, seed, scale);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -244,8 +243,7 @@ int main(int argc, char **argv) {
 
   fill_random_bf16(d_inp1, max_elems, seed ^ 0x1001u, 1.0f, stream);
   fill_random_bf16(d_inp2, max_elems, seed ^ 0x2002u, 1.0f, stream);
-  fill_random_bf16(d_weight, static_cast<size_t>(width), seed ^ 0x3003u, 0.5f,
-                   stream);
+  fill_random_bf16(d_weight, static_cast<size_t>(width), seed ^ 0x3003u, 0.5f, stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   int device = 0;
@@ -279,25 +277,17 @@ int main(int argc, char **argv) {
     const double split_bytes = residual_bytes + rms_bytes;
 
     auto run_rms = [&]() {
-      CUDA_CHECK(gemma4_rmsnorm_bf16(
-          d_rms_out, d_rstd, d_inp1, d_weight, rows, width,
-          GEMMA4_RMS_NORM_EPS, stream));
+      CUDA_CHECK(gemma4_rmsnorm_bf16(d_rms_out, d_rstd, d_inp1, d_weight, rows, width, GEMMA4_RMS_NORM_EPS, stream));
     };
     auto run_residual = [&]() {
-      CUDA_CHECK(gemma4_residual_add_bf16(
-          d_residual, d_inp1, d_inp2, count, stream));
+      CUDA_CHECK(gemma4_residual_add_bf16(d_residual, d_inp1, d_inp2, count, stream));
     };
     auto run_fused = [&]() {
-      CUDA_CHECK(gemma4_residual_add_rmsnorm_bf16(
-          d_split_residual, d_fused_normed, d_fused_rstd, d_inp1, d_inp2,
-          d_weight, rows, width, GEMMA4_RMS_NORM_EPS, stream));
+      CUDA_CHECK(gemma4_residual_add_rmsnorm_bf16(d_split_residual, d_fused_normed, d_fused_rstd, d_inp1, d_inp2, d_weight, rows, width, GEMMA4_RMS_NORM_EPS, stream));
     };
     auto run_split = [&]() {
-      CUDA_CHECK(gemma4_residual_add_bf16(
-          d_split_residual, d_inp1, d_inp2, count, stream));
-      CUDA_CHECK(gemma4_rmsnorm_bf16(
-          d_split_normed, d_split_rstd, d_split_residual, d_weight, rows, width,
-          GEMMA4_RMS_NORM_EPS, stream));
+      CUDA_CHECK(gemma4_residual_add_bf16(d_split_residual, d_inp1, d_inp2, count, stream));
+      CUDA_CHECK(gemma4_rmsnorm_bf16(d_split_normed, d_split_rstd, d_split_residual, d_weight, rows, width, GEMMA4_RMS_NORM_EPS, stream));
     };
 
     run_rms();
@@ -387,12 +377,8 @@ int main(int argc, char **argv) {
           diff_stats_bf16(d_rms_out, d_rms_cudnn_out, count);
       std::vector<float> h_custom_rstd(rows);
       std::vector<float> h_cudnn_rstd(rows);
-      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_rstd,
-                                   static_cast<size_t>(rows) * sizeof(float),
-                                   cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd,
-                                   static_cast<size_t>(rows) * sizeof(float),
-                                   cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_rstd, static_cast<size_t>(rows) * sizeof(float), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd, static_cast<size_t>(rows) * sizeof(float), cudaMemcpyDeviceToHost));
       float max_rstd = 0.0f;
       for (int i = 0; i < rows; ++i) {
         max_rstd =
@@ -402,8 +388,7 @@ int main(int argc, char **argv) {
       cudnn_rstd_max_abs = max_rstd;
 
       auto run_cudnn_split = [&]() {
-        CUDA_CHECK(gemma4_residual_add_bf16(
-            d_residual, d_inp1, d_inp2, count, stream));
+        CUDA_CHECK(gemma4_residual_add_bf16(d_residual, d_inp1, d_inp2, count, stream));
         cudnn.run(d_residual, d_weight, d_rms_cudnn_out, d_cudnn_rstd);
       };
       run_cudnn_split();
@@ -427,12 +412,8 @@ int main(int argc, char **argv) {
       CUDA_CHECK(cudaStreamSynchronize(stream));
       DiffStats split_out_diff =
           diff_stats_bf16(d_fused_normed, d_rms_cudnn_out, count);
-      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_fused_rstd,
-                                   static_cast<size_t>(rows) * sizeof(float),
-                                   cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd,
-                                   static_cast<size_t>(rows) * sizeof(float),
-                                   cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_fused_rstd, static_cast<size_t>(rows) * sizeof(float), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd, static_cast<size_t>(rows) * sizeof(float), cudaMemcpyDeviceToHost));
       max_rstd = 0.0f;
       for (int i = 0; i < rows; ++i) {
         max_rstd =
