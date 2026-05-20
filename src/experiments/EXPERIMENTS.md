@@ -3679,3 +3679,179 @@ Conclusion:
   design, such as a real CUTLASS/Tuna-style pipelined tensor-core kernel with multiple
   MMA tiles per warp and async staging. The current one-warp-per-WMMA-tile variants have
   no remaining low-hanging parameter-tuning path against cuBLASLt.
+
+## 2026-05-20 - SGEMM BF16 ffn_down production-shape tuning
+
+Goal: tune only the SGEMM BF16 prefill GEMM path as hard as practical for one Gemma 4
+production shape while keeping it valid across a token-count sweep. The chosen shape was
+`ffn_down`, because Gemma 4 31B has 60 dense FFN down projections with
+`intermediate_size=21504` and `hidden_size=5376`:
+
+```text
+Y[M,5376] = X[M,21504] * W[5376,21504]^T
+```
+
+Architecture basis:
+
+- `gemma4_architecture.md`: Gemma 4 31B dense text config has `hidden_size=5376`,
+  `intermediate_size=21504`, and `num_hidden_layers=60`.
+- `src/gemma4.h`: `GEMMA4_INTERMEDIATE_SIZE=21504`,
+  `GEMMA4_HIDDEN_SIZE=5376`, and `GEMMA4_PACKED_FFN_SIZE=43008`.
+
+Files changed:
+
+- `experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu`
+  - Added a broader SGEMM BF16 config space:
+    `bf16_16x16`, `bf16_16x32`, `bf16_16x64`, `bf16_16x128`,
+    `bf16_32x32`, `bf16_32x64`, `bf16_32x128`, `bf16_64x64`,
+    `bf16_64x128`, `bf16_128x64`.
+  - Added staged shared-memory variants: `bf16_smem64_32x64`,
+    `bf16_smem64_64x64`.
+  - Added wide-warp variants that reuse one A fragment across multiple N tiles:
+    `bf16_warp_16x32`, `bf16_warp_16x64`, `bf16_warp_16x128`.
+  - Added split-K variants for `ffn_down`: `bf16_splitk4_16x32`,
+    `bf16_splitk4_32x64`.
+- `src/experiments/gemma4_prefill_tune.py`
+  - Added the new SGEMM BF16 configs to the tuner.
+  - Fixed duplicated CSV field names for `cublas_backend` and `cublas_algo`.
+
+CUDA guide check:
+
+- Queried the local CUDA Programming Guide KB for WMMA BF16, shared-memory tiling,
+  occupancy, and launch bounds. Relevant guide areas were kernel occupancy, shared-memory
+  access patterns, and launch bounds. This matched the tuning directions tried here:
+  tile geometry, shared-memory staging, register/occupancy pressure, and launch-bound
+  constraints.
+
+Commands:
+
+```bash
+make sgemm-bf16-prefill-bench
+
+GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
+  ./build/experiments/gemma4_sgemm_bf16_prefill_bench \
+  ffn_down 10 3 16,64 bf16_smem64_64x64
+
+GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
+  ./build/experiments/gemma4_sgemm_bf16_prefill_bench \
+  ffn_down 10 3 16,64 bf16_warp_16x64
+
+GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
+  ./build/experiments/gemma4_sgemm_bf16_prefill_bench \
+  ffn_down 10 3 16,64 bf16_splitk4_32x64
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down \
+  --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_128x64,bf16_smem64_32x64,bf16_smem64_64x64,bf16_warp_16x64,bf16_splitk4_32x64 \
+  --m 8,16,32,64,128,256 --iters 10 --warmup 3 \
+  --cublas-backend lt \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_selected_arch.csv
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down --configs bf16_32x64 \
+  --m 8,16,32,64,128,256 --iters 100 --warmup 25 \
+  --cublas-backend lt \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_best_stability.csv
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down \
+  --configs bf16_16x16,bf16_16x32,bf16_16x64,bf16_16x128,bf16_32x32,bf16_32x64,bf16_32x128,bf16_64x64,bf16_64x128,bf16_128x64,bf16_smem64_32x64,bf16_smem64_64x64,bf16_warp_16x32,bf16_warp_16x64,bf16_warp_16x128,bf16_splitk4_16x32,bf16_splitk4_32x64 \
+  --m 8,16,32,64,128,256 --iters 10 --warmup 3 \
+  --cublas-backend lt \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_extreme.csv
+
+python3 src/experiments/gemma4_prefill_tune.py summarize \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_extreme.csv \
+  --custom-threshold 1.0 \
+  --dispatch-out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_extreme_dispatch.csv
+```
+
+Tried and rejected:
+
+- Shared-memory K-stage 64 (`bf16_smem64_*`): correct, but slower than direct WMMA
+  loads and slower than cuBLASLt.
+- Wide-warp N reuse (`bf16_warp_*`): correct, but the extra long-lived accumulator
+  fragments reduced useful parallelism and did not beat the simpler tilings.
+- Split-K=4 (`bf16_splitk4_*`): correct, but the partial write plus reduction overhead
+  dominated for this shape.
+- `__launch_bounds__(..., 2)` on the plain WMMA kernels: produced ptxas warnings for
+  1024-thread block variants and did not improve the sweep; reverted to
+  `__launch_bounds__(..., 1)`.
+- Nsight Compute command:
+
+```bash
+ncu --metric gpu__time_duration.sum --target-processes all \
+  ./build/experiments/gemma4_sgemm_bf16_prefill_bench ffn_down 1 0 32 bf16_32x64
+```
+
+This failed in the Thunder runtime with an unsupported-library assertion, so the recorded
+numbers below use CUDA event timing after warmup.
+
+Selected-architecture sweep, `M=8,16,32,64,128,256`, `iters=10`, `warmup=3`:
+
+| M | Best custom config | Custom ms | cuBLASLt ms | Speedup vs cuBLASLt | Max abs |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 8 | `bf16_16x64` | 0.3856 | 0.3388 | 0.879x | 0.03125 |
+| 16 | `bf16_16x32` | 0.3868 | 0.3420 | 0.884x | 0.03125 |
+| 32 | `bf16_16x64` | 0.4135 | 0.3421 | 0.827x | 0.03125 |
+| 64 | `bf16_16x64` | 0.7776 | 0.3549 | 0.456x | 0.03125 |
+| 128 | `bf16_128x64` | 1.5976 | 0.3768 | 0.236x | 0.0625 |
+| 256 | `bf16_128x64` | 3.1981 | 0.4160 | 0.130x | 0.03125 |
+
+Full extreme sweep, `M=8,16,32,64,128,256`, `iters=10`, `warmup=3`:
+
+| M | Best custom config | Custom ms | cuBLASLt ms | Speedup vs cuBLASLt | Custom TFLOP/s | Max abs |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 8 | `bf16_16x32` | 0.3852 | 0.3383 | 0.878x | 4.80 | 0.03125 |
+| 16 | `bf16_16x32` | 0.3853 | 0.3407 | 0.884x | 9.60 | 0.03125 |
+| 32 | `bf16_32x32` | 0.4119 | 0.3407 | 0.827x | 17.96 | 0.03125 |
+| 64 | `bf16_16x64` | 0.7778 | 0.3542 | 0.455x | 19.03 | 0.03125 |
+| 128 | `bf16_128x64` | 1.4910 | 0.3753 | 0.252x | 19.85 | 0.0625 |
+| 256 | `bf16_128x64` | 2.9172 | 0.4127 | 0.141x | 20.29 | 0.03125 |
+
+Best full-sweep config by geomean:
+
+| Config | Geomean speedup vs cuBLASLt | Worst speedup |
+| --- | ---: | ---: |
+| `bf16_32x64` | 0.344x | 0.070x |
+| `bf16_32x32` | 0.326x | 0.046x |
+| `bf16_64x64` | 0.318x | 0.126x |
+| `bf16_32x128` | 0.308x | 0.104x |
+| `bf16_16x128` | 0.296x | 0.035x |
+| `bf16_16x64` | 0.286x | 0.029x |
+| `bf16_splitk4_32x64` | 0.255x | 0.069x |
+| `bf16_128x64` | 0.208x | 0.141x |
+
+Stability pass for `bf16_32x64`, `M=8,16,32,64,128,256`, `iters=100`,
+`warmup=25`:
+
+| M | Custom ms | cuBLASLt ms | Speedup vs cuBLASLt | Custom TFLOP/s | Max abs |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 0.4123 | 0.3376 | 0.819x | 4.49 | 0.03125 |
+| 16 | 0.4087 | 0.3400 | 0.832x | 9.05 | 0.03125 |
+| 32 | 0.4028 | 0.3398 | 0.844x | 18.37 | 0.03125 |
+| 64 | 1.3972 | 0.3536 | 0.253x | 10.59 | 0.03125 |
+| 128 | 2.1470 | 0.3769 | 0.176x | 13.78 | 0.0625 |
+| 256 | 5.7529 | 0.4681 | 0.081x | 10.29 | 0.03125 |
+
+Dispatch result from the full extreme sweep:
+
+- All `M` values route to cuBLASLt when the custom threshold is `1.0`.
+- Weighted dispatch ms: `129.7140`.
+- Weighted cuBLASLt ms: `129.7140`.
+- Weighted custom-only ms: `382.1040`.
+- Custom-only vs cuBLASLt: `0.3395x`.
+
+Conclusion:
+
+- The SGEMM BF16 kernels were tuned heavily for the production `ffn_down` shape and
+  validated over a variety of token counts (`M=8,16,32,64,128,256`).
+- Correctness against cuBLASLt stayed within BF16-level tolerances for the tested random
+  inputs (`max_abs` generally `0.03125`, worst observed `0.0625`).
+- The best custom kernels are only close for `M<=32`, where they still lose by roughly
+  12-17%. For larger M, cuBLASLt is much faster.
+- No variant in this one-warp-per-WMMA/direct-or-lightly-staged kernel family should be
+  promoted into the production prefill path. Keep cuBLASLt as the production baseline
+  for this shape. Further custom GEMM work should start from a substantially different
+  architecture, such as a CUTLASS-style pipelined CTA with deeper K staging and a better
+  accumulator/store strategy.
