@@ -20,6 +20,10 @@ constexpr int kRmsnormBlockSize = 64;
 constexpr int kRmsnormRowsPerBlock = kRmsnormBlockSize / WARP_SIZE;
 constexpr int kResidualAddThreads = 256;
 
+#ifndef GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM
+#define GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM 2
+#endif
+
 __device__ __forceinline__ float gemma4_rmsnorm_scale(float sum_sq,
                                                       int width,
                                                       float eps) {
@@ -260,7 +264,8 @@ gemma4_residual_add_rmsnorm_scale_free_bf16_decode_kernel(
 }
 
 template <int Threads>
-__global__ __launch_bounds__(Threads, 1) void
+__global__ __launch_bounds__(
+    Threads, GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM) void
 gemma4_residual_add_rmsnorm_bf16_hidden_prefill_kernel(
     floatX *residual,
     floatX *normed,
@@ -283,15 +288,17 @@ gemma4_residual_add_rmsnorm_bf16_hidden_prefill_kernel(
   normed += offset;
 
   const int pack = threadIdx.x;
-  RmsnormPack values = gemma4_load_residual_pack(inp1, inp2, pack);
-  RmsnormPack gamma = load128g(weight + pack * kFloatXPerPack);
+  RmsnormPack a = load128g(inp1 + pack * kFloatXPerPack);
+  RmsnormPack b = load128g(inp2 + pack * kFloatXPerPack);
+  RmsnormPack values = gemma4_bf16_pack_add(a, b);
   float sum_sq = 0.0f;
   gemma4_bf16_pack_accumulate_square(values, sum_sq);
   store128(residual + pack * kFloatXPerPack, values);
 
   float scale = gemma4_block_rmsnorm_scale<Threads>(
       sum_sq, rstd, row, GEMMA4_HIDDEN_SIZE, s_scale, eps);
-  RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
+  RmsnormPack result =
+      gemma4_apply_weighted_rmsnorm_pack(values, weight, pack, scale);
   store128(normed + pack * kFloatXPerPack, result);
 }
 
