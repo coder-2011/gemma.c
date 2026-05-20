@@ -2896,3 +2896,62 @@ Correctness and cleanup checks:
 - `git diff --check -- src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh tests/test_rmsnorm.cu`
   passed.
 - No remaining RMSNorm-local `__forceinline__` helpers or removed helper symbols.
+
+## 2026-05-20 - RMSNorm dead fallback removal
+
+Runtime files:
+
+- `src/gemma4_rmsnorm.cu`
+- `src/gemma4_rmsnorm.cuh`
+- `tests/test_rmsnorm.cu`
+
+Reason:
+
+- Remove the fallback warp kernels and generic fused residual add plus RMSNorm paths
+  that are not part of the Gemma 4 dense model path.
+- Keep fused residual add plus learned RMSNorm hidden-width-only, because the residual
+  stream is width `5376`.
+- Keep standalone learned RMSNorm and scale-free RMSNorm shared kernels, because Q/K/V
+  norms still need width `256` and `512` coverage.
+
+Commands:
+
+```bash
+make -B test-rmsnorm
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_rmsnorm.cu -o /tmp/gemma4_rmsnorm.o
+make -B rmsnorm-hidden-fused-bench
+./build/experiments/gemma4_rmsnorm_hidden_fused_bench
+make -B rmsnorm-bench
+```
+
+Environment:
+
+- Device: NVIDIA RTX A6000
+- Focused benchmark defaults: `200` captured kernel calls, `20` graph warmup launches,
+  `5` trials
+- Benchmark seed printed by run: `0x71383c77c5b4702c`
+
+Focused hidden-width fused benchmark, graph replay:
+
+| Rows | Best ms | Avg ms | Effective GiB/s |
+| ---: | ---: | ---: | ---: |
+| 4 | 0.002080 | 0.002083 | 96.277 |
+| 16 | 0.002133 | 0.002136 | 375.631 |
+| 64 | 0.002841 | 0.002947 | 1127.866 |
+| 256 | 0.017191 | 0.017252 | 745.627 |
+| 1024 | 0.065856 | 0.065873 | 778.564 |
+
+Resource check:
+
+- Kernel count in `src/gemma4_rmsnorm.cu`: `6`.
+- Hidden prefill kernel: `28` registers, `0` stack, `0` spills, `96` bytes shared memory.
+- Decode kernels: `38` registers, `0` stack, `0` spills.
+- Remaining shared kernels: up to `44` registers, `0` stack, `0` spills.
+
+Correctness and build checks:
+
+- `make -B test-rmsnorm` passed.
+- `make -B rmsnorm-hidden-fused-bench` passed.
+- `make -B rmsnorm-bench` passed.
+- `git diff --check` passed before this note was added.
