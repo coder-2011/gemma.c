@@ -42,40 +42,4 @@ cudaError_t gemma4_rope_forward_bf16(__nv_bfloat16 *q,
                                      int rotary_dim,
                                      cudaStream_t stream);
 
-cudaError_t gemma4_sliding_rope_bf16(__nv_bfloat16 *q,
-                                     __nv_bfloat16 *k,
-                                     const float *cos,
-                                     const float *sin,
-                                     int seq_len,
-                                     int batch_size,
-                                     int cos_batch_size,
-                                     cudaStream_t stream);
-
-cudaError_t gemma4_sliding_rope_forward_bf16(__nv_bfloat16 *q,
-                                             __nv_bfloat16 *k,
-                                             const float *cos,
-                                             const float *sin,
-                                             int seq_len,
-                                             int batch_size,
-                                             int cos_batch_size,
-                                             cudaStream_t stream);
-
-cudaError_t gemma4_global_rope_bf16(__nv_bfloat16 *q,
-                                    __nv_bfloat16 *k,
-                                    const float *cos,
-                                    const float *sin,
-                                    int seq_len,
-                                    int batch_size,
-                                    int cos_batch_size,
-                                    cudaStream_t stream);
-
-cudaError_t gemma4_global_rope_forward_bf16(__nv_bfloat16 *q,
-                                            __nv_bfloat16 *k,
-                                            const float *cos,
-                                            const float *sin,
-                                            int seq_len,
-                                            int batch_size,
-                                            int cos_batch_size,
-                                            cudaStream_t stream);
-
 #endif

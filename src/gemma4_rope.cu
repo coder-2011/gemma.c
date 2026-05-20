@@ -1,13 +1,11 @@
 #include "gemma4_rope.cuh"
 #include "gemma4_cuda_utils.cuh"
-#include "gemma4.h"
 
 #include <stdint.h>
 
 namespace {
 
 constexpr int kRopeThreads = 128;
-constexpr int kGemma4GlobalRotaryDim = GEMMA4_GLOBAL_HEAD_DIM / 4;
 
 __device__ __forceinline__ void rotate_head_bf16(floatX *head,
                                                  const float *cos_row,
@@ -95,37 +93,6 @@ __global__ void gemma4_rope_forward_bf16_kernel(floatX *q,
   }
 }
 
-bool rope_dims_valid(int seq_len,
-                     int batch_size,
-                     int cos_batch_size,
-                     int q_heads,
-                     int kv_heads,
-                     int head_dim,
-                     int rotary_dim) {
-  return seq_len >= 0 && batch_size >= 0 && q_heads >= 0 && kv_heads >= 0 && head_dim > 0 && rotary_dim > 0 && rotary_dim <= head_dim && (rotary_dim % 2) == 0 && (cos_batch_size == 1 || cos_batch_size == batch_size);
-}
-
-bool rope_buffers_valid(const floatX *q,
-                        const floatX *k,
-                        const float *cos,
-                        const float *sin) {
-  return q != nullptr && k != nullptr && cos != nullptr && sin != nullptr && is_aligned_16(q) && is_aligned_16(k);
-}
-
-bool rope_strides_valid(int64_t q_row_stride,
-                        int64_t k_row_stride,
-                        int64_t cos_row_stride,
-                        int64_t sin_row_stride,
-                        int q_heads,
-                        int kv_heads,
-                        int head_dim,
-                        int rotary_dim) {
-  int rotary_half = rotary_dim / 2;
-  int64_t min_q_row_stride = static_cast<int64_t>(q_heads) * head_dim;
-  int64_t min_k_row_stride = static_cast<int64_t>(kv_heads) * head_dim;
-  return q_row_stride >= min_q_row_stride && k_row_stride >= min_k_row_stride && cos_row_stride >= rotary_half && sin_row_stride >= rotary_half;
-}
-
 }  // namespace
 
 cudaError_t gemma4_rope_bf16(floatX *q,
@@ -144,24 +111,17 @@ cudaError_t gemma4_rope_bf16(floatX *q,
                              int head_dim,
                              int rotary_dim,
                              cudaStream_t stream) {
-  if (!rope_dims_valid(seq_len, batch_size, cos_batch_size, q_heads, kv_heads, head_dim, rotary_dim)) {
-    return cudaErrorInvalidValue;
-  }
-  if (seq_len == 0 || batch_size == 0) {
-    return cudaSuccess;
-  }
-  if (!rope_buffers_valid(q, k, cos, sin) || !rope_strides_valid(q_row_stride, k_row_stride, cos_row_stride, sin_row_stride, q_heads, kv_heads, head_dim, rotary_dim)) {
-    return cudaErrorInvalidValue;
-  }
+  if (seq_len < 0 || batch_size < 0 || q_heads < 0 || kv_heads < 0 || head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim || (rotary_dim % 2) != 0 || (cos_batch_size != 1 && cos_batch_size != batch_size)) return cudaErrorInvalidValue;
+  if (seq_len == 0 || batch_size == 0 || (q_heads == 0 && kv_heads == 0)) return cudaSuccess;
+  if (q == nullptr || k == nullptr || cos == nullptr || sin == nullptr) return cudaErrorInvalidValue;
 
+  int rotary_half = rotary_dim / 2;
+  if (q_row_stride < static_cast<int64_t>(q_heads) * head_dim || k_row_stride < static_cast<int64_t>(kv_heads) * head_dim || cos_row_stride < rotary_half || sin_row_stride < rotary_half) return cudaErrorInvalidValue;
   int rows = batch_size * seq_len;
   int heads = q_heads > kv_heads ? q_heads : kv_heads;
-  if (heads == 0) {
-    return cudaSuccess;
-  }
 
   dim3 grid(rows, heads);
-  gemma4_rope_bf16_kernel<<<grid, kRopeThreads, 0, stream>>>(q, q_row_stride, k, k_row_stride, cos, cos_row_stride, sin, sin_row_stride, seq_len, cos_batch_size, q_heads, kv_heads, head_dim, rotary_dim / 2);
+  gemma4_rope_bf16_kernel<<<grid, kRopeThreads, 0, stream>>>(q, q_row_stride, k, k_row_stride, cos, cos_row_stride, sin, sin_row_stride, seq_len, cos_batch_size, q_heads, kv_heads, head_dim, rotary_half);
   return cudaGetLastError();
 }
 
@@ -177,68 +137,15 @@ cudaError_t gemma4_rope_forward_bf16(floatX *q,
                                      int head_dim,
                                      int rotary_dim,
                                      cudaStream_t stream) {
-  if (!rope_dims_valid(seq_len, batch_size, cos_batch_size, q_heads, kv_heads, head_dim, rotary_dim)) {
-    return cudaErrorInvalidValue;
-  }
-  if (seq_len == 0 || batch_size == 0) {
-    return cudaSuccess;
-  }
-  if (!rope_buffers_valid(q, k, cos, sin)) {
-    return cudaErrorInvalidValue;
-  }
+  if (seq_len < 0 || batch_size < 0 || q_heads < 0 || kv_heads < 0 || head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim || (rotary_dim % 2) != 0 || (cos_batch_size != 1 && cos_batch_size != batch_size)) return cudaErrorInvalidValue;
+  if (seq_len == 0 || batch_size == 0 || (q_heads == 0 && kv_heads == 0)) return cudaSuccess;
+  if (q == nullptr || k == nullptr || cos == nullptr || sin == nullptr) return cudaErrorInvalidValue;
 
   int rows = batch_size * seq_len;
   int heads = q_heads > kv_heads ? q_heads : kv_heads;
-  if (heads == 0) {
-    return cudaSuccess;
-  }
 
   dim3 grid(rows, heads);
   int rotary_half = rotary_dim / 2;
   gemma4_rope_forward_bf16_kernel<<<grid, kRopeThreads, 0, stream>>>(q, k, cos, head_dim, sin, head_dim, seq_len, cos_batch_size, q_heads, kv_heads, head_dim, rotary_half);
   return cudaGetLastError();
-}
-
-cudaError_t gemma4_sliding_rope_bf16(floatX *q,
-                                     floatX *k,
-                                     const float *cos,
-                                     const float *sin,
-                                     int seq_len,
-                                     int batch_size,
-                                     int cos_batch_size,
-                                     cudaStream_t stream) {
-  return gemma4_rope_bf16(q, GEMMA4_SLIDING_Q_PROJ_SIZE, k, GEMMA4_SLIDING_KV_PROJ_SIZE, cos, GEMMA4_SLIDING_HEAD_DIM, sin, GEMMA4_SLIDING_HEAD_DIM, seq_len, batch_size, cos_batch_size, GEMMA4_NUM_QUERY_HEADS, GEMMA4_SLIDING_KV_HEADS, GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_HEAD_DIM, stream);
-}
-
-cudaError_t gemma4_sliding_rope_forward_bf16(floatX *q,
-                                             floatX *k,
-                                             const float *cos,
-                                             const float *sin,
-                                             int seq_len,
-                                             int batch_size,
-                                             int cos_batch_size,
-                                             cudaStream_t stream) {
-  return gemma4_rope_forward_bf16(q, k, cos, sin, seq_len, batch_size, cos_batch_size, GEMMA4_NUM_QUERY_HEADS, GEMMA4_SLIDING_KV_HEADS, GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_HEAD_DIM, stream);
-}
-
-cudaError_t gemma4_global_rope_bf16(floatX *q,
-                                    floatX *k,
-                                    const float *cos,
-                                    const float *sin,
-                                    int seq_len,
-                                    int batch_size,
-                                    int cos_batch_size,
-                                    cudaStream_t stream) {
-  return gemma4_rope_bf16(q, GEMMA4_GLOBAL_Q_PROJ_SIZE, k, GEMMA4_GLOBAL_K_PROJ_SIZE, cos, GEMMA4_GLOBAL_HEAD_DIM, sin, GEMMA4_GLOBAL_HEAD_DIM, seq_len, batch_size, cos_batch_size, GEMMA4_NUM_QUERY_HEADS, GEMMA4_GLOBAL_KV_HEADS, GEMMA4_GLOBAL_HEAD_DIM, kGemma4GlobalRotaryDim, stream);
-}
-
-cudaError_t gemma4_global_rope_forward_bf16(floatX *q,
-                                            floatX *k,
-                                            const float *cos,
-                                            const float *sin,
-                                            int seq_len,
-                                            int batch_size,
-                                            int cos_batch_size,
-                                            cudaStream_t stream) {
-  return gemma4_rope_forward_bf16(q, k, cos, sin, seq_len, batch_size, cos_batch_size, GEMMA4_NUM_QUERY_HEADS, GEMMA4_GLOBAL_KV_HEADS, GEMMA4_GLOBAL_HEAD_DIM, kGemma4GlobalRotaryDim, stream);
 }
