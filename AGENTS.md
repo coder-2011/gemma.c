@@ -80,6 +80,16 @@ Approximate model memory footprints:
 - Do not hardcode block, thread, warp, or lane assumptions inside reusable `__device__` helpers. The caller should own the threading model.
 - Pass lane IDs, row indices, offsets, strides, and dimensions explicitly into device helpers instead of reading `threadIdx`, `blockIdx`, or assuming a fixed warp layout inside the helper.
 - Keep concise non-declaration statements on one line when they remain readable. This includes simple guard `if` conditions, boolean `return` expressions, CUDA kernel launches, and wrapper/delegating calls. Function declarations/definitions and genuinely complex expressions may stay multiline.
+- Anchor CUDA code to hardware reality: names, launch shapes, pointer qualifiers, memory layout, synchronization, and comments should make the execution space obvious.
+- Name every `__global__` function with a `_kernel` suffix, and keep host launchers/wrappers clearly separate from kernels.
+- Check every CUDA/cuBLAS/cuDNN API call, and check every kernel launch with `cudaGetLastError()` before depending on later synchronization to surface failures.
+- Prefer `const` and `__restrict__` kernel parameters when aliasing is not intended. Keep allocation ownership obvious; use RAII in host/test/benchmark code when it reduces cleanup risk without hiding important CUDA behavior.
+- Keep launch constants such as block sizes, tile sizes, and warp counts in named `constexpr` values. Thread block sizes should be multiples of `WARP_SIZE` unless there is a measured reason not to.
+- Avoid warp-divergent control flow in hot paths, and never put `__syncthreads()` behind divergent branches.
+- Choose data layouts for coalesced global memory access, then profile shared-memory bank conflicts, occupancy, and warp stalls with Nsight before making performance claims.
+- Comments should explain hardware constraints such as coalescing, bank-conflict avoidance, synchronization, occupancy, and launch-shape rationale; do not restate obvious C++.
+- Validate each kernel against a CPU/PyTorch reference and run sanitizers when memory safety is uncertain before tuning performance.
+- Prefer `cudaMemcpyAsync` with explicit streams in measured paths; do not mix synchronous and asynchronous transfers casually.
 - Example pattern:
 
 ```cpp
