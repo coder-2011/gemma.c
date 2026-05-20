@@ -4,8 +4,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-// If weight is nullptr, this computes scale-free RMSNorm:
-// y = x * rsqrt(mean(x * x) + eps).
+// Learned-weight RMSNorm:
+// y = x * rsqrt(mean(x * x) + eps) * weight.
 cudaError_t gemma4_rmsnorm_bf16(__nv_bfloat16 *out,
                                 float *__restrict__ rstd,
                                 const __nv_bfloat16 *inp,

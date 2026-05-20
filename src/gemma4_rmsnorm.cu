@@ -15,8 +15,8 @@ constexpr int kDecodeRmsnormThreads = 704;
 constexpr int kDecodeFusedThreads = 672;
 constexpr int kDecodePacks = GEMMA4_HIDDEN_SIZE / kFloatXPerPack;
 constexpr int kHiddenPrefillFusedThreads = kDecodePacks;
-constexpr int kRmsnormBlockSize = 64;
-constexpr int kRmsnormRowsPerBlock = kRmsnormBlockSize / WARP_SIZE;
+constexpr int kRmsnormRowsPerBlock = 2;
+constexpr int kRmsnormThreads = WARP_SIZE * kRmsnormRowsPerBlock;
 constexpr int kResidualAddThreads = 256;
 
 #ifndef GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM
@@ -186,87 +186,7 @@ gemma4_residual_add_rmsnorm_bf16_hidden_prefill_kernel(
   store128(normed + pack * kFloatXPerPack, result);
 }
 
-__global__ __launch_bounds__(kRmsnormBlockSize) void
-gemma4_rmsnorm_bf16_warp_kernel(
-    floatX *out,
-    float *__restrict__ rstd,
-    const floatX *inp,
-    const floatX *__restrict__ weight,
-    int rows,
-    int width,
-    float eps) {
-  const int lane = threadIdx.x & (WARP_SIZE - 1);
-  const int warp = threadIdx.x / WARP_SIZE;
-  const int warps_per_block = blockDim.x / WARP_SIZE;
-  const int row = blockIdx.x * warps_per_block + warp;
-  if (row >= rows) {
-    return;
-  }
-
-  inp += row * width;
-  out += row * width;
-
-  const int packs_per_row = width / kFloatXPerPack;
-  float sum_sq = 0.0f;
-  for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values = load128g(inp + pack * kFloatXPerPack);
-    gemma4_bf16_pack_accumulate_square(values, sum_sq);
-  }
-  sum_sq = warp_reduce_sum(sum_sq);
-  float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
-  if (lane == 0 && rstd != nullptr) {
-    rstd[row] = scale;
-  }
-
-  for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values = load128cs(inp + pack * kFloatXPerPack);
-    RmsnormPack gamma = load128g(weight + pack * kFloatXPerPack);
-    RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(out + pack * kFloatXPerPack, result);
-  }
-}
-
-__global__ __launch_bounds__(kRmsnormBlockSize) void
-gemma4_rmsnorm_scale_free_bf16_warp_kernel(
-    floatX *out,
-    float *__restrict__ rstd,
-    const floatX *inp,
-    int rows,
-    int width,
-    float eps) {
-  const int lane = threadIdx.x & (WARP_SIZE - 1);
-  const int warp = threadIdx.x / WARP_SIZE;
-  const int warps_per_block = blockDim.x / WARP_SIZE;
-  const int row = blockIdx.x * warps_per_block + warp;
-  if (row >= rows) {
-    return;
-  }
-
-  inp += row * width;
-  out += row * width;
-
-  const int packs_per_row = width / kFloatXPerPack;
-  float sum_sq = 0.0f;
-  for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values = load128g(inp + pack * kFloatXPerPack);
-    gemma4_bf16_pack_accumulate_square(values, sum_sq);
-  }
-  sum_sq = warp_reduce_sum(sum_sq);
-  float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
-  if (lane == 0 && rstd != nullptr) {
-    rstd[row] = scale;
-  }
-
-  RmsnormPack ones{make_int4(kBf16OnePairBits, kBf16OnePairBits,
-                             kBf16OnePairBits, kBf16OnePairBits)};
-  for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values = load128cs(inp + pack * kFloatXPerPack);
-    RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, ones, scale);
-    store128cs(out + pack * kFloatXPerPack, result);
-  }
-}
-
-__global__ __launch_bounds__(kRmsnormBlockSize) void
+__global__ __launch_bounds__(kRmsnormThreads) void
 gemma4_rmsnorm_bf16_shared_kernel(
     floatX *out,
     float *__restrict__ rstd,
@@ -317,7 +237,7 @@ gemma4_rmsnorm_bf16_shared_kernel(
   }
 }
 
-__global__ __launch_bounds__(kRmsnormBlockSize) void
+__global__ __launch_bounds__(kRmsnormThreads) void
 gemma4_rmsnorm_scale_free_bf16_shared_kernel(
     floatX *out,
     float *__restrict__ rstd,
@@ -376,112 +296,6 @@ gemma4_residual_add_bf16_kernel(
   store128(out + pack * kFloatXPerPack, result);
 }
 
-__global__ __launch_bounds__(kRmsnormBlockSize) void
-gemma4_residual_add_rmsnorm_bf16_warp_kernel(
-    floatX *residual,
-    floatX *normed,
-    float *__restrict__ rstd,
-    const floatX *inp1,
-    const floatX *inp2,
-    const floatX *__restrict__ weight,
-    int rows,
-    int width,
-    float eps) {
-  const int lane = threadIdx.x & (WARP_SIZE - 1);
-  const int warp = threadIdx.x / WARP_SIZE;
-  const int warps_per_block = blockDim.x / WARP_SIZE;
-  const int row = blockIdx.x * warps_per_block + warp;
-  if (row >= rows) {
-    return;
-  }
-
-  inp1 += row * width;
-  inp2 += row * width;
-  residual += row * width;
-  normed += row * width;
-
-  const int packs_per_row = width / kFloatXPerPack;
-  float sum_sq = 0.0f;
-  for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
-    RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
-    RmsnormPack result = gemma4_bf16_pack_add(a, b);
-    gemma4_bf16_pack_accumulate_square(result, sum_sq);
-    store128(residual + pack * kFloatXPerPack, result);
-  }
-  sum_sq = warp_reduce_sum(sum_sq);
-  float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
-  if (lane == 0 && rstd != nullptr) {
-    rstd[row] = scale;
-  }
-
-  for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values = load128(residual + pack * kFloatXPerPack);
-    RmsnormPack gamma = load128g(weight + pack * kFloatXPerPack);
-    RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(normed + pack * kFloatXPerPack, result);
-  }
-}
-
-__global__ __launch_bounds__(kRmsnormBlockSize) void
-gemma4_residual_add_rmsnorm_bf16_shared_kernel(
-    floatX *residual,
-    floatX *normed,
-    float *__restrict__ rstd,
-    const floatX *inp1,
-    const floatX *inp2,
-    const floatX *__restrict__ weight,
-    int rows,
-    int width,
-    int packs_per_row,
-    float eps) {
-  extern __shared__ int4 shared_packs[];
-  auto *shared = reinterpret_cast<RmsnormPack *>(shared_packs);
-  RmsnormPack *s_weight = shared;
-  RmsnormPack *s_res = shared + packs_per_row + threadIdx.y * packs_per_row;
-
-  const int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
-  const int packed_stride = WARP_SIZE * blockDim.y;
-  for (int pack = packed_thread; pack < packs_per_row;
-       pack += packed_stride) {
-    s_weight[pack] = load128g(weight + pack * kFloatXPerPack);
-  }
-  __syncthreads();
-
-  const int row = blockIdx.x * blockDim.y + threadIdx.y;
-  if (row >= rows) {
-    return;
-  }
-
-  inp1 += row * width;
-  inp2 += row * width;
-  residual += row * width;
-  normed += row * width;
-
-  float sum_sq = 0.0f;
-  for (int pack = threadIdx.x; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
-    RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
-    RmsnormPack result = gemma4_bf16_pack_add(a, b);
-    gemma4_bf16_pack_accumulate_square(result, sum_sq);
-    s_res[pack] = result;
-    store128cs(residual + pack * kFloatXPerPack, result);
-  }
-
-  sum_sq = warp_reduce_sum(sum_sq);
-  float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
-  if (threadIdx.x == 0 && rstd != nullptr) {
-    rstd[row] = scale;
-  }
-
-  for (int pack = threadIdx.x; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values = s_res[pack];
-    RmsnormPack result =
-        gemma4_bf16_pack_apply_rmsnorm(values, s_weight[pack], scale);
-    store128cs(normed + pack * kFloatXPerPack, result);
-  }
-}
-
 // -----------------------------------------------------------------------------
 // Host launch helpers
 
@@ -518,6 +332,9 @@ bool gemma4_residual_add_rmsnorm_args_valid(floatX *residual,
   if (!gemma4_rmsnorm_args_valid(normed, inp1, rows, width)) {
     return false;
   }
+  if (width != GEMMA4_HIDDEN_SIZE) {
+    return false;
+  }
   if (rows == 0) {
     return true;
   }
@@ -550,17 +367,9 @@ cudaError_t gemma4_rmsnorm_bf16_impl(floatX *out,
   const size_t smem = static_cast<size_t>(1 + kRmsnormRowsPerBlock) *
                       packs_per_row * sizeof(RmsnormPack);
 
-  cudaError_t attr = cudaFuncSetAttribute(
-      reinterpret_cast<const void *>(gemma4_rmsnorm_bf16_shared_kernel),
-      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
-  if (attr == cudaSuccess) {
-    gemma4_rmsnorm_bf16_shared_kernel<<<
-        grid, dim3(WARP_SIZE, kRmsnormRowsPerBlock), smem, stream>>>(
-        out, rstd, inp, weight, rows, width, packs_per_row, eps);
-  } else {
-    gemma4_rmsnorm_bf16_warp_kernel<<<grid, kRmsnormBlockSize, 0, stream>>>(
-        out, rstd, inp, weight, rows, width, eps);
-  }
+  gemma4_rmsnorm_bf16_shared_kernel<<<
+      grid, dim3(WARP_SIZE, kRmsnormRowsPerBlock), smem, stream>>>(
+      out, rstd, inp, weight, rows, width, packs_per_row, eps);
   return cudaGetLastError();
 }
 
@@ -582,18 +391,9 @@ cudaError_t gemma4_rmsnorm_scale_free_bf16_impl(floatX *out,
   const size_t smem = static_cast<size_t>(kRmsnormRowsPerBlock) *
                       packs_per_row * sizeof(RmsnormPack);
 
-  cudaError_t attr = cudaFuncSetAttribute(
-      reinterpret_cast<const void *>(
-          gemma4_rmsnorm_scale_free_bf16_shared_kernel),
-      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
-  if (attr == cudaSuccess) {
-    gemma4_rmsnorm_scale_free_bf16_shared_kernel<<<
-        grid, dim3(WARP_SIZE, kRmsnormRowsPerBlock), smem, stream>>>(
-        out, rstd, inp, rows, width, packs_per_row, eps);
-  } else {
-    gemma4_rmsnorm_scale_free_bf16_warp_kernel<<<
-        grid, kRmsnormBlockSize, 0, stream>>>(out, rstd, inp, rows, width, eps);
-  }
+  gemma4_rmsnorm_scale_free_bf16_shared_kernel<<<
+      grid, dim3(WARP_SIZE, kRmsnormRowsPerBlock), smem, stream>>>(
+      out, rstd, inp, rows, width, packs_per_row, eps);
   return cudaGetLastError();
 }
 
@@ -618,39 +418,17 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16_impl(
   if (rows == 0) {
     return cudaSuccess;
   }
-  if (rows == 1 && width == GEMMA4_HIDDEN_SIZE) {
+  if (rows == 1) {
     gemma4_residual_add_rmsnorm_bf16_decode_kernel<kDecodeFusedThreads>
         <<<1, kDecodeFusedThreads, 0, stream>>>(
         residual, normed, rstd, inp1, inp2, weight, eps);
     return cudaGetLastError();
   }
-  if (width == GEMMA4_HIDDEN_SIZE) {
-    gemma4_residual_add_rmsnorm_bf16_hidden_prefill_kernel<
-        kHiddenPrefillFusedThreads><<<rows, kHiddenPrefillFusedThreads, 0,
-                                      stream>>>(
-        residual, normed, rstd, inp1, inp2, weight, eps);
-    return cudaGetLastError();
-  }
 
-  const int packs_per_row = width / kFloatXPerPack;
-  const int grid = div_up(rows, kRmsnormRowsPerBlock);
-  const size_t smem = static_cast<size_t>(1 + kRmsnormRowsPerBlock) *
-                      packs_per_row * sizeof(RmsnormPack);
-
-  cudaError_t attr = cudaFuncSetAttribute(
-      reinterpret_cast<const void *>(
-          gemma4_residual_add_rmsnorm_bf16_shared_kernel),
-      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
-  if (attr == cudaSuccess) {
-    gemma4_residual_add_rmsnorm_bf16_shared_kernel<<<
-        grid, dim3(WARP_SIZE, kRmsnormRowsPerBlock), smem, stream>>>(
-        residual, normed, rstd, inp1, inp2, weight, rows, width,
-        packs_per_row, eps);
-  } else {
-    gemma4_residual_add_rmsnorm_bf16_warp_kernel<<<
-        grid, kRmsnormBlockSize, 0, stream>>>(
-        residual, normed, rstd, inp1, inp2, weight, rows, width, eps);
-  }
+  gemma4_residual_add_rmsnorm_bf16_hidden_prefill_kernel<
+      kHiddenPrefillFusedThreads><<<rows, kHiddenPrefillFusedThreads, 0,
+                                    stream>>>(
+      residual, normed, rstd, inp1, inp2, weight, eps);
   return cudaGetLastError();
 }
 
@@ -664,12 +442,8 @@ cudaError_t gemma4_rmsnorm_bf16(floatX *out,
                                 int width,
                                 float eps,
                                 cudaStream_t stream) {
-  if (weight != nullptr) {
-    return gemma4_rmsnorm_bf16_impl(
-        out, rstd, inp, weight, rows, width, eps, stream);
-  }
-  return gemma4_rmsnorm_scale_free_bf16_impl(
-      out, rstd, inp, rows, width, eps, stream);
+  return gemma4_rmsnorm_bf16_impl(
+      out, rstd, inp, weight, rows, width, eps, stream);
 }
 
 cudaError_t gemma4_rmsnorm_scale_free_bf16(floatX *out,
