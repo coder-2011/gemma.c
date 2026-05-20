@@ -16,6 +16,11 @@ typedef enum {
   GEMMA4_PROJECTION_FINAL_LOGITS,
 } Gemma4Projection;
 
+typedef enum {
+  GEMMA4_DECODE_SWIZZLE_IDENTITY = 0,
+  GEMMA4_DECODE_SWIZZLE_INTERLEAVE_16 = 1,
+} Gemma4DecodeSwizzle;
+
 cublasStatus_t gemma4_projection_prefill(
     Gemma4Projection projection,
     cublasHandle_t handle,
@@ -27,6 +32,14 @@ cublasStatus_t gemma4_projection_prefill(
 
 cudaError_t gemma4_projection_decode(
     Gemma4Projection projection,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    cudaStream_t stream);
+
+cudaError_t gemma4_projection_decode_swizzled(
+    Gemma4Projection projection,
+    Gemma4DecodeSwizzle swizzle,
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major,
     __nv_bfloat16 *__restrict__ y,

@@ -9,6 +9,7 @@ namespace {
 constexpr int kDefaultThreads = 512;
 constexpr int kDefaultColsPerBlock = 8;
 constexpr int kDefaultMinBlocksPerSm = 2;
+constexpr int kInterleaveSwizzleBlocks = 16;
 constexpr int kFfnDownThreads = 1024;
 constexpr int kFfnDownColsPerBlock = 8;
 constexpr int kFfnDownMinBlocksPerSm = 1;
@@ -34,6 +35,19 @@ __device__ __forceinline__ int pack_offset(int pack_idx) {
 template <int K>
 __device__ __forceinline__ int weight_offset(int col, int element_idx) {
   return col * K + element_idx;
+}
+
+template <int BlockCount, int SwizzleTileBlocks>
+__device__ __forceinline__ int swizzle_col_block(int block_idx) {
+  if constexpr (SwizzleTileBlocks <= 1) {
+    return block_idx;
+  } else {
+    static_assert((BlockCount % SwizzleTileBlocks) == 0,
+                  "swizzled decode GEMV block count must divide tile size");
+    constexpr int tiles = BlockCount / SwizzleTileBlocks;
+    return (block_idx % SwizzleTileBlocks) * tiles +
+           block_idx / SwizzleTileBlocks;
+  }
 }
 
 __device__ __forceinline__ Bf16Packed128
@@ -90,7 +104,12 @@ __device__ __forceinline__ void dot_cols(
   }
 }
 
-template <int K, int N, int ColsPerBlock, int Threads, int MinBlocksPerSM>
+template <int K,
+          int N,
+          int ColsPerBlock,
+          int Threads,
+          int MinBlocksPerSM,
+          int SwizzleTileBlocks>
 __global__ __launch_bounds__(Threads, MinBlocksPerSM) void
 gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
                                const __nv_bfloat16 *__restrict__ w_col_major,
@@ -100,10 +119,13 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
 
   static_assert((Threads % WARP_SIZE) == 0,
                 "decode thread count must be a whole number of warps");
+  constexpr int blocks = N / ColsPerBlock;
   constexpr int warps = Threads / WARP_SIZE;
   __shared__ float warp_sums[ColsPerBlock][warps];
 
-  const int col0 = blockIdx.x * ColsPerBlock;
+  const int logical_block =
+      swizzle_col_block<blocks, SwizzleTileBlocks>(blockIdx.x);
+  const int col0 = logical_block * ColsPerBlock;
   const int lane = threadIdx.x & (WARP_SIZE - 1);
   const int warp = threadIdx.x / WARP_SIZE;
 
@@ -145,7 +167,12 @@ static cudaError_t check_decode_args(
   return cudaSuccess;
 }
 
-template <int K, int N, int ColsPerBlock, int Threads, int MinBlocksPerSM>
+template <int K,
+          int N,
+          int ColsPerBlock,
+          int Threads,
+          int MinBlocksPerSM,
+          int SwizzleTileBlocks>
 cudaError_t launch_decode_gemv(const __nv_bfloat16 *__restrict__ x,
                                const __nv_bfloat16 *__restrict__ w_col_major,
                                __nv_bfloat16 *__restrict__ y,
@@ -156,7 +183,12 @@ cudaError_t launch_decode_gemv(const __nv_bfloat16 *__restrict__ x,
   }
 
   constexpr int blocks = N / ColsPerBlock;
-  gemma4_decode_gemv_cols_kernel<K, N, ColsPerBlock, Threads, MinBlocksPerSM>
+  gemma4_decode_gemv_cols_kernel<K,
+                                 N,
+                                 ColsPerBlock,
+                                 Threads,
+                                 MinBlocksPerSM,
+                                 SwizzleTileBlocks>
       <<<blocks, Threads, 0, stream>>>(x, w_col_major, y);
   return cudaGetLastError();
 }
@@ -218,6 +250,60 @@ static bool projection_shape(Gemma4Projection projection,
   return false;
 }
 
+template <int SwizzleTileBlocks>
+cudaError_t projection_decode_impl(
+    Gemma4Projection projection,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    cudaStream_t stream) {
+  switch (projection) {
+  case GEMMA4_PROJECTION_FFN_GATE_UP:
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_FFN_DOWN:
+    return launch_decode_gemv<
+        GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE,
+        kFfnDownColsPerBlock, kFfnDownThreads,
+        kFfnDownMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_SLIDING_QKV:
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_SLIDING_O:
+    return launch_decode_gemv<GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
+                              GEMMA4_HIDDEN_SIZE, kDefaultColsPerBlock,
+                              kDefaultThreads, kDefaultMinBlocksPerSm,
+                              SwizzleTileBlocks>(x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_GLOBAL_Q:
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_GLOBAL_K:
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_GLOBAL_O:
+    return launch_decode_gemv<
+        GEMMA4_GLOBAL_ATTENTION_OUT_SIZE, GEMMA4_HIDDEN_SIZE,
+        kGlobalOColsPerBlock, kGlobalOThreads,
+        kGlobalOMinBlocksPerSm, SwizzleTileBlocks>(x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_FINAL_LOGITS:
+    return launch_decode_gemv<
+        GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE,
+        kFinalLogitsColsPerBlock, kFinalLogitsThreads,
+        kFinalLogitsMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
+  }
+  return cudaErrorInvalidValue;
+}
+
 }  // namespace
 
 cublasStatus_t gemma4_projection_prefill(
@@ -238,47 +324,22 @@ cudaError_t gemma4_projection_decode(Gemma4Projection projection,
                                      const __nv_bfloat16 *__restrict__ w_col_major,
                                      __nv_bfloat16 *__restrict__ y,
                                      cudaStream_t stream) {
-  switch (projection) {
-  case GEMMA4_PROJECTION_FFN_GATE_UP:
-    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE,
-                              kDefaultColsPerBlock, kDefaultThreads,
-                              kDefaultMinBlocksPerSm>(x, w_col_major, y,
-                                                       stream);
-  case GEMMA4_PROJECTION_FFN_DOWN:
-    return launch_decode_gemv<
-        GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE,
-        kFfnDownColsPerBlock, kFfnDownThreads,
-        kFfnDownMinBlocksPerSm>(x, w_col_major, y, stream);
-  case GEMMA4_PROJECTION_SLIDING_QKV:
-    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE,
-                              kDefaultColsPerBlock, kDefaultThreads,
-                              kDefaultMinBlocksPerSm>(x, w_col_major, y,
-                                                       stream);
-  case GEMMA4_PROJECTION_SLIDING_O:
-    return launch_decode_gemv<GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
-                              GEMMA4_HIDDEN_SIZE, kDefaultColsPerBlock,
-                              kDefaultThreads, kDefaultMinBlocksPerSm>(
-        x, w_col_major, y, stream);
-  case GEMMA4_PROJECTION_GLOBAL_Q:
-    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE,
-                              kDefaultColsPerBlock, kDefaultThreads,
-                              kDefaultMinBlocksPerSm>(x, w_col_major, y,
-                                                       stream);
-  case GEMMA4_PROJECTION_GLOBAL_K:
-    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
-                              kDefaultColsPerBlock, kDefaultThreads,
-                              kDefaultMinBlocksPerSm>(x, w_col_major, y,
-                                                       stream);
-  case GEMMA4_PROJECTION_GLOBAL_O:
-    return launch_decode_gemv<
-        GEMMA4_GLOBAL_ATTENTION_OUT_SIZE, GEMMA4_HIDDEN_SIZE,
-        kGlobalOColsPerBlock, kGlobalOThreads,
-        kGlobalOMinBlocksPerSm>(x, w_col_major, y, stream);
-  case GEMMA4_PROJECTION_FINAL_LOGITS:
-    return launch_decode_gemv<
-        GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE,
-        kFinalLogitsColsPerBlock, kFinalLogitsThreads,
-        kFinalLogitsMinBlocksPerSm>(x, w_col_major, y, stream);
+  return projection_decode_impl<1>(projection, x, w_col_major, y, stream);
+}
+
+cudaError_t gemma4_projection_decode_swizzled(
+    Gemma4Projection projection,
+    Gemma4DecodeSwizzle swizzle,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    cudaStream_t stream) {
+  switch (swizzle) {
+  case GEMMA4_DECODE_SWIZZLE_IDENTITY:
+    return projection_decode_impl<1>(projection, x, w_col_major, y, stream);
+  case GEMMA4_DECODE_SWIZZLE_INTERLEAVE_16:
+    return projection_decode_impl<kInterleaveSwizzleBlocks>(
+        projection, x, w_col_major, y, stream);
   }
   return cudaErrorInvalidValue;
 }

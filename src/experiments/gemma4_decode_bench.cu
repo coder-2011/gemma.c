@@ -237,6 +237,7 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   __nv_bfloat16 *x = nullptr;
   __nv_bfloat16 *w = nullptr;
   __nv_bfloat16 *custom_y = nullptr;
+  __nv_bfloat16 *swizzled_y = nullptr;
   __nv_bfloat16 *gemv_y = nullptr;
   __nv_bfloat16 *gemm_y = nullptr;
   __nv_bfloat16 *cudnn_y = nullptr;
@@ -247,6 +248,7 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   CUDA_CHECK(cudaMalloc(&x, x_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&w, w_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&custom_y, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&swizzled_y, y_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&gemv_y, y_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&gemm_y, y_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&cudnn_y, y_count * sizeof(__nv_bfloat16)));
@@ -260,6 +262,7 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   fill_random_bf16(x, x_count, x_seed, kInputScale, stream);
   fill_random_bf16(w, w_count, w_seed, kWeightScale, stream);
   CUDA_CHECK(cudaMemsetAsync(custom_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+  CUDA_CHECK(cudaMemsetAsync(swizzled_y, 0, y_count * sizeof(__nv_bfloat16), stream));
   CUDA_CHECK(cudaMemsetAsync(gemv_y, 0, y_count * sizeof(__nv_bfloat16), stream));
   CUDA_CHECK(cudaMemsetAsync(gemm_y, 0, y_count * sizeof(__nv_bfloat16), stream));
   CUDA_CHECK(cudaMemsetAsync(cudnn_y, 0, y_count * sizeof(__nv_bfloat16), stream));
@@ -268,18 +271,27 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   auto run_custom = [&]() {
     CUDA_CHECK(gemma4_projection_decode(op.projection, x, w, custom_y, stream));
   };
+  auto run_swizzled = [&]() {
+    CUDA_CHECK(gemma4_projection_decode_swizzled(
+        op.projection, GEMMA4_DECODE_SWIZZLE_INTERLEAVE_16, x, w, swizzled_y,
+        stream));
+  };
   auto run_gemv = [&]() { cublas.gemv(x, w, gemv_y, op.k, op.n); };
   auto run_gemm = [&]() { cublas.gemm_m1(x, w, gemm_y, op.k, op.n); };
 
   run_custom();
+  run_swizzled();
   run_gemv();
   run_gemm();
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
+  const DiffStats swizzled_diff = diff_stats_bf16(custom_y, swizzled_y, op.n);
   const DiffStats gemv_diff = diff_stats_bf16(custom_y, gemv_y, op.n);
   const DiffStats gemm_diff = diff_stats_bf16(custom_y, gemm_y, op.n);
 
   const TimingStats custom = time_ms(run_custom, stream, warmup, iters, trials);
+  const TimingStats swizzled =
+      time_ms(run_swizzled, stream, warmup, iters, trials);
   const TimingStats gemv = time_ms(run_gemv, stream, warmup, iters, trials);
   const TimingStats gemm = time_ms(run_gemm, stream, warmup, iters, trials);
   const double bytes = double(op.n) * double(op.k) * sizeof(__nv_bfloat16);
@@ -324,6 +336,13 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
               kWeightScale);
   std::printf("custom_best_ms=%.6f,custom_avg_ms=%.6f,custom_best_weight_gbps=%.3f\n",
               custom.best_ms, custom.avg_ms, bytes / (custom.best_ms * 1.0e6));
+  std::printf("custom_swizzle16_best_ms=%.6f,"
+              "custom_swizzle16_avg_ms=%.6f,"
+              "custom_swizzle16_best_weight_gbps=%.3f,"
+              "custom_swizzle16_vs_identity=%.6f\n",
+              swizzled.best_ms, swizzled.avg_ms,
+              bytes / (swizzled.best_ms * 1.0e6),
+              custom.best_ms / swizzled.best_ms);
   std::printf("cublas_bf16_gemv_best_ms=%.6f,"
               "cublas_bf16_gemv_avg_ms=%.6f,"
               "cublas_bf16_gemv_best_weight_gbps=%.3f\n",
@@ -345,6 +364,11 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
               "cublas_bf16_gemv_mean_abs_diff=%.6g,"
               "cublas_bf16_gemv_max_rel_diff=%.6g\n",
               gemv_diff.max_abs, gemv_diff.mean_abs, gemv_diff.max_rel);
+  std::printf("custom_swizzle16_max_abs_diff=%.6g,"
+              "custom_swizzle16_mean_abs_diff=%.6g,"
+              "custom_swizzle16_max_rel_diff=%.6g\n",
+              swizzled_diff.max_abs, swizzled_diff.mean_abs,
+              swizzled_diff.max_rel);
   std::printf("cublas_bf16_gemm_m1_max_abs_diff=%.6g,"
               "cublas_bf16_gemm_m1_mean_abs_diff=%.6g,"
               "cublas_bf16_gemm_m1_max_rel_diff=%.6g\n",
@@ -359,6 +383,7 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   CUDA_CHECK(cudaFree(x));
   CUDA_CHECK(cudaFree(w));
   CUDA_CHECK(cudaFree(custom_y));
+  CUDA_CHECK(cudaFree(swizzled_y));
   CUDA_CHECK(cudaFree(gemv_y));
   CUDA_CHECK(cudaFree(gemm_y));
   CUDA_CHECK(cudaFree(cudnn_y));
