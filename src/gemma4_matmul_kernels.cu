@@ -28,17 +28,17 @@ struct Gemma4ProjectionShape {
   int n;
 };
 
-__device__ __forceinline__ int pack_offset(int pack_idx) {
+__device__ inline int pack_offset(int pack_idx) {
   return pack_idx * kBf16Packed128Elements;
 }
 
 template <int K>
-__device__ __forceinline__ int weight_offset(int col, int element_idx) {
+__device__ inline int weight_offset(int col, int element_idx) {
   return col * K + element_idx;
 }
 
 template <int BlockCount, int SwizzleTileBlocks>
-__device__ __forceinline__ int swizzle_col_block(int block_idx) {
+__device__ inline int swizzle_col_block(int block_idx) {
   if constexpr (SwizzleTileBlocks <= 1) {
     return block_idx;
   } else {
@@ -50,20 +50,20 @@ __device__ __forceinline__ int swizzle_col_block(int block_idx) {
   }
 }
 
-__device__ __forceinline__ Bf16Packed128
+__device__ inline Bf16Packed128
 load_activation_pack(const __nv_bfloat16 *__restrict__ x, int element_idx) {
   return load128g(x + element_idx);
 }
 
 template <int K>
-__device__ __forceinline__ Bf16Packed128
+__device__ inline Bf16Packed128
 load_weight_pack(
     const __nv_bfloat16 *__restrict__ w_col_major, int col, int element_idx) {
   return load128cs(w_col_major + weight_offset<K>(col, element_idx));
 }
 
 template <int ColsPerBlock>
-__device__ __forceinline__ void store_cols(
+__device__ inline void store_cols(
     __nv_bfloat16 *__restrict__ dst, const float (&sums)[ColsPerBlock]) {
   if constexpr (ColsPerBlock == kBf16Packed128Elements) {
     Bf16Packed128 out;
@@ -81,7 +81,7 @@ __device__ __forceinline__ void store_cols(
 }
 
 template <int K, int ColsPerBlock, int Threads>
-__device__ __forceinline__ void dot_cols(
+__device__ inline void dot_cols(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major, int col0, int thread_idx,
     float (&sums)[ColsPerBlock]) {

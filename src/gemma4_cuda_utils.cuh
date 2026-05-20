@@ -49,36 +49,36 @@ struct alignas(16) Packed128 {
 };
 
 template <typename ElementType>
-__device__ __forceinline__ Packed128<ElementType>
+__device__ inline Packed128<ElementType>
 load128(const ElementType *address) {
   return Packed128<ElementType>{*reinterpret_cast<const int4 *>(address)};
 }
 
 template <typename ElementType>
-__device__ __forceinline__ Packed128<ElementType>
+__device__ inline Packed128<ElementType>
 load128g(const ElementType *address) {
   return Packed128<ElementType>{__ldg(reinterpret_cast<const int4 *>(address))};
 }
 
 template <typename ElementType>
-__device__ __forceinline__ Packed128<ElementType>
+__device__ inline Packed128<ElementType>
 load128cs(const ElementType *address) {
   return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4 *>(address))};
 }
 
 template <typename ElementType>
-__device__ __forceinline__ ElementType loadg(const ElementType *address) {
+__device__ inline ElementType loadg(const ElementType *address) {
   return __ldg(address);
 }
 
 template <typename ElementType>
-__device__ __forceinline__ void store128(
+__device__ inline void store128(
     ElementType *address, Packed128<ElementType> value) {
   *reinterpret_cast<int4 *>(address) = value.bits();
 }
 
 template <typename ElementType>
-__device__ __forceinline__ void store128cs(
+__device__ inline void store128cs(
     ElementType *address, Packed128<ElementType> value) {
   __stcs(reinterpret_cast<int4 *>(address), value.bits());
 }
@@ -94,17 +94,17 @@ static_assert((kBf16Packed128Elements % 2) == 0,
 static_assert(alignof(Bf16Packed128) >= alignof(__nv_bfloat162),
               "Packed128 bf16 payload must be aligned for bf16x2 access");
 
-__device__ __forceinline__ const __nv_bfloat162 *
+__device__ inline const __nv_bfloat162 *
 gemma4_bf16_pack_pairs(const Bf16Packed128 &pack) {
   return reinterpret_cast<const __nv_bfloat162 *>(pack.payload);
 }
 
-__device__ __forceinline__ __nv_bfloat162 *
+__device__ inline __nv_bfloat162 *
 gemma4_bf16_pack_pairs(Bf16Packed128 &pack) {
   return reinterpret_cast<__nv_bfloat162 *>(pack.payload);
 }
 
-__device__ __forceinline__ void gemma4_bf16_pack_accumulate_square(
+__device__ inline void gemma4_bf16_pack_accumulate_square(
     const Bf16Packed128 &values,
     float &sum_sq) {
   const __nv_bfloat162 *pairs = gemma4_bf16_pack_pairs(values);
@@ -116,7 +116,7 @@ __device__ __forceinline__ void gemma4_bf16_pack_accumulate_square(
   }
 }
 
-__device__ __forceinline__ void gemma4_bf16_pack_accumulate_dot(
+__device__ inline void gemma4_bf16_pack_accumulate_dot(
     const Bf16Packed128 &x_pack,
     const Bf16Packed128 &w_pack,
     float &sum) {
@@ -131,7 +131,7 @@ __device__ __forceinline__ void gemma4_bf16_pack_accumulate_dot(
   }
 }
 
-__device__ __forceinline__ Bf16Packed128 gemma4_bf16_pack_add(
+__device__ inline Bf16Packed128 gemma4_bf16_pack_add(
     const Bf16Packed128 &a,
     const Bf16Packed128 &b) {
   const __nv_bfloat162 *a_pairs = gemma4_bf16_pack_pairs(a);
@@ -147,7 +147,7 @@ __device__ __forceinline__ Bf16Packed128 gemma4_bf16_pack_add(
   return result;
 }
 
-__device__ __forceinline__ Bf16Packed128 gemma4_bf16_pack_apply_rmsnorm(
+__device__ inline Bf16Packed128 gemma4_bf16_pack_apply_rmsnorm(
     const Bf16Packed128 &values,
     const Bf16Packed128 &gamma,
     float scale) {
@@ -165,7 +165,7 @@ __device__ __forceinline__ Bf16Packed128 gemma4_bf16_pack_apply_rmsnorm(
   return result;
 }
 
-__device__ __forceinline__ float warp_reduce_sum(float value) {
+__device__ inline float warp_reduce_sum(float value) {
   for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
     value += __shfl_xor_sync(0xffffffffu, value, offset);
   }
@@ -173,7 +173,7 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
 }
 
 template <int Count>
-__device__ __forceinline__ void warp_reduce_sum_to_lane0(
+__device__ inline void warp_reduce_sum_to_lane0(
     float (&values)[Count]) {
   for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
 #pragma unroll

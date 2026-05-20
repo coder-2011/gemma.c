@@ -7,10 +7,10 @@ namespace {
 
 constexpr int kRopeThreads = 128;
 
-__device__ __forceinline__ void rotate_head_bf16(floatX *__restrict__ head,
-                                                 const float *__restrict__ cos_row,
-                                                 const float *__restrict__ sin_row,
-                                                 int rotary_half) {
+__device__ inline void rotate_head_bf16(floatX *__restrict__ head,
+                                        const float *__restrict__ cos_row,
+                                        const float *__restrict__ sin_row,
+                                        int rotary_half) {
   for (int i = threadIdx.x; i < rotary_half; i += blockDim.x) {
     float x1 = __bfloat162float(head[i]);
     float x2 = __bfloat162float(head[rotary_half + i]);
