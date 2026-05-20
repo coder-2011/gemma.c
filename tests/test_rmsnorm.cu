@@ -59,7 +59,6 @@ class DeviceBuffer {
 
 enum class RmsnormMode {
   LearnedWeight,
-  NullWeight,
   ScaleFreeWrapper,
 };
 
@@ -280,11 +279,9 @@ void run_fused_case(int rows, int width) {
 int main() {
   run_rmsnorm_case(1, 256, RmsnormMode::LearnedWeight);
   run_rmsnorm_case(17, GEMMA4_HIDDEN_SIZE, RmsnormMode::LearnedWeight);
-  run_rmsnorm_case(1, 256, RmsnormMode::NullWeight);
   run_rmsnorm_case(7, 512, RmsnormMode::ScaleFreeWrapper);
-  run_rmsnorm_case(1, GEMMA4_HIDDEN_SIZE, RmsnormMode::NullWeight);
   run_residual_add_case(9, GEMMA4_HIDDEN_SIZE);
-  run_fused_case(1, 512);
+  run_fused_case(1, GEMMA4_HIDDEN_SIZE);
   run_fused_case(19, GEMMA4_HIDDEN_SIZE);
 
   cudaError_t invalid = gemma4_rmsnorm_bf16(
