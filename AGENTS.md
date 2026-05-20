@@ -35,14 +35,80 @@ frequently when making design, implementation, optimization, or correctness deci
 This project will be profiling-heavy. Kernel changes should be measured directly, and
 inference-path changes should be compared against established runtimes where possible.
 
+Benchmark timing must separate one-time setup costs from steady-state kernel execution.
+Do not time the first invocation of cuDNN, cuBLAS/cuBLASLt, Triton, PyTorch compiled
+graphs, or other autotuned/JIT-backed paths as though it were a normal iteration. First
+calls can include algorithm search, plan construction, workspace allocation, compilation,
+cache population, and GPU clock ramp. Warm up every benchmarked path before timing it.
+
+Use CUDA events recorded on the same stream as the work for CUDA microbenchmarks. CPU
+timers usually measure host enqueue time, not GPU execution time. A correct timing window
+records a start event, launches the measured work on that stream, records a stop event,
+synchronizes the stop event, and then reads `cudaEventElapsedTime`. If a benchmark uses a
+non-default stream, all kernels, library calls, memory copies being timed, and timing
+events must use that same stream.
+
+Run enough warmup and timed iterations to make the result stable. As a starting point,
+use 5-25 warmup iterations and 100-1000 timed iterations for microbenchmarks, then report
+at least median, min, and max. Prefer the median over the mean when summarizing a noisy
+run because outliers from scheduling, boost behavior, or thermal throttling skew means.
+
+When comparing against cuDNN or PyTorch/cuDNN baselines, either:
+
+- bypass cuDNN entirely for the custom CUDA path;
+- run cuDNN warmups outside the timing window before measuring a library baseline; or
+- disable cuDNN in PyTorch when the desired comparison is against PyTorch's non-cuDNN
+  CUDA behavior.
+
+Cache state is part of the benchmark definition. Repeating a kernel on the same buffers
+can measure warm-L2 behavior rather than HBM traffic. For bandwidth-sensitive kernels,
+decide explicitly whether the benchmark is cold-cache or warm-cache. If measuring cold
+cache, flush L2 between timed iterations with a device buffer at least as large as the
+target GPU's L2 cache. If measuring warm cache, say so in the experiment notes.
+
+For small kernels, especially sub-5us kernels timed from Python, CUDA event timing can be
+distorted by host enqueue latency. Prefer a C++ harness or `ncu` for very short kernels.
+If Python must be used, use enough repeated work per timed region or another documented
+technique that keeps the GPU timeline measurement meaningful.
+
 Nsight Compute (`ncu`) is the main profiling tool for this project. It should be used
 constantly for per-kernel analysis, including memory throughput, compute utilization,
 warp stalls, and occupancy.
+
+Treat `ncu` as the ground-truth profiler for per-kernel timing and bottleneck analysis
+when it is available. Useful starting points:
+
+```bash
+ncu --metric gpu__time_duration.sum --target-processes all ./benchmark
+ncu --set full -o profile_output ./benchmark
+```
+
+`ncu` may replay kernels and flush caches depending on the selected sections and replay
+mode. Record the command line and relevant cache/replay behavior in experiment notes so
+numbers remain comparable.
 
 Nsight Systems (`nsys`) is used for system-level profiling (this machine doesn't have
 nsys). It is useful for timeline analysis, kernel launch overhead, CPU/GPU overlap, and
 idle gaps. The project's `benchmark_on_modal.py` script runs `nsys profile` explicitly
 on machines where it is installed.
+
+Lock GPU clocks for serious benchmark runs when possible, especially before comparing
+small deltas. GPU frequency changes with power, thermals, and boost state. On machines
+where permissions allow it, record the locked SM and memory clocks and reset them after
+the run. If clocks cannot be locked, state that in the experiment notes.
+
+Every benchmark result should include enough roofline context to interpret it. For GEMMs,
+report FLOPs, bytes moved, TFLOP/s, approximate bandwidth, and utilization relative to
+the target GPU's practical peak when possible. For memory-bound kernels, report effective
+GB/s and the expected bytes touched. Use these numbers to decide whether a kernel is
+compute-bound, bandwidth-bound, launch-bound, or dominated by library/setup overhead.
+
+Experiment logs under `src/experiments/EXPERIMENTS.md` should include the build command,
+timing command, GPU model, driver, CUDA/NVCC version, relevant library versions, warmup
+and repeat counts, cache policy, clock policy, correctness tolerance, and a short
+conclusion. If a benchmark compares custom CUDA against cuDNN/cuBLAS/cuBLASLt/PyTorch,
+state exactly how the library path was warmed up and whether autotuning/setup costs were
+excluded.
 
 Primary benchmark targets:
 
