@@ -3,6 +3,64 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-05-20 - Decode GEMV block swizzle experiment
+
+Runtime files:
+
+- `src/gemma4_matmul_kernels.cu`
+- `src/gemma4_matmul_kernels.cuh`
+- `src/experiments/gemma4_decode_bench.cu`
+
+Research notes:
+
+- NVIDIA's thread-group ID swizzling guidance targets 2D compute grids where adjacent
+  thread groups have overlapping memory footprints but row-major launch order sends
+  concurrently executing groups far apart.
+- CUTLASS/CUDA Tile-style GEMM swizzles are also 2D output-tile mappings intended to
+  improve reuse of shared A/B tiles through L2.
+- The current decode GEMV is a 1D output-column grid: one CTA computes 8 output columns
+  and the full K dot product for those columns. Adjacent CTAs do not reuse weight data;
+  they only share the small activation vector.
+
+Implementation:
+
+- Added `Gemma4DecodeSwizzle` with an identity policy and an experimental
+  `GEMMA4_DECODE_SWIZZLE_INTERLEAVE_16` policy.
+- The swizzled path remaps physical CTA IDs through a compile-time interleave over
+  groups of 16 column blocks.
+- `gemma4_projection_decode` keeps the identity mapping by default.
+- `gemma4_projection_decode_swizzled` exposes the native swizzled path for direct
+  benchmarking or future call sites.
+- The decode benchmark now runs identity and swizzled custom GEMV and checks exact
+  output equality.
+
+Commands:
+
+```bash
+make decode-bench
+GEMMA4_DECODE_BENCH_SEED=0x20260520 ./build/experiments/gemma4_decode_bench ffn_gate_up 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x20260520 ./build/experiments/gemma4_decode_bench global_k 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x20260520 ./build/experiments/gemma4_decode_bench final_logits 20 5 2
+```
+
+Results:
+
+| Op | Identity ms | Swizzle16 ms | Swizzle speedup | Max abs diff |
+| --- | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.650819 | 0.650897 | 0.9999x | 0 |
+| `global_k` | 0.034588 | 0.034268 | 1.0093x | 0 |
+| `final_logits` | 3.956267 | 3.953227 | 1.0008x | 0 |
+
+Conclusion:
+
+- Native block swizzling is implemented and measurable, but the interleave-16 mapping is
+  neutral on the tested decode GEMV shapes.
+- This matches the geometry expectation: the current GEMV is 1D and streams weights with
+  almost no cross-CTA weight reuse, so 2D thread-group tiling does not directly transfer.
+- Keep identity as the default. Revisit swizzling if the GEMV is changed to a 2D output
+  tile, split-K/persistent schedule, or a fused multi-vector/multi-token decode kernel
+  with real cross-CTA footprint overlap.
+
 ## 2026-05-20 - Scale-free V RMSNorm in existing RMSNorm kernels
 
 Runtime files:
@@ -2411,3 +2469,196 @@ Correctness:
 
 - cuDNN max abs diff stayed at `0.0078125` for Q/K except one global seq-1 K case at `0.00390625`, consistent with BF16 table precision.
 - `make test-rope` passed after the benchmark changes.
+
+## 2026-05-20 - RMSNorm scale-free V launch tuning
+
+Runtime files:
+
+- `src/gemma4_rmsnorm.cu`
+- `src/experiments/gemma4_rmsnorm_bench.cu`
+- `tests/test_rmsnorm.cu`
+
+Reason:
+
+- Add and tune a separate scale-free BF16 RMSNorm path for V normalization without making the learned-weight RMSNorm kernels carry `has_weight` template logic.
+- Compare realistic V head shapes against a cuDNN one-scale RMSNorm baseline.
+
+Reference checks:
+
+- NVIDIA CUDA Programming Guide query confirmed that `--use_fast_math`, `-ftz`, `-prec-div`, `-prec-sqrt`, and `-fmad` can change device math behavior and should be correctness-checked before use.
+- The same guide notes that register/occupancy tuning can help or hurt, especially when it causes spills.
+- Exa search found the official NVIDIA NVCC docs and CUDA Best Practices NVCC switch notes for the compiler-flag sweep.
+
+Commands:
+
+```bash
+make -B rmsnorm-bench
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 80 20 3 1024 5376
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 80 20 3 16384 256
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 80 20 3 4096 512
+make test-rmsnorm
+make cuda-kernels
+```
+
+Environment:
+
+- Device: NVIDIA RTX A6000
+- Seed: `0x20260520`
+- Main timings use CUDA graph replay columns.
+
+Candidates:
+
+| Candidate | Decision | Notes |
+| --- | --- | --- |
+| `--use_fast_math` | Rejected | Mixed timing and changes math semantics. |
+| Direct BF16 scale helper | Rejected | No stable win over the shared unit-gamma helper. |
+| `-ftz=true` | Rejected | Mixed timing and changes subnormal behavior. |
+| `kDecodeRmsnormThreads=512` | Rejected | Helped scale-free decode row 1, but later decode thread counts were better. |
+| `kDecodeRmsnormThreads=1024` | Rejected | Improved weighted row 1 to `0.001998 ms`, then was superseded by 704 threads. |
+| `kDecodeRmsnormThreads=704` | Kept | Best weighted row 1, `0.001952 ms`; scale-free tied the best measured value at `0.001760 ms`. |
+| `kDecodeFusedThreads=768` | Rejected | Improved fused row 1 to `0.002409 ms`, then was superseded by 672 threads. |
+| `kDecodeFusedThreads=512` | Rejected | Fused row 1 regressed to `0.002491 ms`. |
+| `kDecodeFusedThreads=672` | Kept | Best fused row 1, `0.002395 ms`. |
+| `kDecodeFusedThreads=736` | Rejected | Close to 672, but slower at `0.002401 ms`. |
+| `kRmsnormBlockSize=32` | Rejected | Helped some small rows but lost width-256 rows 64 and width-512 rows 4 versus 64. |
+| `kRmsnormBlockSize=96` | Rejected | Did not beat 64 on the balanced small-row set. |
+| `kRmsnormBlockSize=128` | Rejected | Good for larger prefill rows, but regressed global decode-like width-512 rows 4. |
+| `kRmsnormBlockSize=512` | Rejected | Regressed most width-256 and width-512 V rows. |
+| `kRmsnormBlockSize=64` | Kept | Best decode-like V points, with acceptable large-row tradeoffs. |
+
+Final scale-free V graph replay timings:
+
+| Width | Rows | Custom ms | cuDNN one-scale ms | Speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 256 | 16 | 0.001421 | 0.001892 | 1.33x |
+| 256 | 64 | 0.001414 | 0.002142 | 1.51x |
+| 256 | 1024 | 0.001860 | 0.002342 | 1.26x |
+| 256 | 16384 | 0.026069 | 0.027506 | 1.06x |
+| 512 | 4 | 0.001476 | 0.001918 | 1.30x |
+| 512 | 64 | 0.001519 | 0.002438 | 1.61x |
+| 512 | 1024 | 0.002185 | 0.003346 | 1.53x |
+| 512 | 4096 | 0.010502 | 0.011870 | 1.13x |
+
+Verification:
+
+```bash
+make test-rmsnorm
+make cuda-kernels
+git diff --check
+```
+
+Result:
+
+- `rmsnorm tests passed`
+- Final kept constants: `kDecodeRmsnormThreads=704`, `kDecodeFusedThreads=672`, `kRmsnormBlockSize=64`.
+
+## 2026-05-20 - RMSNorm real-shape benchmark rerun
+
+Runtime files:
+
+- `src/gemma4_rmsnorm.cu`
+- `src/experiments/gemma4_rmsnorm_bench.cu`
+- `src/experiments/gemma4_bench_utils.cuh`
+
+Reason:
+
+- Rerun the RMSNorm benchmark suite on realistic Gemma 4 shapes after the final launch-constant tuning.
+- Use only CUDA graph replay columns for cuDNN comparisons so cuDNN handle/frontend graph construction, plan build, workspace allocation, CUDA graph capture, and CUDA graph instantiation are outside the measured region.
+
+Benchmarking rule:
+
+- The benchmark still prints stream-loop columns, but the comparison below uses `*_graph_kernel_ms` columns only.
+- The cuDNN frontend graph is built once per `(rows, width)` before timing. CUDA graph capture and instantiation happen inside `time_ms_graph` before CUDA events are recorded.
+
+Commands:
+
+```bash
+make -B test-rmsnorm rmsnorm-bench
+mkdir -p /tmp/gemma4_rmsnorm_real_20260520
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 100 30 5 1024 5376 > /tmp/gemma4_rmsnorm_real_20260520/hidden_w5376.csv
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 100 30 5 16384 256 > /tmp/gemma4_rmsnorm_real_20260520/sliding_v_w256.csv
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 100 30 5 4096 512 > /tmp/gemma4_rmsnorm_real_20260520/global_v_w512.csv
+```
+
+Environment:
+
+- Device: NVIDIA RTX A6000
+- Seed: `0x20260520`
+- Iterations: `100`, warmup: `30`, trials: `5`
+- cuDNN frontend: compiled
+
+Real-shape mapping:
+
+- Hidden RMSNorm: width `5376`, rows up to `1024`.
+- Sliding V/head RMSNorm: width `256`, rows up to `16384` (`1024 * 16` KV heads).
+- Global V/head RMSNorm: width `512`, rows up to `4096` (`1024 * 4` KV heads).
+
+Scale-free RMSNorm graph replay:
+
+| Shape | Rows | Custom ms | cuDNN one-scale ms | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| hidden w5376 | 1 | 0.001924 | 0.002529 | 1.31x |
+| hidden w5376 | 4 | 0.004052 | 0.002548 | 0.63x |
+| hidden w5376 | 16 | 0.004088 | 0.002608 | 0.64x |
+| hidden w5376 | 64 | 0.004221 | 0.003134 | 0.74x |
+| hidden w5376 | 256 | 0.007315 | 0.004972 | 0.68x |
+| hidden w5376 | 1024 | 0.034361 | 0.034851 | 1.01x |
+| sliding w256 | 1 | 0.001384 | 0.001965 | 1.42x |
+| sliding w256 | 4 | 0.001389 | 0.001843 | 1.33x |
+| sliding w256 | 16 | 0.001383 | 0.001869 | 1.35x |
+| sliding w256 | 64 | 0.001403 | 0.002114 | 1.51x |
+| sliding w256 | 256 | 0.001427 | 0.002149 | 1.51x |
+| sliding w256 | 1024 | 0.001690 | 0.002354 | 1.39x |
+| sliding w256 | 4096 | 0.002899 | 0.003645 | 1.26x |
+| sliding w256 | 8192 | 0.010870 | 0.011645 | 1.07x |
+| sliding w256 | 16384 | 0.026101 | 0.027444 | 1.05x |
+| global w512 | 1 | 0.001490 | 0.001882 | 1.26x |
+| global w512 | 4 | 0.001476 | 0.001879 | 1.27x |
+| global w512 | 16 | 0.001483 | 0.001991 | 1.34x |
+| global w512 | 64 | 0.001553 | 0.002437 | 1.57x |
+| global w512 | 256 | 0.001551 | 0.002528 | 1.63x |
+| global w512 | 1024 | 0.002083 | 0.003436 | 1.65x |
+| global w512 | 4096 | 0.010461 | 0.012035 | 1.15x |
+
+Weighted RMSNorm graph replay:
+
+| Shape | Rows | Custom ms | cuDNN ms | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| hidden w5376 | 1 | 0.002172 | 0.002523 | 1.16x |
+| hidden w5376 | 4 | 0.006324 | 0.002559 | 0.40x |
+| hidden w5376 | 16 | 0.006284 | 0.002688 | 0.43x |
+| hidden w5376 | 64 | 0.006550 | 0.003594 | 0.55x |
+| hidden w5376 | 256 | 0.009953 | 0.005540 | 0.56x |
+| hidden w5376 | 1024 | 0.040808 | 0.035017 | 0.86x |
+| sliding w256 | 16 | 0.001680 | 0.001878 | 1.12x |
+| sliding w256 | 1024 | 0.002185 | 0.002346 | 1.07x |
+| sliding w256 | 16384 | 0.026403 | 0.027580 | 1.04x |
+| global w512 | 4 | 0.001753 | 0.001910 | 1.09x |
+| global w512 | 1024 | 0.002826 | 0.003336 | 1.18x |
+| global w512 | 4096 | 0.011070 | 0.011980 | 1.08x |
+
+Fused residual add plus weighted RMSNorm graph replay:
+
+| Shape | Rows | Fused ms | Split CUDA ms | Split speedup | Custom residual + cuDNN RMSNorm ms | cuDNN split speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| hidden w5376 | 1 | 0.002435 | 0.003458 | 1.42x | 0.004036 | 1.66x |
+| hidden w5376 | 1024 | 0.075144 | 0.083685 | 1.11x | 0.085250 | 1.13x |
+| sliding w256 | 16 | 0.001693 | 0.002876 | 1.70x | 0.003399 | 2.01x |
+| sliding w256 | 4096 | 0.010832 | 0.012856 | 1.19x | 0.014506 | 1.34x |
+| sliding w256 | 16384 | 0.050849 | 0.058269 | 1.15x | 0.066084 | 1.30x |
+| global w512 | 4 | 0.001973 | 0.002967 | 1.50x | 0.003447 | 1.75x |
+| global w512 | 1024 | 0.005133 | 0.004814 | 0.94x | 0.005964 | 1.16x |
+| global w512 | 4096 | 0.026419 | 0.026671 | 1.01x | 0.029587 | 1.12x |
+
+Correctness:
+
+- `make test-rmsnorm` passed.
+- Max output diffs versus cuDNN were BF16-sized or zero:
+  - hidden w5376: up to `0.00390625`
+  - sliding w256: up to `0.00390625`
+  - global w512: up to `0.00195312`
+- Max `rstd` diffs were at most `2.38419e-07`.
+
+Notes:
+
+- Nsight Compute was not rerun for this benchmark entry. Earlier in this environment it aborted under Thunder's unsupported CUPTI path, so these results are benchmark timings, not NCU counter profiles.

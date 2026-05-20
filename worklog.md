@@ -24,3 +24,5 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 - exapted a boilerplate RoPE kernel. Considering how I an optimize it.
 
 - Benchmarked RoPE vs cuDNN pointwise decomposition. Custom kernel wins by a lot, roughly 2.4-3x at seq 4096 even after graph capture. Not worth using cuDNN here; next move is fuse Q/K norm + RoPE + KV write.
+
+- Rebenchmarked RMSNorm on real shapes, making sure cuDNN setup/plan/build overhead is not in the measured numbers. The comparison uses CUDA graph replay columns only. For the actual new target, scale-free V RMSNorm, custom is better: width 256 is about 1.05-1.51x faster than cuDNN one-scale, and width 512 is about 1.15-1.65x faster. So yes, keep the custom V RMSNorm path. For hidden width 5376, custom only wins decode row=1; cuDNN is better for prefill rows 4-1024. Fused residual+RMSNorm mostly wins too, but there are a couple of row-counts where split CUDA is basically tied/slightly better, so don't overclaim that one.
