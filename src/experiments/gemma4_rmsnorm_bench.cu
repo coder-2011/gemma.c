@@ -118,6 +118,29 @@ double gib_per_second(double bytes, float ms) {
   return gib / (static_cast<double>(ms) / 1000.0);
 }
 
+template <typename T>
+class DeviceBuffer {
+ public:
+  explicit DeviceBuffer(size_t count) {
+    CUDA_CHECK(cudaMalloc(&ptr_, count * sizeof(T)));
+  }
+
+  ~DeviceBuffer() {
+    if (ptr_ != nullptr) {
+      cudaFree(ptr_);
+    }
+  }
+
+  DeviceBuffer(const DeviceBuffer &) = delete;
+  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+
+  operator T *() { return ptr_; }
+  operator const T *() const { return ptr_; }
+
+ private:
+  T *ptr_ = nullptr;
+};
+
 #if GEMMA4_HAS_CUDNN_FRONTEND
 
 namespace fe = cudnn_frontend;
@@ -235,44 +258,27 @@ int main(int argc, char **argv) {
   const size_t max_elems = static_cast<size_t>(max_rows) * width;
   const uint64_t seed = make_seed();
 
-  __nv_bfloat16 *d_inp1 = nullptr;
-  __nv_bfloat16 *d_inp2 = nullptr;
-  __nv_bfloat16 *d_weight = nullptr;
-  __nv_bfloat16 *d_ones_weight = nullptr;
-  __nv_bfloat16 *d_rms_out = nullptr;
-  __nv_bfloat16 *d_rms_cudnn_out = nullptr;
-  __nv_bfloat16 *d_scale_free_out = nullptr;
-  __nv_bfloat16 *d_scale_free_cudnn_out = nullptr;
-  __nv_bfloat16 *d_residual = nullptr;
-  __nv_bfloat16 *d_split_residual = nullptr;
-  __nv_bfloat16 *d_fused_normed = nullptr;
-  __nv_bfloat16 *d_split_normed = nullptr;
-  float *d_rstd = nullptr;
-  float *d_cudnn_rstd = nullptr;
-  float *d_scale_free_rstd = nullptr;
-  float *d_scale_free_cudnn_rstd = nullptr;
-  float *d_fused_rstd = nullptr;
-  float *d_split_rstd = nullptr;
+  const size_t width_elems = static_cast<size_t>(width);
+  const size_t max_row_elems = static_cast<size_t>(max_rows);
 
-  CUDA_CHECK(cudaMalloc(&d_inp1, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_inp2, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_weight, static_cast<size_t>(width) * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_ones_weight, static_cast<size_t>(width) * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_rms_out, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_rms_cudnn_out, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_scale_free_out, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_scale_free_cudnn_out, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_residual, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_split_residual, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_fused_normed, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_split_normed, max_elems * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&d_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_cudnn_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_scale_free_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_scale_free_cudnn_rstd,
-                        static_cast<size_t>(max_rows) * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_fused_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_split_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
+  DeviceBuffer<__nv_bfloat16> d_inp1(max_elems);
+  DeviceBuffer<__nv_bfloat16> d_inp2(max_elems);
+  DeviceBuffer<__nv_bfloat16> d_weight(width_elems);
+  DeviceBuffer<__nv_bfloat16> d_ones_weight(width_elems);
+  DeviceBuffer<__nv_bfloat16> d_rms_out(max_elems);
+  DeviceBuffer<__nv_bfloat16> d_rms_cudnn_out(max_elems);
+  DeviceBuffer<__nv_bfloat16> d_scale_free_out(max_elems);
+  DeviceBuffer<__nv_bfloat16> d_scale_free_cudnn_out(max_elems);
+  DeviceBuffer<__nv_bfloat16> d_residual(max_elems);
+  DeviceBuffer<__nv_bfloat16> d_split_residual(max_elems);
+  DeviceBuffer<__nv_bfloat16> d_fused_normed(max_elems);
+  DeviceBuffer<__nv_bfloat16> d_split_normed(max_elems);
+  DeviceBuffer<float> d_rstd(max_row_elems);
+  DeviceBuffer<float> d_cudnn_rstd(max_row_elems);
+  DeviceBuffer<float> d_scale_free_rstd(max_row_elems);
+  DeviceBuffer<float> d_scale_free_cudnn_rstd(max_row_elems);
+  DeviceBuffer<float> d_fused_rstd(max_row_elems);
+  DeviceBuffer<float> d_split_rstd(max_row_elems);
 
   fill_random_bf16(d_inp1, max_elems, seed ^ 0x1001u, 1.0f, stream);
   fill_random_bf16(d_inp2, max_elems, seed ^ 0x2002u, 1.0f, stream);
@@ -593,24 +599,6 @@ int main(int argc, char **argv) {
                 cudnn_split_max_abs, cudnn_split_rstd_max_abs);
   }
 
-  CUDA_CHECK(cudaFree(d_inp1));
-  CUDA_CHECK(cudaFree(d_inp2));
-  CUDA_CHECK(cudaFree(d_weight));
-  CUDA_CHECK(cudaFree(d_ones_weight));
-  CUDA_CHECK(cudaFree(d_rms_out));
-  CUDA_CHECK(cudaFree(d_rms_cudnn_out));
-  CUDA_CHECK(cudaFree(d_scale_free_out));
-  CUDA_CHECK(cudaFree(d_scale_free_cudnn_out));
-  CUDA_CHECK(cudaFree(d_residual));
-  CUDA_CHECK(cudaFree(d_split_residual));
-  CUDA_CHECK(cudaFree(d_fused_normed));
-  CUDA_CHECK(cudaFree(d_split_normed));
-  CUDA_CHECK(cudaFree(d_rstd));
-  CUDA_CHECK(cudaFree(d_cudnn_rstd));
-  CUDA_CHECK(cudaFree(d_scale_free_rstd));
-  CUDA_CHECK(cudaFree(d_scale_free_cudnn_rstd));
-  CUDA_CHECK(cudaFree(d_fused_rstd));
-  CUDA_CHECK(cudaFree(d_split_rstd));
   CUDA_CHECK(cudaStreamDestroy(stream));
   return 0;
 }
