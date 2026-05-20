@@ -146,7 +146,7 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   }
 }
 
-cudaError_t gemma4_check_decode_gemv_args(
+static cudaError_t gemma4_check_decode_gemv_args(
     const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
     const __nv_bfloat16 *y) {
   if (!x || !w_col_major || !y || !is_aligned_16(x) ||
@@ -191,7 +191,7 @@ cudaError_t gemma4_decode_gemv_fixed_cols(const __nv_bfloat16 *x,
   return cudaGetLastError();
 }
 
-cublasStatus_t gemma4_bf16_prefill_gemm(
+static cublasStatus_t gemma4_bf16_prefill_gemm(
     cublasHandle_t handle, const __nv_bfloat16 *x,
     const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m, int k, int n,
     cudaStream_t stream) {
@@ -214,8 +214,8 @@ cublasStatus_t gemma4_bf16_prefill_gemm(
                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-bool gemma4_projection_shape(Gemma4Projection projection,
-                             Gemma4ProjectionShape &shape) {
+static bool gemma4_projection_shape(Gemma4Projection projection,
+                                    Gemma4ProjectionShape &shape) {
   switch (projection) {
   case GEMMA4_PROJECTION_FFN_GATE_UP:
     shape = {GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE};
