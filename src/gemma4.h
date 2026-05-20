@@ -45,55 +45,55 @@
 #define GEMMA4_GLOBAL_ATTENTION_OUT_SIZE GEMMA4_GLOBAL_Q_PROJ_SIZE
 
 typedef struct {
-    int32_t vocab_size;
-    int32_t hidden_size;
-    int32_t intermediate_size;
-    int32_t num_layers;
-    int32_t max_position_embeddings;
+  int32_t vocab_size;
+  int32_t hidden_size;
+  int32_t intermediate_size;
+  int32_t num_layers;
+  int32_t max_position_embeddings;
 
-    int32_t num_query_heads;
-    int32_t sliding_kv_heads;
-    int32_t global_kv_heads;
-    int32_t sliding_head_dim;
-    int32_t global_head_dim;
-    int32_t sliding_window;
+  int32_t num_query_heads;
+  int32_t sliding_kv_heads;
+  int32_t global_kv_heads;
+  int32_t sliding_head_dim;
+  int32_t global_head_dim;
+  int32_t sliding_window;
 
-    float rope_theta_sliding;
-    float rope_theta_global;
-    float partial_rotary_factor_global;
-    float rms_norm_eps;
-    float final_logit_softcapping;
+  float rope_theta_sliding;
+  float rope_theta_global;
+  float partial_rotary_factor_global;
+  float rms_norm_eps;
+  float final_logit_softcapping;
 } Gemma4DenseConfig;
 
 typedef struct {
-    bool global;
-    int32_t q_heads;
-    int32_t kv_heads;
-    int32_t head_dim;
-    int32_t window;
-    int32_t rotary_dims;
-    float rope_theta;
+  bool global;
+  int32_t q_heads;
+  int32_t kv_heads;
+  int32_t head_dim;
+  int32_t window;
+  int32_t rotary_dims;
+  float rope_theta;
 } Gemma4AttentionSpec;
 
 inline constexpr Gemma4DenseConfig gemma4_config = {
-    GEMMA4_VOCAB_SIZE,
-    GEMMA4_HIDDEN_SIZE,
-    GEMMA4_INTERMEDIATE_SIZE,
-    GEMMA4_NUM_LAYERS,
-    GEMMA4_MAX_POSITION_EMBEDDINGS,
+  GEMMA4_VOCAB_SIZE,
+  GEMMA4_HIDDEN_SIZE,
+  GEMMA4_INTERMEDIATE_SIZE,
+  GEMMA4_NUM_LAYERS,
+  GEMMA4_MAX_POSITION_EMBEDDINGS,
 
-    GEMMA4_NUM_QUERY_HEADS,
-    GEMMA4_SLIDING_KV_HEADS,
-    GEMMA4_GLOBAL_KV_HEADS,
-    GEMMA4_SLIDING_HEAD_DIM,
-    GEMMA4_GLOBAL_HEAD_DIM,
-    GEMMA4_SLIDING_WINDOW,
+  GEMMA4_NUM_QUERY_HEADS,
+  GEMMA4_SLIDING_KV_HEADS,
+  GEMMA4_GLOBAL_KV_HEADS,
+  GEMMA4_SLIDING_HEAD_DIM,
+  GEMMA4_GLOBAL_HEAD_DIM,
+  GEMMA4_SLIDING_WINDOW,
 
-    GEMMA4_ROPE_THETA_SLIDING,
-    GEMMA4_ROPE_THETA_GLOBAL,
-    GEMMA4_PARTIAL_ROTARY_FACTOR_GLOBAL,
-    GEMMA4_RMS_NORM_EPS,
-    GEMMA4_FINAL_LOGIT_SOFTCAPPING,
+  GEMMA4_ROPE_THETA_SLIDING,
+  GEMMA4_ROPE_THETA_GLOBAL,
+  GEMMA4_PARTIAL_ROTARY_FACTOR_GLOBAL,
+  GEMMA4_RMS_NORM_EPS,
+  GEMMA4_FINAL_LOGIT_SOFTCAPPING,
 };
 
 bool gemma4_is_global_layer(int32_t layer_index);

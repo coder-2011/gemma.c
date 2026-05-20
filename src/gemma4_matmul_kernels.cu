@@ -79,14 +79,12 @@ __device__ __forceinline__ void dot_cols(
   constexpr int packs_per_col = K / kBf16Packed128Elements;
 
 #pragma unroll
-  for (int pack_idx = thread_idx; pack_idx < packs_per_col;
-       pack_idx += Threads) {
+  for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
     const int element_idx = pack_offset(pack_idx);
     const Bf16Packed128 x_pack = load_activation_pack(x, element_idx);
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      const Bf16Packed128 w_pack =
-          load_weight_pack<K>(w_col_major, col0 + col, element_idx);
+      const Bf16Packed128 w_pack = load_weight_pack<K>(w_col_major, col0 + col, element_idx);
       gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
     }
   }
@@ -110,8 +108,7 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   const int warp = threadIdx.x / WARP_SIZE;
 
   float sums[ColsPerBlock] = {};
-  dot_cols<K, ColsPerBlock, Threads>(
-      x, w_col_major, col0, threadIdx.x, sums);
+  dot_cols<K, ColsPerBlock, Threads>(x, w_col_major, col0, threadIdx.x, sums);
 
   warp_reduce_sum_to_lane0(sums);
 
@@ -140,8 +137,7 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
 static cudaError_t check_decode_args(
     const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
     const __nv_bfloat16 *y) {
-  if (!x || !w_col_major || !y || !is_aligned_16(x) ||
-      !is_aligned_16(w_col_major) || !is_aligned_16(y)) {
+  if (!x || !w_col_major || !y || !is_aligned_16(x) || !is_aligned_16(w_col_major) || !is_aligned_16(y)) {
     return cudaErrorInvalidValue;
   }
   return cudaSuccess;
@@ -158,8 +154,7 @@ cudaError_t launch_decode_gemv(const __nv_bfloat16 *x,
   }
 
   constexpr int blocks = N / ColsPerBlock;
-  gemma4_decode_gemv_cols_kernel<K, N, ColsPerBlock, Threads, MinBlocksPerSM>
-      <<<blocks, Threads, 0, stream>>>(x, w_col_major, y);
+  gemma4_decode_gemv_cols_kernel<K, N, ColsPerBlock, Threads, MinBlocksPerSM><<<blocks, Threads, 0, stream>>>(x, w_col_major, y);
   return cudaGetLastError();
 }
 

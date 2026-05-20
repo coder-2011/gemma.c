@@ -42,18 +42,18 @@ __global__ void gemma4_rope_bf16_kernel(floatX *q,
   int batch = row / seq_len;
   int seq = row - batch * seq_len;
   int table_row = cos_batch_size == 1 ? seq : batch * seq_len + seq;
-  int64_t table_offset = (int64_t)table_row;
+  int64_t table_offset = table_row;
 
   const float *cos_row = cos + table_offset * cos_row_stride;
   const float *sin_row = sin + table_offset * sin_row_stride;
 
   if (head < q_heads) {
-    int64_t q_offset = (int64_t)row * q_row_stride + (int64_t)head * head_dim;
+    int64_t q_offset = static_cast<int64_t>(row) * q_row_stride + head * head_dim;
     floatX *q_head = q + q_offset;
     rotate_head_bf16(q_head, cos_row, sin_row, rotary_half);
   }
   if (head < kv_heads) {
-    int64_t k_offset = (int64_t)row * k_row_stride + (int64_t)head * head_dim;
+    int64_t k_offset = static_cast<int64_t>(row) * k_row_stride + head * head_dim;
     floatX *k_head = k + k_offset;
     rotate_head_bf16(k_head, cos_row, sin_row, rotary_half);
   }
@@ -76,18 +76,20 @@ __global__ void gemma4_rope_forward_bf16_kernel(floatX *q,
   int batch = row / seq_len;
   int seq = row - batch * seq_len;
   int table_row = cos_batch_size == 1 ? seq : batch * seq_len + seq;
-  int64_t table_offset = (int64_t)table_row;
+  int64_t table_offset = table_row;
 
   const float *cos_row = cos + table_offset * cos_row_stride;
   const float *sin_row = sin + table_offset * sin_row_stride;
 
   if (head < q_heads) {
-    int64_t q_offset = ((int64_t)batch * q_heads + head) * seq_len * head_dim + (int64_t)seq * head_dim;
+    int64_t batch_head = static_cast<int64_t>(batch) * q_heads + head;
+    int64_t q_offset = (batch_head * seq_len + seq) * head_dim;
     floatX *q_head = q + q_offset;
     rotate_head_bf16(q_head, cos_row, sin_row, rotary_half);
   }
   if (head < kv_heads) {
-    int64_t k_offset = ((int64_t)batch * kv_heads + head) * seq_len * head_dim + (int64_t)seq * head_dim;
+    int64_t batch_head = static_cast<int64_t>(batch) * kv_heads + head;
+    int64_t k_offset = (batch_head * seq_len + seq) * head_dim;
     floatX *k_head = k + k_offset;
     rotate_head_bf16(k_head, cos_row, sin_row, rotary_half);
   }
@@ -101,10 +103,6 @@ bool rope_dims_valid(int seq_len,
                      int head_dim,
                      int rotary_dim) {
   return seq_len >= 0 && batch_size >= 0 && q_heads >= 0 && kv_heads >= 0 && head_dim > 0 && rotary_dim > 0 && rotary_dim <= head_dim && (rotary_dim % 2) == 0 && (cos_batch_size == 1 || cos_batch_size == batch_size);
-}
-
-bool rope_no_work(int seq_len, int batch_size) {
-  return seq_len == 0 || batch_size == 0;
 }
 
 bool rope_buffers_valid(const floatX *q,
@@ -123,7 +121,9 @@ bool rope_strides_valid(int64_t q_row_stride,
                         int head_dim,
                         int rotary_dim) {
   int rotary_half = rotary_dim / 2;
-  return q_row_stride >= (int64_t)q_heads * head_dim && k_row_stride >= (int64_t)kv_heads * head_dim && cos_row_stride >= rotary_half && sin_row_stride >= rotary_half;
+  int64_t min_q_row_stride = static_cast<int64_t>(q_heads) * head_dim;
+  int64_t min_k_row_stride = static_cast<int64_t>(kv_heads) * head_dim;
+  return q_row_stride >= min_q_row_stride && k_row_stride >= min_k_row_stride && cos_row_stride >= rotary_half && sin_row_stride >= rotary_half;
 }
 
 }  // namespace
@@ -147,7 +147,7 @@ cudaError_t gemma4_rope_bf16(floatX *q,
   if (!rope_dims_valid(seq_len, batch_size, cos_batch_size, q_heads, kv_heads, head_dim, rotary_dim)) {
     return cudaErrorInvalidValue;
   }
-  if (rope_no_work(seq_len, batch_size)) {
+  if (seq_len == 0 || batch_size == 0) {
     return cudaSuccess;
   }
   if (!rope_buffers_valid(q, k, cos, sin) || !rope_strides_valid(q_row_stride, k_row_stride, cos_row_stride, sin_row_stride, q_heads, kv_heads, head_dim, rotary_dim)) {
@@ -180,7 +180,7 @@ cudaError_t gemma4_rope_forward_bf16(floatX *q,
   if (!rope_dims_valid(seq_len, batch_size, cos_batch_size, q_heads, kv_heads, head_dim, rotary_dim)) {
     return cudaErrorInvalidValue;
   }
-  if (rope_no_work(seq_len, batch_size)) {
+  if (seq_len == 0 || batch_size == 0) {
     return cudaSuccess;
   }
   if (!rope_buffers_valid(q, k, cos, sin)) {

@@ -71,8 +71,7 @@ gemma4_rmsnorm_bf16_decode_kernel(floatX *out,
 
   float sum_sq = 0.0f;
   for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
-    RmsnormPack values =
-        load128cs(inp + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack values = load128cs(inp + pack * kFloatXPerPack);
     s_in[pack] = values;
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
@@ -88,10 +87,9 @@ gemma4_rmsnorm_bf16_decode_kernel(floatX *out,
   float scale = s_scale;
   for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
     RmsnormPack values = s_in[pack];
-    RmsnormPack gamma =
-        load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack gamma = load128(weight + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128(out + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128(out + pack * kFloatXPerPack, result);
   }
 }
 
@@ -111,14 +109,12 @@ gemma4_residual_add_rmsnorm_bf16_decode_kernel(floatX *residual,
 
   float sum_sq = 0.0f;
   for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
-    RmsnormPack a =
-        load128cs(inp1 + static_cast<int64_t>(pack) * kFloatXPerPack);
-    RmsnormPack b =
-        load128cs(inp2 + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
+    RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_add(a, b);
     gemma4_bf16_pack_accumulate_square(result, sum_sq);
     s_res[pack] = result;
-    store128(residual + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128(residual + pack * kFloatXPerPack, result);
   }
 
   float block_sum = gemma4_block_reduce_sum<Threads>(sum_sq);
@@ -132,10 +128,9 @@ gemma4_residual_add_rmsnorm_bf16_decode_kernel(floatX *residual,
   float scale = s_scale;
   for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
     RmsnormPack values = s_res[pack];
-    RmsnormPack gamma =
-        load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack gamma = load128(weight + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128(normed + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128(normed + pack * kFloatXPerPack, result);
   }
 }
 
@@ -155,14 +150,13 @@ __global__ void gemma4_rmsnorm_bf16_warp_kernel(
     return;
   }
 
-  inp += static_cast<int64_t>(row) * width;
-  out += static_cast<int64_t>(row) * width;
+  inp += row * width;
+  out += row * width;
 
   const int packs_per_row = width / kFloatXPerPack;
   float sum_sq = 0.0f;
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values =
-        load128(inp + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack values = load128(inp + pack * kFloatXPerPack);
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
   sum_sq = warp_reduce_sum(sum_sq);
@@ -172,12 +166,10 @@ __global__ void gemma4_rmsnorm_bf16_warp_kernel(
   }
 
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values =
-        load128cs(inp + static_cast<int64_t>(pack) * kFloatXPerPack);
-    RmsnormPack gamma =
-        load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack values = load128cs(inp + pack * kFloatXPerPack);
+    RmsnormPack gamma = load128(weight + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(out + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128cs(out + pack * kFloatXPerPack, result);
   }
 }
 
@@ -193,14 +185,12 @@ __global__ void gemma4_rmsnorm_bf16_shared_kernel(
   extern __shared__ unsigned char shared_bytes[];
   auto *shared = reinterpret_cast<RmsnormPack *>(shared_bytes);
   RmsnormPack *s_weight = shared;
-  RmsnormPack *s_in = s_weight + packs_per_row +
-                      static_cast<int64_t>(threadIdx.y) * packs_per_row;
+  RmsnormPack *s_in = s_weight + packs_per_row + threadIdx.y * packs_per_row;
 
   const int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
   const int packed_stride = WARP_SIZE * blockDim.y;
   for (int pack = packed_thread; pack < packs_per_row; pack += packed_stride) {
-    s_weight[pack] =
-        load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
+    s_weight[pack] = load128(weight + pack * kFloatXPerPack);
   }
   __syncthreads();
 
@@ -209,14 +199,12 @@ __global__ void gemma4_rmsnorm_bf16_shared_kernel(
     return;
   }
 
-  inp += static_cast<int64_t>(row) * width;
-  out += static_cast<int64_t>(row) * width;
+  inp += row * width;
+  out += row * width;
 
   float sum_sq = 0.0f;
-  for (int pack = threadIdx.x; pack < packs_per_row;
-       pack += WARP_SIZE) {
-    RmsnormPack values =
-        load128cs(inp + static_cast<int64_t>(pack) * kFloatXPerPack);
+  for (int pack = threadIdx.x; pack < packs_per_row; pack += WARP_SIZE) {
+    RmsnormPack values = load128cs(inp + pack * kFloatXPerPack);
     s_in[pack] = values;
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
@@ -227,12 +215,11 @@ __global__ void gemma4_rmsnorm_bf16_shared_kernel(
     gemma4_store_rstd(rstd, row, scale);
   }
 
-  for (int pack = threadIdx.x; pack < packs_per_row;
-       pack += WARP_SIZE) {
+  for (int pack = threadIdx.x; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack values = s_in[pack];
     RmsnormPack gamma = s_weight[pack];
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(out + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128cs(out + pack * kFloatXPerPack, result);
   }
 }
 
@@ -246,12 +233,10 @@ __global__ void gemma4_residual_add_bf16_kernel(
     return;
   }
 
-  RmsnormPack a =
-      load128cs(inp1 + static_cast<int64_t>(pack) * kFloatXPerPack);
-  RmsnormPack b =
-      load128cs(inp2 + static_cast<int64_t>(pack) * kFloatXPerPack);
+  RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
+  RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
   RmsnormPack result = gemma4_bf16_pack_add(a, b);
-  store128(out + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+  store128(out + pack * kFloatXPerPack, result);
 }
 
 __global__ void gemma4_residual_add_rmsnorm_bf16_warp_kernel(
@@ -272,21 +257,19 @@ __global__ void gemma4_residual_add_rmsnorm_bf16_warp_kernel(
     return;
   }
 
-  inp1 += static_cast<int64_t>(row) * width;
-  inp2 += static_cast<int64_t>(row) * width;
-  residual += static_cast<int64_t>(row) * width;
-  normed += static_cast<int64_t>(row) * width;
+  inp1 += row * width;
+  inp2 += row * width;
+  residual += row * width;
+  normed += row * width;
 
   const int packs_per_row = width / kFloatXPerPack;
   float sum_sq = 0.0f;
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack a =
-        load128cs(inp1 + static_cast<int64_t>(pack) * kFloatXPerPack);
-    RmsnormPack b =
-        load128cs(inp2 + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
+    RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_add(a, b);
     gemma4_bf16_pack_accumulate_square(result, sum_sq);
-    store128(residual + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128(residual + pack * kFloatXPerPack, result);
   }
   sum_sq = warp_reduce_sum(sum_sq);
   float scale = gemma4_rmsnorm_scale(sum_sq, width, eps);
@@ -295,12 +278,10 @@ __global__ void gemma4_residual_add_rmsnorm_bf16_warp_kernel(
   }
 
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values =
-        load128(residual + static_cast<int64_t>(pack) * kFloatXPerPack);
-    RmsnormPack gamma =
-        load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
+    RmsnormPack values = load128(residual + pack * kFloatXPerPack);
+    RmsnormPack gamma = load128(weight + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(normed + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128cs(normed + pack * kFloatXPerPack, result);
   }
 }
 
@@ -318,14 +299,12 @@ __global__ void gemma4_residual_add_rmsnorm_bf16_shared_kernel(
   extern __shared__ unsigned char shared_bytes[];
   auto *shared = reinterpret_cast<RmsnormPack *>(shared_bytes);
   RmsnormPack *s_weight = shared;
-  RmsnormPack *s_res = s_weight + packs_per_row +
-                       static_cast<int64_t>(threadIdx.y) * packs_per_row;
+  RmsnormPack *s_res = s_weight + packs_per_row + threadIdx.y * packs_per_row;
 
   const int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
   const int packed_stride = WARP_SIZE * blockDim.y;
   for (int pack = packed_thread; pack < packs_per_row; pack += packed_stride) {
-    s_weight[pack] =
-        load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
+    s_weight[pack] = load128(weight + pack * kFloatXPerPack);
   }
   __syncthreads();
 
@@ -334,22 +313,19 @@ __global__ void gemma4_residual_add_rmsnorm_bf16_shared_kernel(
     return;
   }
 
-  inp1 += static_cast<int64_t>(row) * width;
-  inp2 += static_cast<int64_t>(row) * width;
-  residual += static_cast<int64_t>(row) * width;
-  normed += static_cast<int64_t>(row) * width;
+  inp1 += row * width;
+  inp2 += row * width;
+  residual += row * width;
+  normed += row * width;
 
   float sum_sq = 0.0f;
-  for (int pack = threadIdx.x; pack < packs_per_row;
-       pack += WARP_SIZE) {
-    RmsnormPack a =
-        load128cs(inp1 + static_cast<int64_t>(pack) * kFloatXPerPack);
-    RmsnormPack b =
-        load128cs(inp2 + static_cast<int64_t>(pack) * kFloatXPerPack);
+  for (int pack = threadIdx.x; pack < packs_per_row; pack += WARP_SIZE) {
+    RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
+    RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_add(a, b);
     gemma4_bf16_pack_accumulate_square(result, sum_sq);
     s_res[pack] = result;
-    store128cs(residual + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128cs(residual + pack * kFloatXPerPack, result);
   }
 
   sum_sq = warp_reduce_sum(sum_sq);
@@ -358,12 +334,11 @@ __global__ void gemma4_residual_add_rmsnorm_bf16_shared_kernel(
     gemma4_store_rstd(rstd, row, scale);
   }
 
-  for (int pack = threadIdx.x; pack < packs_per_row;
-       pack += WARP_SIZE) {
+  for (int pack = threadIdx.x; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack values = s_res[pack];
     RmsnormPack gamma = s_weight[pack];
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(normed + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128cs(normed + pack * kFloatXPerPack, result);
   }
 }
 
@@ -387,8 +362,7 @@ bool gemma4_rmsnorm_args_valid(const floatX *out,
   if ((width % kFloatXPerPack) != 0) {
     return false;
   }
-  return is_aligned_16(out) && is_aligned_16(inp) &&
-         is_aligned_16(weight);
+  return is_aligned_16(out) && is_aligned_16(inp) && is_aligned_16(weight);
 }
 
 struct RmsnormLaunchShape {
@@ -412,9 +386,7 @@ RmsnormLaunchShape gemma4_rmsnorm_launch_shape(int rows, int width) {
 
 template <typename Kernel>
 cudaError_t gemma4_set_max_dynamic_smem(Kernel kernel, size_t bytes) {
-  return cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel),
-                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              static_cast<int>(bytes));
+  return cudaFuncSetAttribute(reinterpret_cast<const void *>(kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
 }
 
 }  // namespace
@@ -434,26 +406,17 @@ cudaError_t gemma4_rmsnorm_bf16(floatX *out,
     return cudaSuccess;
   }
   if (rows == 1 && width == GEMMA4_HIDDEN_SIZE) {
-    gemma4_rmsnorm_bf16_decode_kernel<kDecodeRmsnormThreads>
-        <<<1, kDecodeRmsnormThreads, 0, stream>>>(
-            out, rstd, inp, weight, eps);
+    gemma4_rmsnorm_bf16_decode_kernel<kDecodeRmsnormThreads><<<1, kDecodeRmsnormThreads, 0, stream>>>(out, rstd, inp, weight, eps);
     return cudaGetLastError();
   }
 
   RmsnormLaunchShape shape = gemma4_rmsnorm_launch_shape(rows, width);
 
-  cudaError_t attr =
-      gemma4_set_max_dynamic_smem(gemma4_rmsnorm_bf16_shared_kernel,
-                                  shape.smem);
+  cudaError_t attr = gemma4_set_max_dynamic_smem(gemma4_rmsnorm_bf16_shared_kernel, shape.smem);
   if (attr == cudaSuccess) {
-    gemma4_rmsnorm_bf16_shared_kernel<<<
-        shape.grid, dim3(WARP_SIZE, RmsnormLaunchShape::block_y), shape.smem,
-        stream>>>(out, rstd, inp, weight, rows, width, shape.packs_per_row,
-                  eps);
+    gemma4_rmsnorm_bf16_shared_kernel<<<shape.grid, dim3(WARP_SIZE, RmsnormLaunchShape::block_y), shape.smem, stream>>>(out, rstd, inp, weight, rows, width, shape.packs_per_row, eps);
   } else {
-    gemma4_rmsnorm_bf16_warp_kernel<<<
-        shape.grid, RmsnormLaunchShape::block_size, 0, stream>>>(
-        out, rstd, inp, weight, rows, width, eps);
+    gemma4_rmsnorm_bf16_warp_kernel<<<shape.grid, RmsnormLaunchShape::block_size, 0, stream>>>(out, rstd, inp, weight, rows, width, eps);
   }
   return cudaGetLastError();
 }
@@ -475,16 +438,14 @@ cudaError_t gemma4_residual_add_bf16(floatX *out,
   if ((count % kFloatXPerPack) != 0) {
     return cudaErrorInvalidValue;
   }
-  if (!is_aligned_16(out) || !is_aligned_16(inp1) ||
-      !is_aligned_16(inp2)) {
+  if (!is_aligned_16(out) || !is_aligned_16(inp1) || !is_aligned_16(inp2)) {
     return cudaErrorInvalidValue;
   }
 
   constexpr int block_size = 256;
   int packs = count / kFloatXPerPack;
   int grid = div_up(packs, block_size);
-  gemma4_residual_add_bf16_kernel<<<grid, block_size, 0, stream>>>(
-      out, inp1, inp2, packs);
+  gemma4_residual_add_bf16_kernel<<<grid, block_size, 0, stream>>>(out, inp1, inp2, packs);
   return cudaGetLastError();
 }
 
@@ -511,25 +472,17 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16(floatX *residual,
     return cudaErrorInvalidValue;
   }
   if (rows == 1 && width == GEMMA4_HIDDEN_SIZE) {
-    gemma4_residual_add_rmsnorm_bf16_decode_kernel<kDecodeFusedThreads>
-        <<<1, kDecodeFusedThreads, 0, stream>>>(
-            residual, normed, rstd, inp1, inp2, weight, eps);
+    gemma4_residual_add_rmsnorm_bf16_decode_kernel<kDecodeFusedThreads><<<1, kDecodeFusedThreads, 0, stream>>>(residual, normed, rstd, inp1, inp2, weight, eps);
     return cudaGetLastError();
   }
 
   RmsnormLaunchShape shape = gemma4_rmsnorm_launch_shape(rows, width);
 
-  cudaError_t attr = gemma4_set_max_dynamic_smem(
-      gemma4_residual_add_rmsnorm_bf16_shared_kernel, shape.smem);
+  cudaError_t attr = gemma4_set_max_dynamic_smem(gemma4_residual_add_rmsnorm_bf16_shared_kernel, shape.smem);
   if (attr == cudaSuccess) {
-    gemma4_residual_add_rmsnorm_bf16_shared_kernel<<<
-        shape.grid, dim3(WARP_SIZE, RmsnormLaunchShape::block_y), shape.smem,
-        stream>>>(residual, normed, rstd, inp1, inp2, weight, rows, width,
-                  shape.packs_per_row, eps);
+    gemma4_residual_add_rmsnorm_bf16_shared_kernel<<<shape.grid, dim3(WARP_SIZE, RmsnormLaunchShape::block_y), shape.smem, stream>>>(residual, normed, rstd, inp1, inp2, weight, rows, width, shape.packs_per_row, eps);
   } else {
-    gemma4_residual_add_rmsnorm_bf16_warp_kernel<<<
-        shape.grid, RmsnormLaunchShape::block_size, 0, stream>>>(
-        residual, normed, rstd, inp1, inp2, weight, rows, width, eps);
+    gemma4_residual_add_rmsnorm_bf16_warp_kernel<<<shape.grid, RmsnormLaunchShape::block_size, 0, stream>>>(residual, normed, rstd, inp1, inp2, weight, rows, width, eps);
   }
   return cudaGetLastError();
 }
