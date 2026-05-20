@@ -4,22 +4,66 @@
 
 ## High-Priority Kernel Work
 
-- Write a hyperoptimized CUDA kernel path for the Gemma 4 31B FFN matmuls, the dominant total-FLOP workload:
-  - Gate/up projection: `[M, 5376] x [5376, 21504]`
-  - Down projection: `[M, 21504] x [21504, 5376]`
-  - Consider a packed gate/up variant: `[M, 5376] x [5376, 43008]`
-  - Optimize first for correctness, then profile on RTX A6000-class hardware with `ncu`.
+- Fix the current RMSNorm build break before building new dependent kernels.
+  - `src/gemma4_rmsnorm.cu` still references fallback kernels removed during cleanup.
+  - `make test-rmsnorm` should compile and pass again before RMSNorm-dependent work proceeds.
 - Fuse token embedding gather with the first matrix multiplication in the language path once the unfused baseline is correct.
   - Avoid materializing the initial `[M, 5376]` hidden buffer when the first projection can consume embedding rows directly.
   - Benchmark against the standalone embedding gather plus cuBLAS/cuBLASLt baseline before keeping the fusion.
-- Split the RMSNorm kernels into separate decode and prefill paths.
-  - Decode path should optimize for one row/token and low launch/device overhead.
-  - Prefill path should optimize for many rows and sustained memory bandwidth.
-  - Keep the existing shared implementation as the correctness baseline until both specialized paths pass tests and benchmarks.
 
-## Decode GEMV Priority Order
+## Remaining Unfused Inference Buildout
 
-## Decode GEMV Kernel-Shape Experiments
+Build the remaining model-path pieces in this rough order. Keep each kernel
+standalone, numerically tested, benchmarked, and logged in
+`src/experiments/EXPERIMENTS.md` before wiring it into the full path.
+
+1. Q/K per-head RMSNorm
+   - Sliding layers: learned-weight RMSNorm over head dim `256`.
+   - Global layers: learned-weight RMSNorm over head dim `512`.
+   - Weights are shared across heads.
+
+2. KV-cache write/update
+   - Sliding cache: K/V width `4096`, window `1024`, wraparound.
+   - Global cache: K/V width `2048`, full context up to `256000`.
+   - Support prefill bulk writes, decode appends, and sliding-window wraparound.
+
+3. Sliding-window attention
+   - FlashAttention-style local causal attention.
+   - Head dim `256`.
+   - GQA ratio: `32` Q heads / `16` KV heads = `2` Q heads per KV head.
+   - Support prefill local causal attention and single-token decode.
+
+4. Global attention
+   - FlashAttention-style full causal attention.
+   - Head dim `512`.
+   - GQA ratio: `32` Q heads / `4` KV heads = `8` Q heads per KV head.
+   - Support prefill full causal attention and decode over the full KV cache.
+
+5. Attention output packing
+   - Sliding layers produce projection input width `8192`.
+   - Global layers produce projection input width `16384`.
+   - Prefer having attention kernels write directly in projection-ready layout once correct.
+
+6. GeGLU tanh activation
+   - Apply `gate * GELU_tanh(up)`.
+   - Width `21504`.
+   - Baseline standalone first; later fuse into FFN output handling.
+
+7. Final logit softcap
+   - Apply `tanh(logits / 30.0) * 30.0`.
+   - Width `262144`.
+   - Later fuse with sampling when useful.
+
+8. Sampling
+   - Start with greedy argmax over vocab `262144`.
+   - Add temperature, top-k, top-p, and random sampling after the deterministic path works.
+
+9. Full prefill/decode orchestration
+   - Wire the correct unfused layer pipeline using baseline kernels plus cuBLAS/cuBLASLt GEMMs.
+   - Validate end-to-end against a known-good reference before fusion work.
+   - Benchmark against TensorRT-LLM and vLLM once the path is correct.
+
+## Decode GEMV Tuning
 
 - Benchmark warp-tiled GEMV variants against the current CTA-cooperative baseline.
   - Current baseline: one CTA computes eight output columns, with all CTA threads reducing the same eight dots.
@@ -33,13 +77,11 @@
 1. FFN gate+up GEMV
    - Shape: `x[5376] -> gate_up[43008]`
    - Estimated weight traffic: `~27.7 GB/token` across 60 layers.
-   - Baseline custom decode GEMV exists.
-   - Biggest fixed-shape decode target.
+   - Biggest fixed-shape decode tuning target.
 
 2. FFN down GEMV
    - Shape: `ffn_hidden[21504] -> hidden[5376]`
    - Estimated weight traffic: `~13.9 GB/token`.
-   - Baseline custom decode GEMV exists; needs tuning.
    - Same every layer, huge, clean.
 
 3. Sliding QKV packed GEMV
@@ -47,23 +89,19 @@
    - Estimated weight traffic: `~8.8 GB/token` across 50 sliding layers.
    - Do not optimize sliding Q/K/V separately if we can avoid it.
    - Pack as `Q 8192 + K 4096 + V 4096 = 16384`.
-   - Baseline custom decode GEMV exists; needs tuning.
 
 4. Sliding O GEMV
    - Shape: `attn_out[8192] -> hidden[5376]`
    - Estimated weight traffic: `~4.4 GB/token`.
    - Repeated across 50 sliding layers.
-   - Baseline custom decode GEMV exists; needs tuning.
 
 5. Final vocab/logits GEMV
    - Shape: `hidden[5376] -> logits[262144]`
    - Estimated weight traffic: `~2.8 GB/token`.
    - Huge single kernel.
    - High value if fused with softcap/top-k/argmax, but only runs once per token.
-   - Baseline custom decode GEMV exists; needs fusion with softcap/sampling.
 
 6. Global Q/O GEMVs
    - Global Q shape: `x[5376] -> q[16384]`
    - Global O shape: `attn_out[16384] -> hidden[5376]`
    - Estimated weight traffic: `~1.76 GB/token` each.
-   - Baseline custom decode GEMVs exist for global Q, K, and O; Q/O need tuning.
