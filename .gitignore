@@ -3,3 +3,4 @@
 .agents/
 skills-lock.json
 models/
+build/experiments/
