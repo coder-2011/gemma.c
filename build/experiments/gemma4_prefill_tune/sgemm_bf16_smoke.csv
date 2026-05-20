@@ -1,0 +1,5 @@
+backend,op,config,m,k,n,cublas_ms,custom_ms,speedup,custom_tflops,max_abs
+sgemm-bf16,global_k,bf16_16x32,16,5376,2048,1.8897,0.0704,26.854,5.01,0.015625
+sgemm-bf16,global_k,bf16_16x32,64,5376,2048,2.1135,0.1032,20.472,13.65,0.015625
+sgemm-bf16,global_k,bf16_64x64,16,5376,2048,1.7748,0.2022,8.778,1.74,0.015625
+sgemm-bf16,global_k,bf16_64x64,64,5376,2048,2.4028,0.2022,11.882,6.97,0.015625

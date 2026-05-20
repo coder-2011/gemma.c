@@ -1,0 +1,7 @@
+backend,cublas_backend,cublas_algo,op,config,m,k,n,cublas_ms,custom_ms,speedup,custom_tflops,max_abs
+sgemm-bf16,lt,default_tensor,ffn_down,bf16_32x64,8,21504,5376,0.3376,0.4123,0.819,4.49,0.03125
+sgemm-bf16,lt,default_tensor,ffn_down,bf16_32x64,16,21504,5376,0.34,0.4087,0.832,9.05,0.03125
+sgemm-bf16,lt,default_tensor,ffn_down,bf16_32x64,32,21504,5376,0.3398,0.4028,0.843,18.37,0.03125
+sgemm-bf16,lt,default_tensor,ffn_down,bf16_32x64,64,21504,5376,0.3536,1.3972,0.253,10.59,0.03125
+sgemm-bf16,lt,default_tensor,ffn_down,bf16_32x64,128,21504,5376,0.3769,2.147,0.176,13.78,0.0625
+sgemm-bf16,lt,default_tensor,ffn_down,bf16_32x64,256,21504,5376,0.4681,5.7529,0.081,10.29,0.03125

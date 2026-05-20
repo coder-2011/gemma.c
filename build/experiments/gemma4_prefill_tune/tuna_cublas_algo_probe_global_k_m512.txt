@@ -1,0 +1,34 @@
+default_tensor,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  1.7016 cublas_tflops=   6.63 max_abs=0.015625
+default_tensor,global_k,  wmma_16x64 custom_ms=  0.6515 custom_tflops=  17.30 speedup= 2.612x
+algo0,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  2.5624 cublas_tflops=   4.40 max_abs=0.015625
+algo0,global_k,  wmma_16x64 custom_ms=  0.6451 custom_tflops=  17.48 speedup= 3.972x
+algo1,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  2.0043 cublas_tflops=   5.63 max_abs=0.015625
+algo1,global_k,  wmma_16x64 custom_ms=  0.6442 custom_tflops=  17.50 speedup= 3.111x
+algo2,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  3.2605 cublas_tflops=   3.46 max_abs=0.015625
+algo2,global_k,  wmma_16x64 custom_ms=  0.6383 custom_tflops=  17.66 speedup= 5.109x
+algo3,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  1.7931 cublas_tflops=   6.29 max_abs=0.015625
+algo3,global_k,  wmma_16x64 custom_ms=  0.6459 custom_tflops=  17.45 speedup= 2.776x
+algo4,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  3.3233 cublas_tflops=   3.39 max_abs=0.015625
+algo4,global_k,  wmma_16x64 custom_ms=  0.6393 custom_tflops=  17.63 speedup= 5.198x
+algo5,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  1.8668 cublas_tflops=   6.04 max_abs=0.015625
+algo5,global_k,  wmma_16x64 custom_ms=  0.6401 custom_tflops=  17.61 speedup= 2.916x
+algo6,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  3.4940 cublas_tflops=   3.23 max_abs=0.015625
+algo6,global_k,  wmma_16x64 custom_ms=  0.6412 custom_tflops=  17.58 speedup= 5.449x
+algo7,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  1.3571 cublas_tflops=   8.31 max_abs=0.015625
+algo7,global_k,  wmma_16x64 custom_ms=  0.6461 custom_tflops=  17.45 speedup= 2.100x
+algo8,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  3.0425 cublas_tflops=   3.71 max_abs=0.015625
+algo8,global_k,  wmma_16x64 custom_ms=  0.6374 custom_tflops=  17.69 speedup= 4.774x
+algo9,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  1.6551 cublas_tflops=   6.81 max_abs=0.015625
+algo9,global_k,  wmma_16x64 custom_ms=  0.6454 custom_tflops=  17.47 speedup= 2.565x
+algo10,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  2.7682 cublas_tflops=   4.07 max_abs=0.015625
+algo10,global_k,  wmma_16x64 custom_ms=  0.6387 custom_tflops=  17.65 speedup= 4.334x
+algo11,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  3.0972 cublas_tflops=   3.64 max_abs=0.015625
+algo11,global_k,  wmma_16x64 custom_ms=  0.6455 custom_tflops=  17.46 speedup= 4.798x
+algo12,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  2.9843 cublas_tflops=   3.78 max_abs=0.015625
+algo12,global_k,  wmma_16x64 custom_ms=  0.6414 custom_tflops=  17.58 speedup= 4.652x
+algo13,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  3.7465 cublas_tflops=   3.01 max_abs=0.015625
+algo13,global_k,  wmma_16x64 custom_ms=  0.6470 custom_tflops=  17.43 speedup= 5.791x
+algo14,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  2.8636 cublas_tflops=   3.94 max_abs=0.015625
+algo14,global_k,  wmma_16x64 custom_ms=  0.6482 custom_tflops=  17.39 speedup= 4.417x
+algo15,global_k,global_k       M= 512 K= 5376 N=  2048 cublas_ms=  2.4526 cublas_tflops=   4.60 max_abs=0.015625
+algo15,global_k,  wmma_16x64 custom_ms=  0.6387 custom_tflops=  17.65 speedup= 3.840x
