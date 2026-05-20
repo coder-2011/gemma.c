@@ -72,6 +72,88 @@ __device__ __forceinline__ void store128cs(
   __stcs(reinterpret_cast<int4 *>(address), value.bits());
 }
 
+using Bf16Packed128 = Packed128<__nv_bfloat16>;
+static constexpr int kBf16Packed128Elements = Bf16Packed128::size;
+static constexpr int kBf16Packed128Pairs = kBf16Packed128Elements / 2;
+static_assert(sizeof(Bf16Packed128) == sizeof(int4) &&
+                  alignof(Bf16Packed128) >= alignof(int4),
+              "Packed128 bf16 must map to one aligned int4 load");
+static_assert((kBf16Packed128Elements % 2) == 0,
+              "Packed128 bf16 width must contain whole bf16 pairs");
+static_assert(alignof(Bf16Packed128) >= alignof(__nv_bfloat162),
+              "Packed128 bf16 payload must be aligned for bf16x2 access");
+
+__device__ __forceinline__ const __nv_bfloat162 *
+gemma4_bf16_pack_pairs(const Bf16Packed128 &pack) {
+  return reinterpret_cast<const __nv_bfloat162 *>(pack.payload);
+}
+
+__device__ __forceinline__ __nv_bfloat162 *
+gemma4_bf16_pack_pairs(Bf16Packed128 &pack) {
+  return reinterpret_cast<__nv_bfloat162 *>(pack.payload);
+}
+
+__device__ __forceinline__ void gemma4_bf16_pack_accumulate_square(
+    const Bf16Packed128 &values,
+    float &sum_sq) {
+  const __nv_bfloat162 *pairs = gemma4_bf16_pack_pairs(values);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    float2 value = __bfloat1622float2(pairs[p]);
+    sum_sq = fmaf(value.x, value.x, sum_sq);
+    sum_sq = fmaf(value.y, value.y, sum_sq);
+  }
+}
+
+__device__ __forceinline__ void gemma4_bf16_pack_accumulate_dot(
+    const Bf16Packed128 &x_pack,
+    const Bf16Packed128 &w_pack,
+    float &sum) {
+  const __nv_bfloat162 *x_pairs = gemma4_bf16_pack_pairs(x_pack);
+  const __nv_bfloat162 *w_pairs = gemma4_bf16_pack_pairs(w_pack);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    const float2 xv = __bfloat1622float2(x_pairs[p]);
+    const float2 wv = __bfloat1622float2(w_pairs[p]);
+    sum = fmaf(xv.x, wv.x, sum);
+    sum = fmaf(xv.y, wv.y, sum);
+  }
+}
+
+__device__ __forceinline__ Bf16Packed128 gemma4_bf16_pack_add(
+    const Bf16Packed128 &a,
+    const Bf16Packed128 &b) {
+  const __nv_bfloat162 *a_pairs = gemma4_bf16_pack_pairs(a);
+  const __nv_bfloat162 *b_pairs = gemma4_bf16_pack_pairs(b);
+  Bf16Packed128 result;
+  __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(result);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    float2 av = __bfloat1622float2(a_pairs[p]);
+    float2 bv = __bfloat1622float2(b_pairs[p]);
+    out_pairs[p] = __floats2bfloat162_rn(av.x + bv.x, av.y + bv.y);
+  }
+  return result;
+}
+
+__device__ __forceinline__ Bf16Packed128 gemma4_bf16_pack_apply_rmsnorm(
+    const Bf16Packed128 &values,
+    const Bf16Packed128 &gamma,
+    float scale) {
+  const __nv_bfloat162 *value_pairs = gemma4_bf16_pack_pairs(values);
+  const __nv_bfloat162 *gamma_pairs = gemma4_bf16_pack_pairs(gamma);
+  Bf16Packed128 result;
+  __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(result);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    float2 value = __bfloat1622float2(value_pairs[p]);
+    float2 weight = __bfloat1622float2(gamma_pairs[p]);
+    out_pairs[p] = __floats2bfloat162_rn(value.x * scale * weight.x,
+                                         value.y * scale * weight.y);
+  }
+  return result;
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float value) {
   for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
     value += __shfl_xor_sync(0xffffffffu, value, offset);
