@@ -4093,3 +4093,281 @@ Conclusion: after comparing against a stronger, overhead-factored cuBLASLt basel
 the current CUTLASS and Stream-K custom routes do not outperform cuBLASLt for Gemma 4
 `ffn_down`. Further work needs a materially different custom architecture or a narrower
 deployment target than "15-20% average over a large M range."
+
+## 2026-05-20 - Custom CUDA graph timing and larger-M tile sweep
+
+Follow-up reason:
+
+- The previous correction graph-timed cuBLAS/cuBLASLt but left custom kernels in the
+  direct launch loop. CUDA events can include GPU idle gaps between host launches when
+  kernels are short.
+- This pass adds stream-aware CUTLASS launches and graph-times custom CUTLASS/Stream-K
+  routes too, so both sides can be compared with host-launch gaps factored out.
+- It also checks whether the large-M losses were caused by `bf16_auto_ffn_down` choosing
+  the wrong existing CUTLASS tile.
+
+Code changes:
+
+- CUTLASS and Stream-K launchers now accept an explicit `cudaStream_t`.
+- `launch_bf16` forwards the stream to CUTLASS-backed configs.
+- When `GEMMA4_PREFILL_GRAPH_REPEATS > 1`, custom CUTLASS-backed configs are captured
+  and timed on a nonblocking CUDA stream, just like the cuBLASLt candidates.
+
+Commands:
+
+```bash
+GEMMA4_PREFILL_GRAPH_REPEATS=16 \
+  python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down \
+  --configs bf16_auto_ffn_down,bf16_cutlass_64x128x64,bf16_streamk_64x64x64,bf16_streamk_64x128x64,bf16_streamk_128x128x64 \
+  --m 8,16,32,64,96,128,256 --iters 30 --warmup 8 \
+  --cublas-backend lt --cublaslt-heuristics 32 \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_both_graph_streamk_cublaslt_h32.csv
+
+GEMMA4_PREFILL_GRAPH_REPEATS=16 \
+  python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down \
+  --configs bf16_auto_ffn_down,bf16_cutlass_64x64,bf16_cutlass_64x128,bf16_cutlass_64x128x64,bf16_cutlass_128x64,bf16_cutlass_128x64x64,bf16_cutlass_128x128,bf16_cutlass_128x128x64,bf16_cutlass_128x256,bf16_streamk_64x64x64,bf16_streamk_64x128x64,bf16_streamk_128x128x64 \
+  --m 256,512 --iters 20 --warmup 5 \
+  --cublas-backend lt --cublaslt-heuristics 32 \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_large_m_tiles_both_graph_cublaslt_h32.csv
+```
+
+Both-sides graph timing over `M=8..256`:
+
+| M | Best custom config | cuBLASLt h32 ms | Custom ms | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 8 | `bf16_streamk_64x64x64` | 0.3299 | 0.3330 | 0.991x |
+| 16 | `bf16_streamk_64x64x64` | 0.3305 | 0.3337 | 0.990x |
+| 32 | `bf16_streamk_64x64x64` | 0.3328 | 0.3355 | 0.992x |
+| 64 | `bf16_streamk_64x64x64` | 0.3423 | 0.3389 | 1.010x |
+| 96 | `bf16_cutlass_64x128x64` | 0.3747 | 0.3620 | 1.035x |
+| 128 | `bf16_streamk_128x128x64` | 0.3806 | 0.3758 | 1.013x |
+| 256 | `bf16_auto_ffn_down` | 0.5087 | 0.5470 | 0.930x |
+
+Summary for `M=8..256`: best custom geomean is `0.962x`, worst is `0.930x`, and no
+case reaches the `1.05x` custom routing threshold. Graph-timing the custom side does not
+reveal a hidden win.
+
+Broader existing-tile check at larger `M`:
+
+| M | Best custom config | cuBLASLt h32 ms | Custom ms | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 256 | `bf16_cutlass_128x128` | 0.4924 | 0.5482 | 0.898x |
+| 512 | `bf16_cutlass_128x256` | 0.9189 | 0.9639 | 0.953x |
+
+Conclusion: using CUDA graphs for both custom and cuBLASLt makes the comparison cleaner
+but does not change the direction. The current CUTLASS tile inventory and Stream-K route
+still do not beat cuBLASLt h32 for `ffn_down`, and a broader large-M tile sweep did not
+find a better existing dispatch choice.
+
+## 2026-05-20 - Stream-K split-factor ffn_down check
+
+Follow-up reason:
+
+- CUTLASS example 47 exposes Stream-K's `batch_split` argument as a tile-splitting factor
+  for `GemmUniversalMode::kGemm`.
+- The previous Stream-K configs only measured the default split factor `1`, so this pass
+  checks whether Stream-K split-K emulation helps the small/medium `M` range where custom
+  was closest to cuBLASLt.
+
+Code changes:
+
+- `launch_cutlass_streamk_gemm` now accepts a `split_k_factor` and passes it to
+  `GemmUniversal::Arguments`.
+- Added split-factor configs:
+  `bf16_streamk_s2_64x64x64`, `bf16_streamk_s2_64x128x64`,
+  `bf16_streamk_s2_128x128x64`, `bf16_streamk_s4_64x64x64`,
+  `bf16_streamk_s4_64x128x64`, and `bf16_streamk_s4_128x128x64`.
+
+Commands:
+
+```bash
+GEMMA4_PREFILL_GRAPH_REPEATS=16 \
+  python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down \
+  --configs bf16_streamk_64x64x64,bf16_streamk_s2_64x64x64,bf16_streamk_s4_64x64x64,bf16_streamk_64x128x64,bf16_streamk_s2_64x128x64,bf16_streamk_s4_64x128x64,bf16_streamk_128x128x64,bf16_streamk_s2_128x128x64,bf16_streamk_s4_128x128x64 \
+  --m 64,96,128 --iters 20 --warmup 5 \
+  --cublas-backend lt --cublaslt-heuristics 32 \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_split_both_graph_cublaslt_h32.csv
+
+python3 src/experiments/gemma4_prefill_tune.py summarize \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_both_graph_streamk_cublaslt_h32.csv \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_split_both_graph_cublaslt_h32.csv \
+  --custom-threshold 1.05 \
+  --dispatch-out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_both_graph_with_split_cublaslt_h32_dispatch.csv
+```
+
+Targeted split-factor sweep:
+
+| M | Best config | cuBLASLt h32 ms | Custom ms | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | `bf16_streamk_64x64x64` | 0.3416 | 0.3381 | 1.010x |
+| 96 | `bf16_streamk_s2_128x128x64` | 0.3721 | 0.3602 | 1.033x |
+| 128 | `bf16_streamk_s2_128x128x64` | 0.3760 | 0.3611 | 1.041x |
+
+Combined dynamic route over `M=8..256` after adding split-factor configs:
+
+- No `M` routes to custom at the `1.05x` threshold.
+- Weighted custom-only speedup is `0.9935x` versus graph-timed cuBLASLt h32.
+- The best split-factor config helps `M=96` and `M=128`, but not enough for the requested
+  15-20% average win, and split factors are much worse at larger `M`.
+
+Conclusion: Stream-K split-K emulation is not the missing architecture lever for this
+`ffn_down` sweep. It narrows the gap in a small band but does not outperform cuBLASLt
+over a large dynamic-M range.
+
+## 2026-05-20 - CUTLASS generated SM80 BF16 shape sweep
+
+Follow-up reason:
+
+- The hand-instantiated CUTLASS configs only covered a small subset of SM80 BF16 tensor-op
+  GEMM shapes.
+- CUTLASS's generator lists many more BF16 `nt` candidates for SM80, including
+  `256x128`, `256x64`, `64x256`, and higher-stage `64x64` / `64x128` tiles.
+- This pass adds a focused subset of those generated shapes instead of guessing more
+  hand-written tile sizes.
+
+Research / discovery:
+
+```bash
+python3 /tmp/cutlass/python/cutlass_library/generator.py \
+  --operations gemm --architectures 80 \
+  --build-dir /tmp/cutlass-gemm-list \
+  --curr-build-dir /tmp/cutlass-gemm-list \
+  --generator-target library \
+  --kernels 'cutlass_tensorop_*bf16*gemm*' \
+  --selected-kernel-list /tmp/cutlass-gemm-list/kernels.txt
+```
+
+- The generator emitted 638 SM80 BF16 tensor-op GEMM candidate names.
+- The relevant layout family for this benchmark is `nt` with BF16 input/output and FP32
+  accumulation, matching `Y[M,N] = X[M,K] * W[N,K]^T`.
+
+Code changes:
+
+- Added valid generated-shape configs:
+  `bf16_cutlass_64x64_s10`, `bf16_cutlass_64x64x64_s5`,
+  `bf16_cutlass_64x128_s6`, `bf16_cutlass_64x256_s4`,
+  `bf16_cutlass_128x64_s6`, `bf16_cutlass_128x128_s5`,
+  `bf16_cutlass_256x64`, `bf16_cutlass_256x64_s4`, and
+  `bf16_cutlass_256x128`.
+- Added tuner `--keep-going` so generated-kernel sweeps can skip failed configs while
+  preserving measurements from valid configs.
+- Rejected generated configs that failed correctness with `max_abs=6.90625`:
+  `bf16_cutlass_64x256x64_s4`, `bf16_cutlass_128x256x64`,
+  `bf16_cutlass_256x64x64`, and `bf16_cutlass_256x128x64`.
+
+Commands:
+
+```bash
+GEMMA4_PREFILL_GRAPH_REPEATS=16 \
+  python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down \
+  --configs bf16_cutlass_64x64_s10,bf16_cutlass_64x64x64_s5,bf16_cutlass_64x128_s6,bf16_cutlass_64x256_s4,bf16_cutlass_128x64_s6,bf16_cutlass_128x128_s5,bf16_cutlass_128x256x64,bf16_cutlass_256x64,bf16_cutlass_256x64_s4,bf16_cutlass_256x64x64,bf16_cutlass_256x128,bf16_cutlass_256x128x64 \
+  --m 64,96,128,256 --iters 16 --warmup 4 \
+  --cublas-backend lt --cublaslt-heuristics 16 --keep-going \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_generated_cutlass_both_graph_cublaslt_h16.csv
+```
+
+Best valid generated shapes:
+
+| M | Best config | cuBLASLt h16 ms | Custom ms | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | `bf16_cutlass_64x64_s10` | 0.3419 | 0.3379 | 1.012x |
+| 96 | `bf16_cutlass_64x128_s6` | 0.3723 | 0.3513 | 1.060x |
+| 128 | `bf16_cutlass_64x128_s6` | 0.3771 | 0.3736 | 1.009x |
+| 256 | `bf16_cutlass_128x128_s5` | 0.5035 | 0.5367 | 0.938x |
+
+Summary:
+
+- The generated shape sweep finds a local `1.06x` win at `M=96` against h16 cuBLASLt.
+- The dynamic dispatch result over `M=64,96,128,256` is only `1.013x` because the route
+  still falls back to cuBLASLt for most sizes.
+- Custom-only speedup remains below parity (`0.997x`) for this focused sweep.
+
+Conclusion: CUTLASS's generated SM80 BF16 default shapes add one narrow local win but do
+not produce the requested broad 15-20% average speedup over cuBLASLt. The generated list
+also confirms that some legal-looking K=64 large-tile instantiations are numerically
+invalid in this harness and must remain excluded.
+
+### Explicit M >= 256 check
+
+Follow-up correction:
+
+- The previous generated-shape sweep covered `M=256`, but the large-token side also needs
+  explicit checks beyond `256`.
+- This run checks `M=256,512,1024,2048` with the current best larger-M candidate set.
+
+Command:
+
+```bash
+GEMMA4_PREFILL_GRAPH_REPEATS=16 \
+  python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down \
+  --configs bf16_auto_ffn_down,bf16_cutlass_128x128_s5,bf16_cutlass_128x128x64,bf16_cutlass_128x256,bf16_cutlass_256x128,bf16_streamk_128x128x64 \
+  --m 256,512,1024,2048 --iters 20 --warmup 5 \
+  --cublas-backend lt --cublaslt-heuristics 32 --skip-build \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_m256_2048_check_cublaslt_h32.csv
+```
+
+Results using the best custom config per `M` and the best graph-timed cuBLASLt h32 time:
+
+| M | Best custom config | cuBLASLt h32 ms | Custom ms | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 256 | `bf16_cutlass_128x128_s5` | 0.4909 | 0.5275 | 0.931x |
+| 512 | `bf16_cutlass_256x128` | 0.9118 | 0.9423 | 0.968x |
+| 1024 | `bf16_cutlass_128x256` | 1.8790 | 1.8695 | 1.005x |
+| 2048 | `bf16_cutlass_128x256` | 3.6909 | 3.7630 | 0.981x |
+
+Summary:
+
+- Best custom geomean over `M=256,512,1024,2048`: `0.930x`.
+- Weighted custom-only speedup over this explicit large-M sweep: `0.9817x`.
+- No `M >= 256` reaches the `1.05x` custom routing threshold.
+- `M=1024` is near parity, but not close to the requested 15-20% win.
+
+Conclusion: the larger-token check confirms that the current custom routes do not beat
+cuBLASLt beyond `M=256`; the remaining gap is not just a small-M artifact.
+
+### cuBLASLt h64 heuristic check
+
+Follow-up reason:
+
+- Most corrected comparisons used up to 32 cuBLASLt heuristic candidates.
+- To check whether the library baseline was still under-tuned, this run increases the
+  cuBLASLt candidate count to 64 over the current critical `M=64..1024` range.
+
+Command:
+
+```bash
+GEMMA4_PREFILL_GRAPH_REPEATS=16 \
+  python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down \
+  --configs bf16_auto_ffn_down,bf16_cutlass_64x64_s10,bf16_cutlass_64x128_s6,bf16_cutlass_128x128_s5,bf16_cutlass_128x256,bf16_cutlass_256x128,bf16_streamk_64x64x64,bf16_streamk_s2_128x128x64 \
+  --m 64,96,128,256,512,1024 --iters 16 --warmup 4 \
+  --cublas-backend lt --cublaslt-heuristics 64 --skip-build \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_h64_check_cublaslt.csv
+```
+
+Best custom config per `M`:
+
+| M | Best custom config | cuBLASLt h64 ms | Custom ms | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | `bf16_cutlass_64x64_s10` | 0.3420 | 0.3378 | 1.012x |
+| 96 | `bf16_cutlass_64x128_s6` | 0.3720 | 0.3552 | 1.047x |
+| 128 | `bf16_streamk_s2_128x128x64` | 0.3769 | 0.3619 | 1.041x |
+| 256 | `bf16_cutlass_128x128_s5` | 0.5024 | 0.5341 | 0.941x |
+| 512 | `bf16_cutlass_256x128` | 0.9383 | 0.9633 | 0.974x |
+| 1024 | `bf16_cutlass_256x128` | 1.8999 | 1.8876 | 1.007x |
+
+Summary:
+
+- Dynamic custom-only speedup over `M=64..1024`: `0.9981x`.
+- No `M` routes to custom at the `1.05x` threshold when using the minimum cuBLASLt h64
+  baseline per `M`.
+- Increasing the cuBLASLt heuristic count does not create a custom win; it reinforces
+  that the remaining custom route is near parity at best.
+
+Conclusion: h64 cuBLASLt remains the correct comparison target for this shape class, and
+the current custom candidates still do not produce the requested broad 15-20% win.
