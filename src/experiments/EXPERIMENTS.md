@@ -2183,3 +2183,34 @@ Conclusion:
 
 - Do not enable cp.async for this current per-thread/per-column GEMV mapping.
 - If cp.async is revisited, change the tiling so each async-staged payload is reused more, or group larger batches per wait. A same-thread one-use 16-byte pack is too fine-grained for this pipeline structure.
+
+## 2026-05-20 - RoPE CUDA baseline from Triton reference
+
+Runtime files:
+
+- `src/gemma4_rope.cu`
+- `src/gemma4_rope.cuh`
+- `tests/test_rope.cu`
+
+Reason:
+
+- The next attention-prep step after Q/K/V projection and normalization is to apply RoPE before KV-cache write and attention.
+- The user provided a Triton split-half RoPE implementation. The CUDA baseline mirrors its physical `[batch, seq, heads, head_dim]` layout while adding Gemma 4's partial global p-RoPE support.
+
+Implementation:
+
+- Added in-place BF16 Q/K rotation with precomputed FP32 cos/sin tables.
+- Supports shared `[1, seq, rotary_dim / 2]` and batch-specific `[batch, seq, rotary_dim / 2]` cos/sin tables.
+- Sliding wrapper uses `head_dim=256`, `rotary_dim=256`.
+- Global wrapper uses `head_dim=512`, `rotary_dim=128`, leaving the NoPE tail unchanged.
+- Baseline mapping is one CUDA block per `(batch_seq_row, head)` pair; later fusion can combine Q/K RMSNorm, RoPE, and KV-cache write.
+
+Verification:
+
+```bash
+make cuda-kernels test-rope
+```
+
+Result:
+
+- `rope tests passed`

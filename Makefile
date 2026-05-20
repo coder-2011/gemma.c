@@ -7,11 +7,11 @@ CUDNN_FRONTEND_INCLUDE ?= /tmp/cudnn-frontend/include
 
 BUILD_DIR := build
 
-.PHONY: all cuda-kernels decode-bench embedding-gather-bench rmsnorm-bench test-cuda-utils test-embedding-gather test-rmsnorm clean
+.PHONY: all cuda-kernels decode-bench embedding-gather-bench rmsnorm-bench test-cuda-utils test-embedding-gather test-rmsnorm test-rope clean
 
 all: $(BUILD_DIR)/gemma4.o
 
-cuda-kernels: $(BUILD_DIR)/gemma4_matmul_kernels.o $(BUILD_DIR)/gemma4_rmsnorm.o
+cuda-kernels: $(BUILD_DIR)/gemma4_matmul_kernels.o $(BUILD_DIR)/gemma4_rmsnorm.o $(BUILD_DIR)/gemma4_rope.o
 decode-bench: $(BUILD_DIR)/experiments/gemma4_decode_bench
 embedding-gather-bench: $(BUILD_DIR)/experiments/gemma4_embedding_gather_bench
 rmsnorm-bench: $(BUILD_DIR)/experiments/gemma4_rmsnorm_bench
@@ -20,6 +20,8 @@ test-cuda-utils: $(BUILD_DIR)/tests/cuda_utils/test_cuda_utils
 test-embedding-gather: $(BUILD_DIR)/tests/test_embedding_gather
 	./$<
 test-rmsnorm: $(BUILD_DIR)/tests/test_rmsnorm
+	./$<
+test-rope: $(BUILD_DIR)/tests/test_rope
 	./$<
 
 $(BUILD_DIR):
@@ -33,6 +35,9 @@ $(BUILD_DIR)/gemma4_matmul_kernels.o: src/gemma4_matmul_kernels.cu src/gemma4_ma
 
 $(BUILD_DIR)/gemma4_rmsnorm.o: src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -c src/gemma4_rmsnorm.cu -o $@
+
+$(BUILD_DIR)/gemma4_rope.o: src/gemma4_rope.cu src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) -c src/gemma4_rope.cu -o $@
 
 $(BUILD_DIR)/experiments:
 	mkdir -p $(BUILD_DIR)/experiments
@@ -60,6 +65,9 @@ $(BUILD_DIR)/tests/cuda_utils/test_cuda_utils: tests/cuda_utils/test_cuda_utils.
 
 $(BUILD_DIR)/tests/test_rmsnorm: tests/test_rmsnorm.cu src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_rmsnorm.cu src/gemma4_rmsnorm.cu -o $@
+
+$(BUILD_DIR)/tests/test_rope: tests/test_rope.cu src/gemma4_rope.cu src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_rope.cu src/gemma4_rope.cu -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)
