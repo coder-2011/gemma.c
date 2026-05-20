@@ -90,7 +90,7 @@ gemma4_rmsnorm_bf16_decode_kernel(floatX *out,
   float scale = s_scale;
   for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
     RmsnormPack values = s_in[pack];
-    RmsnormPack gamma = load128(weight + pack * kFloatXPerPack);
+    RmsnormPack gamma = load128g(weight + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
     store128(out + pack * kFloatXPerPack, result);
   }
@@ -131,7 +131,7 @@ gemma4_residual_add_rmsnorm_bf16_decode_kernel(floatX *residual,
   float scale = s_scale;
   for (int pack = threadIdx.x; pack < kDecodePacks; pack += Threads) {
     RmsnormPack values = s_res[pack];
-    RmsnormPack gamma = load128(weight + pack * kFloatXPerPack);
+    RmsnormPack gamma = load128g(weight + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
     store128(normed + pack * kFloatXPerPack, result);
   }
@@ -160,7 +160,7 @@ gemma4_rmsnorm_bf16_warp_kernel(
   const int packs_per_row = width / kFloatXPerPack;
   float sum_sq = 0.0f;
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
-    RmsnormPack values = load128(inp + pack * kFloatXPerPack);
+    RmsnormPack values = load128g(inp + pack * kFloatXPerPack);
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
   sum_sq = warp_reduce_sum(sum_sq);
@@ -171,7 +171,7 @@ gemma4_rmsnorm_bf16_warp_kernel(
 
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack values = load128cs(inp + pack * kFloatXPerPack);
-    RmsnormPack gamma = load128(weight + pack * kFloatXPerPack);
+    RmsnormPack gamma = load128g(weight + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
     store128cs(out + pack * kFloatXPerPack, result);
   }
@@ -195,7 +195,7 @@ gemma4_rmsnorm_bf16_shared_kernel(
   const int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
   const int packed_stride = WARP_SIZE * blockDim.y;
   for (int pack = packed_thread; pack < packs_per_row; pack += packed_stride) {
-    s_weight[pack] = load128(weight + pack * kFloatXPerPack);
+    s_weight[pack] = load128g(weight + pack * kFloatXPerPack);
   }
   __syncthreads();
 
@@ -286,7 +286,7 @@ gemma4_residual_add_rmsnorm_bf16_warp_kernel(
 
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack values = load128(residual + pack * kFloatXPerPack);
-    RmsnormPack gamma = load128(weight + pack * kFloatXPerPack);
+    RmsnormPack gamma = load128g(weight + pack * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
     store128cs(normed + pack * kFloatXPerPack, result);
   }
@@ -312,7 +312,7 @@ gemma4_residual_add_rmsnorm_bf16_shared_kernel(
   const int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
   const int packed_stride = WARP_SIZE * blockDim.y;
   for (int pack = packed_thread; pack < packs_per_row; pack += packed_stride) {
-    s_weight[pack] = load128(weight + pack * kFloatXPerPack);
+    s_weight[pack] = load128g(weight + pack * kFloatXPerPack);
   }
   __syncthreads();
 

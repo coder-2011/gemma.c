@@ -38,7 +38,7 @@ __device__ __forceinline__ int weight_offset(int col, int element_idx) {
 
 __device__ __forceinline__ Bf16Packed128
 load_activation_pack(const __nv_bfloat16 *__restrict__ x, int element_idx) {
-  return load128(x + element_idx);
+  return load128g(x + element_idx);
 }
 
 template <int K>

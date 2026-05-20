@@ -14,8 +14,8 @@ __device__ __forceinline__ void rotate_head_bf16(floatX *__restrict__ head,
   for (int i = threadIdx.x; i < rotary_half; i += blockDim.x) {
     float x1 = __bfloat162float(head[i]);
     float x2 = __bfloat162float(head[rotary_half + i]);
-    float c = cos_row[i];
-    float s = sin_row[i];
+    float c = loadg(cos_row + i);
+    float s = loadg(sin_row + i);
     head[i] = __float2bfloat16_rn(fmaf(-x2, s, x1 * c));
     head[rotary_half + i] = __float2bfloat16_rn(fmaf(x1, s, x2 * c));
   }
