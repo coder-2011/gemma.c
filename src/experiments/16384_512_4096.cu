@@ -373,7 +373,9 @@ static float max_abs_diff(const half *a, const half *b, size_t n,
   gemma4_experiment_max_abs_diff_kernel<<<blocks, threads, 0, stream>>>(a, b, d_blocks, n);
   CUDA_CHECK(cudaGetLastError());
   std::vector<float> h_blocks(blocks);
-  CUDA_CHECK(cudaMemcpyAsync(h_blocks.data(), d_blocks, static_cast<size_t>(blocks) * sizeof(float), cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaMemcpyAsync(h_blocks.data(), d_blocks,
+                             static_cast<size_t>(blocks) * sizeof(float),
+                             cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
   CUDA_CHECK(cudaFree(d_blocks));
   return *std::max_element(h_blocks.begin(), h_blocks.end());
@@ -413,8 +415,12 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaMalloc(&cublas_c, c_elems * sizeof(half)));
 
   int threads = 256;
-  gemma4_experiment_fill_half_kernel<<<(a_elems + threads - 1) / threads, threads, 0, stream>>>(a, a_elems, 1);
-  gemma4_experiment_fill_half_kernel<<<(b_elems + threads - 1) / threads, threads, 0, stream>>>(b_col_major, b_elems, 2);
+  gemma4_experiment_fill_half_kernel<<<
+      (a_elems + threads - 1) / threads, threads, 0, stream>>>(
+      a, a_elems, 1);
+  gemma4_experiment_fill_half_kernel<<<
+      (b_elems + threads - 1) / threads, threads, 0, stream>>>(
+      b_col_major, b_elems, 2);
   CUDA_CHECK(cudaMemsetAsync(custom_c, 0, c_elems * sizeof(half), stream));
   CUDA_CHECK(cudaMemsetAsync(cublas_c, 0, c_elems * sizeof(half), stream));
   CUDA_CHECK(cudaGetLastError());
@@ -516,7 +522,10 @@ int main(int argc, char **argv) {
       reinterpret_cast<half *>(b_col_major.data_ptr()),                        \
       reinterpret_cast<half *>(c.data_ptr()), M, N, K, (stride));
 
-void cuda_l2_3090_fp32(torch::Tensor a, torch::Tensor b, torch::Tensor b_col_major, torch::Tensor c) {
+void cuda_l2_3090_fp32(torch::Tensor a,
+                       torch::Tensor b,
+                       torch::Tensor b_col_major,
+                       torch::Tensor c) {
   CHECK_TORCH_TENSOR_DTYPE(a, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(b, torch::kHalf)
   CHECK_TORCH_TENSOR_DTYPE(c, torch::kHalf)

@@ -56,6 +56,15 @@ Conclusion:
 - CUDA Graph capture makes short-sequence launch overhead much smaller, but cuDNN remains slower because RoPE is decomposed into multiple pointwise launches instead of one fused kernel.
 - Keep the custom RoPE baseline. Future optimization should focus on fusing Q/K RMSNorm, RoPE, and KV-cache write rather than replacing this path with cuDNN pointwise ops.
 
+Follow-up static profile:
+
+- Built PTX/SASS artifacts with `nvcc -std=c++17 -O3 -arch=sm_86 -Isrc`.
+- `ptxas -v` reports 26 registers for the low-level layout kernel, 29 registers for the forward-layout kernel, 0 stack bytes, 0 spill loads/stores, and 0 barriers.
+- `cuobjdump --dump-resource-usage` reports `SHARED:0` and `LOCAL:0` for both RoPE kernels.
+- PTX and SASS contain no shared-memory instructions (`ld.shared`, `st.shared`, `LDS`, `STS`) and no local-memory spill instructions (`ld.local`, `st.local`, `LDL`, `STL`).
+- RoPE memory ops are scalar, not vectorized: PTX uses `ld.global.u16`/`st.global.u16` for BF16 Q/K and `ld.global.f32` for cos/sin; SASS uses `LDG.E.U16`, `STG.E.U16`, and scalar 32-bit `LDG.E`.
+- `ncu` could not collect bank-conflict counters on this Thunder instance; it aborted in Thunder/CUPTI with `Unimplemented CUDA export table function: Table=cupti_device_query, Index=7`.
+
 ## 2026-05-17 - 16384x512x4096 CUTE matmul vs cuBLAS
 
 Experiment file: `src/experiments/16384_512_4096.cu`

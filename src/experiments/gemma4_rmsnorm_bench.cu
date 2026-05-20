@@ -262,7 +262,14 @@ int main(int argc, char **argv) {
               "not_compiled"
 #endif
   );
-  std::printf("rows,rms_ms,rms_gib_s,rms_graph_kernel_ms,rms_graph_kernel_gib_s,cudnn_ms,cudnn_gib_s,cudnn_graph_kernel_ms,cudnn_graph_kernel_gib_s,cudnn_max_abs,cudnn_rstd_max_abs,residual_ms,fused_ms,split_ms,fused_vs_split,fused_graph_kernel_ms,split_graph_kernel_ms,fused_graph_vs_split_graph,cudnn_split_ms,cudnn_split_graph_ms,fused_vs_cudnn_split,cudnn_split_max_abs,cudnn_split_rstd_max_abs\n");
+  std::printf("rows,rms_ms,rms_gib_s,rms_graph_kernel_ms,"
+              "rms_graph_kernel_gib_s,cudnn_ms,cudnn_gib_s,"
+              "cudnn_graph_kernel_ms,cudnn_graph_kernel_gib_s,"
+              "cudnn_max_abs,cudnn_rstd_max_abs,residual_ms,fused_ms,"
+              "split_ms,fused_vs_split,fused_graph_kernel_ms,"
+              "split_graph_kernel_ms,fused_graph_vs_split_graph,"
+              "cudnn_split_ms,cudnn_split_graph_ms,fused_vs_cudnn_split,"
+              "cudnn_split_max_abs,cudnn_split_rstd_max_abs\n");
 
   for (int rows : row_counts_up_to(max_rows)) {
     const int count = rows * width;
@@ -277,17 +284,23 @@ int main(int argc, char **argv) {
     const double split_bytes = residual_bytes + rms_bytes;
 
     auto run_rms = [&]() {
-      CUDA_CHECK(gemma4_rmsnorm_bf16(d_rms_out, d_rstd, d_inp1, d_weight, rows, width, GEMMA4_RMS_NORM_EPS, stream));
+      CUDA_CHECK(gemma4_rmsnorm_bf16(d_rms_out, d_rstd, d_inp1,
+                                     d_weight, rows, width,
+                                     GEMMA4_RMS_NORM_EPS, stream));
     };
     auto run_residual = [&]() {
       CUDA_CHECK(gemma4_residual_add_bf16(d_residual, d_inp1, d_inp2, count, stream));
     };
     auto run_fused = [&]() {
-      CUDA_CHECK(gemma4_residual_add_rmsnorm_bf16(d_split_residual, d_fused_normed, d_fused_rstd, d_inp1, d_inp2, d_weight, rows, width, GEMMA4_RMS_NORM_EPS, stream));
+      CUDA_CHECK(gemma4_residual_add_rmsnorm_bf16(
+          d_split_residual, d_fused_normed, d_fused_rstd, d_inp1, d_inp2,
+          d_weight, rows, width, GEMMA4_RMS_NORM_EPS, stream));
     };
     auto run_split = [&]() {
       CUDA_CHECK(gemma4_residual_add_bf16(d_split_residual, d_inp1, d_inp2, count, stream));
-      CUDA_CHECK(gemma4_rmsnorm_bf16(d_split_normed, d_split_rstd, d_split_residual, d_weight, rows, width, GEMMA4_RMS_NORM_EPS, stream));
+      CUDA_CHECK(gemma4_rmsnorm_bf16(d_split_normed, d_split_rstd,
+                                     d_split_residual, d_weight, rows, width,
+                                     GEMMA4_RMS_NORM_EPS, stream));
     };
 
     run_rms();
@@ -377,8 +390,12 @@ int main(int argc, char **argv) {
           diff_stats_bf16(d_rms_out, d_rms_cudnn_out, count);
       std::vector<float> h_custom_rstd(rows);
       std::vector<float> h_cudnn_rstd(rows);
-      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_rstd, static_cast<size_t>(rows) * sizeof(float), cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd, static_cast<size_t>(rows) * sizeof(float), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_rstd,
+                            static_cast<size_t>(rows) * sizeof(float),
+                            cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd,
+                            static_cast<size_t>(rows) * sizeof(float),
+                            cudaMemcpyDeviceToHost));
       float max_rstd = 0.0f;
       for (int i = 0; i < rows; ++i) {
         max_rstd =
@@ -403,7 +420,8 @@ int main(int argc, char **argv) {
         cudnn_split_graph_ms = cudnn_split_graph_stats.best_ms;
       } catch (const std::exception &e) {
         std::fprintf(stderr,
-                     "custom residual + cuDNN RMSNorm CUDA graph timing unavailable for rows=%d: %s\n",
+                     "custom residual + cuDNN RMSNorm CUDA graph timing "
+                     "unavailable for rows=%d: %s\n",
                      rows, e.what());
       }
 
@@ -412,8 +430,12 @@ int main(int argc, char **argv) {
       CUDA_CHECK(cudaStreamSynchronize(stream));
       DiffStats split_out_diff =
           diff_stats_bf16(d_fused_normed, d_rms_cudnn_out, count);
-      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_fused_rstd, static_cast<size_t>(rows) * sizeof(float), cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd, static_cast<size_t>(rows) * sizeof(float), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_fused_rstd,
+                            static_cast<size_t>(rows) * sizeof(float),
+                            cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd,
+                            static_cast<size_t>(rows) * sizeof(float),
+                            cudaMemcpyDeviceToHost));
       max_rstd = 0.0f;
       for (int i = 0; i < rows; ++i) {
         max_rstd =
@@ -433,7 +455,9 @@ int main(int argc, char **argv) {
             : -1.0f;
     float fused_vs_cudnn_split =
         cudnn_split_ms > 0.0f ? cudnn_split_ms / fused_stats.best_ms : -1.0f;
-    std::printf("%d,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6g,%.6g,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,%.3f,%.6f,%.6f,%.3f,%.6g,%.6g\n",
+    std::printf("%d,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,"
+                "%.6g,%.6g,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,"
+                "%.3f,%.6f,%.6f,%.3f,%.6g,%.6g\n",
                 rows, rms_stats.best_ms,
                 gib_per_second(rms_bytes, rms_stats.best_ms), rms_graph_ms,
                 rms_graph_gib_s, cudnn_ms, cudnn_gib_s, cudnn_graph_ms,

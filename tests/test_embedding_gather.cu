@@ -13,7 +13,8 @@ namespace {
 
 void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
   if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr, cudaGetErrorString(status));
+    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
+                 cudaGetErrorString(status));
     std::exit(1);
   }
 }
@@ -45,11 +46,17 @@ void run_case(int vocab_size, const std::vector<int32_t> &token_ids) {
   CHECK_CUDA(cudaMalloc(&d_out, out.size() * sizeof(__nv_bfloat16)));
   CHECK_CUDA(cudaMalloc(&d_token_ids, token_ids.size() * sizeof(int32_t)));
 
-  CHECK_CUDA(cudaMemcpy(d_embeddings, embeddings.data(), embeddings.size() * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_token_ids, token_ids.data(), token_ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_embeddings, embeddings.data(),
+                        embeddings.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_token_ids, token_ids.data(),
+                        token_ids.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
 
   CHECK_CUDA(gemma4_embedding_gather_bf16(d_out, d_token_ids, d_embeddings, num_tokens, 0));
-  CHECK_CUDA(cudaMemcpy(out.data(), d_out, out.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(out.data(), d_out,
+                        out.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost));
 
   const uint16_t *out_bits = reinterpret_cast<const uint16_t *>(out.data());
   const uint16_t *embedding_bits = reinterpret_cast<const uint16_t *>(embeddings.data());
@@ -59,7 +66,10 @@ void run_case(int vocab_size, const std::vector<int32_t> &token_ids) {
       uint16_t actual = out_bits[static_cast<size_t>(token_idx) * hidden_size + c];
       uint16_t expected = embedding_bits[static_cast<size_t>(token_id) * hidden_size + c];
       if (actual != expected) {
-        std::fprintf(stderr, "mismatch token_idx=%d token_id=%d channel=%d actual=0x%04x expected=0x%04x\n", token_idx, token_id, c, actual, expected);
+        std::fprintf(stderr,
+                     "mismatch token_idx=%d token_id=%d channel=%d "
+                     "actual=0x%04x expected=0x%04x\n",
+                     token_idx, token_id, c, actual, expected);
         std::exit(1);
       }
     }

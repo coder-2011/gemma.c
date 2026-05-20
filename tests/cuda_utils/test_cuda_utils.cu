@@ -11,7 +11,8 @@ namespace {
 
 void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
   if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr, cudaGetErrorString(status));
+    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
+                 cudaGetErrorString(status));
     std::exit(1);
   }
 }

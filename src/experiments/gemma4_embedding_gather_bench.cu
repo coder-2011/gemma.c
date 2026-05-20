@@ -42,7 +42,10 @@ int main(int argc, char **argv) {
   const int max_tokens = argc > 4 ? std::atoi(argv[4]) : 4096;
 
   if (iters <= 0 || warmup < 0 || trials <= 0 || max_tokens <= 0) {
-    std::fprintf(stderr, "usage: %s [iters=200] [warmup=30] [trials=5] [max_tokens=4096]\n", argv[0]);
+    std::fprintf(stderr,
+                 "usage: %s [iters=200] [warmup=30] [trials=5] "
+                 "[max_tokens=4096]\n",
+                 argv[0]);
     return 1;
   }
 
@@ -76,30 +79,39 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
   std::printf("device=%s\n", prop.name);
-  std::printf("shape=hidden%d,vocab%d,embedding_bytes=%zu,out_max_tokens=%d\n", hidden_size, vocab_size, embedding_bytes, max_tokens);
+  std::printf("shape=hidden%d,vocab%d,embedding_bytes=%zu,"
+              "out_max_tokens=%d\n",
+              hidden_size, vocab_size, embedding_bytes, max_tokens);
   std::printf("iters=%d,warmup_iters=%d,trials=%d\n", iters, warmup, trials);
   std::printf("tokens,best_ms,avg_ms,best_effective_gib_s,avg_effective_gib_s,effective_mib\n");
 
   for (int token_count : token_counts_up_to(max_tokens)) {
     fill_token_ids(h_token_ids, token_count, vocab_size);
-    CUDA_CHECK(cudaMemcpyAsync(d_token_ids, h_token_ids.data(), static_cast<size_t>(token_count) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_token_ids, h_token_ids.data(),
+                               static_cast<size_t>(token_count) *
+                                   sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto run_gather = [&]() {
-      CUDA_CHECK(gemma4_embedding_gather_bf16(d_out, d_token_ids, d_embeddings, token_count, stream));
+      CUDA_CHECK(gemma4_embedding_gather_bf16(
+          d_out, d_token_ids, d_embeddings, token_count, stream));
     };
 
     run_gather();
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     TimingStats stats = time_ms(run_gather, stream, warmup, iters, trials);
-    const double moved_bytes = 2.0 * static_cast<double>(token_count) * hidden_size * sizeof(__nv_bfloat16);
+    const double moved_bytes = 2.0 * static_cast<double>(token_count) *
+                               hidden_size * sizeof(__nv_bfloat16);
     const double moved_gib = moved_bytes / (1024.0 * 1024.0 * 1024.0);
     const double best_gib_s = moved_gib / (static_cast<double>(stats.best_ms) / 1000.0);
     const double avg_gib_s = moved_gib / (static_cast<double>(stats.avg_ms) / 1000.0);
     const double moved_mib = moved_bytes / (1024.0 * 1024.0);
 
-    std::printf("%d,%.6f,%.6f,%.3f,%.3f,%.3f\n", token_count, stats.best_ms, stats.avg_ms, best_gib_s, avg_gib_s, moved_mib);
+    std::printf("%d,%.6f,%.6f,%.3f,%.3f,%.3f\n", token_count,
+                stats.best_ms, stats.avg_ms, best_gib_s, avg_gib_s,
+                moved_mib);
   }
 
   CUDA_CHECK(cudaFree(d_embeddings));

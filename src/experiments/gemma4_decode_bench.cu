@@ -324,22 +324,34 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
               kWeightScale);
   std::printf("custom_best_ms=%.6f,custom_avg_ms=%.6f,custom_best_weight_gbps=%.3f\n",
               custom.best_ms, custom.avg_ms, bytes / (custom.best_ms * 1.0e6));
-  std::printf("cublas_bf16_gemv_best_ms=%.6f,cublas_bf16_gemv_avg_ms=%.6f,cublas_bf16_gemv_best_weight_gbps=%.3f\n",
+  std::printf("cublas_bf16_gemv_best_ms=%.6f,"
+              "cublas_bf16_gemv_avg_ms=%.6f,"
+              "cublas_bf16_gemv_best_weight_gbps=%.3f\n",
               gemv.best_ms, gemv.avg_ms, bytes / (gemv.best_ms * 1.0e6));
-  std::printf("cublas_bf16_gemm_m1_best_ms=%.6f,cublas_bf16_gemm_m1_avg_ms=%.6f,cublas_bf16_gemm_m1_best_weight_gbps=%.3f\n",
+  std::printf("cublas_bf16_gemm_m1_best_ms=%.6f,"
+              "cublas_bf16_gemm_m1_avg_ms=%.6f,"
+              "cublas_bf16_gemm_m1_best_weight_gbps=%.3f\n",
               gemm.best_ms, gemm.avg_ms, bytes / (gemm.best_ms * 1.0e6));
-  std::printf("cudnn_bf16_conv1x1_best_ms=%.6f,cudnn_bf16_conv1x1_avg_ms=%.6f,cudnn_bf16_conv1x1_best_weight_gbps=%.3f\n",
+  std::printf("cudnn_bf16_conv1x1_best_ms=%.6f,"
+              "cudnn_bf16_conv1x1_avg_ms=%.6f,"
+              "cudnn_bf16_conv1x1_best_weight_gbps=%.3f\n",
               cudnn_best_ms, cudnn_avg_ms, cudnn_gbps);
   std::printf("custom_vs_cublas_gemv_speedup=%.6f\n",
               gemv.best_ms / custom.best_ms);
   std::printf("custom_vs_cublas_gemm_m1_speedup=%.6f\n",
               gemm.best_ms / custom.best_ms);
   std::printf("custom_vs_cudnn_conv1x1_speedup=%.6f\n", cudnn_speedup);
-  std::printf("cublas_bf16_gemv_max_abs_diff=%.6g,cublas_bf16_gemv_mean_abs_diff=%.6g,cublas_bf16_gemv_max_rel_diff=%.6g\n",
+  std::printf("cublas_bf16_gemv_max_abs_diff=%.6g,"
+              "cublas_bf16_gemv_mean_abs_diff=%.6g,"
+              "cublas_bf16_gemv_max_rel_diff=%.6g\n",
               gemv_diff.max_abs, gemv_diff.mean_abs, gemv_diff.max_rel);
-  std::printf("cublas_bf16_gemm_m1_max_abs_diff=%.6g,cublas_bf16_gemm_m1_mean_abs_diff=%.6g,cublas_bf16_gemm_m1_max_rel_diff=%.6g\n",
+  std::printf("cublas_bf16_gemm_m1_max_abs_diff=%.6g,"
+              "cublas_bf16_gemm_m1_mean_abs_diff=%.6g,"
+              "cublas_bf16_gemm_m1_max_rel_diff=%.6g\n",
               gemm_diff.max_abs, gemm_diff.mean_abs, gemm_diff.max_rel);
-  std::printf("cudnn_bf16_conv1x1_max_abs_diff=%.6g,cudnn_bf16_conv1x1_mean_abs_diff=%.6g,cudnn_bf16_conv1x1_max_rel_diff=%.6g\n",
+  std::printf("cudnn_bf16_conv1x1_max_abs_diff=%.6g,"
+              "cudnn_bf16_conv1x1_mean_abs_diff=%.6g,"
+              "cudnn_bf16_conv1x1_max_rel_diff=%.6g\n",
               cudnn_max_abs, cudnn_mean_abs, cudnn_max_rel);
   std::printf("cudnn_bf16_conv1x1_algo=%d,cudnn_bf16_conv1x1_workspace_bytes=%zu\n\n",
               cudnn_algo, cudnn_workspace_bytes);
