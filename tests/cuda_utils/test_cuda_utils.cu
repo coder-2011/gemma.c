@@ -9,11 +9,9 @@
 
 namespace {
 
-void check_cuda(cudaError_t status, const char *expr, const char *file,
-                int line) {
+void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
   if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
+    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr, cudaGetErrorString(status));
     std::exit(1);
   }
 }
@@ -66,14 +64,11 @@ int main() {
   float *d_out = nullptr;
   CHECK_CUDA(cudaMalloc(&d_inp, inp.size() * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&d_out, out.size() * sizeof(float)));
-  CHECK_CUDA(cudaMemcpy(d_inp, inp.data(), inp.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_inp, inp.data(), inp.size() * sizeof(float), cudaMemcpyHostToDevice));
 
-  warp_reduce_sum_real_kernel<<<blocks, threads>>>(d_inp, d_out,
-                                                   warps_per_block);
+  warp_reduce_sum_real_kernel<<<blocks, threads>>>(d_inp, d_out, warps_per_block);
   CHECK_CUDA(cudaGetLastError());
-  CHECK_CUDA(cudaMemcpy(out.data(), d_out, out.size() * sizeof(float),
-                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(out.data(), d_out, out.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
   for (int warp = 0; warp < total_warps; ++warp) {
     for (int lane = 0; lane < WARP_SIZE; ++lane) {

@@ -12,11 +12,9 @@
 
 namespace {
 
-void check_cuda(cudaError_t status, const char *expr, const char *file,
-                int line) {
+void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
   if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
+    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr, cudaGetErrorString(status));
     std::exit(1);
   }
 }
@@ -64,10 +62,8 @@ void reference_rope(std::vector<__nv_bfloat16> &values,
     for (int pos = 0; pos < seq_len; ++pos) {
       int row = b * seq_len + pos;
       int table_batch = cos_batch_size == 1 ? 0 : b;
-      const float *cos_row =
-          cos.data() + (table_batch * seq_len + pos) * cos_row_stride;
-      const float *sin_row =
-          sin.data() + (table_batch * seq_len + pos) * cos_row_stride;
+      const float *cos_row = cos.data() + (table_batch * seq_len + pos) * cos_row_stride;
+      const float *sin_row = sin.data() + (table_batch * seq_len + pos) * cos_row_stride;
       for (int h = 0; h < heads; ++h) {
         int base = row * row_stride + h * head_dim;
         for (int i = 0; i < rotary_half; ++i) {
@@ -103,9 +99,7 @@ void reference_rope_forward_layout(std::vector<__nv_bfloat16> &values,
             cos.data() + (table_batch * seq_len + pos) * cos_row_stride;
         const float *sin_row =
             sin.data() + (table_batch * seq_len + pos) * cos_row_stride;
-        int base =
-            (static_cast<int64_t>(b) * heads + h) * seq_len * head_dim +
-            pos * head_dim;
+        int base = (static_cast<int64_t>(b) * heads + h) * seq_len * head_dim + pos * head_dim;
         for (int i = 0; i < rotary_half; ++i) {
           float x1 = bf16_to_float(values[base + i]);
           float x2 = bf16_to_float(values[base + rotary_half + i]);
@@ -186,26 +180,14 @@ void run_case(int batch_size,
   CHECK_CUDA(cudaMalloc(&d_k, static_cast<size_t>(k_count) * sizeof(k[0])));
   CHECK_CUDA(cudaMalloc(&d_cos, static_cast<size_t>(table_count) * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&d_sin, static_cast<size_t>(table_count) * sizeof(float)));
-  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(),
-                        static_cast<size_t>(table_count) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(),
-                        static_cast<size_t>(table_count) * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(), static_cast<size_t>(table_count) * sizeof(float), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(), static_cast<size_t>(table_count) * sizeof(float), cudaMemcpyHostToDevice));
 
-  CHECK_CUDA(gemma4_rope_bf16(
-      d_q, static_cast<int64_t>(q_heads) * head_dim, d_k,
-      static_cast<int64_t>(kv_heads) * head_dim, d_cos, rotary_half, d_sin,
-      rotary_half, seq_len, batch_size, cos_batch_size, q_heads, kv_heads,
-      head_dim, rotary_dim, 0));
-  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]),
-                        cudaMemcpyDeviceToHost));
-  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]),
-                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(gemma4_rope_bf16(d_q, static_cast<int64_t>(q_heads) * head_dim, d_k, static_cast<int64_t>(kv_heads) * head_dim, d_cos, rotary_half, d_sin, rotary_half, seq_len, batch_size, cos_batch_size, q_heads, kv_heads, head_dim, rotary_dim, 0));
+  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]), cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]), cudaMemcpyDeviceToHost));
 
   compare_bf16(q, expected_q, 0.0078125f, "rope q");
   compare_bf16(k, expected_k, 0.0078125f, "rope k");
@@ -259,24 +241,14 @@ void run_forward_case(int batch_size,
   CHECK_CUDA(cudaMalloc(&d_k, static_cast<size_t>(k_count) * sizeof(k[0])));
   CHECK_CUDA(cudaMalloc(&d_cos, static_cast<size_t>(table_count) * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&d_sin, static_cast<size_t>(table_count) * sizeof(float)));
-  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(),
-                        static_cast<size_t>(table_count) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(),
-                        static_cast<size_t>(table_count) * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(), static_cast<size_t>(table_count) * sizeof(float), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(), static_cast<size_t>(table_count) * sizeof(float), cudaMemcpyHostToDevice));
 
-  CHECK_CUDA(gemma4_rope_forward_bf16(
-      d_q, d_k, d_cos, d_sin, seq_len, batch_size, cos_batch_size, q_heads,
-      kv_heads, head_dim, rotary_dim, 0));
-  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]),
-                        cudaMemcpyDeviceToHost));
-  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]),
-                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(gemma4_rope_forward_bf16(d_q, d_k, d_cos, d_sin, seq_len, batch_size, cos_batch_size, q_heads, kv_heads, head_dim, rotary_dim, 0));
+  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]), cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]), cudaMemcpyDeviceToHost));
 
   compare_bf16(q, expected_q, 0.0078125f, "forward rope q");
   compare_bf16(k, expected_k, 0.0078125f, "forward rope k");
@@ -330,28 +302,18 @@ void run_wrapper_case(bool global) {
   CHECK_CUDA(cudaMalloc(&d_k, static_cast<size_t>(k_count) * sizeof(k[0])));
   CHECK_CUDA(cudaMalloc(&d_cos, static_cast<size_t>(table_count) * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&d_sin, static_cast<size_t>(table_count) * sizeof(float)));
-  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(),
-                        static_cast<size_t>(table_count) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(),
-                        static_cast<size_t>(table_count) * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(), static_cast<size_t>(table_count) * sizeof(float), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(), static_cast<size_t>(table_count) * sizeof(float), cudaMemcpyHostToDevice));
 
   if (global) {
-    CHECK_CUDA(gemma4_global_rope_bf16(d_q, d_k, d_cos, d_sin, seq_len,
-                                       batch_size, cos_batch_size, 0));
+    CHECK_CUDA(gemma4_global_rope_bf16(d_q, d_k, d_cos, d_sin, seq_len, batch_size, cos_batch_size, 0));
   } else {
-    CHECK_CUDA(gemma4_sliding_rope_bf16(d_q, d_k, d_cos, d_sin, seq_len,
-                                        batch_size, cos_batch_size, 0));
+    CHECK_CUDA(gemma4_sliding_rope_bf16(d_q, d_k, d_cos, d_sin, seq_len, batch_size, cos_batch_size, 0));
   }
-  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]),
-                        cudaMemcpyDeviceToHost));
-  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]),
-                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]), cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]), cudaMemcpyDeviceToHost));
 
   compare_bf16(q, expected_q, 0.0078125f,
                global ? "global rope q" : "sliding rope q");
@@ -409,30 +371,18 @@ void run_forward_wrapper_case(bool global) {
   CHECK_CUDA(cudaMalloc(&d_k, static_cast<size_t>(k_count) * sizeof(k[0])));
   CHECK_CUDA(cudaMalloc(&d_cos, static_cast<size_t>(table_count) * sizeof(float)));
   CHECK_CUDA(cudaMalloc(&d_sin, static_cast<size_t>(table_count) * sizeof(float)));
-  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(),
-                        static_cast<size_t>(table_count) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(),
-                        static_cast<size_t>(table_count) * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(), static_cast<size_t>(table_count) * sizeof(float), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(), static_cast<size_t>(table_count) * sizeof(float), cudaMemcpyHostToDevice));
 
   if (global) {
-    CHECK_CUDA(gemma4_global_rope_forward_bf16(d_q, d_k, d_cos, d_sin,
-                                               seq_len, batch_size,
-                                               cos_batch_size, 0));
+    CHECK_CUDA(gemma4_global_rope_forward_bf16(d_q, d_k, d_cos, d_sin, seq_len, batch_size, cos_batch_size, 0));
   } else {
-    CHECK_CUDA(gemma4_sliding_rope_forward_bf16(d_q, d_k, d_cos, d_sin,
-                                                seq_len, batch_size,
-                                                cos_batch_size, 0));
+    CHECK_CUDA(gemma4_sliding_rope_forward_bf16(d_q, d_k, d_cos, d_sin, seq_len, batch_size, cos_batch_size, 0));
   }
-  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]),
-                        cudaMemcpyDeviceToHost));
-  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]),
-                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]), cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]), cudaMemcpyDeviceToHost));
 
   compare_bf16(q, expected_q, 0.0078125f,
                global ? "global forward rope q" : "sliding forward rope q");
@@ -462,9 +412,7 @@ int main() {
   run_forward_wrapper_case(false);
   run_forward_wrapper_case(true);
 
-  cudaError_t invalid =
-      gemma4_rope_bf16(nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, 1, 1,
-                       1, 1, 1, GEMMA4_SLIDING_HEAD_DIM, 127, 0);
+  cudaError_t invalid = gemma4_rope_bf16(nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, 1, 1, 1, 1, 1, GEMMA4_SLIDING_HEAD_DIM, 127, 0);
   if (invalid != cudaErrorInvalidValue) {
     std::fprintf(stderr, "expected cudaErrorInvalidValue for invalid RoPE args\n");
     return 1;
