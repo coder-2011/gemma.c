@@ -121,7 +121,10 @@ cudaError_t gemma4_rope_bf16(floatX *q,
   int heads = q_heads > kv_heads ? q_heads : kv_heads;
 
   dim3 grid(rows, heads);
-  gemma4_rope_bf16_kernel<<<grid, kRopeThreads, 0, stream>>>(q, q_row_stride, k, k_row_stride, cos, cos_row_stride, sin, sin_row_stride, seq_len, cos_batch_size, q_heads, kv_heads, head_dim, rotary_half);
+  gemma4_rope_bf16_kernel<<<grid, kRopeThreads, 0, stream>>>
+  (q, q_row_stride, k, k_row_stride, cos, cos_row_stride, 
+    sin, sin_row_stride, seq_len, cos_batch_size, 
+    q_heads, kv_heads, head_dim, rotary_half);
   return cudaGetLastError();
 }
 
