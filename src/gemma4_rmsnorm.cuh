@@ -29,7 +29,6 @@ cudaError_t gemma4_residual_add_bf16(__nv_bfloat16 *out,
                                      int count,
                                      cudaStream_t stream);
 
-// If weight is nullptr, the normalized residual uses scale-free RMSNorm.
 cudaError_t gemma4_residual_add_rmsnorm_bf16(__nv_bfloat16 *residual,
                                              __nv_bfloat16 *normed,
                                              float *__restrict__ rstd,

@@ -234,7 +234,7 @@ void run_residual_add_case(int rows, int width) {
   compare_bf16(actual, expected, 0.0f, "residual add output");
 }
 
-void run_fused_case(int rows, int width, bool has_weight) {
+void run_fused_case(int rows, int width) {
   const int elems = rows * width;
   std::vector<__nv_bfloat16> inp1(elems);
   std::vector<__nv_bfloat16> inp2(elems);
@@ -248,21 +248,19 @@ void run_fused_case(int rows, int width, bool has_weight) {
 
   fill_residual_inputs(inp1, inp2, expected_residual);
   fill_values(weight, make_weight_value);
-  reference_rmsnorm(expected_normed, expected_rstd, expected_residual,
-                    has_weight ? &weight : nullptr, rows, width,
+  reference_rmsnorm(expected_normed, expected_rstd, expected_residual, &weight,
+                    rows, width,
                     GEMMA4_RMS_NORM_EPS);
 
   DeviceBuffer<__nv_bfloat16> d_inp1(elems);
   DeviceBuffer<__nv_bfloat16> d_inp2(elems);
-  DeviceBuffer<__nv_bfloat16> d_weight(has_weight ? width : 0);
+  DeviceBuffer<__nv_bfloat16> d_weight(width);
   DeviceBuffer<__nv_bfloat16> d_residual(elems);
   DeviceBuffer<__nv_bfloat16> d_normed(elems);
   DeviceBuffer<float> d_rstd(rows);
   d_inp1.copy_from(inp1);
   d_inp2.copy_from(inp2);
-  if (has_weight) {
-    d_weight.copy_from(weight);
-  }
+  d_weight.copy_from(weight);
 
   CHECK_CUDA(gemma4_residual_add_rmsnorm_bf16(
       d_residual.get(), d_normed.get(), d_rstd.get(), d_inp1.get(),
@@ -272,10 +270,9 @@ void run_fused_case(int rows, int width, bool has_weight) {
   d_normed.copy_to(actual_normed);
   d_rstd.copy_to(actual_rstd);
 
-  const char *label = has_weight ? "fused" : "scale-free fused";
-  compare_bf16(actual_residual, expected_residual, 0.0f, label);
-  compare_bf16(actual_normed, expected_normed, 0.03125f, label);
-  compare_float(actual_rstd, expected_rstd, 2.0e-4f, label);
+  compare_bf16(actual_residual, expected_residual, 0.0f, "fused");
+  compare_bf16(actual_normed, expected_normed, 0.03125f, "fused");
+  compare_float(actual_rstd, expected_rstd, 2.0e-4f, "fused");
 }
 
 }  // namespace
@@ -287,10 +284,8 @@ int main() {
   run_rmsnorm_case(7, 512, RmsnormMode::ScaleFreeWrapper);
   run_rmsnorm_case(1, GEMMA4_HIDDEN_SIZE, RmsnormMode::NullWeight);
   run_residual_add_case(9, GEMMA4_HIDDEN_SIZE);
-  run_fused_case(1, 512, true);
-  run_fused_case(19, GEMMA4_HIDDEN_SIZE, true);
-  run_fused_case(5, 512, false);
-  run_fused_case(1, GEMMA4_HIDDEN_SIZE, false);
+  run_fused_case(1, 512);
+  run_fused_case(19, GEMMA4_HIDDEN_SIZE);
 
   cudaError_t invalid = gemma4_rmsnorm_bf16(
       nullptr, nullptr, nullptr, nullptr, 1, GEMMA4_HIDDEN_SIZE + 1,
