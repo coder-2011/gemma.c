@@ -16,35 +16,33 @@
 #include <string>
 #include <vector>
 
-using DecodeLaunch = cudaError_t (*)(const __nv_bfloat16 *,
-                                     const __nv_bfloat16 *, __nv_bfloat16 *,
-                                     cudaStream_t);
-
 struct DecodeOp {
   const char *name;
+  Gemma4Projection projection;
   int k;
   int n;
   int layers_per_token;
-  DecodeLaunch launch;
 };
 
 static const DecodeOp kDecodeOps[] = {
-    {"ffn_gate_up", GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE,
-     GEMMA4_NUM_LAYERS, gemma4_ffn_gate_up_decode},
-    {"ffn_down", GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE,
-     GEMMA4_NUM_LAYERS, gemma4_ffn_down_decode},
-    {"sliding_qkv", GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE,
-     GEMMA4_SLIDING_LAYER_COUNT, gemma4_sliding_qkv_decode},
-    {"sliding_o", GEMMA4_SLIDING_ATTENTION_OUT_SIZE, GEMMA4_HIDDEN_SIZE,
-     GEMMA4_SLIDING_LAYER_COUNT, gemma4_sliding_o_decode},
-    {"global_q", GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE,
-     GEMMA4_GLOBAL_LAYER_COUNT, gemma4_global_q_decode},
-    {"global_k", GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
-     GEMMA4_GLOBAL_LAYER_COUNT, gemma4_global_k_decode},
-    {"global_o", GEMMA4_GLOBAL_ATTENTION_OUT_SIZE, GEMMA4_HIDDEN_SIZE,
-     GEMMA4_GLOBAL_LAYER_COUNT, gemma4_global_o_decode},
-    {"final_logits", GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE, 1,
-     gemma4_final_logits_decode},
+    {"ffn_gate_up", GEMMA4_PROJECTION_FFN_GATE_UP, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_PACKED_FFN_SIZE, GEMMA4_NUM_LAYERS},
+    {"ffn_down", GEMMA4_PROJECTION_FFN_DOWN, GEMMA4_INTERMEDIATE_SIZE,
+     GEMMA4_HIDDEN_SIZE, GEMMA4_NUM_LAYERS},
+    {"sliding_qkv", GEMMA4_PROJECTION_SLIDING_QKV, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_SLIDING_QKV_SIZE, GEMMA4_SLIDING_LAYER_COUNT},
+    {"sliding_o", GEMMA4_PROJECTION_SLIDING_O,
+     GEMMA4_SLIDING_ATTENTION_OUT_SIZE, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_SLIDING_LAYER_COUNT},
+    {"global_q", GEMMA4_PROJECTION_GLOBAL_Q, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_GLOBAL_Q_PROJ_SIZE, GEMMA4_GLOBAL_LAYER_COUNT},
+    {"global_k", GEMMA4_PROJECTION_GLOBAL_K, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_GLOBAL_K_PROJ_SIZE, GEMMA4_GLOBAL_LAYER_COUNT},
+    {"global_o", GEMMA4_PROJECTION_GLOBAL_O,
+     GEMMA4_GLOBAL_ATTENTION_OUT_SIZE, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_GLOBAL_LAYER_COUNT},
+    {"final_logits", GEMMA4_PROJECTION_FINAL_LOGITS, GEMMA4_HIDDEN_SIZE,
+     GEMMA4_VOCAB_SIZE, 1},
 };
 
 __device__ uint32_t gemma4_mix_u32_device(uint32_t x) {
@@ -268,7 +266,10 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   CUDA_CHECK(cudaMemsetAsync(cudnn_y, 0, y_count * sizeof(__nv_bfloat16), stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  auto run_custom = [&]() { CUDA_CHECK(op.launch(x, w, custom_y, stream)); };
+  auto run_custom = [&]() {
+    CUDA_CHECK(
+        gemma4_projection_decode(op.projection, x, w, custom_y, stream));
+  };
   auto run_gemv = [&]() { cublas.gemv(x, w, gemv_y, op.k, op.n); };
   auto run_gemm = [&]() { cublas.gemm_m1(x, w, gemm_y, op.k, op.n); };
 
