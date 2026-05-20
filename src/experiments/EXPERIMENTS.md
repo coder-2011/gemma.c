@@ -2843,3 +2843,56 @@ Resource check:
 Correctness:
 
 - `make -B test-rmsnorm` passed.
+
+## 2026-05-20 - RMSNorm helper cleanup validation
+
+Runtime file:
+
+- `src/gemma4_rmsnorm.cu`
+
+Reason:
+
+- Remove dead scale-free fused residual add plus RMSNorm paths and tiny RMSNorm-local
+  wrapper helpers.
+- Keep the remaining block reduction helper explicit: callers now pass thread, lane,
+  warp, and shared scratch storage instead of letting the helper read `threadIdx.x`.
+
+Commands:
+
+```bash
+make -B test-rmsnorm
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_rmsnorm.cu -o /tmp/gemma4_rmsnorm.o
+make -B rmsnorm-hidden-fused-bench
+./build/experiments/gemma4_rmsnorm_hidden_fused_bench
+```
+
+Environment:
+
+- Device: NVIDIA RTX A6000
+- Focused benchmark defaults: `200` captured kernel calls, `20` graph warmup launches,
+  `5` trials
+- Benchmark seed printed by run: `0x6b1233712354a17b`
+
+Focused hidden-width fused benchmark, graph replay:
+
+| Rows | Best ms | Avg ms | Effective GiB/s |
+| ---: | ---: | ---: | ---: |
+| 4 | 0.002104 | 0.002119 | 95.171 |
+| 16 | 0.002157 | 0.002158 | 371.451 |
+| 64 | 0.002839 | 0.003056 | 1128.947 |
+| 256 | 0.017169 | 0.017213 | 746.606 |
+| 1024 | 0.065835 | 0.065862 | 778.819 |
+
+Resource check:
+
+- Hidden prefill kernel: `28` registers, `0` stack, `0` spills, `96` bytes shared memory.
+- Decode kernels: `38` registers, `0` stack, `0` spills.
+- Shared generic kernels: up to `44` registers, `0` stack, `0` spills.
+
+Correctness and cleanup checks:
+
+- `make -B test-rmsnorm` passed.
+- `git diff --check -- src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh tests/test_rmsnorm.cu`
+  passed.
+- No remaining RMSNorm-local `__forceinline__` helpers or removed helper symbols.

@@ -30,3 +30,5 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 - Fixed the hidden RMSNorm prefill weakness by making fused residual add + RMSNorm use one block per row, then keeping the residual pack in registers instead of shared memory. This finally beats cuDNN split on real hidden shapes, about 1.16-1.99x for prefill rows 4-1024, so fused RMSNorm is now worth keeping for both decode and prefill.
 
 - Plucked some low hanging fruit: SMEM buffering the data arriving from DRAM, because we load _x_ twice–once for sum of squares, and once for multiplying by _γ_. After a bit of tuning, we run ~ 0.4% faster
+
+- Cleaned up the RMSNorm file after that tuning pass. Removed dead scale-free fused residual paths and most of the tiny RMSNorm-local wrapper helpers, then made the remaining block reduction helper take explicit thread/lane/warp state plus shared scratch storage. Tests still pass, ptxas reports no stack/spills, and the focused hidden fused smoke benchmark stayed in the same range: best graph replay for rows 4/16/64/256/1024 was 0.002104/0.002157/0.002839/0.017169/0.065835ms.
