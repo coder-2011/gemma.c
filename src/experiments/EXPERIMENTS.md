@@ -3,6 +3,437 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-05-20 - Tuna BF16 prefill GEMM adaptation baseline
+
+Runtime files:
+
+- `experiments/tuna/gemma4_prefill_bench.cu`
+- `Makefile`
+
+Reason:
+
+- The imported Tuna kernel is tuned for FP16 x FP4 GEMM with quantized activations.
+- Gemma 4 prefill projections use BF16 activations and BF16 weights with variable token
+  count `M`: `Y[M,N] = X[M,K] * W[N,K]^T`.
+- This pass establishes a Gemma-specific BF16 benchmark harness before deeper tuning or
+  more invasive Tuna pipeline changes.
+
+Gemma 4 projection shapes covered:
+
+| Op | K | N |
+| --- | ---: | ---: |
+| `ffn_gate_up` | 5376 | 43008 |
+| `ffn_down` | 21504 | 5376 |
+| `sliding_qkv` | 5376 | 16384 |
+| `sliding_o` | 8192 | 5376 |
+| `global_q` | 5376 | 16384 |
+| `global_k` | 5376 | 2048 |
+| `global_o` | 16384 | 5376 |
+| `final_logits` | 5376 | 262144 |
+
+Implementation:
+
+- Added `gemma4_prefill_bench.cu` under the Tuna experiment folder.
+- Replaced Tuna's FP4 activation quantization assumption with BF16 x BF16 WMMA tensor-core
+  kernels using FP32 accumulation and BF16 output conversion.
+- The benchmark uses the same weight layout as the main Gemma decode helpers:
+  weights are stored as `[N,K]`, so logical matrix B is loaded as column-major `[K,N]`.
+- Added global-load WMMA tile variants and a first shared-memory-staged variant:
+  `wmma_16x16`, `wmma_16x32`, `wmma_16x64`, `wmma_32x64`, `wmma_64x64`,
+  `smem_16x64`, `smem_16x128`, `smem_32x64`, `smem_32x128`, and `smem_64x64`.
+- Added a `make tuna-prefill-bench` target.
+
+Build:
+
+```bash
+make tuna-prefill-bench
+```
+
+Correctness:
+
+- Compared each run against `cublasGemmEx` BF16 input, FP32 accumulate, BF16 output.
+- Observed max absolute differences were `0`, `0.015625`, or `0.03125` depending on
+  shape and reduction length, consistent with BF16 output rounding/order differences.
+
+Benchmark commands:
+
+```bash
+./build/experiments/gemma4_tuna_prefill_bench global_k 80 20 1,16,64,256,1024
+./build/experiments/gemma4_tuna_prefill_bench ffn_gate_up 10 3 16,64,256,1024 wmma_64x64
+./build/experiments/gemma4_tuna_prefill_bench sliding_qkv 20 5 16,64,256,1024 wmma_64x64
+```
+
+Selected results:
+
+| Op | M | Best/custom config | Custom ms | cuBLAS ms | Speedup |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `global_k` | 16 | `wmma_16x32` | 0.0665 | 1.4408 | 21.67x |
+| `global_k` | 64 | `wmma_16x16` | 0.0860 | 1.9580 | 22.78x |
+| `global_k` | 256 | `wmma_16x16` | 0.3292 | 0.0593 | 0.18x |
+| `global_k` | 1024 | `wmma_32x64` | 1.2957 | 1.6951 | 1.31x |
+| `ffn_gate_up` | 16 | `wmma_64x64` | 1.5670 | 0.6687 | 0.43x |
+| `ffn_gate_up` | 64 | `wmma_64x64` | 1.5616 | 0.6917 | 0.44x |
+| `ffn_gate_up` | 256 | `wmma_64x64` | 6.4659 | 0.8452 | 0.13x |
+| `sliding_qkv` | 16 | `wmma_64x64` | 0.7812 | 1.4959 | 1.92x |
+| `sliding_qkv` | 64 | `wmma_64x64` | 0.7803 | 0.2814 | 0.36x |
+| `sliding_qkv` | 256 | `wmma_64x64` | 2.5746 | 0.4059 | 0.16x |
+
+Profiling:
+
+```bash
+ncu --metric gpu__time_duration.sum --target-processes all \
+  ./build/experiments/gemma4_tuna_prefill_bench global_k 1 0 256 wmma_16x16
+```
+
+- `ncu` failed on this Thunder instance with an internal Thunder runtime assertion for
+  an unsupported library path. CUDA-event timing remains the available timing source for
+  this pass.
+
+Conclusion:
+
+- The first BF16 Tuna adaptation is correct and shape-aware, but not yet a competitive
+  replacement for cuBLAS on the dominant wide prefill projections.
+- Global-load WMMA variants are currently better than the simple shared-memory-staged
+  variants for `global_k`; the staged version likely needs vectorized loads, bank-conflict
+  work, and a real async pipeline before it can pay for its synchronization overhead.
+- The only promising cases in this pass are narrow/small-M projections, especially
+  `global_k` at small `M` and `sliding_qkv` at `M=16`.
+- Next Tuna work should either port more of the original pipelined Tuna machinery to
+  BF16 or stop spending time on the current WMMA baseline for wide prefill shapes.
+
+## 2026-05-20 - SGEMM Gemma-shape prefill baseline
+
+Runtime files:
+
+- `experiments/sgemm.cu/gemma4_prefill_bench.cu`
+- `Makefile`
+
+Reason:
+
+- The imported SGEMM implementation is tuned around square FP32 GEMMs.
+- Gemma 4 prefill projections have fixed `K,N` projection dimensions and variable token
+  count `M`, so the original square benchmark is not representative.
+
+Implementation:
+
+- Added a Gemma-shape benchmark that reuses the imported `sgemm()` launcher.
+- The benchmark covers the same Gemma projection shapes as the Tuna benchmark.
+- This is explicitly an FP32 shape/tile baseline. It does not yet replace the datatype
+  path with Gemma's BF16 inference math.
+- Added `make sgemm-prefill-bench`.
+
+Build:
+
+```bash
+make sgemm-prefill-bench
+```
+
+Benchmark commands:
+
+```bash
+./build/experiments/gemma4_sgemm_prefill_bench global_k 20 5 16,64,256
+./build/experiments/gemma4_sgemm_prefill_bench ffn_gate_up 5 2 16,64
+```
+
+Selected results:
+
+| Op | M | Custom ms | cuBLAS ms | Speedup | Max abs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `global_k` | 16 | 0.5476 | 1.8707 | 3.416x | 1.43051e-05 |
+| `global_k` | 64 | 0.5468 | 2.0852 | 3.813x | 9.53674e-06 |
+| `global_k` | 256 | 0.5576 | 1.7969 | 3.222x | 1.19209e-05 |
+| `ffn_gate_up` | 16 | 1.9557 | 1.3309 | 0.681x | 1.23978e-05 |
+| `ffn_gate_up` | 64 | 2.0290 | 1.3708 | 0.676x | 0 |
+
+Conclusion:
+
+- The imported SGEMM shape policy can beat `cublasSgemm` for the narrow `global_k`
+  FP32 baseline on this machine, but loses on the wide `ffn_gate_up` shape.
+- This does not satisfy the final Gemma datatype requirement because the kernel remains
+  FP32. The next SGEMM step is to decide whether to port its cp.async/shared-memory
+  schedule to BF16 tensor cores or treat it as a non-candidate for the BF16 inference
+  path.
+
+## 2026-05-20 - SGEMM BF16 prefill adaptation
+
+Runtime files:
+
+- `experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu`
+- `Makefile`
+
+Reason:
+
+- The FP32 SGEMM shape benchmark does not match Gemma 4 inference datatype.
+- This pass adds a BF16 x BF16 tensor-core path under the SGEMM experiment and benchmarks
+  SGEMM-style CTA shapes against cuBLAS across variable `M`.
+
+Implementation:
+
+- Added `make sgemm-bf16-prefill-bench`.
+- Added BF16 WMMA kernels with FP32 accumulation and BF16 output.
+- Weight layout matches the main Gemma projection layout: `[N,K]`, interpreted as
+  column-major `[K,N]` for `Y[M,N] = X[M,K] * W[N,K]^T`.
+- SGEMM-style tile variants tested:
+  `bf16_16x32`, `bf16_16x64`, `bf16_32x64`, `bf16_64x64`,
+  `bf16_64x128`, and `bf16_128x64`.
+- Larger square-ish CTA shapes from the imported SGEMM source cannot be copied directly
+  with one warp per 16x16 WMMA tile because a true `128x128` tile would require 64 warps
+  / 2048 threads. The largest tested shapes stay within CUDA's legal block size.
+
+Build:
+
+```bash
+make sgemm-bf16-prefill-bench
+```
+
+Benchmark commands:
+
+```bash
+./build/experiments/gemma4_sgemm_bf16_prefill_bench global_k 40 10 16,64,256
+./build/experiments/gemma4_sgemm_bf16_prefill_bench ffn_gate_up 10 3 16,64,256 bf16_64x64
+./build/experiments/gemma4_sgemm_bf16_prefill_bench sliding_qkv 20 5 16,64,256 bf16_64x64
+```
+
+Selected results:
+
+| Op | M | Best/custom config | Custom ms | cuBLAS ms | Speedup | Max abs |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| `global_k` | 16 | `bf16_16x32` | 0.0678 | 1.5484 | 22.824x | 0.015625 |
+| `global_k` | 64 | `bf16_16x64` | 0.1007 | 1.8713 | 18.583x | 0.015625 |
+| `global_k` | 256 | `bf16_16x32` | 0.3317 | 0.0637 | 0.192x | 0 |
+| `ffn_gate_up` | 16 | `bf16_64x64` | 1.5684 | 0.6677 | 0.426x | 0 |
+| `ffn_gate_up` | 64 | `bf16_64x64` | 1.5668 | 0.6911 | 0.441x | 0.015625 |
+| `ffn_gate_up` | 256 | `bf16_64x64` | 6.5583 | 0.8496 | 0.130x | 0 |
+| `sliding_qkv` | 16 | `bf16_64x64` | 0.7790 | 1.2916 | 1.658x | 0.015625 |
+| `sliding_qkv` | 64 | `bf16_64x64` | 0.7787 | 0.2786 | 0.358x | 0 |
+| `sliding_qkv` | 256 | `bf16_64x64` | 2.5505 | 0.4059 | 0.159x | 0 |
+
+Conclusion:
+
+- The SGEMM BF16 adaptation is correct against cuBLAS at BF16 output tolerance.
+- For variable `M`, small row tiles win on narrow `global_k` at small M; larger CTA-style
+  tiles waste too much work there.
+- On dominant wide-N prefill projections, this simple WMMA adaptation loses badly to
+  cuBLAS. Further SGEMM work would need a deeper tensor-core schedule with multiple WMMA
+  tiles per warp and a real cp.async pipeline rather than the current one-warp-per-tile
+  implementation.
+
+## 2026-05-20 - Prefill GEMM focused tuner automation
+
+Runtime files:
+
+- `src/experiments/gemma4_prefill_tune.py`
+- `build/experiments/gemma4_prefill_tune/tuna_focused.csv`
+- `build/experiments/gemma4_prefill_tune/sgemm_bf16_focused.csv`
+
+Reason:
+
+- Manual one-off benchmark commands made it too easy to compare a config that was good
+  at one `M` but poor across the variable-M prefill range.
+- The tuner runs benchmark binaries sequentially, writes CSV rows, and ranks configs by
+  geometric mean speedup plus worst-case speedup across the chosen M sweep.
+
+Validation:
+
+```bash
+python3 -m py_compile src/experiments/gemma4_prefill_tune.py
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops global_k \
+  --configs bf16_16x32,bf16_64x64 --m 16,64 --iters 5 --warmup 2 \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_smoke.csv
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend tuna --ops global_k \
+  --configs wmma_16x32,wmma_64x64 --m 16,64 --iters 5 --warmup 2 \
+  --out build/experiments/gemma4_prefill_tune/tuna_smoke.csv
+```
+
+Focused tuning commands:
+
+```bash
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend tuna --ops global_k,sliding_qkv,ffn_gate_up \
+  --configs wmma_16x32,wmma_16x64,wmma_32x64,wmma_64x64 \
+  --m 16,64,256 --iters 10 --warmup 3 \
+  --out build/experiments/gemma4_prefill_tune/tuna_focused.csv
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops global_k,sliding_qkv,ffn_gate_up \
+  --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_64x128,bf16_128x64 \
+  --m 16,64,256 --iters 10 --warmup 3 \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_focused.csv
+```
+
+Dispatch summary command:
+
+```bash
+python3 src/experiments/gemma4_prefill_tune.py summarize \
+  build/experiments/gemma4_prefill_tune/tuna_focused.csv \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_focused.csv \
+  --custom-threshold 1.0
+```
+
+Focused Tuna summary:
+
+| Op | Best config | Geomean speedup | Worst speedup |
+| --- | --- | ---: | ---: |
+| `ffn_gate_up` | `wmma_64x64` | 0.293x | 0.133x |
+| `global_k` | `wmma_32x64` | 10.330x | 0.162x |
+| `sliding_qkv` | `wmma_32x64` | 0.511x | 0.081x |
+
+Focused SGEMM BF16 summary:
+
+| Op | Best config | Geomean speedup | Worst speedup |
+| --- | --- | ---: | ---: |
+| `ffn_gate_up` | `bf16_64x64` | 0.293x | 0.133x |
+| `global_k` | `bf16_16x64` | 6.024x | 0.184x |
+| `sliding_qkv` | `bf16_64x64` | 0.672x | 0.161x |
+
+Hybrid dispatch summary:
+
+Note: this first focused summary used the cuBLAS timing from the same row as the selected
+custom config. Later summaries below use the fastest observed cuBLAS time for each
+`(backend, op, M)` case and should be treated as the conservative dispatch evidence.
+
+| Backend | Dispatch weighted ms | cuBLAS weighted ms | Custom-only weighted ms | Dispatch vs cuBLAS | Custom-only vs cuBLAS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Tuna | 188.2440 | 323.6200 | 755.1540 | 1.7192x | 0.4285x |
+| SGEMM BF16 | 188.6090 | 439.9490 | 759.2650 | 2.3326x | 0.5794x |
+
+The dispatch policy uses custom kernels only where the measured custom config is faster
+than cuBLAS for that `(op, M)` point, otherwise it falls back to cuBLAS. This is not a
+final production policy because small-M cuBLAS measurements are noisy here, but it is a
+useful guardrail: the current custom kernels are only candidates for specific small-M
+projection cases, not broad prefill replacements.
+
+Caveats:
+
+- Small-M cuBLAS timings are noisy on this Thunder instance, even with warmup. The tuner
+  is useful for reproducible sweeps and spotting clear losers, but longer runs and a
+  production profiling instance are still needed before treating the exact speedups as
+  final.
+- The current one-warp-per-WMMA-tile custom kernels are not competitive on the dominant
+  wide prefill projections. The tuner reinforces the earlier conclusion: deeper pipeline
+  work is needed before custom prefill GEMM can replace cuBLAS for most Gemma 4 shapes.
+
+All-shape follow-up:
+
+```bash
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend tuna \
+  --ops ffn_gate_up,ffn_down,sliding_qkv,sliding_o,global_q,global_k,global_o,final_logits \
+  --configs wmma_16x32,wmma_32x64,wmma_64x64 \
+  --m 16,64,256 --iters 5 --warmup 2 \
+  --out build/experiments/gemma4_prefill_tune/tuna_all_shapes.csv
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 \
+  --ops ffn_gate_up,ffn_down,sliding_qkv,sliding_o,global_q,global_k,global_o,final_logits \
+  --configs bf16_16x32,bf16_32x64,bf16_64x64 \
+  --m 16,64,256 --iters 5 --warmup 2 \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes.csv
+
+python3 src/experiments/gemma4_prefill_tune.py summarize \
+  build/experiments/gemma4_prefill_tune/tuna_all_shapes.csv \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes.csv \
+  --custom-threshold 1.0
+```
+
+All-shape config ranking:
+
+| Backend | Op | Best config | Geomean speedup | Worst speedup |
+| --- | --- | --- | ---: | ---: |
+| Tuna | `ffn_down` | `wmma_64x64` | 2.648x | 1.060x |
+| Tuna | `ffn_gate_up` | `wmma_64x64` | 0.293x | 0.134x |
+| Tuna | `final_logits` | `wmma_64x64` | 0.289x | 0.132x |
+| Tuna | `global_k` | `wmma_16x32` | 4.261x | 0.189x |
+| Tuna | `global_o` | `wmma_32x64` | 0.551x | 0.431x |
+| Tuna | `global_q` | `wmma_64x64` | 0.643x | 0.162x |
+| Tuna | `sliding_o` | `wmma_32x64` | 0.798x | 0.446x |
+| Tuna | `sliding_qkv` | `wmma_64x64` | 0.595x | 0.161x |
+| SGEMM BF16 | `ffn_down` | `bf16_64x64` | 1.720x | 0.373x |
+| SGEMM BF16 | `ffn_gate_up` | `bf16_64x64` | 0.286x | 0.127x |
+| SGEMM BF16 | `final_logits` | `bf16_64x64` | 0.292x | 0.137x |
+| SGEMM BF16 | `global_k` | `bf16_32x64` | 3.888x | 0.165x |
+| SGEMM BF16 | `global_o` | `bf16_32x64` | 0.564x | 0.294x |
+| SGEMM BF16 | `global_q` | `bf16_64x64` | 0.578x | 0.161x |
+| SGEMM BF16 | `sliding_o` | `bf16_64x64` | 0.874x | 0.438x |
+| SGEMM BF16 | `sliding_qkv` | `bf16_64x64` | 0.729x | 0.161x |
+
+All-shape weighted dispatch summary:
+
+| Backend | Dispatch weighted ms | cuBLAS weighted ms | Custom-only weighted ms | Dispatch vs cuBLAS | Custom-only vs cuBLAS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Tuna | 576.6059 | 1169.7969 | 1234.8390 | 2.0288x | 0.9473x |
+| SGEMM BF16 | 450.3071 | 683.7701 | 1246.3649 | 1.5185x | 0.5486x |
+
+Interpretation:
+
+- The all-shape sweep identifies `ffn_down`, small-M `global_k`, M=16
+  `global_q`/`sliding_qkv`, and M=256 `sliding_o` as the only consistently interesting
+  custom-kernel candidates in this first adaptation.
+- `ffn_gate_up`, `final_logits`, most QKV/global-Q at larger M, and most output
+  projections should stay on cuBLAS unless a deeper pipelined tensor-core kernel is
+  written.
+- Tuna and SGEMM BF16 are still structurally similar after this adaptation. Tuna has a
+  slight edge in the all-shape custom-only result because its measured `ffn_down` run was
+  stronger; SGEMM BF16 has slightly better focused `sliding_qkv` in the earlier run.
+
+Candidate deep sweep:
+
+After the all-shape sweep narrowed the search space, I reran only the surviving candidate
+ops over a denser M range and the full config sets.
+
+```bash
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend tuna --ops ffn_down,global_k,sliding_o \
+  --configs wmma_16x16,wmma_16x32,wmma_16x64,wmma_32x64,wmma_64x64,smem_16x64,smem_16x128,smem_32x64,smem_32x128,smem_64x64 \
+  --m 16,32,64,128,256,512 --iters 10 --warmup 3 \
+  --out build/experiments/gemma4_prefill_tune/tuna_candidate_deep.csv
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down,global_k,sliding_o \
+  --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_64x128,bf16_128x64 \
+  --m 16,32,64,128,256,512 --iters 10 --warmup 3 \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_deep.csv
+
+python3 src/experiments/gemma4_prefill_tune.py summarize \
+  build/experiments/gemma4_prefill_tune/tuna_candidate_deep.csv \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_deep.csv \
+  --custom-threshold 1.0
+```
+
+Candidate deep summary:
+
+| Backend | Op | Best config | Geomean speedup | Worst speedup |
+| --- | --- | --- | ---: | ---: |
+| Tuna | `ffn_down` | `wmma_64x64` | 0.864x | 0.110x |
+| Tuna | `global_k` | `wmma_16x16` | 3.233x | 0.189x |
+| Tuna | `sliding_o` | `wmma_64x64` | 0.378x | 0.123x |
+| SGEMM BF16 | `ffn_down` | `bf16_32x64` | 0.798x | 0.050x |
+| SGEMM BF16 | `global_k` | `bf16_16x64` | 4.046x | 0.188x |
+| SGEMM BF16 | `sliding_o` | `bf16_64x64` | 0.375x | 0.122x |
+
+Candidate dispatch summary:
+
+| Backend | Dispatch weighted ms | cuBLAS weighted ms | Custom-only weighted ms | Dispatch vs cuBLAS | Custom-only vs cuBLAS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Tuna | 426.9340 | 708.2160 | 1066.1890 | 1.6588x | 0.6642x |
+| SGEMM BF16 | 399.7810 | 625.7630 | 1022.0280 | 1.5653x | 0.6123x |
+
+Deep-sweep dispatch windows:
+
+- `ffn_down`: custom is useful for M=16,32,64; use cuBLAS from M=128 onward.
+- `global_k`: custom is useful at M=16,32,64; M=128 and M=256 should use cuBLAS.
+  The measured M=512 custom win is suspicious because cuBLAS timing remains noisy for
+  small-ish N; rerun before encoding a production rule there.
+- `sliding_o`: custom is mostly rejected; M=256 barely wins in both backends, but the
+  margin is small enough that I would not dispatch to it without a longer stable run.
+- The simple staged shared-memory Tuna variants did not surface as winners in the deep
+  sweep, so the current smem path is not worth promoting without a more serious async
+  pipeline redesign.
+
 ## 2026-05-20 - Decode GEMV block swizzle experiment
 
 Runtime files:
@@ -2955,3 +3386,296 @@ Correctness and build checks:
 - `make -B rmsnorm-hidden-fused-bench` passed.
 - `make -B rmsnorm-bench` passed.
 - `git diff --check` passed before this note was added.
+
+## 2026-05-20 - Prefill GEMM stability rerun and dispatch manifests
+
+Runtime files:
+
+- `src/experiments/gemma4_prefill_tune.py`
+- `build/experiments/gemma4_prefill_tune/candidate_deep_dispatch.csv`
+- `build/experiments/gemma4_prefill_tune/all_shapes_dispatch.csv`
+- `build/experiments/gemma4_prefill_tune/tuna_stability_globalk_slidingo.csv`
+- `build/experiments/gemma4_prefill_tune/sgemm_bf16_stability_globalk_slidingo.csv`
+- `build/experiments/gemma4_prefill_tune/stability_globalk_slidingo_dispatch.csv`
+- `build/experiments/gemma4_prefill_tune/stability_globalk_slidingo_dispatch_threshold_1p25.csv`
+- `build/experiments/gemma4_prefill_tune/tuna_cublas_algo_probe_global_k_m512.txt`
+- `build/experiments/gemma4_prefill_tune/tuna_cublas_algo_probe_sliding_o_m256.txt`
+
+Reason:
+
+- The previous deep sweep showed suspicious or marginal custom wins for `global_k` at
+  `M=512` and `sliding_o` at `M=256`.
+- The tuner summary was useful interactively, but did not write the chosen
+  custom-vs-cuBLAS route as a machine-readable artifact.
+
+Implementation:
+
+- Added `--dispatch-out` to the tuner `summarize` mode. It writes one CSV row per
+  `(backend, op, M)` with route, config, chosen time, cuBLAS time, custom time, speedup,
+  and layer-count weight.
+- Fixed the combined summary printout to rank and display best configs per backend and
+  op, instead of printing backend-ambiguous op summaries.
+- Added `GEMMA4_PREFILL_CUBLAS_ALGO` support to both BF16 prefill benchmark binaries.
+  Accepted values are `default`, `default_tensor`, and `algo0` through `algo15`, mapping
+  to the corresponding `cublasGemmEx` algorithms. The default remains
+  `CUBLAS_GEMM_DEFAULT_TENSOR_OP`.
+
+Validation:
+
+```bash
+python3 -m py_compile src/experiments/gemma4_prefill_tune.py
+rm -rf src/experiments/__pycache__
+
+python3 src/experiments/gemma4_prefill_tune.py summarize \
+  build/experiments/gemma4_prefill_tune/tuna_candidate_deep.csv \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_deep.csv \
+  --custom-threshold 1.0 \
+  --dispatch-out build/experiments/gemma4_prefill_tune/candidate_deep_dispatch.csv
+
+python3 src/experiments/gemma4_prefill_tune.py summarize \
+  build/experiments/gemma4_prefill_tune/tuna_all_shapes.csv \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes.csv \
+  --custom-threshold 1.0 \
+  --dispatch-out build/experiments/gemma4_prefill_tune/all_shapes_dispatch.csv
+
+make tuna-prefill-bench sgemm-bf16-prefill-bench
+GEMMA4_PREFILL_CUBLAS_ALGO=algo7 \
+  ./build/experiments/gemma4_sgemm_bf16_prefill_bench global_k 5 2 512 bf16_16x64
+```
+
+Focused stability commands:
+
+```bash
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend tuna --ops global_k,sliding_o \
+  --configs wmma_16x16,wmma_16x32,wmma_16x64,wmma_32x64,wmma_64x64 \
+  --m 256,512 --iters 100 --warmup 25 \
+  --out build/experiments/gemma4_prefill_tune/tuna_stability_globalk_slidingo.csv
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops global_k,sliding_o \
+  --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_64x128,bf16_128x64 \
+  --m 256,512 --iters 100 --warmup 25 \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_stability_globalk_slidingo.csv
+
+python3 src/experiments/gemma4_prefill_tune.py summarize \
+  build/experiments/gemma4_prefill_tune/tuna_stability_globalk_slidingo.csv \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_stability_globalk_slidingo.csv \
+  --custom-threshold 1.25 \
+  --dispatch-out build/experiments/gemma4_prefill_tune/stability_globalk_slidingo_dispatch_threshold_1p25.csv
+```
+
+Focused stability results:
+
+| Backend | Op | Best config | Geomean speedup | Worst speedup |
+| --- | --- | --- | ---: | ---: |
+| Tuna | `global_k` | `wmma_16x16` | 0.608x | 0.182x |
+| Tuna | `sliding_o` | `wmma_64x64` | 0.350x | 0.120x |
+| SGEMM BF16 | `global_k` | `bf16_16x64` | 0.629x | 0.176x |
+| SGEMM BF16 | `sliding_o` | `bf16_64x128` | 0.382x | 0.125x |
+
+Conservative dispatch with threshold `1.25`:
+
+| Backend | Dispatch weighted ms | cuBLAS weighted ms | Custom-only weighted ms | Dispatch vs cuBLAS | Custom-only vs cuBLAS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Tuna | 85.9960 | 92.8600 | 198.7840 | 1.0798x | 0.4671x |
+| SGEMM BF16 | 92.3180 | 100.4880 | 190.1170 | 1.0885x | 0.5286x |
+
+Direct repeat checks:
+
+```bash
+./build/experiments/gemma4_tuna_prefill_bench global_k 200 50 512 wmma_16x64
+./build/experiments/gemma4_tuna_prefill_bench global_k 200 50 512 wmma_16x64
+./build/experiments/gemma4_tuna_prefill_bench global_k 200 50 256 wmma_16x64
+./build/experiments/gemma4_tuna_prefill_bench sliding_o 200 50 256 wmma_64x64
+./build/experiments/gemma4_tuna_prefill_bench sliding_o 200 50 512 wmma_64x64
+```
+
+Observed direct checks:
+
+| Op | M | Config | Custom ms | cuBLAS ms | Speedup |
+| --- | ---: | --- | ---: | ---: | ---: |
+| `global_k` | 512 | `wmma_16x64` | 0.6590 | 3.1496 | 4.779x |
+| `global_k` | 512 | `wmma_16x64` | 0.6846 | 1.7154 | 2.506x |
+| `global_k` | 256 | `wmma_16x64` | 0.3422 | 0.0611 | 0.179x |
+| `sliding_o` | 256 | `wmma_64x64` | 1.2435 | 1.8639 | 1.499x |
+| `sliding_o` | 512 | `wmma_64x64` | 2.5940 | 0.3484 | 0.134x |
+
+Interpretation:
+
+- The direct repeats confirmed that cuBLAS has shape-specific timing cliffs in this
+  harness: `global_k M=256` and `sliding_o M=512` are fast, while adjacent larger or
+  smaller shapes can be much slower.
+- These results justify keeping the custom kernels as measured candidates for narrow
+  small-M or cuBLAS-cliff cases, but not as broad prefill GEMM replacements.
+- `sliding_o M=256` is too marginal under the conservative `1.25` threshold and should
+  stay on cuBLAS unless repeated on a production profiling setup or against a tuned
+  cuBLASLt baseline.
+- `global_k M=512` remains a candidate against this `cublasGemmEx` baseline, but it is
+  suspicious enough that it should not be hard-coded without checking cuBLASLt or
+  explicit cuBLAS algorithm selection.
+
+Explicit cuBLAS algorithm probe:
+
+```bash
+for algo in default_tensor algo0 algo1 algo2 algo3 algo4 algo5 algo6 algo7 \
+    algo8 algo9 algo10 algo11 algo12 algo13 algo14 algo15; do
+  GEMMA4_PREFILL_CUBLAS_ALGO=$algo \
+    ./build/experiments/gemma4_tuna_prefill_bench global_k 50 15 512 wmma_16x64 |
+    awk -v algo=$algo '/global_k/{print algo ",global_k," $0} /wmma_16x64/{print algo ",global_k," $0}'
+done > build/experiments/gemma4_prefill_tune/tuna_cublas_algo_probe_global_k_m512.txt
+
+for algo in default_tensor algo0 algo1 algo2 algo3 algo4 algo5 algo6 algo7 \
+    algo8 algo9 algo10 algo11 algo12 algo13 algo14 algo15; do
+  GEMMA4_PREFILL_CUBLAS_ALGO=$algo \
+    ./build/experiments/gemma4_tuna_prefill_bench sliding_o 50 15 256 wmma_64x64 |
+    awk -v algo=$algo '/sliding_o/{print algo ",sliding_o," $0} /wmma_64x64/{print algo ",sliding_o," $0}'
+done > build/experiments/gemma4_prefill_tune/tuna_cublas_algo_probe_sliding_o_m256.txt
+```
+
+Best observed explicit-algorithm checks:
+
+| Op | M | Best cuBLAS algorithm | cuBLAS ms | Custom config | Custom ms | Speedup |
+| --- | ---: | --- | ---: | --- | ---: | ---: |
+| `global_k` | 512 | `algo7` | 1.3571 | `wmma_16x64` | 0.6461 | 2.100x |
+| `sliding_o` | 256 | `algo14` | 1.5024 | `wmma_64x64` | 1.2408 | 1.211x |
+
+Conclusion after the algorithm probe:
+
+- The explicit `cublasGemmEx` tensor-op algorithms did not remove the timing cliff for
+  these two cases.
+- `global_k M=512` is still a plausible custom dispatch candidate against cuBLAS GEMMEx.
+- `sliding_o M=256` is still a weak candidate because the best explicit cuBLAS algorithm
+  narrows the margin to roughly `1.21x`; keep the conservative `1.25x` route on cuBLAS
+  until cuBLASLt is tested.
+
+## 2026-05-20 - Prefill GEMM cuBLASLt baseline
+
+Runtime files:
+
+- `experiments/tuna/gemma4_prefill_bench.cu`
+- `experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu`
+- `src/experiments/gemma4_prefill_tune.py`
+- `build/experiments/gemma4_prefill_tune/tuna_candidate_cublaslt.csv`
+- `build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_cublaslt.csv`
+- `build/experiments/gemma4_prefill_tune/candidate_cublaslt_dispatch.csv`
+- `build/experiments/gemma4_prefill_tune/tuna_all_shapes_cublaslt.csv`
+- `build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes_cublaslt.csv`
+- `build/experiments/gemma4_prefill_tune/all_shapes_cublaslt_dispatch.csv`
+
+Reason:
+
+- Earlier custom wins were measured against `cublasGemmEx` with
+  `CUBLAS_GEMM_DEFAULT_TENSOR_OP`.
+- Direct explicit-algorithm probing showed that GEMMEx has timing cliffs on the remaining
+  candidate shapes, so cuBLASLt needed to be checked before any production dispatch rule.
+
+Implementation:
+
+- Added `GEMMA4_PREFILL_CUBLAS_BACKEND=gemmex|lt` to both BF16 prefill benchmark
+  binaries. The default remains `gemmex`.
+- The `lt` path uses row-major cuBLASLt descriptors for the actual Gemma layout:
+  `Y[M,N] = X[M,K] * W[N,K]^T`, with BF16 inputs, FP32 compute, BF16 output, and a
+  `32 MiB` workspace preference.
+- cuBLASLt descriptor creation and heuristic selection happen outside the timed loop.
+  Timed work is only warmup plus repeated `cublasLtMatmul` calls on the same benchmark
+  path.
+- The tuner now accepts `--cublas-backend gemmex|lt` and records `cublas_backend` and
+  `cublas_algo` columns in new CSVs and dispatch manifests.
+
+Validation:
+
+```bash
+make tuna-prefill-bench sgemm-bf16-prefill-bench
+
+GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
+  ./build/experiments/gemma4_tuna_prefill_bench global_k 5 2 16 wmma_16x32
+
+GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
+  ./build/experiments/gemma4_sgemm_bf16_prefill_bench global_k 5 2 16 bf16_16x32
+
+python3 -m py_compile src/experiments/gemma4_prefill_tune.py
+rm -rf src/experiments/__pycache__
+```
+
+Smoke results:
+
+| Backend | Op | M | Library | Library ms | Custom config | Custom ms | Max abs |
+| --- | --- | ---: | --- | ---: | --- | ---: | ---: |
+| Tuna | `global_k` | 16 | cuBLASLt | 0.0458 | `wmma_16x32` | 0.0717 | 0.015625 |
+| SGEMM BF16 | `global_k` | 16 | cuBLASLt | 0.0455 | `bf16_16x32` | 0.0717 | 0.015625 |
+
+Candidate cuBLASLt sweeps:
+
+```bash
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend tuna --ops ffn_down,global_k,sliding_o \
+  --configs wmma_16x16,wmma_16x32,wmma_16x64,wmma_32x64,wmma_64x64,smem_16x64,smem_16x128,smem_32x64,smem_32x128,smem_64x64 \
+  --m 16,32,64,128,256,512 --iters 20 --warmup 5 \
+  --cublas-backend lt \
+  --out build/experiments/gemma4_prefill_tune/tuna_candidate_cublaslt.csv
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 --ops ffn_down,global_k,sliding_o \
+  --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_64x128,bf16_128x64 \
+  --m 16,32,64,128,256,512 --iters 20 --warmup 5 \
+  --cublas-backend lt \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_cublaslt.csv
+```
+
+Candidate cuBLASLt summary:
+
+| Backend | Op | Best config | Geomean speedup vs cuBLASLt | Worst speedup |
+| --- | --- | --- | ---: | ---: |
+| Tuna | `ffn_down` | `wmma_64x64` | 0.249x | 0.110x |
+| Tuna | `global_k` | `wmma_16x16` | 0.348x | 0.188x |
+| Tuna | `sliding_o` | `wmma_64x64` | 0.276x | 0.122x |
+| SGEMM BF16 | `ffn_down` | `bf16_64x64` | 0.254x | 0.114x |
+| SGEMM BF16 | `global_k` | `bf16_16x64` | 0.329x | 0.181x |
+| SGEMM BF16 | `sliding_o` | `bf16_64x64` | 0.276x | 0.120x |
+
+All-shape cuBLASLt sweeps:
+
+```bash
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend tuna \
+  --ops ffn_gate_up,ffn_down,sliding_qkv,sliding_o,global_q,global_k,global_o,final_logits \
+  --configs wmma_16x32,wmma_32x64,wmma_64x64 \
+  --m 16,64,256 --iters 10 --warmup 3 --cublas-backend lt \
+  --out build/experiments/gemma4_prefill_tune/tuna_all_shapes_cublaslt.csv
+
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 \
+  --ops ffn_gate_up,ffn_down,sliding_qkv,sliding_o,global_q,global_k,global_o,final_logits \
+  --configs bf16_16x32,bf16_32x64,bf16_64x64 \
+  --m 16,64,256 --iters 10 --warmup 3 --cublas-backend lt \
+  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes_cublaslt.csv
+
+python3 src/experiments/gemma4_prefill_tune.py summarize \
+  build/experiments/gemma4_prefill_tune/tuna_all_shapes_cublaslt.csv \
+  build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes_cublaslt.csv \
+  --custom-threshold 1.0 \
+  --dispatch-out build/experiments/gemma4_prefill_tune/all_shapes_cublaslt_dispatch.csv
+```
+
+All-shape cuBLASLt dispatch:
+
+| Backend | Dispatch weighted ms | cuBLASLt weighted ms | Custom-only weighted ms | Dispatch vs cuBLASLt | Custom-only vs cuBLASLt |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Tuna | 306.8089 | 306.8089 | 1238.9731 | 1.0000x | 0.2476x |
+| SGEMM BF16 | 305.9398 | 305.9398 | 1236.2197 | 1.0000x | 0.2475x |
+
+Conclusion:
+
+- cuBLASLt removes the GEMMEx timing cliffs that made the simple custom WMMA kernels look
+  useful for small-M `global_k`, `ffn_down`, and `sliding_o`.
+- After checking all Gemma 4 projection shapes over `M=16,64,256`, every dispatch route
+  goes to cuBLASLt. The custom-only path is roughly `4x` slower in the weighted all-shape
+  sweep.
+- Do not promote the current Tuna or SGEMM BF16 adaptations into the inference path for
+  prefill GEMM. The useful artifact is the shape-aware benchmark/tuner plus the negative
+  result: cuBLASLt is the baseline to use for the unfused prefill path.
+- Further custom prefill GEMM work should only resume with a substantially different
+  design, such as a real CUTLASS/Tuna-style pipelined tensor-core kernel with multiple
+  MMA tiles per warp and async staging. The current one-warp-per-WMMA-tile variants have
+  no remaining low-hanging parameter-tuning path against cuBLASLt.

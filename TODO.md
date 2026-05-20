@@ -7,6 +7,10 @@
 - Fix the current RMSNorm build break before building new dependent kernels.
   - `src/gemma4_rmsnorm.cu` still references fallback kernels removed during cleanup.
   - `make test-rmsnorm` should compile and pass again before RMSNorm-dependent work proceeds.
+- Benchmark the RMSNorm kernels again after the current cleanup/recovery work.
+  - Include hidden width `5376` plus Q/K widths `256` and `512`.
+  - Confirm the hidden-width-only fused residual+RMSNorm path is skipped for non-hidden widths.
+  - Log commands, GPU/clocks, warmup/iteration counts, cache policy, and results in `src/experiments/EXPERIMENTS.md`.
 - Fuse token embedding gather with the first matrix multiplication in the language path once the unfused baseline is correct.
   - Avoid materializing the initial `[M, 5376]` hidden buffer when the first projection can consume embedding rows directly.
   - Benchmark against the standalone embedding gather plus cuBLAS/cuBLASLt baseline before keeping the fusion.
