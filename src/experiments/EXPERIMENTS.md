@@ -47,6 +47,8 @@ Result:
 
 - `rmsnorm tests passed`
 - Scale-free test coverage includes width `256`, width `512`, and width `5376`.
+- The scale-free fused residual+RMSNorm dispatch is also covered at width `512` and
+  width `5376`.
 - `ptxas` reported `0 bytes` spills for all weighted and scale-free RMSNorm
   instantiations.
 
