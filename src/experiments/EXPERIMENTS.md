@@ -2191,6 +2191,7 @@ Runtime files:
 - `src/gemma4_rope.cu`
 - `src/gemma4_rope.cuh`
 - `tests/test_rope.cu`
+- `docs/rope.md`
 
 Reason:
 
@@ -2200,7 +2201,8 @@ Reason:
 Implementation:
 
 - Added in-place BF16 Q/K rotation with precomputed FP32 cos/sin tables.
-- Supports shared `[1, seq, rotary_dim / 2]` and batch-specific `[batch, seq, rotary_dim / 2]` cos/sin tables.
+- The low-level entry point accepts explicit cos/sin row strides, including compact `rotary_dim / 2` rows and full `head_dim` rows.
+- Added forward-layout launchers for direct `[batch, heads, seq, head_dim]` Q/K buffers, matching the Python `forward` inputs for inference.
 - Sliding wrapper uses `head_dim=256`, `rotary_dim=256`.
 - Global wrapper uses `head_dim=512`, `rotary_dim=128`, leaving the NoPE tail unchanged.
 - Baseline mapping is one CUDA block per `(batch_seq_row, head)` pair; later fusion can combine Q/K RMSNorm, RoPE, and KV-cache write.

@@ -6,8 +6,8 @@ entry point small and Gemma-specific.
 
 ## Tensor Layout
 
-The CUDA kernel expects Q and K in the same physical layout that the Triton
-code creates after `transpose(1, 2).contiguous()`:
+The low-level CUDA kernel expects Q and K in the same physical layout that the
+Triton code creates after `transpose(1, 2).contiguous()`:
 
 ```text
 q: [batch, seq, q_heads, head_dim]
@@ -22,17 +22,30 @@ q_row_stride = q_heads * head_dim
 k_row_stride = kv_heads * head_dim
 ```
 
-Cosine and sine tables are precomputed FP32 arrays. They may be shared across
-the batch:
+The forward-layout CUDA entry point matches the Python-facing `forward`
+signature:
 
 ```text
-cos/sin: [1, seq, rotary_dim / 2]
+q: [batch, q_heads, seq, head_dim]
+k: [batch, kv_heads, seq, head_dim]
+```
+
+It applies RoPE in place for inference.
+
+Cosine and sine tables are precomputed FP32 arrays. The low-level API accepts
+an explicit row stride, so it can consume either compact rows of
+`rotary_dim / 2` values or full rows of `head_dim` values. The forward-layout
+API matches the Python signature and expects full rows. Tables may be shared
+across the batch:
+
+```text
+cos/sin: [1, seq, head_dim]
 ```
 
 or batch-specific:
 
 ```text
-cos/sin: [batch, seq, rotary_dim / 2]
+cos/sin: [batch, seq, head_dim]
 ```
 
 ## Rotation Math

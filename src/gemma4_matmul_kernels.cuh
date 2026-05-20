@@ -5,8 +5,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-extern "C" {
-
 typedef enum {
   GEMMA4_PROJECTION_FFN_GATE_UP = 0,
   GEMMA4_PROJECTION_FFN_DOWN,
@@ -33,7 +31,5 @@ cudaError_t gemma4_projection_decode(
     const __nv_bfloat16 *w_col_major,
     __nv_bfloat16 *y,
     cudaStream_t stream);
-
-}
 
 #endif

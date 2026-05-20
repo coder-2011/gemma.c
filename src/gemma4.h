@@ -44,10 +44,6 @@
     (GEMMA4_GLOBAL_KV_HEADS * GEMMA4_GLOBAL_HEAD_DIM)
 #define GEMMA4_GLOBAL_ATTENTION_OUT_SIZE GEMMA4_GLOBAL_Q_PROJ_SIZE
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 typedef struct {
     int32_t vocab_size;
     int32_t hidden_size;
@@ -79,13 +75,28 @@ typedef struct {
     float rope_theta;
 } Gemma4AttentionSpec;
 
-extern const Gemma4DenseConfig gemma4_config;
+inline constexpr Gemma4DenseConfig gemma4_config = {
+    GEMMA4_VOCAB_SIZE,
+    GEMMA4_HIDDEN_SIZE,
+    GEMMA4_INTERMEDIATE_SIZE,
+    GEMMA4_NUM_LAYERS,
+    GEMMA4_MAX_POSITION_EMBEDDINGS,
+
+    GEMMA4_NUM_QUERY_HEADS,
+    GEMMA4_SLIDING_KV_HEADS,
+    GEMMA4_GLOBAL_KV_HEADS,
+    GEMMA4_SLIDING_HEAD_DIM,
+    GEMMA4_GLOBAL_HEAD_DIM,
+    GEMMA4_SLIDING_WINDOW,
+
+    GEMMA4_ROPE_THETA_SLIDING,
+    GEMMA4_ROPE_THETA_GLOBAL,
+    GEMMA4_PARTIAL_ROTARY_FACTOR_GLOBAL,
+    GEMMA4_RMS_NORM_EPS,
+    GEMMA4_FINAL_LOGIT_SOFTCAPPING,
+};
 
 bool gemma4_is_global_layer(int32_t layer_index);
 Gemma4AttentionSpec gemma4_attention_spec(int32_t layer_index);
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif

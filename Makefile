@@ -1,5 +1,5 @@
-CC ?= clang
-CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
+CXX ?= clang++
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
 CPPFLAGS ?= -Isrc
 NVCC ?= nvcc
 NVCCFLAGS ?= -std=c++17 -O3 -arch=sm_86
@@ -27,8 +27,8 @@ test-rope: $(BUILD_DIR)/tests/test_rope
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/gemma4.o: src/gemma4.c src/gemma4.h | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c src/gemma4.c -o $@
+$(BUILD_DIR)/gemma4.o: src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c src/gemma4.cpp -o $@
 
 $(BUILD_DIR)/gemma4_matmul_kernels.o: src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -c src/gemma4_matmul_kernels.cu -o $@

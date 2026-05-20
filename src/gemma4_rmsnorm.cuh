@@ -4,8 +4,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-extern "C" {
-
 cudaError_t gemma4_rmsnorm_bf16(__nv_bfloat16 *out,
                                 float *rstd,
                                 const __nv_bfloat16 *inp,
@@ -31,7 +29,5 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16(__nv_bfloat16 *residual,
                                              int width,
                                              float eps,
                                              cudaStream_t stream);
-
-}
 
 #endif

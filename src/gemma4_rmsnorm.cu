@@ -15,6 +15,23 @@ constexpr int kDecodeRmsnormThreads = 768;
 constexpr int kDecodeFusedThreads = 1024;
 constexpr int kDecodePacks = GEMMA4_HIDDEN_SIZE / kFloatXPerPack;
 
+// -----------------------------------------------------------------------------
+// CUDA helpers
+
+__device__ __forceinline__ float gemma4_rmsnorm_scale(float sum_sq,
+                                                      int width,
+                                                      float eps) {
+  return rsqrtf(sum_sq / static_cast<float>(width) + eps);
+}
+
+__device__ __forceinline__ void gemma4_store_rstd(float *rstd,
+                                                  int row,
+                                                  float scale) {
+  if (rstd != nullptr) {
+    rstd[row] = scale;
+  }
+}
+
 template <int Threads>
 __device__ __forceinline__ float gemma4_block_reduce_sum(float value) {
   static_assert((Threads % WARP_SIZE) == 0,
@@ -36,6 +53,9 @@ __device__ __forceinline__ float gemma4_block_reduce_sum(float value) {
   }
   return value;
 }
+
+// -----------------------------------------------------------------------------
+// CUDA kernels
 
 template <int Threads>
 __global__ __launch_bounds__(Threads, 1) void
@@ -59,12 +79,9 @@ gemma4_rmsnorm_bf16_decode_kernel(floatX *out,
 
   float block_sum = gemma4_block_reduce_sum<Threads>(sum_sq);
   if (threadIdx.x == 0) {
-    float scale =
-        rsqrtf(block_sum / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
+    float scale = gemma4_rmsnorm_scale(block_sum, GEMMA4_HIDDEN_SIZE, eps);
     s_scale = scale;
-    if (rstd != nullptr) {
-      rstd[0] = scale;
-    }
+    gemma4_store_rstd(rstd, 0, scale);
   }
   __syncthreads();
 
@@ -106,12 +123,9 @@ gemma4_residual_add_rmsnorm_bf16_decode_kernel(floatX *residual,
 
   float block_sum = gemma4_block_reduce_sum<Threads>(sum_sq);
   if (threadIdx.x == 0) {
-    float scale =
-        rsqrtf(block_sum / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
+    float scale = gemma4_rmsnorm_scale(block_sum, GEMMA4_HIDDEN_SIZE, eps);
     s_scale = scale;
-    if (rstd != nullptr) {
-      rstd[0] = scale;
-    }
+    gemma4_store_rstd(rstd, 0, scale);
   }
   __syncthreads();
 
@@ -133,36 +147,37 @@ __global__ void gemma4_rmsnorm_bf16_warp_kernel(
     int rows,
     int width,
     float eps) {
-  int lane = threadIdx.x % WARP_SIZE;
-  int warp = threadIdx.x / WARP_SIZE;
-  int warps_per_block = blockDim.x / WARP_SIZE;
-  int row = blockIdx.x * warps_per_block + warp;
+  const int lane = threadIdx.x & (WARP_SIZE - 1);
+  const int warp = threadIdx.x / WARP_SIZE;
+  const int warps_per_block = blockDim.x / WARP_SIZE;
+  const int row = blockIdx.x * warps_per_block + warp;
   if (row >= rows) {
     return;
   }
 
-  const floatX *x = inp + static_cast<int64_t>(row) * width;
-  int packs_per_row = width / kFloatXPerPack;
+  inp += static_cast<int64_t>(row) * width;
+  out += static_cast<int64_t>(row) * width;
+
+  const int packs_per_row = width / kFloatXPerPack;
   float sum_sq = 0.0f;
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack values =
-        load128(x + static_cast<int64_t>(pack) * kFloatXPerPack);
+        load128(inp + static_cast<int64_t>(pack) * kFloatXPerPack);
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
   sum_sq = warp_reduce_sum(sum_sq);
-  float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
-  if (lane == 0 && rstd != nullptr) {
-    rstd[row] = scale;
+  float scale = gemma4_rmsnorm_scale(sum_sq, width, eps);
+  if (lane == 0) {
+    gemma4_store_rstd(rstd, row, scale);
   }
 
-  floatX *y = out + static_cast<int64_t>(row) * width;
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack values =
-        load128cs(x + static_cast<int64_t>(pack) * kFloatXPerPack);
+        load128cs(inp + static_cast<int64_t>(pack) * kFloatXPerPack);
     RmsnormPack gamma =
         load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(y + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128cs(out + static_cast<int64_t>(pack) * kFloatXPerPack, result);
   }
 }
 
@@ -181,43 +196,43 @@ __global__ void gemma4_rmsnorm_bf16_shared_kernel(
   RmsnormPack *s_in = s_weight + packs_per_row +
                       static_cast<int64_t>(threadIdx.y) * packs_per_row;
 
-  int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
-  int packed_stride = WARP_SIZE * blockDim.y;
+  const int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
+  const int packed_stride = WARP_SIZE * blockDim.y;
   for (int pack = packed_thread; pack < packs_per_row; pack += packed_stride) {
     s_weight[pack] =
         load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
   }
   __syncthreads();
 
-  int row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int row = blockIdx.x * blockDim.y + threadIdx.y;
   if (row >= rows) {
     return;
   }
 
-  const floatX *x = inp + static_cast<int64_t>(row) * width;
+  inp += static_cast<int64_t>(row) * width;
+  out += static_cast<int64_t>(row) * width;
+
   float sum_sq = 0.0f;
   for (int pack = threadIdx.x; pack < packs_per_row;
        pack += WARP_SIZE) {
     RmsnormPack values =
-        load128cs(x + static_cast<int64_t>(pack) * kFloatXPerPack);
+        load128cs(inp + static_cast<int64_t>(pack) * kFloatXPerPack);
     s_in[pack] = values;
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
 
   sum_sq = warp_reduce_sum(sum_sq);
-  float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
-  if (threadIdx.x == 0 && rstd != nullptr) {
-    rstd[row] = scale;
+  float scale = gemma4_rmsnorm_scale(sum_sq, width, eps);
+  if (threadIdx.x == 0) {
+    gemma4_store_rstd(rstd, row, scale);
   }
 
-  floatX *y = out + static_cast<int64_t>(row) * width;
   for (int pack = threadIdx.x; pack < packs_per_row;
        pack += WARP_SIZE) {
     RmsnormPack values = s_in[pack];
     RmsnormPack gamma = s_weight[pack];
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(y + static_cast<int64_t>(pack) * kFloatXPerPack,
-                      result);
+    store128cs(out + static_cast<int64_t>(pack) * kFloatXPerPack, result);
   }
 }
 
@@ -249,42 +264,43 @@ __global__ void gemma4_residual_add_rmsnorm_bf16_warp_kernel(
     int rows,
     int width,
     float eps) {
-  int lane = threadIdx.x % WARP_SIZE;
-  int warp = threadIdx.x / WARP_SIZE;
-  int warps_per_block = blockDim.x / WARP_SIZE;
-  int row = blockIdx.x * warps_per_block + warp;
+  const int lane = threadIdx.x & (WARP_SIZE - 1);
+  const int warp = threadIdx.x / WARP_SIZE;
+  const int warps_per_block = blockDim.x / WARP_SIZE;
+  const int row = blockIdx.x * warps_per_block + warp;
   if (row >= rows) {
     return;
   }
 
-  const floatX *x1 = inp1 + static_cast<int64_t>(row) * width;
-  const floatX *x2 = inp2 + static_cast<int64_t>(row) * width;
-  floatX *res = residual + static_cast<int64_t>(row) * width;
-  int packs_per_row = width / kFloatXPerPack;
+  inp1 += static_cast<int64_t>(row) * width;
+  inp2 += static_cast<int64_t>(row) * width;
+  residual += static_cast<int64_t>(row) * width;
+  normed += static_cast<int64_t>(row) * width;
+
+  const int packs_per_row = width / kFloatXPerPack;
   float sum_sq = 0.0f;
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack a =
-        load128cs(x1 + static_cast<int64_t>(pack) * kFloatXPerPack);
+        load128cs(inp1 + static_cast<int64_t>(pack) * kFloatXPerPack);
     RmsnormPack b =
-        load128cs(x2 + static_cast<int64_t>(pack) * kFloatXPerPack);
+        load128cs(inp2 + static_cast<int64_t>(pack) * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_add(a, b);
     gemma4_bf16_pack_accumulate_square(result, sum_sq);
-    store128(res + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128(residual + static_cast<int64_t>(pack) * kFloatXPerPack, result);
   }
   sum_sq = warp_reduce_sum(sum_sq);
-  float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
-  if (lane == 0 && rstd != nullptr) {
-    rstd[row] = scale;
+  float scale = gemma4_rmsnorm_scale(sum_sq, width, eps);
+  if (lane == 0) {
+    gemma4_store_rstd(rstd, row, scale);
   }
 
-  floatX *y = normed + static_cast<int64_t>(row) * width;
   for (int pack = lane; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack values =
-        load128(res + static_cast<int64_t>(pack) * kFloatXPerPack);
+        load128(residual + static_cast<int64_t>(pack) * kFloatXPerPack);
     RmsnormPack gamma =
         load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(y + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128cs(normed + static_cast<int64_t>(pack) * kFloatXPerPack, result);
   }
 }
 
@@ -305,53 +321,54 @@ __global__ void gemma4_residual_add_rmsnorm_bf16_shared_kernel(
   RmsnormPack *s_res = s_weight + packs_per_row +
                        static_cast<int64_t>(threadIdx.y) * packs_per_row;
 
-  int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
-  int packed_stride = WARP_SIZE * blockDim.y;
+  const int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
+  const int packed_stride = WARP_SIZE * blockDim.y;
   for (int pack = packed_thread; pack < packs_per_row; pack += packed_stride) {
     s_weight[pack] =
         load128(weight + static_cast<int64_t>(pack) * kFloatXPerPack);
   }
   __syncthreads();
 
-  int row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int row = blockIdx.x * blockDim.y + threadIdx.y;
   if (row >= rows) {
     return;
   }
 
-  const floatX *x1 = inp1 + static_cast<int64_t>(row) * width;
-  const floatX *x2 = inp2 + static_cast<int64_t>(row) * width;
-  floatX *residual_row = residual + static_cast<int64_t>(row) * width;
+  inp1 += static_cast<int64_t>(row) * width;
+  inp2 += static_cast<int64_t>(row) * width;
+  residual += static_cast<int64_t>(row) * width;
+  normed += static_cast<int64_t>(row) * width;
 
   float sum_sq = 0.0f;
   for (int pack = threadIdx.x; pack < packs_per_row;
        pack += WARP_SIZE) {
     RmsnormPack a =
-        load128cs(x1 + static_cast<int64_t>(pack) * kFloatXPerPack);
+        load128cs(inp1 + static_cast<int64_t>(pack) * kFloatXPerPack);
     RmsnormPack b =
-        load128cs(x2 + static_cast<int64_t>(pack) * kFloatXPerPack);
+        load128cs(inp2 + static_cast<int64_t>(pack) * kFloatXPerPack);
     RmsnormPack result = gemma4_bf16_pack_add(a, b);
     gemma4_bf16_pack_accumulate_square(result, sum_sq);
     s_res[pack] = result;
-    store128cs(
-        residual_row + static_cast<int64_t>(pack) * kFloatXPerPack, result);
+    store128cs(residual + static_cast<int64_t>(pack) * kFloatXPerPack, result);
   }
 
   sum_sq = warp_reduce_sum(sum_sq);
-  float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
-  if (threadIdx.x == 0 && rstd != nullptr) {
-    rstd[row] = scale;
+  float scale = gemma4_rmsnorm_scale(sum_sq, width, eps);
+  if (threadIdx.x == 0) {
+    gemma4_store_rstd(rstd, row, scale);
   }
 
-  floatX *y = normed + static_cast<int64_t>(row) * width;
   for (int pack = threadIdx.x; pack < packs_per_row;
        pack += WARP_SIZE) {
     RmsnormPack values = s_res[pack];
     RmsnormPack gamma = s_weight[pack];
     RmsnormPack result = gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);
-    store128cs(y + static_cast<int64_t>(pack) * kFloatXPerPack,
-                      result);
+    store128cs(normed + static_cast<int64_t>(pack) * kFloatXPerPack, result);
   }
 }
+
+// -----------------------------------------------------------------------------
+// Host launch helpers
 
 bool gemma4_rmsnorm_args_valid(const floatX *out,
                                const floatX *inp,

@@ -6,32 +6,33 @@
 
 namespace {
 
-constexpr int kGemma4EmbeddingPacks =
+constexpr int kPacksPerEmbeddingRow =
     GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
               "embedding width must be divisible by Packed128 bf16 width");
 
-__global__ void gemma4_embedding_gather_bf16_warp_kernel(
+__global__ void embedding_gather_kernel(
     __nv_bfloat16* out,
     const int32_t* token_ids,
     const __nv_bfloat16* embeddings) {
-    int32_t token_idx = blockIdx.x;
-    int32_t lane = threadIdx.x;
+    const int token_idx = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int token_id = token_ids[token_idx];
 
-    int32_t token_id = token_ids[token_idx];
     if (token_id < 0 || token_id >= GEMMA4_VOCAB_SIZE) {
         return;
     }
 
     const __nv_bfloat16* embedding_row =
-        embeddings + (int64_t)token_id * GEMMA4_HIDDEN_SIZE;
-    __nv_bfloat16* out_row = out + (int64_t)token_idx * GEMMA4_HIDDEN_SIZE;
+        embeddings + static_cast<int64_t>(token_id) * GEMMA4_HIDDEN_SIZE;
+    __nv_bfloat16* out_row =
+        out + static_cast<int64_t>(token_idx) * GEMMA4_HIDDEN_SIZE;
 
-    for (int32_t pack_idx = lane; pack_idx < kGemma4EmbeddingPacks;
+    for (int pack_idx = lane; pack_idx < kPacksPerEmbeddingRow;
          pack_idx += WARP_SIZE) {
-        Bf16Packed128 pack =
-            load128cs(embedding_row + pack_idx * kBf16Packed128Elements);
-        store128(out_row + pack_idx * kBf16Packed128Elements, pack);
+        const int offset = pack_idx * kBf16Packed128Elements;
+        Bf16Packed128 pack = load128cs(embedding_row + offset);
+        store128(out_row + offset, pack);
     }
 }
 
@@ -56,7 +57,7 @@ cudaError_t gemma4_embedding_gather_bf16(
         return cudaErrorInvalidValue;
     }
 
-    gemma4_embedding_gather_bf16_warp_kernel<<<num_tokens, WARP_SIZE, 0, stream>>>(
+    embedding_gather_kernel<<<num_tokens, WARP_SIZE, 0, stream>>>(
         out, token_ids, embeddings);
     return cudaGetLastError();
 }

@@ -6,19 +6,20 @@
 
 namespace {
 
-constexpr int kGemma4DecodeThreads = 512;
-constexpr int kGemma4DecodeColsPerBlock = 8;
-constexpr int kGemma4DecodeMinBlocksPerSM = 2;
-constexpr int kGemma4FfnDownDecodeThreads = 1024;
-constexpr int kGemma4FfnDownDecodeColsPerBlock = 8;
-constexpr int kGemma4FfnDownDecodeMinBlocksPerSM = 1;
-constexpr int kGemma4GlobalODecodeThreads = 512;
-constexpr int kGemma4GlobalODecodeColsPerBlock = 8;
-constexpr int kGemma4GlobalODecodeMinBlocksPerSM = 1;
-constexpr int kGemma4FinalLogitsDecodeThreads = 1024;
-constexpr int kGemma4FinalLogitsDecodeColsPerBlock = 8;
-constexpr int kGemma4FinalLogitsDecodeMinBlocksPerSM = 1;
-static_assert((kGemma4DecodeThreads % WARP_SIZE) == 0,
+constexpr int kDefaultThreads = 512;
+constexpr int kDefaultColsPerBlock = 8;
+constexpr int kDefaultMinBlocksPerSm = 2;
+constexpr int kFfnDownThreads = 1024;
+constexpr int kFfnDownColsPerBlock = 8;
+constexpr int kFfnDownMinBlocksPerSm = 1;
+constexpr int kGlobalOThreads = 512;
+constexpr int kGlobalOColsPerBlock = 8;
+constexpr int kGlobalOMinBlocksPerSm = 1;
+constexpr int kFinalLogitsThreads = 1024;
+constexpr int kFinalLogitsColsPerBlock = 8;
+constexpr int kFinalLogitsMinBlocksPerSm = 1;
+
+static_assert((kDefaultThreads % WARP_SIZE) == 0,
               "decode thread count must be a whole number of warps");
 
 struct Gemma4ProjectionShape {
@@ -26,43 +27,32 @@ struct Gemma4ProjectionShape {
   int n;
 };
 
-using Gemma4Bf16Pack = Packed128<__nv_bfloat16>;
-
-constexpr int kGemma4Bf16PerPack = Gemma4Bf16Pack::size;
-static_assert(sizeof(Gemma4Bf16Pack) == sizeof(int4) &&
-                  alignof(Gemma4Bf16Pack) >= alignof(int4),
-              "Packed128 bf16 must map to one aligned int4 load");
-static_assert((kGemma4Bf16PerPack % 2) == 0,
-              "Packed128 bf16 width must contain whole bf16 pairs");
-
-__device__ __forceinline__ int gemma4_bf16_pack_element_index(int pack_idx) {
-  return pack_idx * kGemma4Bf16PerPack;
+__device__ __forceinline__ int pack_offset(int pack_idx) {
+  return pack_idx * kBf16Packed128Elements;
 }
 
 template <int K>
-__device__ __forceinline__ int gemma4_weight_pack_offset(int col,
-                                                        int element_idx) {
+__device__ __forceinline__ int weight_offset(int col, int element_idx) {
   return col * K + element_idx;
 }
 
-__device__ __forceinline__ Gemma4Bf16Pack
-gemma4_load_activation_pack(const __nv_bfloat16 *__restrict__ x,
-                            int element_idx) {
+__device__ __forceinline__ Bf16Packed128
+load_activation_pack(const __nv_bfloat16 *__restrict__ x, int element_idx) {
   return load128(x + element_idx);
 }
 
 template <int K>
-__device__ __forceinline__ Gemma4Bf16Pack
-gemma4_load_streaming_weight_pack(
+__device__ __forceinline__ Bf16Packed128
+load_weight_pack(
     const __nv_bfloat16 *__restrict__ w_col_major, int col, int element_idx) {
-  return load128cs(w_col_major + gemma4_weight_pack_offset<K>(col, element_idx));
+  return load128cs(w_col_major + weight_offset<K>(col, element_idx));
 }
 
 template <int ColsPerBlock>
-__device__ __forceinline__ void gemma4_store_bf16_cols(
+__device__ __forceinline__ void store_cols(
     __nv_bfloat16 *__restrict__ dst, const float (&sums)[ColsPerBlock]) {
-  if constexpr (ColsPerBlock == kGemma4Bf16PerPack) {
-    Gemma4Bf16Pack out;
+  if constexpr (ColsPerBlock == kBf16Packed128Elements) {
+    Bf16Packed128 out;
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
       out[col] = __float2bfloat16_rn(sums[col]);
@@ -77,25 +67,26 @@ __device__ __forceinline__ void gemma4_store_bf16_cols(
 }
 
 template <int K, int ColsPerBlock, int Threads>
-__device__ __forceinline__ void gemma4_decode_gemv_cols_dot_device(
+__device__ __forceinline__ void dot_cols(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major, int col0, int thread_idx,
     float (&sums)[ColsPerBlock]) {
-  static_assert((K % kGemma4Bf16PerPack) == 0, "decode GEMV K must be divisible by Packed128 bf16 width");
+  static_assert((K % kBf16Packed128Elements) == 0,
+                "decode GEMV K must be divisible by Packed128 bf16 width");
   static_assert((Threads % WARP_SIZE) == 0,
                 "decode thread count must be a whole number of warps");
 
-  constexpr int packs_per_col = K / kGemma4Bf16PerPack;
+  constexpr int packs_per_col = K / kBf16Packed128Elements;
 
 #pragma unroll
   for (int pack_idx = thread_idx; pack_idx < packs_per_col;
        pack_idx += Threads) {
-    const int element_idx = gemma4_bf16_pack_element_index(pack_idx);
-    const Gemma4Bf16Pack x_pack = gemma4_load_activation_pack(x, element_idx);
+    const int element_idx = pack_offset(pack_idx);
+    const Bf16Packed128 x_pack = load_activation_pack(x, element_idx);
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      const Gemma4Bf16Pack w_pack = gemma4_load_streaming_weight_pack<K>(
-          w_col_major, col0 + col, element_idx);
+      const Bf16Packed128 w_pack =
+          load_weight_pack<K>(w_col_major, col0 + col, element_idx);
       gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
     }
   }
@@ -119,7 +110,7 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   const int warp = threadIdx.x / WARP_SIZE;
 
   float sums[ColsPerBlock] = {};
-  gemma4_decode_gemv_cols_dot_device<K, ColsPerBlock, Threads>(
+  dot_cols<K, ColsPerBlock, Threads>(
       x, w_col_major, col0, threadIdx.x, sums);
 
   warp_reduce_sum_to_lane0(sums);
@@ -142,11 +133,11 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   }
 
   if (threadIdx.x == 0) {
-    gemma4_store_bf16_cols<ColsPerBlock>(y + col0, sums);
+    store_cols<ColsPerBlock>(y + col0, sums);
   }
 }
 
-static cudaError_t gemma4_check_decode_gemv_args(
+static cudaError_t check_decode_args(
     const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
     const __nv_bfloat16 *y) {
   if (!x || !w_col_major || !y || !is_aligned_16(x) ||
@@ -156,31 +147,12 @@ static cudaError_t gemma4_check_decode_gemv_args(
   return cudaSuccess;
 }
 
-template <int K, int N>
-cudaError_t gemma4_decode_gemv(const __nv_bfloat16 *x,
-                               const __nv_bfloat16 *w_col_major,
-                               __nv_bfloat16 *y, cudaStream_t stream) {
-  const cudaError_t arg_status =
-      gemma4_check_decode_gemv_args(x, w_col_major, y);
-  if (arg_status != cudaSuccess) {
-    return arg_status;
-  }
-
-  constexpr int blocks = N / kGemma4DecodeColsPerBlock;
-  gemma4_decode_gemv_cols_kernel<K, N, kGemma4DecodeColsPerBlock,
-                                 kGemma4DecodeThreads,
-                                 kGemma4DecodeMinBlocksPerSM>
-      <<<blocks, kGemma4DecodeThreads, 0, stream>>>(x, w_col_major, y);
-  return cudaGetLastError();
-}
-
 template <int K, int N, int ColsPerBlock, int Threads, int MinBlocksPerSM>
-cudaError_t gemma4_decode_gemv_fixed_cols(const __nv_bfloat16 *x,
-                                          const __nv_bfloat16 *w_col_major,
-                                          __nv_bfloat16 *y,
-                                          cudaStream_t stream) {
-  const cudaError_t arg_status =
-      gemma4_check_decode_gemv_args(x, w_col_major, y);
+cudaError_t launch_decode_gemv(const __nv_bfloat16 *x,
+                               const __nv_bfloat16 *w_col_major,
+                               __nv_bfloat16 *y,
+                               cudaStream_t stream) {
+  const cudaError_t arg_status = check_decode_args(x, w_col_major, y);
   if (arg_status != cudaSuccess) {
     return arg_status;
   }
@@ -191,7 +163,7 @@ cudaError_t gemma4_decode_gemv_fixed_cols(const __nv_bfloat16 *x,
   return cudaGetLastError();
 }
 
-static cublasStatus_t gemma4_bf16_prefill_gemm(
+static cublasStatus_t prefill_gemm(
     cublasHandle_t handle, const __nv_bfloat16 *x,
     const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m, int k, int n,
     cudaStream_t stream) {
@@ -214,8 +186,8 @@ static cublasStatus_t gemma4_bf16_prefill_gemm(
                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 }
 
-static bool gemma4_projection_shape(Gemma4Projection projection,
-                                    Gemma4ProjectionShape &shape) {
+static bool projection_shape(Gemma4Projection projection,
+                             Gemma4ProjectionShape &shape) {
   switch (projection) {
   case GEMMA4_PROJECTION_FFN_GATE_UP:
     shape = {GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE};
@@ -247,18 +219,15 @@ static bool gemma4_projection_shape(Gemma4Projection projection,
 
 }  // namespace
 
-extern "C" {
-
 cublasStatus_t gemma4_projection_prefill(
     Gemma4Projection projection, cublasHandle_t handle,
     const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
     __nv_bfloat16 *y, int m, cudaStream_t stream) {
   Gemma4ProjectionShape shape = {};
-  if (!gemma4_projection_shape(projection, shape)) {
+  if (!projection_shape(projection, shape)) {
     return CUBLAS_STATUS_INVALID_VALUE;
   }
-  return gemma4_bf16_prefill_gemm(handle, x, w_col_major, y, m, shape.k,
-                                  shape.n, stream);
+  return prefill_gemm(handle, x, w_col_major, y, m, shape.k, shape.n, stream);
 }
 
 cudaError_t gemma4_projection_decode(Gemma4Projection projection,
@@ -267,38 +236,45 @@ cudaError_t gemma4_projection_decode(Gemma4Projection projection,
                                      __nv_bfloat16 *y, cudaStream_t stream) {
   switch (projection) {
   case GEMMA4_PROJECTION_FFN_GATE_UP:
-    return gemma4_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE>(
-        x, w_col_major, y, stream);
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm>(x, w_col_major, y,
+                                                       stream);
   case GEMMA4_PROJECTION_FFN_DOWN:
-    return gemma4_decode_gemv_fixed_cols<
+    return launch_decode_gemv<
         GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE,
-        kGemma4FfnDownDecodeColsPerBlock, kGemma4FfnDownDecodeThreads,
-        kGemma4FfnDownDecodeMinBlocksPerSM>(x, w_col_major, y, stream);
+        kFfnDownColsPerBlock, kFfnDownThreads,
+        kFfnDownMinBlocksPerSm>(x, w_col_major, y, stream);
   case GEMMA4_PROJECTION_SLIDING_QKV:
-    return gemma4_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE>(
-        x, w_col_major, y, stream);
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm>(x, w_col_major, y,
+                                                       stream);
   case GEMMA4_PROJECTION_SLIDING_O:
-    return gemma4_decode_gemv<GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
-                              GEMMA4_HIDDEN_SIZE>(x, w_col_major, y, stream);
+    return launch_decode_gemv<GEMMA4_SLIDING_ATTENTION_OUT_SIZE,
+                              GEMMA4_HIDDEN_SIZE, kDefaultColsPerBlock,
+                              kDefaultThreads, kDefaultMinBlocksPerSm>(
+        x, w_col_major, y, stream);
   case GEMMA4_PROJECTION_GLOBAL_Q:
-    return gemma4_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE>(
-        x, w_col_major, y, stream);
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_Q_PROJ_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm>(x, w_col_major, y,
+                                                       stream);
   case GEMMA4_PROJECTION_GLOBAL_K:
-    return gemma4_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE>(
-        x, w_col_major, y, stream);
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm>(x, w_col_major, y,
+                                                       stream);
   case GEMMA4_PROJECTION_GLOBAL_O:
-    return gemma4_decode_gemv_fixed_cols<
+    return launch_decode_gemv<
         GEMMA4_GLOBAL_ATTENTION_OUT_SIZE, GEMMA4_HIDDEN_SIZE,
-        kGemma4GlobalODecodeColsPerBlock, kGemma4GlobalODecodeThreads,
-        kGemma4GlobalODecodeMinBlocksPerSM>(x, w_col_major, y, stream);
+        kGlobalOColsPerBlock, kGlobalOThreads,
+        kGlobalOMinBlocksPerSm>(x, w_col_major, y, stream);
   case GEMMA4_PROJECTION_FINAL_LOGITS:
-    return gemma4_decode_gemv_fixed_cols<
+    return launch_decode_gemv<
         GEMMA4_HIDDEN_SIZE, GEMMA4_VOCAB_SIZE,
-        kGemma4FinalLogitsDecodeColsPerBlock,
-        kGemma4FinalLogitsDecodeThreads,
-        kGemma4FinalLogitsDecodeMinBlocksPerSM>(x, w_col_major, y, stream);
+        kFinalLogitsColsPerBlock, kFinalLogitsThreads,
+        kFinalLogitsMinBlocksPerSm>(x, w_col_major, y, stream);
   }
   return cudaErrorInvalidValue;
-}
-
 }

@@ -34,13 +34,13 @@ void fill_rope_table(std::vector<float> &cos,
                      std::vector<float> &sin,
                      int seq_len,
                      int cos_batch_size,
-                     int rotary_half) {
+                     int table_width) {
   for (int b = 0; b < cos_batch_size; ++b) {
     for (int pos = 0; pos < seq_len; ++pos) {
-      for (int i = 0; i < rotary_half; ++i) {
+      for (int i = 0; i < table_width; ++i) {
         float angle = static_cast<float>((pos + 1) * (i + 3)) * 0.0037f +
                       static_cast<float>(b) * 0.019f;
-        int offset = (b * seq_len + pos) * rotary_half + i;
+        int offset = (b * seq_len + pos) * table_width + i;
         cos[offset] = std::cos(angle);
         sin[offset] = std::sin(angle);
       }
@@ -54,6 +54,7 @@ void reference_rope(std::vector<__nv_bfloat16> &values,
                     int batch_size,
                     int seq_len,
                     int cos_batch_size,
+                    int cos_row_stride,
                     int heads,
                     int head_dim,
                     int rotary_dim) {
@@ -64,11 +65,47 @@ void reference_rope(std::vector<__nv_bfloat16> &values,
       int row = b * seq_len + pos;
       int table_batch = cos_batch_size == 1 ? 0 : b;
       const float *cos_row =
-          cos.data() + (table_batch * seq_len + pos) * rotary_half;
+          cos.data() + (table_batch * seq_len + pos) * cos_row_stride;
       const float *sin_row =
-          sin.data() + (table_batch * seq_len + pos) * rotary_half;
+          sin.data() + (table_batch * seq_len + pos) * cos_row_stride;
       for (int h = 0; h < heads; ++h) {
         int base = row * row_stride + h * head_dim;
+        for (int i = 0; i < rotary_half; ++i) {
+          float x1 = bf16_to_float(values[base + i]);
+          float x2 = bf16_to_float(values[base + rotary_half + i]);
+          float c = cos_row[i];
+          float s = sin_row[i];
+          values[base + i] = __float2bfloat16_rn(fmaf(-x2, s, x1 * c));
+          values[base + rotary_half + i] =
+              __float2bfloat16_rn(fmaf(x1, s, x2 * c));
+        }
+      }
+    }
+  }
+}
+
+void reference_rope_forward_layout(std::vector<__nv_bfloat16> &values,
+                                   const std::vector<float> &cos,
+                                   const std::vector<float> &sin,
+                                   int batch_size,
+                                   int seq_len,
+                                   int cos_batch_size,
+                                   int cos_row_stride,
+                                   int heads,
+                                   int head_dim,
+                                   int rotary_dim) {
+  int rotary_half = rotary_dim / 2;
+  for (int b = 0; b < batch_size; ++b) {
+    for (int h = 0; h < heads; ++h) {
+      for (int pos = 0; pos < seq_len; ++pos) {
+        int table_batch = cos_batch_size == 1 ? 0 : b;
+        const float *cos_row =
+            cos.data() + (table_batch * seq_len + pos) * cos_row_stride;
+        const float *sin_row =
+            sin.data() + (table_batch * seq_len + pos) * cos_row_stride;
+        int base =
+            (static_cast<int64_t>(b) * heads + h) * seq_len * head_dim +
+            pos * head_dim;
         for (int i = 0; i < rotary_half; ++i) {
           float x1 = bf16_to_float(values[base + i]);
           float x2 = bf16_to_float(values[base + rotary_half + i]);
@@ -98,8 +135,11 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
     }
   }
   if (max_abs > tolerance) {
-    std::fprintf(stderr, "%s max_abs=%g at index=%d exceeds tolerance=%g\n",
-                 label, max_abs, max_index, tolerance);
+    std::fprintf(stderr,
+                 "%s max_abs=%g at index=%d actual=%g expected=%g "
+                 "exceeds tolerance=%g\n",
+                 label, max_abs, max_index, bf16_to_float(actual[max_index]),
+                 bf16_to_float(expected[max_index]), tolerance);
     std::exit(1);
   }
 }
@@ -114,7 +154,8 @@ void run_case(int batch_size,
   int q_count = batch_size * seq_len * q_heads * head_dim;
   int k_count = batch_size * seq_len * kv_heads * head_dim;
   int rotary_half = rotary_dim / 2;
-  int table_count = cos_batch_size * seq_len * rotary_half;
+  int table_width = rotary_half;
+  int table_count = cos_batch_size * seq_len * table_width;
 
   std::vector<__nv_bfloat16> q(q_count);
   std::vector<__nv_bfloat16> k(k_count);
@@ -131,11 +172,11 @@ void run_case(int batch_size,
   }
   expected_q = q;
   expected_k = k;
-  fill_rope_table(cos, sin, seq_len, cos_batch_size, rotary_half);
+  fill_rope_table(cos, sin, seq_len, cos_batch_size, table_width);
   reference_rope(expected_q, cos, sin, batch_size, seq_len, cos_batch_size,
-                 q_heads, head_dim, rotary_dim);
+                 table_width, q_heads, head_dim, rotary_dim);
   reference_rope(expected_k, cos, sin, batch_size, seq_len, cos_batch_size,
-                 kv_heads, head_dim, rotary_dim);
+                 table_width, kv_heads, head_dim, rotary_dim);
 
   __nv_bfloat16 *d_q = nullptr;
   __nv_bfloat16 *d_k = nullptr;
@@ -175,6 +216,77 @@ void run_case(int batch_size,
   CHECK_CUDA(cudaFree(d_sin));
 }
 
+void run_forward_case(int batch_size,
+                      int seq_len,
+                      int cos_batch_size,
+                      int q_heads,
+                      int kv_heads,
+                      int head_dim,
+                      int rotary_dim) {
+  int q_count = batch_size * q_heads * seq_len * head_dim;
+  int k_count = batch_size * kv_heads * seq_len * head_dim;
+  int table_width = head_dim;
+  int table_count = cos_batch_size * seq_len * table_width;
+
+  std::vector<__nv_bfloat16> q(q_count);
+  std::vector<__nv_bfloat16> k(k_count);
+  std::vector<__nv_bfloat16> expected_q(q_count);
+  std::vector<__nv_bfloat16> expected_k(k_count);
+  std::vector<float> cos(table_count);
+  std::vector<float> sin(table_count);
+
+  for (int i = 0; i < q_count; ++i) {
+    q[i] = make_value(i + 11);
+  }
+  for (int i = 0; i < k_count; ++i) {
+    k[i] = make_value(i + 2113);
+  }
+  expected_q = q;
+  expected_k = k;
+  fill_rope_table(cos, sin, seq_len, cos_batch_size, table_width);
+  reference_rope_forward_layout(expected_q, cos, sin, batch_size, seq_len,
+                                cos_batch_size, table_width, q_heads, head_dim,
+                                rotary_dim);
+  reference_rope_forward_layout(expected_k, cos, sin, batch_size, seq_len,
+                                cos_batch_size, table_width, kv_heads, head_dim,
+                                rotary_dim);
+
+  __nv_bfloat16 *d_q = nullptr;
+  __nv_bfloat16 *d_k = nullptr;
+  float *d_cos = nullptr;
+  float *d_sin = nullptr;
+  CHECK_CUDA(cudaMalloc(&d_q, static_cast<size_t>(q_count) * sizeof(q[0])));
+  CHECK_CUDA(cudaMalloc(&d_k, static_cast<size_t>(k_count) * sizeof(k[0])));
+  CHECK_CUDA(cudaMalloc(&d_cos, static_cast<size_t>(table_count) * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_sin, static_cast<size_t>(table_count) * sizeof(float)));
+  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(),
+                        static_cast<size_t>(table_count) * sizeof(float),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(),
+                        static_cast<size_t>(table_count) * sizeof(float),
+                        cudaMemcpyHostToDevice));
+
+  CHECK_CUDA(gemma4_rope_forward_bf16(
+      d_q, d_k, d_cos, d_sin, seq_len, batch_size, cos_batch_size, q_heads,
+      kv_heads, head_dim, rotary_dim, 0));
+  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]),
+                        cudaMemcpyDeviceToHost));
+
+  compare_bf16(q, expected_q, 0.0078125f, "forward rope q");
+  compare_bf16(k, expected_k, 0.0078125f, "forward rope k");
+
+  CHECK_CUDA(cudaFree(d_q));
+  CHECK_CUDA(cudaFree(d_k));
+  CHECK_CUDA(cudaFree(d_cos));
+  CHECK_CUDA(cudaFree(d_sin));
+}
+
 void run_wrapper_case(bool global) {
   int batch_size = 1;
   int seq_len = 3;
@@ -186,7 +298,8 @@ void run_wrapper_case(bool global) {
                           : GEMMA4_SLIDING_HEAD_DIM;
   int q_count = batch_size * seq_len * q_heads * head_dim;
   int k_count = batch_size * seq_len * kv_heads * head_dim;
-  int table_count = cos_batch_size * seq_len * (rotary_dim / 2);
+  int table_width = head_dim;
+  int table_count = cos_batch_size * seq_len * table_width;
 
   std::vector<__nv_bfloat16> q(q_count);
   std::vector<__nv_bfloat16> k(k_count);
@@ -203,11 +316,11 @@ void run_wrapper_case(bool global) {
   }
   expected_q = q;
   expected_k = k;
-  fill_rope_table(cos, sin, seq_len, cos_batch_size, rotary_dim / 2);
+  fill_rope_table(cos, sin, seq_len, cos_batch_size, table_width);
   reference_rope(expected_q, cos, sin, batch_size, seq_len, cos_batch_size,
-                 q_heads, head_dim, rotary_dim);
+                 table_width, q_heads, head_dim, rotary_dim);
   reference_rope(expected_k, cos, sin, batch_size, seq_len, cos_batch_size,
-                 kv_heads, head_dim, rotary_dim);
+                 table_width, kv_heads, head_dim, rotary_dim);
 
   __nv_bfloat16 *d_q = nullptr;
   __nv_bfloat16 *d_k = nullptr;
@@ -251,6 +364,87 @@ void run_wrapper_case(bool global) {
   CHECK_CUDA(cudaFree(d_sin));
 }
 
+void run_forward_wrapper_case(bool global) {
+  int batch_size = 1;
+  int seq_len = 4;
+  int cos_batch_size = 1;
+  int q_heads = GEMMA4_NUM_QUERY_HEADS;
+  int kv_heads = global ? GEMMA4_GLOBAL_KV_HEADS : GEMMA4_SLIDING_KV_HEADS;
+  int head_dim = global ? GEMMA4_GLOBAL_HEAD_DIM : GEMMA4_SLIDING_HEAD_DIM;
+  int rotary_dim = global ? GEMMA4_GLOBAL_HEAD_DIM / 4
+                          : GEMMA4_SLIDING_HEAD_DIM;
+  int q_count = batch_size * q_heads * seq_len * head_dim;
+  int k_count = batch_size * kv_heads * seq_len * head_dim;
+  int table_width = head_dim;
+  int table_count = cos_batch_size * seq_len * table_width;
+
+  std::vector<__nv_bfloat16> q(q_count);
+  std::vector<__nv_bfloat16> k(k_count);
+  std::vector<__nv_bfloat16> expected_q(q_count);
+  std::vector<__nv_bfloat16> expected_k(k_count);
+  std::vector<float> cos(table_count);
+  std::vector<float> sin(table_count);
+
+  for (int i = 0; i < q_count; ++i) {
+    q[i] = make_value(i + 317);
+  }
+  for (int i = 0; i < k_count; ++i) {
+    k[i] = make_value(i + 919);
+  }
+  expected_q = q;
+  expected_k = k;
+  fill_rope_table(cos, sin, seq_len, cos_batch_size, table_width);
+  reference_rope_forward_layout(expected_q, cos, sin, batch_size, seq_len,
+                                cos_batch_size, table_width, q_heads, head_dim,
+                                rotary_dim);
+  reference_rope_forward_layout(expected_k, cos, sin, batch_size, seq_len,
+                                cos_batch_size, table_width, kv_heads, head_dim,
+                                rotary_dim);
+
+  __nv_bfloat16 *d_q = nullptr;
+  __nv_bfloat16 *d_k = nullptr;
+  float *d_cos = nullptr;
+  float *d_sin = nullptr;
+  CHECK_CUDA(cudaMalloc(&d_q, static_cast<size_t>(q_count) * sizeof(q[0])));
+  CHECK_CUDA(cudaMalloc(&d_k, static_cast<size_t>(k_count) * sizeof(k[0])));
+  CHECK_CUDA(cudaMalloc(&d_cos, static_cast<size_t>(table_count) * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_sin, static_cast<size_t>(table_count) * sizeof(float)));
+  CHECK_CUDA(cudaMemcpy(d_q, q.data(), static_cast<size_t>(q_count) * sizeof(q[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k, k.data(), static_cast<size_t>(k_count) * sizeof(k[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(),
+                        static_cast<size_t>(table_count) * sizeof(float),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(),
+                        static_cast<size_t>(table_count) * sizeof(float),
+                        cudaMemcpyHostToDevice));
+
+  if (global) {
+    CHECK_CUDA(gemma4_global_rope_forward_bf16(d_q, d_k, d_cos, d_sin,
+                                               seq_len, batch_size,
+                                               cos_batch_size, 0));
+  } else {
+    CHECK_CUDA(gemma4_sliding_rope_forward_bf16(d_q, d_k, d_cos, d_sin,
+                                                seq_len, batch_size,
+                                                cos_batch_size, 0));
+  }
+  CHECK_CUDA(cudaMemcpy(q.data(), d_q, static_cast<size_t>(q_count) * sizeof(q[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(k.data(), d_k, static_cast<size_t>(k_count) * sizeof(k[0]),
+                        cudaMemcpyDeviceToHost));
+
+  compare_bf16(q, expected_q, 0.0078125f,
+               global ? "global forward rope q" : "sliding forward rope q");
+  compare_bf16(k, expected_k, 0.0078125f,
+               global ? "global forward rope k" : "sliding forward rope k");
+
+  CHECK_CUDA(cudaFree(d_q));
+  CHECK_CUDA(cudaFree(d_k));
+  CHECK_CUDA(cudaFree(d_cos));
+  CHECK_CUDA(cudaFree(d_sin));
+}
+
 }  // namespace
 
 int main() {
@@ -258,8 +452,15 @@ int main() {
            GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_HEAD_DIM);
   run_case(2, 5, 2, GEMMA4_NUM_QUERY_HEADS, GEMMA4_GLOBAL_KV_HEADS,
            GEMMA4_GLOBAL_HEAD_DIM, 128);
+  run_forward_case(2, 7, 1, GEMMA4_NUM_QUERY_HEADS,
+                   GEMMA4_SLIDING_KV_HEADS, GEMMA4_SLIDING_HEAD_DIM,
+                   GEMMA4_SLIDING_HEAD_DIM);
+  run_forward_case(2, 5, 2, GEMMA4_NUM_QUERY_HEADS, GEMMA4_GLOBAL_KV_HEADS,
+                   GEMMA4_GLOBAL_HEAD_DIM, 128);
   run_wrapper_case(false);
   run_wrapper_case(true);
+  run_forward_wrapper_case(false);
+  run_forward_wrapper_case(true);
 
   cudaError_t invalid =
       gemma4_rope_bf16(nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, 1, 1,
