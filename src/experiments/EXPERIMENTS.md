@@ -2662,3 +2662,62 @@ Correctness:
 Notes:
 
 - Nsight Compute was not rerun for this benchmark entry. Earlier in this environment it aborted under Thunder's unsupported CUPTI path, so these results are benchmark timings, not NCU counter profiles.
+
+## 2026-05-20 - Hidden fused residual add RMSNorm prefill, one CTA per row
+
+Implemented a hidden-width `5376` prefill path for fused residual add plus weighted
+RMSNorm. It keeps one CUDA block per token row, does the RMS reduction inside that
+block, writes the residual row, then writes the normalized row. No cross-block sync is
+needed because rows are independent.
+
+Command:
+
+```bash
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
+  ./build/experiments/gemma4_rmsnorm_bench 100 30 5 1024 5376 \
+  > /tmp/gemma4_rmsnorm_prefill_blockrow_20260520/hidden_w5376.csv
+```
+
+Fused residual add plus weighted RMSNorm graph replay, hidden width `5376`:
+
+| Rows | Previous fused ms | One-CTA fused ms | Split CUDA ms | cuDNN split ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.002435 | 0.002412 | 0.003476 | 0.004045 |
+| 4 | 0.008589 | 0.002443 | 0.007402 | 0.004110 |
+| 16 | 0.011001 | 0.002609 | 0.007430 | 0.004306 |
+| 64 | 0.012346 | 0.003585 | 0.008250 | 0.005822 |
+| 256 | 0.021028 | 0.017522 | 0.021120 | 0.020122 |
+| 1024 | 0.075144 | 0.066300 | 0.083404 | 0.085198 |
+
+Correctness versus the custom residual plus cuDNN RMSNorm split path:
+
+- output max abs diff: `0` through rows `64`, `0.000976562` at rows `256`,
+  `0.00195312` at rows `1024`
+- `rstd` max abs diff: at most `1.19209e-07`
+
+Conclusion: the one-block-per-row hidden prefill kernel fixes the earlier prefill
+weakness. It beats split CUDA by `1.21x` to `3.03x` and cuDNN split by `1.15x` to
+`1.68x` on these graph replay timings.
+
+## 2026-05-20 - Hidden fused prefill with residual pack kept in registers
+
+Changed the hidden-width fused residual add plus RMSNorm prefill kernel to keep one
+128-bit residual pack per thread in registers instead of writing all residual packs to
+shared memory. This works cleanly because width `5376` is exactly `672` BF16 packs and
+the prefill launch uses `672` threads.
+
+Same benchmark command as above, output:
+`/tmp/gemma4_rmsnorm_prefill_reg_20260520/hidden_w5376.csv`.
+
+| Rows | Shared-residual fused ms | Register-residual fused ms | cuDNN split ms |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.002412 | 0.002507 | 0.004096 |
+| 4 | 0.002443 | 0.002252 | 0.004129 |
+| 16 | 0.002609 | 0.002187 | 0.004345 |
+| 64 | 0.003585 | 0.003276 | 0.005835 |
+| 256 | 0.017522 | 0.017339 | 0.020076 |
+| 1024 | 0.066300 | 0.065971 | 0.085200 |
+
+Conclusion: keep the register version. It is better for prefill rows `4+`, especially
+the smaller prefill sizes, and still beats cuDNN split by `1.16x` to `1.99x` for those
+rows.

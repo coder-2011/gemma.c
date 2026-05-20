@@ -26,3 +26,5 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 - Benchmarked RoPE vs cuDNN pointwise decomposition. Custom kernel wins by a lot, roughly 2.4-3x at seq 4096 even after graph capture. Not worth using cuDNN here; next move is fuse Q/K norm + RoPE + KV write.
 
 - RMSNorm started as a direct llm.c-style baseline, then got split into learned-weight and scale-free V paths. Rebenchmarked real shapes w/ cuDNN setup overhead factored out. Custom V RMSNorm is worth keeping: width 256 is ~1.05-1.51x faster, width 512 is ~1.15-1.65x faster. Hidden width 5376 only wins decode row=1; cuDNN beats prefill because our hidden prefill path is still a simple one-warp-per-row baseline. Fix that later by fusion or a real multi-warp row kernel.
+
+- Fixed the hidden RMSNorm prefill weakness by making fused residual add + RMSNorm use one block per row, then keeping the residual pack in registers instead of shared memory. This finally beats cuDNN split on real hidden shapes, about 1.16-1.99x for prefill rows 4-1024, so fused RMSNorm is now worth keeping for both decode and prefill.
