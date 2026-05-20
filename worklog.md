@@ -18,3 +18,7 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 - Back to matmul, playing around w/ warptiling to torture the chip into giving me all its FLOPs. Benchmarks had to be fixed a bit too, bc it didnt fully account for overhead from cuDNN. I used cuDNN backend API anyways to minimize ovehead. Tried double buffering, but this is GEMV decode: it mostly streams weights once, so mem constraints will not let us speed up much more than this.
 
 - Buffering and fancy memory tricks have mostly not helped the M=1 decode GEMV path. The direct `load128cs` path streams `VRAM -> registers -> FMA`; `cp.async` double buffering changes that to `VRAM -> SMEM -> registers -> FMA`, adding shared-memory traffic plus commit/wait overhead without reducing bytes or creating reuse. If this is revisited, use a different tiling strategy where staged data is reused; don't just pipeline one-use 16-byte packs.
+
+-cleaned up everything for readability
+
+- exapted a boilerplate RoPE kernel. Considering how I an optimize it.
