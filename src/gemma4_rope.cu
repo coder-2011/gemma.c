@@ -7,9 +7,9 @@ namespace {
 
 constexpr int kRopeThreads = 128;
 
-__device__ __forceinline__ void rotate_head_bf16(floatX *head,
-                                                 const float *cos_row,
-                                                 const float *sin_row,
+__device__ __forceinline__ void rotate_head_bf16(floatX *__restrict__ head,
+                                                 const float *__restrict__ cos_row,
+                                                 const float *__restrict__ sin_row,
                                                  int rotary_half) {
   for (int i = threadIdx.x; i < rotary_half; i += blockDim.x) {
     float x1 = __bfloat162float(head[i]);
@@ -21,20 +21,21 @@ __device__ __forceinline__ void rotate_head_bf16(floatX *head,
   }
 }
 
-__global__ void gemma4_rope_bf16_kernel(floatX *q,
-                                        int64_t q_row_stride,
-                                        floatX *k,
-                                        int64_t k_row_stride,
-                                        const float *cos,
-                                        int64_t cos_row_stride,
-                                        const float *sin,
-                                        int64_t sin_row_stride,
-                                        int seq_len,
-                                        int cos_batch_size,
-                                        int q_heads,
-                                        int kv_heads,
-                                        int head_dim,
-                                        int rotary_half) {
+__global__ __launch_bounds__(kRopeThreads) void
+gemma4_rope_bf16_kernel(floatX *__restrict__ q,
+                        int64_t q_row_stride,
+                        floatX *__restrict__ k,
+                        int64_t k_row_stride,
+                        const float *__restrict__ cos,
+                        int64_t cos_row_stride,
+                        const float *__restrict__ sin,
+                        int64_t sin_row_stride,
+                        int seq_len,
+                        int cos_batch_size,
+                        int q_heads,
+                        int kv_heads,
+                        int head_dim,
+                        int rotary_half) {
   int row = blockIdx.x;
   int head = blockIdx.y;
   int batch = row / seq_len;
@@ -57,18 +58,19 @@ __global__ void gemma4_rope_bf16_kernel(floatX *q,
   }
 }
 
-__global__ void gemma4_rope_forward_bf16_kernel(floatX *q,
-                                                floatX *k,
-                                                const float *cos,
-                                                int64_t cos_row_stride,
-                                                const float *sin,
-                                                int64_t sin_row_stride,
-                                                int seq_len,
-                                                int cos_batch_size,
-                                                int q_heads,
-                                                int kv_heads,
-                                                int head_dim,
-                                                int rotary_half) {
+__global__ __launch_bounds__(kRopeThreads) void
+gemma4_rope_forward_bf16_kernel(floatX *__restrict__ q,
+                                floatX *__restrict__ k,
+                                const float *__restrict__ cos,
+                                int64_t cos_row_stride,
+                                const float *__restrict__ sin,
+                                int64_t sin_row_stride,
+                                int seq_len,
+                                int cos_batch_size,
+                                int q_heads,
+                                int kv_heads,
+                                int head_dim,
+                                int rotary_half) {
   int row = blockIdx.x;
   int head = blockIdx.y;
   int batch = row / seq_len;
@@ -95,13 +97,13 @@ __global__ void gemma4_rope_forward_bf16_kernel(floatX *q,
 
 }  // namespace
 
-cudaError_t gemma4_rope_bf16(floatX *q,
+cudaError_t gemma4_rope_bf16(floatX *__restrict__ q,
                              int64_t q_row_stride,
-                             floatX *k,
+                             floatX *__restrict__ k,
                              int64_t k_row_stride,
-                             const float *cos,
+                             const float *__restrict__ cos,
                              int64_t cos_row_stride,
-                             const float *sin,
+                             const float *__restrict__ sin,
                              int64_t sin_row_stride,
                              int seq_len,
                              int batch_size,
@@ -111,27 +113,40 @@ cudaError_t gemma4_rope_bf16(floatX *q,
                              int head_dim,
                              int rotary_dim,
                              cudaStream_t stream) {
-  if (seq_len < 0 || batch_size < 0 || q_heads < 0 || kv_heads < 0 || head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim || (rotary_dim % 2) != 0 || (cos_batch_size != 1 && cos_batch_size != batch_size)) return cudaErrorInvalidValue;
-  if (seq_len == 0 || batch_size == 0 || (q_heads == 0 && kv_heads == 0)) return cudaSuccess;
-  if (q == nullptr || k == nullptr || cos == nullptr || sin == nullptr) return cudaErrorInvalidValue;
+  if (seq_len < 0 || batch_size < 0 || q_heads < 0 || kv_heads < 0 ||
+      head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim ||
+      (rotary_dim % 2) != 0 ||
+      (cos_batch_size != 1 && cos_batch_size != batch_size)) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len == 0 || batch_size == 0 || (q_heads == 0 && kv_heads == 0)) {
+    return cudaSuccess;
+  }
+  if (q == nullptr || k == nullptr || cos == nullptr || sin == nullptr) {
+    return cudaErrorInvalidValue;
+  }
 
   int rotary_half = rotary_dim / 2;
-  if (q_row_stride < static_cast<int64_t>(q_heads) * head_dim || k_row_stride < static_cast<int64_t>(kv_heads) * head_dim || cos_row_stride < rotary_half || sin_row_stride < rotary_half) return cudaErrorInvalidValue;
+  if (q_row_stride < static_cast<int64_t>(q_heads) * head_dim ||
+      k_row_stride < static_cast<int64_t>(kv_heads) * head_dim ||
+      cos_row_stride < rotary_half || sin_row_stride < rotary_half) {
+    return cudaErrorInvalidValue;
+  }
   int rows = batch_size * seq_len;
   int heads = q_heads > kv_heads ? q_heads : kv_heads;
 
   dim3 grid(rows, heads);
-  gemma4_rope_bf16_kernel<<<grid, kRopeThreads, 0, stream>>>
-  (q, q_row_stride, k, k_row_stride, cos, cos_row_stride, 
-    sin, sin_row_stride, seq_len, cos_batch_size, 
-    q_heads, kv_heads, head_dim, rotary_half);
+  gemma4_rope_bf16_kernel<<<grid, kRopeThreads, 0, stream>>>(
+      q, q_row_stride, k, k_row_stride, cos, cos_row_stride, sin,
+      sin_row_stride, seq_len, cos_batch_size, q_heads, kv_heads, head_dim,
+      rotary_half);
   return cudaGetLastError();
 }
 
-cudaError_t gemma4_rope_forward_bf16(floatX *q,
-                                     floatX *k,
-                                     const float *cos,
-                                     const float *sin,
+cudaError_t gemma4_rope_forward_bf16(floatX *__restrict__ q,
+                                     floatX *__restrict__ k,
+                                     const float *__restrict__ cos,
+                                     const float *__restrict__ sin,
                                      int seq_len,
                                      int batch_size,
                                      int cos_batch_size,
@@ -140,15 +155,26 @@ cudaError_t gemma4_rope_forward_bf16(floatX *q,
                                      int head_dim,
                                      int rotary_dim,
                                      cudaStream_t stream) {
-  if (seq_len < 0 || batch_size < 0 || q_heads < 0 || kv_heads < 0 || head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim || (rotary_dim % 2) != 0 || (cos_batch_size != 1 && cos_batch_size != batch_size)) return cudaErrorInvalidValue;
-  if (seq_len == 0 || batch_size == 0 || (q_heads == 0 && kv_heads == 0)) return cudaSuccess;
-  if (q == nullptr || k == nullptr || cos == nullptr || sin == nullptr) return cudaErrorInvalidValue;
+  if (seq_len < 0 || batch_size < 0 || q_heads < 0 || kv_heads < 0 ||
+      head_dim <= 0 || rotary_dim <= 0 || rotary_dim > head_dim ||
+      (rotary_dim % 2) != 0 ||
+      (cos_batch_size != 1 && cos_batch_size != batch_size)) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len == 0 || batch_size == 0 || (q_heads == 0 && kv_heads == 0)) {
+    return cudaSuccess;
+  }
+  if (q == nullptr || k == nullptr || cos == nullptr || sin == nullptr) {
+    return cudaErrorInvalidValue;
+  }
 
   int rows = batch_size * seq_len;
   int heads = q_heads > kv_heads ? q_heads : kv_heads;
 
   dim3 grid(rows, heads);
   int rotary_half = rotary_dim / 2;
-  gemma4_rope_forward_bf16_kernel<<<grid, kRopeThreads, 0, stream>>>(q, k, cos, head_dim, sin, head_dim, seq_len, cos_batch_size, q_heads, kv_heads, head_dim, rotary_half);
+  gemma4_rope_forward_bf16_kernel<<<grid, kRopeThreads, 0, stream>>>(
+      q, k, cos, head_dim, sin, head_dim, seq_len, cos_batch_size, q_heads,
+      kv_heads, head_dim, rotary_half);
   return cudaGetLastError();
 }

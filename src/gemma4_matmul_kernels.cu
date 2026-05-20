@@ -135,18 +135,20 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
 }
 
 static cudaError_t check_decode_args(
-    const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
-    const __nv_bfloat16 *y) {
-  if (!x || !w_col_major || !y || !is_aligned_16(x) || !is_aligned_16(w_col_major) || !is_aligned_16(y)) {
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    const __nv_bfloat16 *__restrict__ y) {
+  if (!x || !w_col_major || !y || !is_aligned_16(x) ||
+      !is_aligned_16(w_col_major) || !is_aligned_16(y)) {
     return cudaErrorInvalidValue;
   }
   return cudaSuccess;
 }
 
 template <int K, int N, int ColsPerBlock, int Threads, int MinBlocksPerSM>
-cudaError_t launch_decode_gemv(const __nv_bfloat16 *x,
-                               const __nv_bfloat16 *w_col_major,
-                               __nv_bfloat16 *y,
+cudaError_t launch_decode_gemv(const __nv_bfloat16 *__restrict__ x,
+                               const __nv_bfloat16 *__restrict__ w_col_major,
+                               __nv_bfloat16 *__restrict__ y,
                                cudaStream_t stream) {
   const cudaError_t arg_status = check_decode_args(x, w_col_major, y);
   if (arg_status != cudaSuccess) {
@@ -154,13 +156,17 @@ cudaError_t launch_decode_gemv(const __nv_bfloat16 *x,
   }
 
   constexpr int blocks = N / ColsPerBlock;
-  gemma4_decode_gemv_cols_kernel<K, N, ColsPerBlock, Threads, MinBlocksPerSM><<<blocks, Threads, 0, stream>>>(x, w_col_major, y);
+  gemma4_decode_gemv_cols_kernel<K, N, ColsPerBlock, Threads, MinBlocksPerSM>
+      <<<blocks, Threads, 0, stream>>>(x, w_col_major, y);
   return cudaGetLastError();
 }
 
 static cublasStatus_t prefill_gemm(
-    cublasHandle_t handle, const __nv_bfloat16 *x,
-    const __nv_bfloat16 *w_col_major, __nv_bfloat16 *y, int m, int k, int n,
+    cublasHandle_t handle,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int m, int k, int n,
     cudaStream_t stream) {
   if (m <= 0) {
     return CUBLAS_STATUS_SUCCESS;
@@ -216,8 +222,10 @@ static bool projection_shape(Gemma4Projection projection,
 
 cublasStatus_t gemma4_projection_prefill(
     Gemma4Projection projection, cublasHandle_t handle,
-    const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
-    __nv_bfloat16 *y, int m, cudaStream_t stream) {
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int m, cudaStream_t stream) {
   Gemma4ProjectionShape shape = {};
   if (!projection_shape(projection, shape)) {
     return CUBLAS_STATUS_INVALID_VALUE;
@@ -226,9 +234,10 @@ cublasStatus_t gemma4_projection_prefill(
 }
 
 cudaError_t gemma4_projection_decode(Gemma4Projection projection,
-                                     const __nv_bfloat16 *x,
-                                     const __nv_bfloat16 *w_col_major,
-                                     __nv_bfloat16 *y, cudaStream_t stream) {
+                                     const __nv_bfloat16 *__restrict__ x,
+                                     const __nv_bfloat16 *__restrict__ w_col_major,
+                                     __nv_bfloat16 *__restrict__ y,
+                                     cudaStream_t stream) {
   switch (projection) {
   case GEMMA4_PROJECTION_FFN_GATE_UP:
     return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE,

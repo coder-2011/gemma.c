@@ -56,8 +56,19 @@ load128(const ElementType *address) {
 
 template <typename ElementType>
 __device__ __forceinline__ Packed128<ElementType>
+load128g(const ElementType *address) {
+  return Packed128<ElementType>{__ldg(reinterpret_cast<const int4 *>(address))};
+}
+
+template <typename ElementType>
+__device__ __forceinline__ Packed128<ElementType>
 load128cs(const ElementType *address) {
   return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4 *>(address))};
+}
+
+template <typename ElementType>
+__device__ __forceinline__ ElementType loadg(const ElementType *address) {
+  return __ldg(address);
 }
 
 template <typename ElementType>

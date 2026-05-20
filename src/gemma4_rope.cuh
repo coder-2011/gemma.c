@@ -8,13 +8,13 @@
 
 // In-place RoPE for physical [batch, seq, heads, head_dim] Q/K buffers.
 // cos_row_stride/sin_row_stride may be compact rotary_dim / 2 or full head_dim.
-cudaError_t gemma4_rope_bf16(__nv_bfloat16 *q,
+cudaError_t gemma4_rope_bf16(__nv_bfloat16 *__restrict__ q,
                              int64_t q_row_stride,
-                             __nv_bfloat16 *k,
+                             __nv_bfloat16 *__restrict__ k,
                              int64_t k_row_stride,
-                             const float *cos,
+                             const float *__restrict__ cos,
                              int64_t cos_row_stride,
-                             const float *sin,
+                             const float *__restrict__ sin,
                              int64_t sin_row_stride,
                              int seq_len,
                              int batch_size,
@@ -29,10 +29,10 @@ cudaError_t gemma4_rope_bf16(__nv_bfloat16 *q,
 // q: [batch, q_heads, seq, head_dim]
 // k: [batch, kv_heads, seq, head_dim]
 // cos/sin: [1 or batch, seq, head_dim]
-cudaError_t gemma4_rope_forward_bf16(__nv_bfloat16 *q,
-                                     __nv_bfloat16 *k,
-                                     const float *cos,
-                                     const float *sin,
+cudaError_t gemma4_rope_forward_bf16(__nv_bfloat16 *__restrict__ q,
+                                     __nv_bfloat16 *__restrict__ k,
+                                     const float *__restrict__ cos,
+                                     const float *__restrict__ sin,
                                      int seq_len,
                                      int batch_size,
                                      int cos_batch_size,
