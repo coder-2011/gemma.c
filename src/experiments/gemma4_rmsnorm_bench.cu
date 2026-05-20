@@ -55,6 +55,15 @@ __global__ void gemma4_rmsnorm_fill_random_bf16_kernel(__nv_bfloat16 *ptr,
   ptr[i] = __float2bfloat16_rn((u * 2.0f - 1.0f) * scale);
 }
 
+__global__ void gemma4_rmsnorm_fill_constant_bf16_kernel(__nv_bfloat16 *ptr,
+                                                         size_t count,
+                                                         float value) {
+  size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  if (i < count) {
+    ptr[i] = __float2bfloat16_rn(value);
+  }
+}
+
 uint64_t make_seed() {
   if (const char *env = std::getenv("GEMMA4_RMSNORM_BENCH_SEED")) {
     return std::strtoull(env, nullptr, 0);
@@ -77,6 +86,17 @@ void fill_random_bf16(__nv_bfloat16 *ptr,
   constexpr int threads = 256;
   int blocks = int((count + threads - 1) / threads);
   gemma4_rmsnorm_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(ptr, count, seed, scale);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+void fill_constant_bf16(__nv_bfloat16 *ptr,
+                        size_t count,
+                        float value,
+                        cudaStream_t stream) {
+  constexpr int threads = 256;
+  int blocks = int((count + threads - 1) / threads);
+  gemma4_rmsnorm_fill_constant_bf16_kernel<<<blocks, threads, 0, stream>>>(
+      ptr, count, value);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -198,10 +218,13 @@ int main(int argc, char **argv) {
   const int warmup = argc > 2 ? std::atoi(argv[2]) : 30;
   const int trials = argc > 3 ? std::atoi(argv[3]) : 5;
   const int max_rows = argc > 4 ? std::atoi(argv[4]) : 4096;
+  const int width = argc > 5 ? std::atoi(argv[5]) : GEMMA4_HIDDEN_SIZE;
 
-  if (iters <= 0 || warmup < 0 || trials <= 0 || max_rows <= 0) {
+  if (iters <= 0 || warmup < 0 || trials <= 0 || max_rows <= 0 ||
+      width <= 0 || (width % 8) != 0) {
     std::fprintf(stderr,
-                 "usage: %s [iters=200] [warmup=30] [trials=5] [max_rows=4096]\n",
+                 "usage: %s [iters=200] [warmup=30] [trials=5] "
+                 "[max_rows=4096] [width=5376]\n",
                  argv[0]);
     return 1;
   }
@@ -209,41 +232,52 @@ int main(int argc, char **argv) {
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-  const int width = GEMMA4_HIDDEN_SIZE;
   const size_t max_elems = static_cast<size_t>(max_rows) * width;
   const uint64_t seed = make_seed();
 
   __nv_bfloat16 *d_inp1 = nullptr;
   __nv_bfloat16 *d_inp2 = nullptr;
   __nv_bfloat16 *d_weight = nullptr;
+  __nv_bfloat16 *d_ones_weight = nullptr;
   __nv_bfloat16 *d_rms_out = nullptr;
   __nv_bfloat16 *d_rms_cudnn_out = nullptr;
+  __nv_bfloat16 *d_scale_free_out = nullptr;
+  __nv_bfloat16 *d_scale_free_cudnn_out = nullptr;
   __nv_bfloat16 *d_residual = nullptr;
   __nv_bfloat16 *d_split_residual = nullptr;
   __nv_bfloat16 *d_fused_normed = nullptr;
   __nv_bfloat16 *d_split_normed = nullptr;
   float *d_rstd = nullptr;
   float *d_cudnn_rstd = nullptr;
+  float *d_scale_free_rstd = nullptr;
+  float *d_scale_free_cudnn_rstd = nullptr;
   float *d_fused_rstd = nullptr;
   float *d_split_rstd = nullptr;
 
   CUDA_CHECK(cudaMalloc(&d_inp1, max_elems * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_inp2, max_elems * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_weight, static_cast<size_t>(width) * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&d_ones_weight, static_cast<size_t>(width) * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_rms_out, max_elems * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_rms_cudnn_out, max_elems * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&d_scale_free_out, max_elems * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&d_scale_free_cudnn_out, max_elems * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_residual, max_elems * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_split_residual, max_elems * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_fused_normed, max_elems * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_split_normed, max_elems * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_cudnn_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_scale_free_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_scale_free_cudnn_rstd,
+                        static_cast<size_t>(max_rows) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_fused_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_split_rstd, static_cast<size_t>(max_rows) * sizeof(float)));
 
   fill_random_bf16(d_inp1, max_elems, seed ^ 0x1001u, 1.0f, stream);
   fill_random_bf16(d_inp2, max_elems, seed ^ 0x2002u, 1.0f, stream);
   fill_random_bf16(d_weight, static_cast<size_t>(width), seed ^ 0x3003u, 0.5f, stream);
+  fill_constant_bf16(d_ones_weight, static_cast<size_t>(width), 1.0f, stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   int device = 0;
@@ -265,7 +299,13 @@ int main(int argc, char **argv) {
   std::printf("rows,rms_ms,rms_gib_s,rms_graph_kernel_ms,"
               "rms_graph_kernel_gib_s,cudnn_ms,cudnn_gib_s,"
               "cudnn_graph_kernel_ms,cudnn_graph_kernel_gib_s,"
-              "cudnn_max_abs,cudnn_rstd_max_abs,residual_ms,fused_ms,"
+              "cudnn_max_abs,cudnn_rstd_max_abs,scale_free_ms,"
+              "scale_free_gib_s,scale_free_graph_kernel_ms,"
+              "scale_free_graph_kernel_gib_s,cudnn_one_scale_ms,"
+              "cudnn_one_scale_gib_s,cudnn_one_scale_graph_kernel_ms,"
+              "cudnn_one_scale_graph_kernel_gib_s,cudnn_one_scale_max_abs,"
+              "cudnn_one_scale_rstd_max_abs,scale_free_vs_cudnn_one_scale,"
+              "residual_ms,fused_ms,"
               "split_ms,fused_vs_split,fused_graph_kernel_ms,"
               "split_graph_kernel_ms,fused_graph_vs_split_graph,"
               "cudnn_split_ms,cudnn_split_graph_ms,fused_vs_cudnn_split,"
@@ -275,6 +315,9 @@ int main(int argc, char **argv) {
     const int count = rows * width;
     const double rms_bytes =
         double(rows) * width * sizeof(__nv_bfloat16) * 3.0 +
+        double(rows) * sizeof(float);
+    const double scale_free_bytes =
+        double(rows) * width * sizeof(__nv_bfloat16) * 2.0 +
         double(rows) * sizeof(float);
     const double residual_bytes =
         double(rows) * width * sizeof(__nv_bfloat16) * 3.0;
@@ -291,6 +334,11 @@ int main(int argc, char **argv) {
     auto run_residual = [&]() {
       CUDA_CHECK(gemma4_residual_add_bf16(d_residual, d_inp1, d_inp2, count, stream));
     };
+    auto run_scale_free = [&]() {
+      CUDA_CHECK(gemma4_rmsnorm_scale_free_bf16(
+          d_scale_free_out, d_scale_free_rstd, d_inp1, rows, width,
+          GEMMA4_RMS_NORM_EPS, stream));
+    };
     auto run_fused = [&]() {
       CUDA_CHECK(gemma4_residual_add_rmsnorm_bf16(
           d_split_residual, d_fused_normed, d_fused_rstd, d_inp1, d_inp2,
@@ -305,6 +353,7 @@ int main(int argc, char **argv) {
 
     run_rms();
     run_residual();
+    run_scale_free();
     run_fused();
     run_split();
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -313,6 +362,8 @@ int main(int argc, char **argv) {
         time_ms(run_rms, stream, warmup, iters, trials);
     TimingStats residual_stats =
         time_ms(run_residual, stream, warmup, iters, trials);
+    TimingStats scale_free_stats =
+        time_ms(run_scale_free, stream, warmup, iters, trials);
     TimingStats fused_stats =
         time_ms(run_fused, stream, warmup, iters, trials);
     TimingStats split_stats =
@@ -352,12 +403,33 @@ int main(int argc, char **argv) {
                    rows, e.what());
     }
 
+    float scale_free_graph_ms = -1.0f;
+    double scale_free_graph_gib_s = 0.0;
+    try {
+      TimingStats scale_free_graph_stats =
+          time_ms_graph(run_scale_free, stream, warmup, iters, trials);
+      scale_free_graph_ms = scale_free_graph_stats.best_ms;
+      scale_free_graph_gib_s =
+          gib_per_second(scale_free_bytes, scale_free_graph_ms);
+    } catch (const std::exception &e) {
+      std::fprintf(stderr,
+                   "custom scale-free RMSNorm CUDA graph timing unavailable "
+                   "for rows=%d: %s\n",
+                   rows, e.what());
+    }
+
     float cudnn_ms = -1.0f;
     double cudnn_gib_s = 0.0;
     float cudnn_graph_ms = -1.0f;
     double cudnn_graph_gib_s = 0.0;
     float cudnn_max_abs = -1.0f;
     float cudnn_rstd_max_abs = -1.0f;
+    float cudnn_one_scale_ms = -1.0f;
+    double cudnn_one_scale_gib_s = 0.0;
+    float cudnn_one_scale_graph_ms = -1.0f;
+    double cudnn_one_scale_graph_gib_s = 0.0;
+    float cudnn_one_scale_max_abs = -1.0f;
+    float cudnn_one_scale_rstd_max_abs = -1.0f;
     float cudnn_split_ms = -1.0f;
     float cudnn_split_graph_ms = -1.0f;
     float cudnn_split_max_abs = -1.0f;
@@ -403,6 +475,46 @@ int main(int argc, char **argv) {
       }
       cudnn_max_abs = out_diff.max_abs;
       cudnn_rstd_max_abs = max_rstd;
+
+      auto run_cudnn_one_scale = [&]() {
+        cudnn.run(d_inp1, d_ones_weight, d_scale_free_cudnn_out,
+                  d_scale_free_cudnn_rstd);
+      };
+      run_cudnn_one_scale();
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+      TimingStats cudnn_one_scale_stats =
+          time_ms(run_cudnn_one_scale, stream, warmup, iters, trials);
+      cudnn_one_scale_ms = cudnn_one_scale_stats.best_ms;
+      cudnn_one_scale_gib_s = gib_per_second(rms_bytes, cudnn_one_scale_ms);
+
+      try {
+        TimingStats cudnn_one_scale_graph_stats =
+            time_ms_graph(run_cudnn_one_scale, stream, warmup, iters, trials);
+        cudnn_one_scale_graph_ms = cudnn_one_scale_graph_stats.best_ms;
+        cudnn_one_scale_graph_gib_s =
+            gib_per_second(rms_bytes, cudnn_one_scale_graph_ms);
+      } catch (const std::exception &e) {
+        std::fprintf(stderr,
+                     "cuDNN one-scale RMSNorm CUDA graph timing unavailable "
+                     "for rows=%d: %s\n",
+                     rows, e.what());
+      }
+
+      DiffStats one_scale_out_diff = diff_stats_bf16(
+          d_scale_free_out, d_scale_free_cudnn_out, count);
+      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_scale_free_rstd,
+                            static_cast<size_t>(rows) * sizeof(float),
+                            cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_scale_free_cudnn_rstd,
+                            static_cast<size_t>(rows) * sizeof(float),
+                            cudaMemcpyDeviceToHost));
+      max_rstd = 0.0f;
+      for (int i = 0; i < rows; ++i) {
+        max_rstd =
+            std::max(max_rstd, std::abs(h_custom_rstd[i] - h_cudnn_rstd[i]));
+      }
+      cudnn_one_scale_max_abs = one_scale_out_diff.max_abs;
+      cudnn_one_scale_rstd_max_abs = max_rstd;
 
       auto run_cudnn_split = [&]() {
         CUDA_CHECK(gemma4_residual_add_bf16(d_residual, d_inp1, d_inp2, count, stream));
@@ -455,13 +567,25 @@ int main(int argc, char **argv) {
             : -1.0f;
     float fused_vs_cudnn_split =
         cudnn_split_ms > 0.0f ? cudnn_split_ms / fused_stats.best_ms : -1.0f;
+    float scale_free_vs_cudnn_one_scale =
+        cudnn_one_scale_ms > 0.0f
+            ? cudnn_one_scale_ms / scale_free_stats.best_ms
+            : -1.0f;
     std::printf("%d,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,"
-                "%.6g,%.6g,%.6f,%.6f,%.6f,%.3f,%.6f,%.6f,"
-                "%.3f,%.6f,%.6f,%.3f,%.6g,%.6g\n",
+                "%.6g,%.6g,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,"
+                "%.6f,%.3f,%.6g,%.6g,%.3f,%.6f,%.6f,%.6f,"
+                "%.3f,%.6f,%.6f,%.3f,%.6f,%.6f,%.3f,%.6g,%.6g\n",
                 rows, rms_stats.best_ms,
                 gib_per_second(rms_bytes, rms_stats.best_ms), rms_graph_ms,
                 rms_graph_gib_s, cudnn_ms, cudnn_gib_s, cudnn_graph_ms,
                 cudnn_graph_gib_s, cudnn_max_abs, cudnn_rstd_max_abs,
+                scale_free_stats.best_ms,
+                gib_per_second(scale_free_bytes, scale_free_stats.best_ms),
+                scale_free_graph_ms, scale_free_graph_gib_s,
+                cudnn_one_scale_ms, cudnn_one_scale_gib_s,
+                cudnn_one_scale_graph_ms, cudnn_one_scale_graph_gib_s,
+                cudnn_one_scale_max_abs, cudnn_one_scale_rstd_max_abs,
+                scale_free_vs_cudnn_one_scale,
                 residual_stats.best_ms, fused_stats.best_ms,
                 split_stats.best_ms, split_stats.best_ms / fused_stats.best_ms,
                 fused_graph_ms, split_graph_ms, fused_graph_vs_split_graph,
@@ -472,14 +596,19 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaFree(d_inp1));
   CUDA_CHECK(cudaFree(d_inp2));
   CUDA_CHECK(cudaFree(d_weight));
+  CUDA_CHECK(cudaFree(d_ones_weight));
   CUDA_CHECK(cudaFree(d_rms_out));
   CUDA_CHECK(cudaFree(d_rms_cudnn_out));
+  CUDA_CHECK(cudaFree(d_scale_free_out));
+  CUDA_CHECK(cudaFree(d_scale_free_cudnn_out));
   CUDA_CHECK(cudaFree(d_residual));
   CUDA_CHECK(cudaFree(d_split_residual));
   CUDA_CHECK(cudaFree(d_fused_normed));
   CUDA_CHECK(cudaFree(d_split_normed));
   CUDA_CHECK(cudaFree(d_rstd));
   CUDA_CHECK(cudaFree(d_cudnn_rstd));
+  CUDA_CHECK(cudaFree(d_scale_free_rstd));
+  CUDA_CHECK(cudaFree(d_scale_free_cudnn_rstd));
   CUDA_CHECK(cudaFree(d_fused_rstd));
   CUDA_CHECK(cudaFree(d_split_rstd));
   CUDA_CHECK(cudaStreamDestroy(stream));

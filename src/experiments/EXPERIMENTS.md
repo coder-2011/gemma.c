@@ -3,6 +3,81 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-05-20 - Scale-free V RMSNorm in existing RMSNorm kernels
+
+Runtime files:
+
+- `src/gemma4_rmsnorm.cu`
+- `src/gemma4_rmsnorm.cuh`
+- `tests/test_rmsnorm.cu`
+- `src/experiments/gemma4_rmsnorm_bench.cu`
+
+Reason:
+
+- Gemma 4 applies RMSNorm to V without a learned scale parameter.
+- Rather than adding a separate V-only kernel, the existing RMSNorm implementation now
+  treats `weight == nullptr` as scale-free RMSNorm and dispatches to compile-time
+  `HasWeight=false` kernel instantiations.
+- The explicit wrapper `gemma4_rmsnorm_scale_free_bf16` is available for call sites
+  where passing a null weight would be less clear.
+
+Implementation:
+
+- Reused the current RMSNorm reduction, launch-shape, shared-memory, and decode-specialized
+  structure.
+- Added scale-free template instantiations that compile out weight loads and apply
+  `y = x * rsqrt(mean(x*x) + eps)`.
+- The fused residual+RMSNorm launcher also accepts `weight == nullptr`, although the
+  immediate target is standalone V RMSNorm.
+- Extended the RMSNorm benchmark to accept an optional width argument and report
+  scale-free custom timings. Since cuDNN frontend RMSNorm requires a scale tensor, the
+  default comparison uses cuDNN RMSNorm with an all-ones BF16 scale.
+
+Build and correctness:
+
+```bash
+make test-rmsnorm
+make rmsnorm-bench
+make cuda-kernels
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_rmsnorm.cu -o /tmp/gemma4_rmsnorm_scale_free_check.o
+```
+
+Result:
+
+- `rmsnorm tests passed`
+- Scale-free test coverage includes width `256`, width `512`, and width `5376`.
+- `ptxas` reported `0 bytes` spills for all weighted and scale-free RMSNorm
+  instantiations.
+
+Benchmark commands:
+
+```bash
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
+  ./build/experiments/gemma4_rmsnorm_bench 30 5 2 1024 256
+
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
+  ./build/experiments/gemma4_rmsnorm_bench 30 5 2 1024 512
+```
+
+Key CUDA graph-captured timing results:
+
+| Width | Rows | Custom scale-free ms | Custom GiB/s | cuDNN one-scale ms | cuDNN GiB/s | Max abs | rstd max abs |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 16 | 0.001641 | 9.337 | 0.002178 | 10.536 | 0 | 1.19209e-7 |
+| 256 | 1024 | 0.002007 | 488.365 | 0.002503 | 586.650 | 0 | 2.38419e-7 |
+| 512 | 4 | 0.001622 | 4.712 | 0.002078 | 5.515 | 0 | 1.19209e-7 |
+| 512 | 1024 | 0.002638 | 741.865 | 0.003444 | 851.706 | 0 | 2.38419e-7 |
+
+Interpretation:
+
+- The scale-free path numerically matches cuDNN RMSNorm with an all-ones scale.
+- At the decode-relevant V shapes (`16 x 256` for sliding, `4 x 512` for global), the
+  custom scale-free kernel is faster than the cuDNN one-scale baseline in graph-captured
+  timings.
+- The stream-loop timings at these small widths are dominated by frontend/API overhead,
+  so graph-captured timings are the more useful kernel-speed comparison.
+
 ## 2026-05-20 - Gemma 4 RoPE baseline vs cuDNN tensor ops
 
 Benchmark file: `src/experiments/gemma4_rope_bench.cu`
