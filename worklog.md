@@ -1,8 +1,8 @@
 # Worklog
 
-This file is a work log of how I went about creating the megakernel
+**This file is a work log of how I went about creating the megakernel
 Note that I have two work logs. experiments/EXPERMIENTS.md is fully agent maintained, annoying to read, and verbose.
-This one is human maintained, and lightly AI formatted, as well as more relevant to read.
+This one is human maintained, and lightly AI formatted, as well as more relevant to read.**
 
 - The general approach for my work through the mega kernel is to start by creating an unfused implementation every kernel, but writing ways that is easy to maintain and fuse later. This is largely to get a feel for what the model is like, because Gemma 4 is a unique, feature-dense architecture and A6000 is a GPU I haven't created many kernels for before.
 
@@ -25,4 +25,4 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 
 - Benchmarked RoPE vs cuDNN pointwise decomposition. Custom kernel wins by a lot, roughly 2.4-3x at seq 4096 even after graph capture. Not worth using cuDNN here; next move is fuse Q/K norm + RoPE + KV write.
 
-- RMSNorm started as a pretty direct llm.c-style baseline, then got split into the normal learned-weight path and the scale-free V path. Rebenchmarked on real shapes with cuDNN setup/plan/build overhead factored out, using CUDA graph replay columns only. The useful result is: custom scale-free V RMSNorm is worth keeping. Width 256 is about 1.05-1.51x faster than cuDNN one-scale, and width 512 is about 1.15-1.65x faster. Hidden width 5376 is different: custom wins decode row=1, but cuDNN beats us for prefill rows 4-1024. I think that is because our prefill hidden RMSNorm is still a simple one-warp-per-row baseline that loops over 672 bf16x8 packs, stages input in smem, and reloads/caches gamma per tiny row group. cuDNN is just a better batched wide-row norm implementation there. So: keep custom V RMSNorm, keep decode hidden RMSNorm, don't pretend the hidden prefill RMSNorm baseline is better than cuDNN until we fuse it or write a more serious multi-warp row kernel.
+- RMSNorm started as a direct llm.c-style baseline, then got split into learned-weight and scale-free V paths. Rebenchmarked real shapes w/ cuDNN setup overhead factored out. Custom V RMSNorm is worth keeping: width 256 is ~1.05-1.51x faster, width 512 is ~1.15-1.65x faster. Hidden width 5376 only wins decode row=1; cuDNN beats prefill because our hidden prefill path is still a simple one-warp-per-row baseline. Fix that later by fusion or a real multi-warp row kernel.
