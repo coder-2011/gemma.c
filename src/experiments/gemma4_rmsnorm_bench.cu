@@ -331,6 +331,7 @@ int main(int argc, char **argv) {
         double(rows) * width * sizeof(__nv_bfloat16) * 5.0 +
         double(rows) * sizeof(float);
     const double split_bytes = residual_bytes + rms_bytes;
+    const bool has_fused = width == GEMMA4_HIDDEN_SIZE;
 
     auto run_rms = [&]() {
       CUDA_CHECK(gemma4_rmsnorm_bf16(d_rms_out, d_rstd, d_inp1,
@@ -346,6 +347,9 @@ int main(int argc, char **argv) {
           GEMMA4_RMS_NORM_EPS, stream));
     };
     auto run_fused = [&]() {
+      if (!has_fused) {
+        return;
+      }
       CUDA_CHECK(gemma4_residual_add_rmsnorm_bf16(
           d_split_residual, d_fused_normed, d_fused_rstd, d_inp1, d_inp2,
           d_weight, rows, width, GEMMA4_RMS_NORM_EPS, stream));
@@ -370,21 +374,27 @@ int main(int argc, char **argv) {
         time_ms(run_residual, stream, warmup, iters, trials);
     TimingStats scale_free_stats =
         time_ms(run_scale_free, stream, warmup, iters, trials);
-    TimingStats fused_stats =
-        time_ms(run_fused, stream, warmup, iters, trials);
+    TimingStats fused_stats{-1.0f, -1.0f};
+    if (has_fused) {
+      fused_stats = time_ms(run_fused, stream, warmup, iters, trials);
+    }
     TimingStats split_stats =
         time_ms(run_split, stream, warmup, iters, trials);
 
     float fused_graph_ms = -1.0f;
     float split_graph_ms = -1.0f;
-    try {
-      TimingStats fused_graph_stats =
-          time_ms_graph(run_fused, stream, warmup, iters, trials);
-      fused_graph_ms = fused_graph_stats.best_ms;
-    } catch (const std::exception &e) {
-      std::fprintf(stderr,
-                   "fused residual+RMSNorm CUDA graph timing unavailable for rows=%d: %s\n",
-                   rows, e.what());
+    if (has_fused) {
+      try {
+        TimingStats fused_graph_stats =
+            time_ms_graph(run_fused, stream, warmup, iters, trials);
+        fused_graph_ms = fused_graph_stats.best_ms;
+      } catch (const std::exception &e) {
+        std::fprintf(
+            stderr,
+            "fused residual+RMSNorm CUDA graph timing unavailable for "
+            "rows=%d: %s\n",
+            rows, e.what());
+      }
     }
     try {
       TimingStats split_graph_stats =
@@ -543,24 +553,26 @@ int main(int argc, char **argv) {
                      rows, e.what());
       }
 
-      run_fused();
-      run_cudnn_split();
-      CUDA_CHECK(cudaStreamSynchronize(stream));
-      DiffStats split_out_diff =
-          diff_stats_bf16(d_fused_normed, d_rms_cudnn_out, count);
-      CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_fused_rstd,
-                            static_cast<size_t>(rows) * sizeof(float),
-                            cudaMemcpyDeviceToHost));
-      CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd,
-                            static_cast<size_t>(rows) * sizeof(float),
-                            cudaMemcpyDeviceToHost));
-      max_rstd = 0.0f;
-      for (int i = 0; i < rows; ++i) {
-        max_rstd =
-            std::max(max_rstd, std::abs(h_custom_rstd[i] - h_cudnn_rstd[i]));
+      if (has_fused) {
+        run_fused();
+        run_cudnn_split();
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        DiffStats split_out_diff =
+            diff_stats_bf16(d_fused_normed, d_rms_cudnn_out, count);
+        CUDA_CHECK(cudaMemcpy(h_custom_rstd.data(), d_fused_rstd,
+                              static_cast<size_t>(rows) * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(h_cudnn_rstd.data(), d_cudnn_rstd,
+                              static_cast<size_t>(rows) * sizeof(float),
+                              cudaMemcpyDeviceToHost));
+        max_rstd = 0.0f;
+        for (int i = 0; i < rows; ++i) {
+          max_rstd =
+              std::max(max_rstd, std::abs(h_custom_rstd[i] - h_cudnn_rstd[i]));
+        }
+        cudnn_split_max_abs = split_out_diff.max_abs;
+        cudnn_split_rstd_max_abs = max_rstd;
       }
-      cudnn_split_max_abs = split_out_diff.max_abs;
-      cudnn_split_rstd_max_abs = max_rstd;
     } catch (const std::exception &e) {
       std::fprintf(stderr, "cuDNN RMSNorm unavailable for rows=%d: %s\n", rows,
                    e.what());
@@ -572,7 +584,11 @@ int main(int argc, char **argv) {
             ? split_graph_ms / fused_graph_ms
             : -1.0f;
     float fused_vs_cudnn_split =
-        cudnn_split_ms > 0.0f ? cudnn_split_ms / fused_stats.best_ms : -1.0f;
+        has_fused && cudnn_split_ms > 0.0f
+            ? cudnn_split_ms / fused_stats.best_ms
+            : -1.0f;
+    float fused_vs_split =
+        has_fused ? split_stats.best_ms / fused_stats.best_ms : -1.0f;
     float scale_free_vs_cudnn_one_scale =
         cudnn_one_scale_ms > 0.0f
             ? cudnn_one_scale_ms / scale_free_stats.best_ms
@@ -593,7 +609,7 @@ int main(int argc, char **argv) {
                 cudnn_one_scale_max_abs, cudnn_one_scale_rstd_max_abs,
                 scale_free_vs_cudnn_one_scale,
                 residual_stats.best_ms, fused_stats.best_ms,
-                split_stats.best_ms, split_stats.best_ms / fused_stats.best_ms,
+                split_stats.best_ms, fused_vs_split,
                 fused_graph_ms, split_graph_ms, fused_graph_vs_split_graph,
                 cudnn_split_ms, cudnn_split_graph_ms, fused_vs_cudnn_split,
                 cudnn_split_max_abs, cudnn_split_rstd_max_abs);

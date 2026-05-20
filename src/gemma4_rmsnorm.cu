@@ -4,6 +4,8 @@
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4.h"
 
+#include <cuda_pipeline_primitives.h>
+
 #include <math.h>
 
 namespace {
@@ -21,6 +23,10 @@ constexpr int kResidualAddThreads = 256;
 
 #ifndef GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM
 #define GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM 2
+#endif
+
+#ifndef GEMMA4_RMSNORM_CP_ASYNC_INPUT
+#define GEMMA4_RMSNORM_CP_ASYNC_INPUT 1
 #endif
 
 template <int Threads>
@@ -45,6 +51,13 @@ __device__ float gemma4_block_reduce_sum(float value,
   }
   return value;
 }
+
+#if GEMMA4_RMSNORM_CP_ASYNC_INPUT
+__device__ void gemma4_async_load_input_pack(RmsnormPack *__restrict__ dst,
+                                             const floatX *__restrict__ src) {
+  __pipeline_memcpy_async(dst, src, sizeof(RmsnormPack));
+}
+#endif
 
 // -----------------------------------------------------------------------------
 // CUDA kernels
@@ -218,11 +231,32 @@ gemma4_rmsnorm_bf16_shared_kernel(
   out += row * width;
 
   float sum_sq = 0.0f;
+#if GEMMA4_RMSNORM_CP_ASYNC_INPUT
+  if (threadIdx.x < packs_per_row) {
+    int pack = threadIdx.x;
+    gemma4_async_load_input_pack(s_in + pack,
+                                 inp + pack * kFloatXPerPack);
+    __pipeline_commit();
+    while (pack < packs_per_row) {
+      __pipeline_wait_prior(0);
+      RmsnormPack values = s_in[pack];
+      const int next_pack = pack + WARP_SIZE;
+      if (next_pack < packs_per_row) {
+        gemma4_async_load_input_pack(s_in + next_pack,
+                                     inp + next_pack * kFloatXPerPack);
+        __pipeline_commit();
+      }
+      gemma4_bf16_pack_accumulate_square(values, sum_sq);
+      pack = next_pack;
+    }
+  }
+#else
   for (int pack = threadIdx.x; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack values = load128cs(inp + pack * kFloatXPerPack);
     s_in[pack] = values;
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
+#endif
   sum_sq = warp_reduce_sum(sum_sq);
   float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
   if (threadIdx.x == 0 && rstd != nullptr) {
@@ -259,11 +293,32 @@ gemma4_rmsnorm_scale_free_bf16_shared_kernel(
   out += row * width;
 
   float sum_sq = 0.0f;
+#if GEMMA4_RMSNORM_CP_ASYNC_INPUT
+  if (threadIdx.x < packs_per_row) {
+    int pack = threadIdx.x;
+    gemma4_async_load_input_pack(s_in + pack,
+                                 inp + pack * kFloatXPerPack);
+    __pipeline_commit();
+    while (pack < packs_per_row) {
+      __pipeline_wait_prior(0);
+      RmsnormPack values = s_in[pack];
+      const int next_pack = pack + WARP_SIZE;
+      if (next_pack < packs_per_row) {
+        gemma4_async_load_input_pack(s_in + next_pack,
+                                     inp + next_pack * kFloatXPerPack);
+        __pipeline_commit();
+      }
+      gemma4_bf16_pack_accumulate_square(values, sum_sq);
+      pack = next_pack;
+    }
+  }
+#else
   for (int pack = threadIdx.x; pack < packs_per_row; pack += WARP_SIZE) {
     RmsnormPack values = load128cs(inp + pack * kFloatXPerPack);
     s_in[pack] = values;
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
+#endif
   sum_sq = warp_reduce_sum(sum_sq);
   float scale = rsqrtf(sum_sq / static_cast<float>(width) + eps);
   if (threadIdx.x == 0 && rstd != nullptr) {
