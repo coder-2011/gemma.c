@@ -7,7 +7,7 @@ CUDNN_FRONTEND_INCLUDE ?= /tmp/cudnn-frontend/include
 
 BUILD_DIR := build
 
-.PHONY: all cuda-kernels decode-bench embedding-gather-bench rmsnorm-bench rope-bench test-cuda-utils test-embedding-gather test-rmsnorm test-rope clean
+.PHONY: all cuda-kernels decode-bench embedding-gather-bench rmsnorm-bench rmsnorm-hidden-fused-bench rope-bench test-cuda-utils test-embedding-gather test-rmsnorm test-rope clean
 
 all: $(BUILD_DIR)/gemma4.o
 
@@ -15,6 +15,7 @@ cuda-kernels: $(BUILD_DIR)/gemma4_matmul_kernels.o $(BUILD_DIR)/gemma4_rmsnorm.o
 decode-bench: $(BUILD_DIR)/experiments/gemma4_decode_bench
 embedding-gather-bench: $(BUILD_DIR)/experiments/gemma4_embedding_gather_bench
 rmsnorm-bench: $(BUILD_DIR)/experiments/gemma4_rmsnorm_bench
+rmsnorm-hidden-fused-bench: $(BUILD_DIR)/experiments/gemma4_rmsnorm_hidden_fused_bench
 rope-bench: $(BUILD_DIR)/experiments/gemma4_rope_bench
 test-cuda-utils: $(BUILD_DIR)/tests/cuda_utils/test_cuda_utils
 	./$<
@@ -57,6 +58,9 @@ $(BUILD_DIR)/experiments/gemma4_embedding_gather_bench: src/experiments/gemma4_e
 
 $(BUILD_DIR)/experiments/gemma4_rmsnorm_bench: src/experiments/gemma4_rmsnorm_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_FRONTEND_INCLUDE) src/experiments/gemma4_rmsnorm_bench.cu src/gemma4_rmsnorm.cu -lcudnn -lnvrtc -lcuda -o $@
+
+$(BUILD_DIR)/experiments/gemma4_rmsnorm_hidden_fused_bench: src/experiments/gemma4_rmsnorm_hidden_fused_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/experiments/gemma4_rmsnorm_hidden_fused_bench.cu src/gemma4_rmsnorm.cu -o $@
 
 $(BUILD_DIR)/experiments/gemma4_rope_bench: src/experiments/gemma4_rope_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_rope.cu src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/experiments/gemma4_rope_bench.cu src/gemma4_rope.cu -lcudnn -o $@
