@@ -55,6 +55,8 @@ __device__ float gemma4_block_reduce_sum(float value,
 #if GEMMA4_RMSNORM_CP_ASYNC_INPUT
 __device__ void gemma4_async_load_input_pack(RmsnormPack *__restrict__ dst,
                                              const floatX *__restrict__ src) {
+  static_assert(sizeof(RmsnormPack) == 16,
+                "LDGSTS path copies one aligned 16-byte RMSNorm pack");
   __pipeline_memcpy_async(dst, src, sizeof(RmsnormPack));
 }
 #endif
@@ -78,10 +80,22 @@ gemma4_rmsnorm_bf16_decode_kernel(floatX *out,
   const int lane = thread & (WARP_SIZE - 1);
   const int warp = thread / WARP_SIZE;
 
+#if GEMMA4_RMSNORM_CP_ASYNC_INPUT
+  for (int pack = thread; pack < kDecodePacks; pack += Threads) {
+    gemma4_async_load_input_pack(s_in + pack, inp + pack * kFloatXPerPack);
+  }
+  __pipeline_commit();
+  __pipeline_wait_prior(0);
+#endif
+
   float sum_sq = 0.0f;
   for (int pack = thread; pack < kDecodePacks; pack += Threads) {
+#if GEMMA4_RMSNORM_CP_ASYNC_INPUT
+    RmsnormPack values = s_in[pack];
+#else
     RmsnormPack values = load128cs(inp + pack * kFloatXPerPack);
     s_in[pack] = values;
+#endif
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
 
