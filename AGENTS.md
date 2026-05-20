@@ -79,6 +79,7 @@ Approximate model memory footprints:
 - Keep load computation, index computation, and load/store logic separate throughout CUDA kernels and device helpers. This makes later fusion into larger kernels easier.
 - Do not hardcode block, thread, warp, or lane assumptions inside reusable `__device__` helpers. The caller should own the threading model.
 - Pass lane IDs, row indices, offsets, strides, and dimensions explicitly into device helpers instead of reading `threadIdx`, `blockIdx`, or assuming a fixed warp layout inside the helper.
+- Keep concise non-declaration statements on one line when they remain readable. This includes simple guard `if` conditions, boolean `return` expressions, CUDA kernel launches, and wrapper/delegating calls. Function declarations/definitions and genuinely complex expressions may stay multiline.
 - Example pattern:
 
 ```cpp
