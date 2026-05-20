@@ -2721,3 +2721,125 @@ Same benchmark command as above, output:
 Conclusion: keep the register version. It is better for prefill rows `4+`, especially
 the smaller prefill sizes, and still beats cuDNN split by `1.16x` to `1.99x` for those
 rows.
+
+## 2026-05-20 - Hidden fused prefill weight prefetch check
+
+Changed the hidden-width fused residual add plus RMSNorm prefill kernel to load the
+per-pack learned weight before the row reduction, keeping that `128`-bit weight pack
+live in registers until the normalized output write.
+
+Commands:
+
+```bash
+make -B rmsnorm-bench
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
+  ./build/experiments/gemma4_rmsnorm_bench 100 30 5 1024 5376 \
+  > /tmp/gemma4_rmsnorm_gamma_prefetch_20260520/hidden_w5376.csv
+make test-rmsnorm
+```
+
+Environment:
+
+- Device: NVIDIA RTX A6000
+- Seed: `0x20260520`
+- Iterations: `100`, warmup: `30`, trials: `5`
+- cuDNN frontend: compiled
+
+Fused residual add plus weighted RMSNorm graph replay, hidden width `5376`:
+
+| Rows | Previous register ms | Weight-prefetch ms | Delta | Split CUDA ms | cuDNN split ms |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.002507 | 0.002459 | -1.91% | 0.003425 | 0.004092 |
+| 4 | 0.002252 | 0.002307 | +2.44% | 0.007255 | 0.004069 |
+| 16 | 0.002187 | 0.002330 | +6.54% | 0.008076 | 0.004305 |
+| 64 | 0.003276 | 0.003605 | +10.04% | 0.008811 | 0.005825 |
+| 256 | 0.017339 | 0.017248 | -0.52% | 0.021150 | 0.020125 |
+| 1024 | 0.065971 | 0.065816 | -0.23% | 0.083469 | 0.085200 |
+
+Correctness:
+
+- `make test-rmsnorm` passed.
+- Correctness versus the custom residual plus cuDNN RMSNorm split path remained unchanged:
+  output max abs diff was `0` through rows `64`, `0.000976562` at rows `256`,
+  and `0.00195312` at rows `1024`; `rstd` max abs diff was at most `1.19209e-07`.
+
+Conclusion: the weight-prefetch version is not a clear win. It slightly improves rows
+`1`, `256`, and `1024`, but regresses rows `4`, `16`, and `64` in this run. Keep this
+only if later full-pipeline profiling shows those larger-row points matter more than the
+small-prefill regression.
+
+## 2026-05-20 - Hidden fused prefill focused tuning pass
+
+Runtime files:
+
+- `src/gemma4_rmsnorm.cu`
+- `src/experiments/gemma4_rmsnorm_hidden_fused_bench.cu`
+- `Makefile`
+
+Reason:
+
+- Tune only small settings/minor code choices for the hidden-width fused residual add
+  plus weighted RMSNorm prefill kernel.
+- Avoid the full RMSNorm benchmark's cuDNN/frontend setup and unrelated kernels during
+  iteration. The focused benchmark times only
+  `gemma4_residual_add_rmsnorm_bf16(..., rows, width=5376, ...)` for `rows > 1`.
+  `rows=1` is intentionally excluded because production routing sends that case to the
+  separate decode kernel.
+
+Commands:
+
+```bash
+make -B rmsnorm-hidden-fused-bench \
+  NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v"
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
+  ./build/experiments/gemma4_rmsnorm_hidden_fused_bench 300 20 7 1024 \
+  > /tmp/gemma4_hidden_fused_tune_20260520/final_simplified.csv
+make -B test-rmsnorm
+```
+
+Environment:
+
+- Device: NVIDIA RTX A6000
+- Seed: `0x20260520`
+- Focused benchmark: `300` captured kernel calls, `20` graph warmup launches,
+  `7` trials
+- Timing column used for decisions: CUDA graph replay `fused_graph_best_ms`
+
+Tuning sweep:
+
+| Variant | Sum best ms rows 4-1024 | Sum avg ms rows 4-1024 | Aggregate best delta |
+| --- | ---: | ---: | ---: |
+| Baseline: prefetch weight, min-blocks 1, streaming input loads | 0.090220 | 0.090350 | baseline |
+| Late weight load, min-blocks 1 | 0.090030 | 0.090300 | -0.21% |
+| Late weight load, min-blocks 2 | 0.089957 | 0.090114 | -0.29% |
+| Late weight load, min-blocks 2, cached input loads | 0.089807 | 0.090009 | -0.46% |
+| Same plus streaming stores | 0.089786 | 0.089957 | -0.48% |
+| Final simplified kept code | 0.089864 | 0.090050 | -0.39% |
+
+The streaming-store candidate moved the aggregate by only about `0.023%` versus the
+previous candidate, below the requested `0.05%` stopping threshold, so tuning stopped
+there. The final kept code uses the meaningful settings only:
+
+- `__launch_bounds__(Threads, 2)` for the hidden prefill kernel
+- cached `load128g` input loads for `inp1` and `inp2`
+- no early gamma/weight prefetch; load the weight at output application time
+- ordinary global stores for residual and normed outputs
+
+Final focused benchmark, graph replay:
+
+| Rows | Final ms | Effective GiB/s |
+| ---: | ---: | ---: |
+| 4 | 0.002065 | 96.968 |
+| 16 | 0.001980 | 404.521 |
+| 64 | 0.002867 | 1117.629 |
+| 256 | 0.017154 | 747.249 |
+| 1024 | 0.065798 | 779.257 |
+
+Resource check:
+
+- Hidden prefill kernel ptxas stayed at `28` registers, `0` stack, `0` spill stores,
+  `0` spill loads, and `96` bytes shared memory.
+
+Correctness:
+
+- `make -B test-rmsnorm` passed.
