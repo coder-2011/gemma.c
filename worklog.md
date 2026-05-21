@@ -36,3 +36,5 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 - Removed the next batch of dead RMSNorm code: fallback warp kernels, generic fused residual+RMSNorm for non-hidden widths, the `cudaFuncSetAttribute` fallback routing, and the null-weight shortcut in learned RMSNorm. Fused residual+RMSNorm is now hidden-width-only, which is the actual residual stream case. The file is down to 6 kernels, tests pass, ptxas still reports no spills, and the focused hidden fused best graph replay for rows 4/16/64/256/1024 was 0.002080/0.002133/0.002841/0.017191/0.065856ms.
 
 - I have discovered that the line is much finer between slop and useful software w/ CUDA. You have to really tighten the agency you give agents compared to programming at a higher level. Kinda wasted time due to this. 
+
+-Micro-optimizations on RoPE: Ofc there is not much point to it, bc RoPE is so extremely cheap anyways, but it was fun, so I did it. 
