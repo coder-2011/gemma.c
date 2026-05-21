@@ -37,4 +37,4 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 
 - I have discovered that the line is much finer between slop and useful software w/ CUDA. You have to really tighten the agency you give agents compared to programming at a higher level. Kinda wasted time due to this. 
 
--Micro-optimizations on RoPE: Ofc there is not much point to it, bc RoPE is so extremely cheap anyways, but it was fun, so I did it. 
+-Micro-optimizations on RoPE: Ofc there is not much point to it, bc RoPE is so extremely cheap anyways, but it was fun, so I did it. Added packed 128-bit Q/K loads/stores, compact sin/cos tables, cache hints, one-warp tiling, and verified FP32 FMA consistency.
