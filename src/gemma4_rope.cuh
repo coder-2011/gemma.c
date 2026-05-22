@@ -28,7 +28,7 @@ cudaError_t gemma4_rope_bf16(__nv_bfloat16 *__restrict__ q,
 // In-place RoPE matching the Python forward signature layout:
 // q: [batch, q_heads, seq, head_dim]
 // k: [batch, kv_heads, seq, head_dim]
-// cos/sin: [1 or batch, seq, head_dim]
+// cos/sin: [1 or batch, seq, rotary_dim / 2]
 cudaError_t gemma4_rope_forward_bf16(__nv_bfloat16 *__restrict__ q,
                                      __nv_bfloat16 *__restrict__ k,
                                      const float *__restrict__ cos,

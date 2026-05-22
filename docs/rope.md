@@ -35,17 +35,17 @@ It applies RoPE in place for inference.
 Cosine and sine tables are precomputed FP32 arrays. The low-level API accepts
 an explicit row stride, so it can consume either compact rows of
 `rotary_dim / 2` values or full rows of `head_dim` values. The forward-layout
-API matches the Python signature and expects full rows. Tables may be shared
-across the batch:
+API uses compact rows to avoid holding unused table columns. Tables may be
+shared across the batch:
 
 ```text
-cos/sin: [1, seq, head_dim]
+cos/sin: [1, seq, rotary_dim / 2]
 ```
 
 or batch-specific:
 
 ```text
-cos/sin: [batch, seq, head_dim]
+cos/sin: [batch, seq, rotary_dim / 2]
 ```
 
 ## Rotation Math
@@ -79,12 +79,17 @@ NoPE split described in `gemma4_architecture.md`.
 
 ## CUDA Mapping
 
-The baseline CUDA mapping is one block per `(row, head)` pair:
+The default CUDA mapping is one block per `(row, head)` pair:
 
 ```text
 grid.x = batch * seq
 grid.y = max(q_heads, kv_heads)
 ```
+
+An experimental `GEMMA4_ROPE_HEAD_FAST_GRID=1` build swaps the dimensions to
+make heads adjacent for the same row. The first split benchmark did not show a
+broad win for that ordering, so the default remains row-fast. The packed Q/K
+input loads use the streaming `load128cs` path by default.
 
 Within each block, threads cover `rotary_dim / 2` element pairs. If the head
 index exists for Q, the block rotates that Q head. If the same head index also

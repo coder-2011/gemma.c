@@ -225,7 +225,7 @@ void run_forward_case(int batch_size,
                       int rotary_dim) {
   int q_count = batch_size * q_heads * seq_len * head_dim;
   int k_count = batch_size * kv_heads * seq_len * head_dim;
-  int table_width = head_dim;
+  int table_width = rotary_dim / 2;
   int table_count = cos_batch_size * seq_len * table_width;
 
   std::vector<__nv_bfloat16> q(q_count);

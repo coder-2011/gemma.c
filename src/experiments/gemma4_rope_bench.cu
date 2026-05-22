@@ -61,16 +61,16 @@ __global__ void fill_unit_rope_table_kernel(float *cos,
                                             float *sin,
                                             size_t count,
                                             int seq_len,
-                                            int head_dim,
+                                            int table_width,
                                             uint64_t seed) {
   size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (i >= count) {
     return;
   }
 
-  int dim = int(i % head_dim);
-  int pos = int((i / head_dim) % seq_len);
-  int batch = int(i / (static_cast<size_t>(seq_len) * head_dim));
+  int dim = int(i % table_width);
+  int pos = int((i / table_width) % seq_len);
+  int batch = int(i / (static_cast<size_t>(seq_len) * table_width));
   uint32_t mixed =
       mix_u32_device(uint32_t(dim * 131 + pos * 17 + batch * 8191) ^
                      uint32_t(seed));
@@ -118,14 +118,14 @@ void fill_unit_rope_table(float *cos,
                           float *sin,
                           int cos_batch_size,
                           int seq_len,
-                          int head_dim,
+                          int table_width,
                           uint64_t seed,
                           cudaStream_t stream) {
   constexpr int threads = 256;
-  size_t count = static_cast<size_t>(cos_batch_size) * seq_len * head_dim;
+  size_t count = static_cast<size_t>(cos_batch_size) * seq_len * table_width;
   int blocks = int((count + threads - 1) / threads);
   fill_unit_rope_table_kernel<<<blocks, threads, 0, stream>>>(
-      cos, sin, count, seq_len, head_dim, seed);
+      cos, sin, count, seq_len, table_width, seed);
   CUDA_CHECK(cudaGetLastError());
 }
 
@@ -283,8 +283,8 @@ struct CudnnRope {
                     seq_len, rotary_half, kv_heads * seq_len * rotary_half,
                     seq_len * rotary_half, rotary_half, 1);
     set_tensor_desc(table_desc.desc, CUDNN_DATA_BFLOAT16, cos_batch_size, 1,
-                    seq_len, rotary_half, seq_len * head_dim,
-                    seq_len * head_dim, head_dim, 1);
+                    seq_len, rotary_half, seq_len * rotary_half,
+                    seq_len * rotary_half, rotary_half, 1);
 
     size_t max_temp_elems =
         static_cast<size_t>(batch_size) * std::max(q_heads, kv_heads) *
@@ -431,7 +431,8 @@ int main(int argc, char **argv) {
       const size_t k_elems = static_cast<size_t>(batch_size) * shape.kv_heads *
                              seq_len * shape.head_dim;
       const size_t table_elems =
-          static_cast<size_t>(cos_batch_size) * seq_len * shape.head_dim;
+          static_cast<size_t>(cos_batch_size) * seq_len *
+          (shape.rotary_dim / 2);
       const double ideal_bytes =
           ideal_rope_bytes(batch_size, seq_len, shape.q_heads, shape.kv_heads,
                            shape.rotary_dim);
@@ -461,7 +462,7 @@ int main(int argc, char **argv) {
       fill_random_bf16(d_q_in, q_elems, seed ^ 0x1111u, 1.0f, stream);
       fill_random_bf16(d_k_in, k_elems, seed ^ 0x2222u, 1.0f, stream);
       fill_unit_rope_table(d_cos, d_sin, cos_batch_size, seq_len,
-                           shape.head_dim, seed ^ 0x3333u, stream);
+                           shape.rotary_dim / 2, seed ^ 0x3333u, stream);
       float_to_bf16(d_cos, d_cos_bf16, table_elems, stream);
       float_to_bf16(d_sin, d_sin_bf16, table_elems, stream);
       CUDA_CHECK(cudaMemcpyAsync(d_q_work, d_q_in,
