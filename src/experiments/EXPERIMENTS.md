@@ -3,6 +3,1494 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-05-22 - cuDNN Frontend FFN decode graph probe
+
+Runtime files:
+
+- `src/experiments/gemma4_ffn_cudnn_bench.cu`
+- `Makefile`
+
+Change:
+
+- Added `make ffn-cudnn-bench`.
+- The benchmark builds:
+  - a cuDNN Frontend GeGLU graph:
+    `act = (x @ w_gate) * GELU_APPROX_TANH(x @ w_up)`
+  - a separate cuDNN Frontend down-projection graph:
+    `out = act @ w_down`
+  - a full-FFN graph probe:
+    `out = ((x @ w_gate) * GELU_APPROX_TANH(x @ w_up)) @ w_down`
+  - the current custom decode fused FFN kernel, including residual add and
+    RMSNorm epilogue
+- The full-FFN path is probed and reported rather than required, because NVIDIA's
+  LLM coverage samples say the analogous three-matmul SwiGLU layer graph is not
+  supported by the cuDNN Graph API on this path.
+
+Command:
+
+```bash
+make ffn-cudnn-bench
+./build/experiments/gemma4_ffn_cudnn_bench 100 10 3 1
+```
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- CUDA target: `sm_86`
+- cuDNN version reported by benchmark: `92200`
+- cuDNN Frontend include path: `/tmp/cudnn-frontend/include`
+- Warmup/timed repeats/trials: 10 warmup, 100 timed iterations, 3 trials
+- Cache policy: repeated-buffer warm-cache benchmark
+- Clock policy: clocks not locked
+
+Results:
+
+```text
+full_graph_supported=0,status="cuDNN frontend error for full_ffn.build_plans: [cudnn_frontend] Error: No valid execution plans built."
+path,best_ms,avg_ms,graph_best_ms,graph_avg_ms,rough_gib_s,workspace_bytes,max_abs_vs_split
+geglu,10.466622,11.574109,0.662417,0.662475,41.152,0,
+down,0.641172,0.707548,0.337504,0.337613,335.919,4194560,
+geglu_plus_down,12.699577,13.331832,1.000316,1.000455,50.876,4194560,
+custom_fused_decode,1.152335,1.157930,1.155604,1.155750,560.728,0,
+custom_scratch_clear,0.004377,0.006027,0.001101,0.001116,0.000,0,
+full_ffn,-1.000000,,-1.000000,,0.000,,-1
+overhead_factored_metric,value
+cudnn_split_device_ms,1.000316
+custom_device_ms,1.155604
+custom_scratch_clear_device_ms,0.001101
+custom_minus_clear_device_ms,1.154503
+custom_vs_cudnn_split_speedup,0.865622
+custom_minus_clear_vs_cudnn_split_speedup,0.866447
+cudnn_direct_minus_device_ms,11.699262
+custom_direct_minus_device_ms,0.000000
+```
+
+Conclusion:
+
+- cuDNN Frontend can build the GeGLU half and down projection as separate graphs.
+- cuDNN Frontend cannot build the full three-matmul FFN graph for this A6000/cuDNN path.
+- CUDA graph replay is the meaningful cuDNN number here; direct repeated
+  `graph.execute` timings include large frontend/host enqueue gaps.
+- The split cuDNN Frontend replay baseline is about `1.000 ms/token` for Gemma 4
+  31B decode FFN shapes.
+- The current custom fused decode kernel is about `1.156 ms/token` with host launch,
+  frontend, and wrapper overhead factored out through CUDA graph replay. Scratch clear
+  is only about `0.001 ms/token`, so it does not explain the gap.
+- The overhead-factored custom speedup versus cuDNN split replay is `0.866x`, so the
+  current simple custom kernel is roughly `15.5%` slower than cuDNN's graph-replay split
+  baseline, even though it avoids the full activation materialization and includes
+  residual+RMSNorm epilogue work.
+- The result says the current simple custom kernel is a useful correctness/design
+  prototype, not yet a performance win. The next performance work needs to improve the
+  work decomposition and tensor-core use, not just compare launch overhead.
+
+## 2026-05-21 - FFN-down decode GEMV K-pack register staging
+
+Runtime files:
+
+- `src/gemma4_matmul_kernels.cu`
+- `src/experiments/gemma4_decode_bench.cu`
+
+Change:
+
+- Added `GEMMA4_DECODE_GEMV_BUFFER_STAGES` as a compile-time experiment knob.
+- Stage count `1` keeps the original simple loop.
+- Stage counts `2-4` use an inlined ring buffer inside `dot_cols()`:
+  - prefill `x_stage[stage]` and `w_stage[stage][col]`
+  - consume `stage = iter % kStages`
+  - load `pack_idx + kStages * Threads` into the same stage before accumulating the
+    current copied pack
+- No new public launcher or helper function was added.
+
+Reason:
+
+- Test whether K-pack software pipelining can hide HBM latency better than the existing
+  per-pack/per-column loop.
+- CUDA guide context: occupancy hides latency (pages 71 and 119), register/shared memory
+  resources limit residency (pages 28 and 71), launch bounds affect register allocation
+  (page 526), and extra local/stack traffic can change kernel behavior even without
+  reported spill stores/loads.
+
+Commands:
+
+```bash
+make decode-bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 \
+  ./build/experiments/gemma4_decode_bench ffn_down 80 20 3
+
+nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_GEMV_BUFFER_STAGES=2 \
+  -Isrc src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu \
+  -lcublas -lcudnn -o /tmp/gemma4_stage2/gemma4_decode_bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 \
+  /tmp/gemma4_stage2/gemma4_decode_bench ffn_down 80 20 3
+
+nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_GEMV_BUFFER_STAGES=3 \
+  -Isrc src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu \
+  -lcublas -lcudnn -o /tmp/gemma4_stage3/gemma4_decode_bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 \
+  /tmp/gemma4_stage3/gemma4_decode_bench ffn_down 80 20 3
+
+nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_GEMV_BUFFER_STAGES=4 \
+  -Isrc src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu \
+  -lcublas -lcudnn -o /tmp/gemma4_stage4/gemma4_decode_bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 \
+  /tmp/gemma4_stage4/gemma4_decode_bench ffn_down 80 20 3
+```
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- CUDA target: `sm_86`
+- Clocks: not locked
+- Cache policy: repeated-buffer warm-cache benchmark
+- Warmup/timed repeats/trials: 20 warmup, 80 timed iterations, 3 trials
+
+Resource usage for FFN-down identity decode:
+
+| Stages | Registers/thread | Stack bytes/thread | Shared bytes/block |
+| ---: | ---: | ---: | ---: |
+| 1 | 58 | 0 | 1024 |
+| 2 | 55 | 288 | 1024 |
+| 3 | 58 | 432 | 1024 |
+| 4 | 55 | 576 | 1024 |
+
+Results:
+
+| Stages | Custom best ms | Custom avg ms | Effective weight GB/s |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.327842 | 0.327962 | 705.251 |
+| 2 | 1.029579 | 1.030183 | 224.569 |
+| 3 | 1.092698 | 1.092928 | 211.596 |
+| 4 | 1.103177 | 1.103208 | 209.586 |
+
+Correctness:
+
+- Custom swizzle16, cuBLAS GEMV, and cuBLAS GEMM M=1 matched the custom output with zero
+  reported absolute/relative difference in all staged runs.
+- cuDNN conv1x1 retained the same expected BF16 accumulation-order differences.
+
+Conclusion:
+
+- Naive K-pack N-buffering is a large regression.
+- The staged arrays do not stay entirely in registers. They create per-thread stack
+  frames, so the attempted latency hiding adds local-memory traffic and extra copy work.
+- The original stage-1 loop remains the right default. If K-pack lookahead is revisited,
+  it needs a hand-shaped 2-stage variant with fewer live packs, lower `ColsPerBlock`, or
+  a different thread/block decomposition instead of `w_stage[Stages][ColsPerBlock]`.
+
+## 2026-05-21 - FFN-down decode GEMV register-lookahead weight load
+
+Runtime files:
+
+- `src/gemma4_matmul_kernels.cu`
+- `src/experiments/gemma4_decode_bench.cu`
+
+Change:
+
+- Changed the decode GEMV inner column loop to issue the next column's weight-pack load
+  before accumulating the current column.
+- This is a register lookahead/software scheduling tweak only; it does not add
+  `cp.async`, shared-memory staging, or a new public launcher.
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- Clocks: not locked
+- CUDA target: `sm_86`
+- Cache policy: repeated-buffer warm-cache benchmark
+- Correctness reference: existing benchmark diffs against cuBLAS GEMV/GEMM and swizzled
+  custom path
+
+Command:
+
+```bash
+make decode-bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 \
+  ./build/experiments/gemma4_decode_bench ffn_down 80 20 3
+```
+
+Results:
+
+| Path | Best ms | Avg ms | Effective weight GB/s |
+| --- | ---: | ---: | ---: |
+| Custom GEMV with register lookahead | 0.327549 | 0.327685 | 705.883 |
+| Custom swizzle16 with register lookahead | 0.327643 | 0.584443 | 705.679 |
+| cuBLAS BF16 GEMV | 0.330064 | 0.465015 | 700.504 |
+| cuBLAS BF16 GEMM M=1 | 0.573587 | 0.655130 | 403.097 |
+| cuDNN BF16 conv1x1 | 0.332157 | 0.555408 | 696.090 |
+
+Correctness:
+
+- Custom swizzle16, cuBLAS GEMV, and cuBLAS GEMM M=1 matched the custom output with zero
+  reported absolute/relative difference in this run.
+- cuDNN conv1x1 differed by `max_abs_diff=0.25`, `mean_abs_diff=0.000392091`,
+  `max_rel_diff=0.00763359`.
+
+Conclusion:
+
+- The register-lookahead edit produced only a tiny best-time improvement versus the prior
+  logged FFN-down custom result (`0.327884 ms` -> `0.327549 ms`, about `0.10%`).
+- This is within the range where repeated benchmark and `ncu` confirmation are needed
+  before treating it as a real optimization.
+
+## 2026-05-21 - RoPE 128-bit pack load baseline
+
+Runtime file:
+
+- `src/gemma4_rope.cu`
+- `src/gemma4_rope.cuh`
+- `tests/test_rope.cu`
+- `src/experiments/gemma4_rope_bench.cu`
+- `docs/rope.md`
+
+Change:
+
+- Replaced the scalar hot-path RoPE loop with a packed path that processes eight rotary
+  pairs per active thread.
+- Q/K halves now use `Bf16Packed128` loads and stores on the full-pack path.
+- Cos/sin tables use two `float4` loads each per eight-pair pack.
+- Kept the scalar pair path as a tail fallback for non-multiple-of-eight rotary widths.
+- Reduced the RoPE thread block from 128 threads to one warp, because Gemma 4's sliding
+  and global rotary widths need only 16 and 8 packed lanes per head respectively.
+- Updated the forward-layout RoPE entry point, tests, docs, and benchmark to use compact
+  cos/sin rows of `rotary_dim / 2` instead of full `head_dim` rows. This removes unused
+  table storage in the forward path:
+  - sliding rows: 128 floats instead of 256
+  - global rows: 64 floats instead of 512
+
+Build and inspection commands:
+
+```bash
+make test-rope
+mkdir -p build/ptx
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc -ptx src/gemma4_rope.cu \
+  -o build/ptx/gemma4_rope_vectorized.ptx
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc -Xptxas -v -c src/gemma4_rope.cu \
+  -o build/ptx/gemma4_rope_vectorized.o
+```
+
+PTX/compiler result:
+
+- Full-pack path emits `ld.global.v4.u32` and `st.global.v4.u32` for BF16 Q/K halves.
+- Full-pack path emits `ld.global.nc.v4.f32` for cos/sin table loads.
+- `ptxas` reports no spills or stack frame.
+- Register count increased versus the scalar version:
+  - low-level layout kernel: 58 registers
+  - forward-layout kernel: 60 registers
+
+Correctness:
+
+```text
+rope tests passed
+```
+
+Benchmark command:
+
+```bash
+make rope-bench
+GEMMA4_ROPE_BENCH_SEED=0x20260521 \
+  ./build/experiments/gemma4_rope_bench 100 20 3 1024 1 1
+```
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- CUDA/NVCC: 12.9.86
+- Build flags: `-std=c++17 -O3 -arch=sm_86`
+- Warmup/timed repeats/trials: 20 warmup, 100 timed iterations, 3 trials
+- Cache policy: repeated-buffer warm-cache benchmark
+- Clock policy: clocks not locked
+- Correctness tolerance: benchmark compares against cuDNN BF16-table path and reports
+  `0.0078125` max absolute difference for all measured cases.
+
+Selected custom graph timings:
+
+| Case | Seq | Graph ms | Effective GiB/s |
+| --- | ---: | ---: | ---: |
+| Sliding | 1 | 0.001741 | 52.573 |
+| Sliding | 256 | 0.015432 | 1518.728 |
+| Sliding | 1024 | 0.076612 | 1223.706 |
+| Global | 1 | 0.001575 | 21.793 |
+| Global | 256 | 0.006732 | 1305.534 |
+| Global | 1024 | 0.029884 | 1176.405 |
+
+Compact-table follow-up:
+
+```bash
+make test-rope
+make rope-bench
+GEMMA4_ROPE_BENCH_SEED=0x20260521 \
+  ./build/experiments/gemma4_rope_bench 100 20 3 1024 1 1
+```
+
+Correctness:
+
+```text
+rope tests passed
+```
+
+Selected compact-table custom graph timings:
+
+| Case | Seq | Graph ms | Effective GiB/s | Speedup vs packed/full-table run |
+| --- | ---: | ---: | ---: | ---: |
+| Sliding | 1 | 0.001754 | 52.199 | 0.993x |
+| Sliding | 256 | 0.016488 | 1421.488 | 0.936x |
+| Sliding | 1024 | 0.076759 | 1221.355 | 0.998x |
+| Global | 1 | 0.001643 | 20.902 | 0.959x |
+| Global | 256 | 0.006704 | 1311.080 | 1.004x |
+| Global | 1024 | 0.029817 | 1179.069 | 1.002x |
+
+Conclusion:
+
+- The C++ pack path successfully produces 128-bit global memory ops without inline PTX.
+- The change is correctness-clean in the existing RoPE tests.
+- The higher register count is the main tradeoff to watch. It did not spill in this
+  build, but this shape should be benchmarked against the scalar kernel before treating
+  it as a settled performance win.
+- Compact cos/sin tables fixed the unused table storage in the forward path. Custom
+  kernel speed was essentially neutral because the kernel already loaded only the used
+  rotary columns; the practical win is lower table allocation footprint and cleaner
+  strides, especially for global p-RoPE.
+
+Cache-order follow-up:
+
+- Changed the RoPE grid from `(rows, heads)` to `(heads, rows)` so heads are the fastest
+  grid dimension, attempting to improve temporal locality for each position's cos/sin
+  row.
+- Changed packed Q/K input loads from normal `load128` to streaming `load128cs`, while
+  keeping output stores normal.
+- PTX confirmed the intended lowering:
+  - row now uses `%ctaid.y`
+  - head now uses `%ctaid.x`
+  - Q/K packed loads emit `ld.global.cs.v4.s32`
+  - cos/sin packed loads remain `ld.global.nc.v4.f32`
+- `ptxas` reported unchanged register/spill profile: 58 registers for the low-level
+  kernel, 60 for the forward-layout kernel, 0 spills.
+
+Correctness:
+
+```text
+rope tests passed
+```
+
+Benchmark command:
+
+```bash
+GEMMA4_ROPE_BENCH_SEED=0x20260521 \
+  ./build/experiments/gemma4_rope_bench 100 20 3 1024 1 1
+```
+
+Selected custom graph timings versus the compact-table packed run:
+
+| Case | Seq | Prior graph ms | Cache-order graph ms | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Sliding | 1 | 0.001754 | 0.001736 | 1.010x |
+| Sliding | 256 | 0.016488 | 0.015046 | 1.096x |
+| Sliding | 1024 | 0.076759 | 0.076900 | 0.998x |
+| Global | 1 | 0.001643 | 0.001582 | 1.039x |
+| Global | 256 | 0.006704 | 0.006824 | 0.982x |
+| Global | 1024 | 0.029817 | 0.031695 | 0.941x |
+
+Conclusion:
+
+- The cache-order change is not a broad speedup. It helped sliding `seq=256` in this
+  short run, was neutral for sliding `seq=1024`, and regressed global `seq=1024`.
+- Do not treat head-fast grid order plus streaming Q/K loads as a retained win without a
+  cleaner A/B split. The two changes should be separated in a later experiment because
+  the grid order may help cos/sin locality while `ld.global.cs` may hurt Q/K reuse or
+  scheduling.
+
+Split A/B follow-up:
+
+- Added compile-time controls:
+  - `GEMMA4_ROPE_HEAD_FAST_GRID`
+  - `GEMMA4_ROPE_QK_LOAD_CS`
+- Built four variants from the same source:
+  - baseline: row-fast grid, normal Q/K loads
+  - headfast: head-fast grid, normal Q/K loads
+  - loadcs: row-fast grid, streaming Q/K loads
+  - both: head-fast grid, streaming Q/K loads
+
+Build pattern:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
+  -DGEMMA4_ROPE_HEAD_FAST_GRID=<0|1> \
+  -DGEMMA4_ROPE_QK_LOAD_CS=<0|1> \
+  src/experiments/gemma4_rope_bench.cu src/gemma4_rope.cu -lcudnn \
+  -o build/experiments/rope_variants/<variant>
+```
+
+Benchmark command for each variant:
+
+```bash
+GEMMA4_ROPE_BENCH_SEED=0x20260521 \
+  ./build/experiments/rope_variants/<variant> 100 20 3 1024 1 1
+```
+
+Custom CUDA graph timings:
+
+| Case | Seq | Baseline | Head-fast only | `load128cs` only | Both | Best |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Sliding | 1 | 0.001666 | 0.001707 | 0.001553 | 0.001646 | `load128cs` |
+| Sliding | 4 | 0.001672 | 0.001959 | 0.001639 | 0.001901 | `load128cs` |
+| Sliding | 16 | 0.002134 | 0.002122 | 0.002083 | 0.002015 | both |
+| Sliding | 64 | 0.003097 | 0.003188 | 0.003091 | 0.003065 | both |
+| Sliding | 256 | 0.016482 | 0.016036 | 0.015215 | 0.014943 | both |
+| Sliding | 1024 | 0.076787 | 0.076737 | 0.075305 | 0.076946 | `load128cs` |
+| Global | 1 | 0.001496 | 0.001556 | 0.001711 | 0.001563 | baseline |
+| Global | 4 | 0.001565 | 0.001646 | 0.001601 | 0.001651 | baseline |
+| Global | 16 | 0.001658 | 0.001820 | 0.001638 | 0.001956 | `load128cs` |
+| Global | 64 | 0.002805 | 0.002773 | 0.002658 | 0.002917 | `load128cs` |
+| Global | 256 | 0.006691 | 0.006674 | 0.006654 | 0.006777 | `load128cs` |
+| Global | 1024 | 0.029790 | 0.031470 | 0.029804 | 0.031625 | baseline |
+
+Conclusion:
+
+- Head-fast grid order alone was not a clear win and hurt several small/large cases.
+- `load128cs` alone was the best isolated change overall: it improved sliding
+  `seq=1024` by about `2%`, improved several mid-size sliding/global cases, and was
+  essentially tied with baseline at global `seq=1024`.
+- The retained default is row-fast grid with `load128cs` enabled. Head-fast grid remains
+  available behind `GEMMA4_ROPE_HEAD_FAST_GRID=1` for future experiments.
+
+## 2026-05-21 - RoPE FP32 accumulation numerical consistency
+
+Runtime files:
+
+- `src/gemma4_rope.cu`
+- `src/experiments/gemma4_rope_numeric_check.cu`
+
+Reason:
+
+- Check whether the RoPE element math should stay in FP32 before rounding back to BF16.
+- CUDA guide reference points used for the standard:
+  - FMA can avoid precision loss during cancellation (CUDA Programming Guide p.583).
+  - `x * y + z -> __fmaf_rn(x, y, z)` has a stated `0 ULP` mapping for float basic
+    operations (p.594).
+  - BF16 has the same range as FP32 but only 7 bits of precision (p.574), so intermediate
+    BF16 rounding is expected to be visibly worse.
+
+Method:
+
+- Randomize BF16 Q/K values and FP32 cos/sin tables.
+- Run the actual GPU RoPE kernel.
+- Compare every rotated BF16 output against:
+  - a CPU FP32/FMA reference rounded once to BF16, matching the current kernel's math;
+  - a double reference rounded to BF16;
+  - a simulated BF16-intermediate path that rounds both products before the add.
+- Also check global p-RoPE's NoPE tail for bit-exact preservation.
+- This is a numerical-consistency experiment, not a timing benchmark.
+
+Build and run:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
+  src/experiments/gemma4_rope_numeric_check.cu src/gemma4_rope.cu \
+  -o build/experiments/gemma4_rope_numeric_check
+./build/experiments/gemma4_rope_numeric_check 64 53 2 0x20260521
+```
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- CUDA/NVCC: 12.9.86
+- Build flags: `-std=c++17 -O3 -arch=sm_86`
+- Shapes: Gemma 4 sliding (`head_dim=256`, full RoPE) and global
+  (`head_dim=512`, `rotary_dim=128` p-RoPE)
+
+Results:
+
+| Case | Rotated outputs | GPU == FP32/FMA | GPU == double | BF16-intermediate == double | GPU mean BF16 ULP vs double | BF16-intermediate mean BF16 ULP vs double | NoPE exact |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Sliding | 83,361,792 | 1.00000000 | 0.99998682 | 0.66429912 | 0.00002023 | 10.25257449 | 1.00000000 |
+| Global | 31,260,672 | 1.00000000 | 0.99998650 | 0.66435267 | 0.00001676 | 10.17400861 | 1.00000000 |
+
+SASS check:
+
+- The hot path uses FP32 `FMUL` plus `FFMA`, followed by `F2FP.BF16.PACK_AB` conversion
+  for stores.
+
+Conclusion:
+
+- Keep the current FP32 RoPE arithmetic and final BF16 rounding.
+- The GPU kernel is bit-exact against the FP32/FMA reference over this randomized sweep.
+- Simulated BF16 intermediates are much less consistent: only about `66.4%` exact versus
+  the double-rounded BF16 reference, with about `10` mean BF16 ULP error.
+- Global p-RoPE's unrotated NoPE dimensions remained bit-exact.
+
+## 2026-05-21 - FFN-down decode GEMV kernel comparison
+
+Runtime files:
+
+- `src/gemma4_matmul_kernels.cu`
+- `src/experiments/gemma4_decode_bench.cu`
+
+Reason:
+
+- Check the project GEMV kernel for the FFN-down shape after the tinygrad/cuBLAS/cuBLASLt
+  FFN-down matmul sweeps.
+- This is the decode `M=1` case, not the prefill `M > 1` matmul case.
+
+Shape:
+
+- FFN-down decode GEMV: `K=21504`, `N=5376`, BF16 input/weights/output, FP32
+  accumulation.
+
+Command:
+
+```bash
+make decode-bench
+GEMMA4_DECODE_BENCH_SEED=0x1234 \
+  ./build/experiments/gemma4_decode_bench ffn_down 80 20 3
+```
+
+Results:
+
+| Path | Best ms | Avg ms | Effective weight GB/s | Speedup vs custom |
+| --- | ---: | ---: | ---: | ---: |
+| Custom GEMV | 0.327884 | 0.327917 | 705.160 | 1.000x |
+| Custom swizzle16 GEMV | 0.327907 | 0.327931 | 705.112 | 0.9999x |
+| cuBLAS BF16 GEMV | 0.329957 | 0.330215 | 700.731 | 0.9937x |
+| cuBLAS BF16 GEMM M=1 | 0.329998 | 0.330041 | 700.645 | 0.9936x |
+| cuDNN BF16 conv1x1 | 0.331502 | 0.331585 | 697.465 | 0.9891x |
+
+Correctness:
+
+- Custom, custom swizzle16, cuBLAS GEMV, and cuBLAS GEMM M=1 matched with zero reported
+  absolute/relative difference in this run.
+- cuDNN conv1x1 differed by `max_abs_diff=0.25`, `mean_abs_diff=0.000392091`,
+  `max_rel_diff=0.00763359`.
+
+Conclusion:
+
+- For FFN-down decode `M=1`, the project custom GEMV kernel is slightly faster than
+  cuBLAS GEMV, cuBLAS GEMM M=1, and cuDNN conv1x1 on this run.
+- The win is small: about `1.006x` over cuBLAS and `1.011x` over cuDNN.
+- This result should not be extrapolated to prefill `M > 1`; the GEMV kernel is a
+  single-token decode path.
+
+## 2026-05-21 - tinygrad late-eval BF16 matmul vs cuBLASLt
+
+Runtime file:
+
+- `src/experiments/tinygrad_late_eval_bench.py`
+
+Change:
+
+- Added a cuBLASLt comparison path to the same benchmark file.
+- The Python script builds a tiny C++ shared helper under `build/experiments/` on first
+  use so cuBLASLt descriptors, heuristics, and opaque algorithm structs stay in C++.
+- cuBLASLt uses the same column-major equivalence as the simple cuBLAS path:
+  `C_col[n,m] = B_col[n,k] * A_col[k,m]`, matching row-major
+  `C[m,n] = A[m,k] * B[k,n]` without explicit transposes.
+- Timing uses CUDA events around the cuBLASLt matmul on a nonblocking stream, with warmup
+  outside the timing loop.
+
+Shape:
+
+- Gemma 4 FFN-down-like GEMM: `M x 21504` by `21504 x 5376`.
+- Data type: BF16 inputs, FP32 accumulation/output.
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- Clocks: not locked
+- Cache policy: repeated-buffer warm-cache microbenchmark
+- Warmup/timed repeats: `WARMUP=3`, `CNT=5`
+- tinygrad search: `SEARCH_BEAM=2`
+- cuBLASLt workspace: default `67108864` bytes
+- cuBLASLt heuristic request count: default `64`
+
+Command:
+
+```bash
+DEV=CUDA M_LIST=1,2,4,8,16,32,64,128,256,288,304,312,320,384,512 \
+  N=5376 K=21504 DTYPE_IN=bfloat16 DTYPE_ACC=float WARMUP=3 CNT=5 \
+  SEARCH_BEAM=2 COMPARE_CUBLAS=1 COMPARE_CUBLASLT=1 \
+  python3 src/experiments/tinygrad_late_eval_bench.py
+```
+
+Results:
+
+| M | tinygrad best us | cuBLAS best us | cuBLASLt best us | tiny/cuBLAS | tiny/cuBLASLt | Winner vs cuBLASLt |
+| ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 1 | 343.30 | 2842.05 | 359.14 | 8.279x | 1.046x | tinygrad |
+| 2 | 377.34 | 2913.57 | 343.10 | 7.721x | 0.909x | cuBLASLt |
+| 4 | 475.87 | 2920.38 | 359.04 | 6.137x | 0.754x | cuBLASLt |
+| 8 | 364.03 | 2841.02 | 352.22 | 7.804x | 0.968x | cuBLASLt |
+| 16 | 449.41 | 3366.94 | 351.39 | 7.492x | 0.782x | cuBLASLt |
+| 32 | 526.53 | 3222.88 | 350.53 | 6.121x | 0.666x | cuBLASLt |
+| 64 | 792.10 | 2595.26 | 363.74 | 3.276x | 0.459x | cuBLASLt |
+| 128 | 1081.31 | 2038.46 | 404.77 | 1.885x | 0.374x | cuBLASLt |
+| 256 | 1696.80 | 2583.97 | 448.06 | 1.523x | 0.264x | cuBLASLt |
+| 288 | 1703.17 | 3745.79 | 702.85 | 2.199x | 0.413x | cuBLASLt |
+| 304 | 2709.09 | 2378.91 | 705.92 | 0.878x | 0.261x | cuBLASLt |
+| 312 | 1864.90 | 2406.37 | 715.30 | 1.290x | 0.384x | cuBLASLt |
+| 320 | 1892.35 | 2277.60 | 714.56 | 1.204x | 0.378x | cuBLASLt |
+| 384 | 1903.49 | 797.89 | 791.94 | 0.419x | 0.416x | cuBLASLt |
+| 512 | 2366.78 | 813.82 | 802.05 | 0.344x | 0.339x | cuBLASLt |
+
+Conclusion:
+
+- cuBLASLt is the real baseline here. tinygrad only beat cuBLASLt at `M=1`, and only by
+  about `4.6%`.
+- From `M=2` onward, cuBLASLt wins in this sweep.
+- The earlier tinygrad wins over simple cuBLAS `GemmEx` do not survive against cuBLASLt.
+- For the FFN-down shape, there is no useful tinygrad integration region from this sweep
+  unless a later generated kernel beats cuBLASLt rather than plain cuBLAS.
+
+## 2026-05-21 - tinygrad late-eval BF16 matmul vs simple cuBLAS GemmEx
+
+Runtime file:
+
+- `src/experiments/tinygrad_late_eval_bench.py`
+
+Change:
+
+- Added a simple ctypes cuBLAS `cublasGemmEx` benchmark path to the existing tinygrad
+  late-eval matmul bench.
+- The cuBLAS path allocates raw device buffers, warms up outside the timed loop, and uses
+  CUDA events on the same nonblocking stream as the cuBLAS call.
+- The cuBLAS call uses column-major equivalence for row-major buffers:
+  `C_col[n,m] = B_col[n,k] * A_col[k,m]`, matching row-major
+  `C[m,n] = A[m,k] * B[k,n]` without explicit transposes.
+- The ctypes path pins to CUDA 12 libraries when available and calls `cudaSetDevice(0)`
+  before cuBLAS timing to restore the CUDA runtime primary context after tinygrad driver
+  API work.
+
+Shape:
+
+- Gemma 4 FFN-down-like GEMM: `M x 21504` by `21504 x 5376`.
+- Data type: BF16 inputs, FP32 accumulation/output.
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- Clocks: not locked
+- Cache policy: repeated-buffer warm-cache microbenchmark
+- Timing: tinygrad internal event timing for generated kernels; CUDA event timing for
+  simple cuBLAS `GemmEx`
+- Warmup/timed repeats: `WARMUP=3`, `CNT=5`
+- tinygrad search: `SEARCH_BEAM=2`
+
+Commands:
+
+```bash
+DEV=CUDA M_LIST=16,32,64,128,256,512,1024 N=5376 K=21504 \
+  DTYPE_IN=bfloat16 DTYPE_ACC=float WARMUP=3 CNT=5 SEARCH_BEAM=2 \
+  COMPARE_CUBLAS=1 python3 src/experiments/tinygrad_late_eval_bench.py
+
+DEV=CUDA M_LIST=288,320,352,384,416,448,480 N=5376 K=21504 \
+  DTYPE_IN=bfloat16 DTYPE_ACC=float WARMUP=3 CNT=5 SEARCH_BEAM=2 \
+  COMPARE_CUBLAS=1 python3 src/experiments/tinygrad_late_eval_bench.py
+
+DEV=CUDA M_LIST=296,304,312 N=5376 K=21504 \
+  DTYPE_IN=bfloat16 DTYPE_ACC=float WARMUP=3 CNT=5 SEARCH_BEAM=2 \
+  COMPARE_CUBLAS=1 python3 src/experiments/tinygrad_late_eval_bench.py
+```
+
+Results:
+
+| M | tinygrad best us | cuBLAS best us | tiny/cuBLAS | Winner |
+| ---: | ---: | ---: | ---: | --- |
+| 16 | 436.80 | 2552.70 | 5.844x | tinygrad |
+| 32 | 487.10 | 1985.60 | 4.076x | tinygrad |
+| 64 | 801.79 | 2698.75 | 3.366x | tinygrad |
+| 128 | 1072.64 | 2784.58 | 2.596x | tinygrad |
+| 256 | 1676.06 | 2228.58 | 1.330x | tinygrad |
+| 288 | 1650.46 | 2832.67 | 1.716x | tinygrad |
+| 296 | 2760.03 | 3464.51 | 1.255x | tinygrad |
+| 304 | 2696.10 | 2237.95 | 0.830x | cuBLAS |
+| 312 | 1845.15 | 2550.53 | 1.382x | tinygrad |
+| 320 | 1899.81 | 1881.73 | 0.990x | cuBLAS |
+| 352 | 2127.07 | 1975.74 | 0.929x | cuBLAS |
+| 384 | 1930.05 | 797.47 | 0.413x | cuBLAS |
+| 416 | 2231.49 | 819.20 | 0.367x | cuBLAS |
+| 448 | 2337.79 | 814.24 | 0.348x | cuBLAS |
+| 480 | 2129.70 | 809.38 | 0.380x | cuBLAS |
+| 512 | 2370.43 | 813.63 | 0.343x | cuBLAS |
+| 1024 | 6015.20 | 4337.31 | 0.721x | cuBLAS |
+
+Conclusion:
+
+- Against this intentionally simple cuBLAS `GemmEx` baseline, tinygrad's beam-2 generated
+  kernel wins clearly through `M=288` and still wins at `M=296` and `M=312`.
+- There is not a clean monotonic crossover because both tinygrad and cuBLAS select
+  different generated/library paths by shape. The first measured losing point is `M=304`;
+  `M=320` and larger measured points lose except the earlier `M=312` outlier.
+- Practical cutoff from this sweep: treat `M <= 288` as the stable tinygrad-win region
+  for this simple cuBLAS comparison, with shape-specific wins possible around `M=296-312`.
+- This does not supersede prior cuBLASLt results. The earlier cuBLASLt FFN-down baseline
+  remains much stronger and is still the relevant integration target.
+
+## 2026-05-20 - tinygrad late-eval BF16 FFN-down bench
+
+Runtime file:
+
+- `src/experiments/tinygrad_late_eval_bench.py`
+
+Reason:
+
+- Exercise tinygrad's normal lazy/late evaluation path without using `experiments/tinygrad/extra`.
+- The file mirrors the internal path from tinygrad proper:
+  `Tensor.empty -> Tensor.matmul -> Tensor.schedule_linear -> compile_linear -> run_linear`.
+- `compile_linear` and `run_linear` are copied into the file and call the same tinygrad
+  pattern matchers (`pm_beam`, `pm_compile`, `pm_optimize_local_size`, `pm_exec`) as the
+  upstream engine.
+- Shape is Gemma 4 FFN-down-like: `M x 21504` by `21504 x 5376`.
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- tinygrad checkout: `experiments/tinygrad`, commit `9e88b08`
+- Clocks: not locked
+- Cache policy: repeated-buffer warm-cache timing
+- Data type: BF16 inputs, FP32 accumulation/output through `Tensor.matmul(..., dtype=dtypes.float)`
+
+Commands:
+
+```bash
+DEV=CUDA M_LIST=64,128 N=5376 K=21504 DTYPE_IN=bfloat16 DTYPE_ACC=float \
+  WARMUP=2 CNT=5 SEARCH_BEAM=0 \
+  python3 src/experiments/tinygrad_late_eval_bench.py
+
+DEV=CUDA M_LIST=64,128 N=5376 K=21504 DTYPE_IN=bfloat16 DTYPE_ACC=float \
+  WARMUP=1 CNT=3 SEARCH_BEAM=2 \
+  python3 src/experiments/tinygrad_late_eval_bench.py
+
+python3 -m py_compile src/experiments/tinygrad_late_eval_bench.py
+```
+
+Results:
+
+| M | Search beam | best us | median us | TFLOP/s | Program |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 64 | 0 | 2373.44 | 2385.28 | 6.23 | `r_42_32_4_2_2_4_4_1344_2` |
+| 128 | 0 | 2751.23 | 2766.24 | 10.76 | `r_2_42_32_4_2_2_4_4_1344_2` |
+| 64 | 2 | 802.30 | 805.38 | 18.44 | `r_4_84_32_2_2_2_4_1344_2` |
+| 128 | 2 | 1065.73 | 1066.43 | 27.77 | `r_4_96_32_2_2_7_2_1344_2` |
+
+Conclusion:
+
+- The one-file late-eval reproduction works and uses tinygrad proper instead of `extra`.
+- Beam search improves the generated BF16 kernel substantially, but the result is still
+  far behind the logged cuBLASLt FFN-down timings (`M=64` around `0.342 ms`, `M=128`
+  around `0.351-0.377 ms`).
+- This path is useful for inspecting tinygrad's generated program choices, but it is not
+  currently a replacement candidate for the FFN-down cuBLASLt path.
+
+Direct library check:
+
+```bash
+PYTHONPATH=experiments/tinygrad DEV=CUDA python3 - <<'PY'
+# Direct Tensor.matmul(...).realize() loop with DEBUG=2 for tinygrad event timing.
+PY
+```
+
+Direct tinygrad `Tensor.matmul` with BF16 inputs and FP32 accumulation, `BEAM=0`,
+`WARMUP=3`, `CNT=10`:
+
+| M | tinygrad best ms | tinygrad median ms | TFLOP/s | Logged cuBLASLt ms | tinygrad/cuBLASLt |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 2.3799 | 2.3950 | 6.22 | 0.3419 | 0.14x |
+| 128 | 2.7416 | 2.7553 | 10.79 | 0.3512 | 0.13x |
+| 256 | 2.8034 | 2.8196 | 21.11 | 0.4945 | 0.18x |
+| 512 | 4.5297 | 4.6244 | 26.13 | 0.9604 | 0.21x |
+
+Confirmation rerun with `WARMUP=5`, `CNT=20`:
+
+| M | tinygrad best ms | tinygrad median ms | tinygrad worst ms | TFLOP/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 2.3809 | 2.3906 | 2.4171 | 6.22 |
+| 128 | 2.7396 | 2.7535 | 2.7656 | 10.80 |
+| 256 | 2.7986 | 2.8047 | 2.8207 | 21.15 |
+| 512 | 4.4820 | 4.5934 | 4.6854 | 26.41 |
+
+## 2026-05-20 - Fresh tinygrad max_matmul Gemma FFN-down M sweep
+
+Runtime files:
+
+- `experiments/tinygrad/extra/gemm/max_matmul.py`
+- `experiments/tinygrad/extra/gemm/max_kernels/`
+
+Source:
+
+- Re-cloned `https://github.com/tinygrad/tinygrad.git` into `experiments/tinygrad`.
+- tinygrad commit: `9e88b08`.
+- Local compatibility patch: `max_matmul.py` now uses `CUDADevice("cuda:0").compiler`
+  because the fresh checkout no longer exports `CUDACompiler` from
+  `tinygrad.runtime.ops_cuda`.
+- Local benchmark patch: added `VALIDATE=0` to skip the NumPy reference matmul for
+  larger timing-only sweeps.
+
+Shape:
+
+- Gemma 4 FFN-down-like GEMM: `M x 21504` by `21504 x 5376`.
+- `M` is the token count / prefill row count.
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- Driver: 580.126.16
+- CUDA/NVCC: 12.9 (`nvcc V12.9.86`)
+- Clocks: not locked
+- Cache policy: repeated-buffer warm-cache microbenchmark
+- Timing: tinygrad `CUDAProgram(..., wait=True)` CUDA event timing; script reports min
+  over `CNT`
+
+FP16 input, FP32 accumulate/output, upstream `GEMM_VARIATION=max`:
+
+Command pattern:
+
+```bash
+PYTHONPATH=. CUDA=1 VALIDATE=0 GEMM_VARIATION=max \
+  DTYPE_IN=half DTYPE_OUT=float DTYPE_ACC=float \
+  M=<M> N=5376 K=21504 CNT=30 INPUT=RAND \
+  python3 extra/gemm/max_matmul.py
+```
+
+| M | min us | TFLOP/s |
+| ---: | ---: | ---: |
+| 64 | 347.26 | 42.61 |
+| 128 | 366.78 | 80.69 |
+| 192 | 508.93 | 87.23 |
+| 256 | 635.17 | 93.19 |
+| 320 | 901.31 | 82.09 |
+| 384 | 1066.08 | 83.28 |
+| 448 | 1216.35 | 85.16 |
+| 512 | 1223.23 | 96.78 |
+| 576 | 1481.28 | 89.91 |
+| 640 | 1562.27 | 94.72 |
+| 704 | 1728.74 | 94.16 |
+| 768 | 1817.76 | 97.69 |
+| 832 | 2057.86 | 93.48 |
+| 896 | 2232.64 | 92.79 |
+| 960 | 2337.34 | 94.96 |
+| 1024 | 2433.31 | 97.30 |
+| 1152 | 2838.46 | 93.84 |
+| 1280 | 3237.86 | 91.40 |
+| 1536 | 4312.86 | 82.34 |
+| 1792 | 5229.02 | 79.24 |
+| 2048 | 5979.49 | 79.19 |
+
+Validation note:
+
+- Default validation passed for the first random-input runs at `M=64,128,192,256`.
+- The default `rtol=1e-3, atol=1e-2` check failed on isolated elements at `M=320` and
+  `M=384` with max absolute violations around `0.010-0.013`; timings were still
+  recorded.
+- The wider sweep used `VALIDATE=0`, so those numbers are timing-only.
+
+FP16 input, FP16 accumulate/output, upstream `GEMM_VARIATION=max`:
+
+Command pattern:
+
+```bash
+PYTHONPATH=. CUDA=1 VALIDATE=0 GEMM_VARIATION=max \
+  DTYPE_IN=half DTYPE_OUT=half DTYPE_ACC=half \
+  M=<M> N=5376 K=21504 CNT=30 INPUT=RAND \
+  python3 extra/gemm/max_matmul.py
+```
+
+| M | min us | TFLOP/s |
+| ---: | ---: | ---: |
+| 256 | 791.62 | 74.77 |
+| 512 | 810.30 | 146.09 |
+| 768 | 1584.99 | 112.03 |
+| 1024 | 1578.72 | 149.97 |
+| 1280 | 2347.46 | 126.07 |
+| 1536 | 2374.30 | 149.58 |
+| 1792 | 3122.05 | 132.71 |
+| 2048 | 3157.95 | 149.95 |
+
+Representative FP32-accumulating variant comparison:
+
+Command pattern:
+
+```bash
+PYTHONPATH=. CUDA=1 VALIDATE=0 GEMM_VARIATION=<variant> \
+  DTYPE_IN=half DTYPE_OUT=float DTYPE_ACC=float \
+  M=<M> N=5376 K=21504 CNT=20 INPUT=RAND \
+  python3 extra/gemm/max_matmul.py
+```
+
+| Variant | M=64 us | M=256 us | M=512 us | M=1024 us |
+| --- | ---: | ---: | ---: | ---: |
+| `max` | 346.88 | 639.58 | 1223.68 | 2443.62 |
+| `2_stage_swizzled_smem_input` | 348.93 | 633.12 | 1215.20 | 2490.08 |
+| `swizzled_smem_input` | 477.54 | 784.86 | 1347.97 | 2950.46 |
+| `flat_smem_input` | 888.42 | 1497.25 | 2789.63 | 5349.54 |
+
+Conclusion:
+
+- For the FP32-accumulating path, `max` and `2_stage_swizzled_smem_input` are close;
+  `2_stage_swizzled_smem_input` edged out `max` at `M=256` and `M=512`, while `max`
+  was better at `M=64` and `M=1024`.
+- `swizzled_smem_input` and `flat_smem_input` are not competitive for this shape.
+- The FP16-accumulating/output path is faster at several aligned `M` values but is not a
+  Gemma correctness candidate without a separate numerical validation argument.
+- These numbers are useful for shape exploration only; the earlier cuBLASLt baseline
+  remains the relevant comparison before considering any integration.
+
+### Existing BF16 binary checkpoint after fresh tinygrad reclone
+
+After the fresh tinygrad reclone, the local BF16 source files and C++ harness that had
+been under `experiments/tinygrad` were gone, but the previously built BF16 binaries still
+existed under `build/experiments/tinygrad`. I used those binaries only as a no-build
+checkpoint before deciding whether source restoration/tuning was worth doing.
+
+Command pattern:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
+  ./build/experiments/tinygrad/<binary> \
+  64,128,192,256,320,384,448,512,640,768,896,1024,1280,1536,1792,1984 \
+  5 20 2
+```
+
+Best observed tinygrad BF16 variant per selected `M`:
+
+| M | Best tinygrad variant | tinygrad ms | cuBLASLt ms | Speedup |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | `bf16_max` | 0.33655 | 0.34189 | 1.016x |
+| 128 | `bf16_max` | 0.38819 | 0.35117 | 0.905x |
+| 192 | `bf16_max` | 0.55025 | 0.48043 | 0.873x |
+| 256 | `bf16_max` | 0.72732 | 0.49453 | 0.680x |
+| 320 | `bf16_max` | 1.05651 | 0.80418 | 0.761x |
+| 512 | `bf16_splitk3` | 1.40796 | 0.95171 | 0.676x |
+| 768 | `bf16_splitk3` | 2.08574 | 1.40242 | 0.672x |
+| 1024 | `bf16_splitk3` | 2.79948 | 1.89341 | 0.676x |
+| 1536 | `bf16_splitk3` | 4.31061 | 2.75091 | 0.638x |
+| 1984 | `bf16_splitk3` | 5.80529 | 3.73639 | 0.644x |
+
+Variant notes:
+
+- `bf16_max` and `bf16_2_stage_swizzled_smem_input` are effectively tied; both only beat
+  cuBLASLt at `M=64` by about `1.6%`.
+- `bf16_splitk3` is worse at small `M`, slightly better than `bf16_max` at larger `M`,
+  but still far behind cuBLASLt.
+- No tested BF16 tinygrad static max variant reaches the requested `1.10x` win threshold
+  over cuBLASLt on this FFN-down shape.
+
+Post-reclone cleanup:
+
+- The fresh reclone intentionally removed local-only tinygrad FFN-down sources such as
+  `experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu` and local BF16 kernel ports.
+- Removed the stale Makefile tinygrad FFN-down targets instead of restoring those files.
+- Deleted the briefly recreated `nv.bf16_f32_bf16.max.cu` source so the tinygrad checkout
+  stays aligned with the intentional reclone cleanup.
+
+## 2026-05-20 - tinygrad ffn_down dynamic-M GEMM sweep
+
+Runtime files:
+
+- `experiments/tinygrad/extra/gemm/`
+- `experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu`
+- `Makefile`
+
+Source:
+
+- Cloned `https://github.com/tinygrad/tinygrad.git` into `experiments/tinygrad`
+  with sparse checkout paths `extra/gemm` and `tinygrad`.
+- tinygrad commit: `a19fa29`.
+
+Reason:
+
+- Test whether the NVIDIA kernels in tinygrad's `extra/gemm/max_kernels` can beat cuBLAS
+  on Gemma 4 `ffn_down`: `M x 21504` by `21504 x 5376`.
+- The first valid comparison uses tinygrad's FP16 input, FP32 accumulation, FP32 output
+  `nv.fp16_fp32_fp32.max.cu` kernel. This is not yet the final Gemma BF16 datatype path,
+  but it isolates the schedule on the exact `ffn_down` dimensions with dynamic `M`.
+
+Implementation:
+
+- Added `gemma4_ffn_down_tinygrad_bench.cu`, a direct CUDA/C++ harness that compiles the
+  imported tinygrad kernel source and compares it against `cublasGemmEx`.
+- Input layout is row-major `A[M,K]` and `B[K,N]`; cuBLAS uses the equivalent
+  column-major `C^T[N,M] = B^T[N,K] * A^T[K,M]`.
+- Timed with CUDA events on one stream after warmup. Reported medians across trials.
+- Checked max absolute output difference against cuBLAS output for every `M`.
+- Added `make tinygrad-ffn-down-bench`.
+
+Build:
+
+```bash
+make tinygrad-ffn-down-bench
+```
+
+Timing command:
+
+```bash
+./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_max_bench 64,128,192,256,320 25 200 7
+```
+
+Environment:
+
+- GPU: NVIDIA RTX A6000
+- Driver: 580.126.16
+- CUDA/NVCC: 12.9 (`nvcc V12.9.86`)
+- Clocks: not locked for this run
+- Cache policy: repeated-buffer warm-cache microbenchmark
+- Correctness reference: cuBLAS FP16 input, FP32 accumulation, FP32 output
+
+Selected stable results:
+
+| M | tinygrad median ms | cuBLAS median ms | Speedup | tinygrad TFLOP/s | cuBLAS TFLOP/s | Max abs |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 0.33812 | 3.44232 | 10.181x | 43.76 | 4.30 | 0.0065002 |
+| 128 | 0.39303 | 3.04844 | 7.756x | 75.30 | 9.71 | 0.0083313 |
+| 192 | 0.55271 | 3.10412 | 5.616x | 80.32 | 14.30 | 0.00737 |
+| 256 | 0.72626 | 3.08555 | 4.249x | 81.50 | 19.18 | 0.00737 |
+| 320 | 1.08439 | 3.23990 | 2.988x | 68.23 | 22.84 | 0.0082092 |
+
+Transition check:
+
+```bash
+./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_max_bench 64,128,192,256,320,384,448,512 20 100 5
+```
+
+- tinygrad continued to win through `M=320`.
+- cuBLAS became faster from `M=384` onward in that run:
+  `M=384` tinygrad `1.16068 ms`, cuBLAS `0.91630 ms`;
+  `M=512` tinygrad `1.41390 ms`, cuBLAS `0.95771 ms`.
+
+Other tinygrad variants tested:
+
+- `nv.fp16_fp32_fp32.2_stage_swizzled_smem_input.cu`
+- `nv.fp16_fp32_fp32.swizzled_smem_input.cu`
+- `nv.fp16_fp32_fp32.flat_smem_input.cu`
+- `nv.fp16_fp16_fp16.max.cu`
+
+The FP32-output `max` kernel was the best valid tinygrad candidate. The FP16-accumulating
+kernel produced invalid output for this shape (`max_abs` around `246-262`) and impossible
+timing numbers, so it is not a candidate.
+
+Conclusion:
+
+- Success for dynamic short-prefill / microbatch `ffn_down` values: the imported
+  tinygrad `max` schedule consistently outperforms cuBLAS by much more than 15% for
+  `M in {64, 128, 192, 256, 320}` on this RTX A6000.
+- This does not replace cuBLAS for all dynamic `M`: cuBLAS is faster by `M=384+`.
+- Next useful step is a dispatcher experiment that uses this tinygrad kernel for
+  `M <= 320` and cuBLAS/cuBLASLt above that cutoff, then ports the valid schedule to
+  Gemma's BF16 input/output contract before considering it for the inference path.
+
+Correction after applying the SGEMM cuBLASLt tuning:
+
+- The initial table compared against plain `cublasGemmEx`. After wiring in the SGEMM
+  cuBLASLt baseline style, the conclusion changes.
+- The tinygrad harness now uses row-major cuBLASLt descriptors, a 32 MiB workspace,
+  `GEMMA4_PREFILL_CUBLASLT_HEURISTICS` returned algorithms, and optional graph replay
+  via `GEMMA4_PREFILL_GRAPH_REPEATS`. It times all returned successful cuBLASLt
+  algorithms and reports the fastest median.
+
+Short-M retest:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
+  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_max_bench 64,128,192,256,320 10 50 3
+```
+
+| M | tinygrad median ms | cuBLASLt median ms | Speedup | Winner |
+| ---: | ---: | ---: | ---: | --- |
+| 64 | 0.33783 | 0.34437 | 1.019x | tinygrad |
+| 128 | 0.41421 | 0.36750 | 0.887x | cuBLASLt |
+| 192 | 0.58297 | 0.50515 | 0.867x | cuBLASLt |
+| 256 | 0.75381 | 0.53224 | 0.706x | cuBLASLt |
+| 320 | 1.15604 | 0.85894 | 0.743x | cuBLASLt |
+
+Representative large-M retest:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
+  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_max_bench 1024,1536,1984 5 20 2
+```
+
+| M | tinygrad median ms | cuBLASLt median ms | Speedup | Winner |
+| ---: | ---: | ---: | ---: | --- |
+| 1024 | 3.00374 | 2.04608 | 0.681x | cuBLASLt |
+| 1536 | 4.59643 | 2.91769 | 0.635x | cuBLASLt |
+| 1984 | 6.12065 | 3.97396 | 0.649x | cuBLASLt |
+
+Updated conclusion:
+
+- Against the tuned cuBLASLt baseline, this imported tinygrad kernel is not a useful
+  `ffn_down` replacement except possibly the marginal `M=64` case.
+- The earlier "tinygrad wins through M=320" conclusion should be treated as a comparison
+  against an insufficient plain cuBLAS baseline, not the optimized library path.
+
+BF16-native tinygrad port:
+
+- Added `experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max.cu`.
+- Ported the tinygrad low-level schedule from FP16 to BF16 by changing the input/shared
+  element type to `__nv_bfloat16`, changing the inline MMA instruction to
+  `mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32`, and converting the FP32
+  accumulators to BF16 in the output epilogue.
+- Renamed the inherited half-fragment helpers in the BF16 source to BF16-specific names
+  and store four BF16 outputs as two packed `__nv_bfloat162` values.
+- Added `make tinygrad-ffn-down-bf16-bench`.
+- CUDA guide context: BF16 is supported as `__nv_bfloat16` via `<cuda_bf16.h>` on compute
+  capability 8.0+ (guide p.587), and WMMA/tensor-core BF16 inputs with FP32 accumulator
+  support include 16x16x16, 32x8x16, and 8x32x16 shapes (guide p.577).
+
+BF16 short-M command:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
+  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_bench 64,128,192,256,320 10 50 3
+```
+
+| M | tinygrad BF16 median ms | cuBLASLt BF16 median ms | Speedup | Winner | Max abs |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 64 | 0.33516 | 0.34146 | 1.019x | tinygrad | 1 |
+| 128 | 0.38952 | 0.35107 | 0.901x | cuBLASLt | 2 |
+| 192 | 0.55607 | 0.48234 | 0.867x | cuBLASLt | 1 |
+| 256 | 0.71795 | 0.48819 | 0.680x | cuBLASLt | 1 |
+| 320 | 1.04997 | 0.79592 | 0.758x | cuBLASLt | 2 |
+
+BF16 representative large-M command:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
+  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_bench 1024,1536,1984 5 20 2
+```
+
+| M | tinygrad BF16 median ms | cuBLASLt BF16 median ms | Speedup | Winner | Max abs |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 1024 | 2.78194 | 1.86801 | 0.671x | cuBLASLt | 1 |
+| 1536 | 4.32392 | 2.72715 | 0.631x | cuBLASLt | 0 |
+| 1984 | 5.86556 | 3.69266 | 0.630x | cuBLASLt | 1 |
+
+BF16 conclusion:
+
+- The native BF16 tinygrad port works and is correctly wired against BF16 cuBLASLt, but
+  it still does not beat the tuned cuBLASLt baseline except for a negligible `M=64`
+  margin.
+- The paired BF16 epilogue is not the bottleneck enough to close the gap; further work
+  needs a different tile schedule or more parallelism across `M`/`N` to compete at
+  `M >= 128`.
+
+Static BF16 variant/resource follow-up:
+
+- Per the user direction, do not use Tinygrad codegen for the next tuning steps. These
+  checks use only the existing static CUDA sources and manual builds.
+- `ncu` is installed, but profiling this cuBLAS-linked harness aborts in the current
+  Thunder environment with an unsupported-library runtime assertion, so `ncu` timing and
+  stall breakdowns were not available here.
+- Static resource usage from `cuobjdump --dump-resource-usage`:
+
+| Variant | Registers/thread | Static shared memory/block |
+| --- | ---: | ---: |
+| `bf16_max` | 148 | 49152 B |
+| `bf16_2stage_swizzled` | 148 | 49152 B |
+| `bf16_swizzled` | 126 | 24576 B |
+| `bf16_flat` | 124 | 24576 B |
+| `bf16_splitk2_partial` | 148 | 49152 B |
+
+- Compiling `bf16_max` with `-maxrregcount=128` did not change the resource usage
+  (`148` registers/thread) and did not improve performance.
+
+Register-cap check:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -maxrregcount=128 -Isrc \
+  -DTINYGRAD_BF16 \
+  -DTINYGRAD_KERNEL_NAME=tinygrad_bf16_max_r128_kernel \
+  -DTINYGRAD_VARIANT_NAME='"bf16_max_r128"' \
+  -Dwmma_example=tinygrad_bf16_max_r128_kernel \
+  experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
+  experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max.cu \
+  -lcublas -lcublasLt \
+  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_r128_bench
+
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
+  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_r128_bench \
+  64,128,192,256,320 10 50 3
+```
+
+| M | tinygrad BF16 median ms | cuBLASLt BF16 median ms | Speedup | Winner |
+| ---: | ---: | ---: | ---: | --- |
+| 64 | 0.33546 | 0.34155 | 1.018x | tinygrad |
+| 128 | 0.39058 | 0.35103 | 0.899x | cuBLASLt |
+| 192 | 0.55646 | 0.48126 | 0.865x | cuBLASLt |
+| 256 | 0.72776 | 0.49553 | 0.681x | cuBLASLt |
+| 320 | 1.06855 | 0.81340 | 0.761x | cuBLASLt |
+
+Static lower-smem variants, same command shape:
+
+| Variant | M=64 | M=128 | M=192 | M=256 | M=320 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `bf16_2stage_swizzled` | 0.33558 | 0.38943 | 0.55745 | 0.72433 | 1.05142 |
+| `bf16_swizzled` | 0.43545 | 0.47631 | 0.75441 | 0.89968 | 1.15999 |
+| `bf16_flat` | 0.83093 | 0.84163 | 1.28007 | 1.33860 | 1.94461 |
+
+Follow-up conclusion:
+
+- The lower-smem variants have more favorable resident-block resources but much weaker
+  runtime, so the current gap is not fixed just by reducing static shared memory.
+- `bf16_max` and `bf16_2stage_swizzled` are essentially tied; `bf16_max` remains the best
+  static source to mutate manually.
+- At `M=128`, the current `64x128` tile launches `2 * 42 = 84` CTAs on the RTX A6000,
+  exactly one CTA per SM. The next manual edit should split the output tile along `M` or
+  `N` without adding a separate reduction pass; split-K already increased CTA count but
+  lost to reduction overhead.
+
+Manual M32 tile split:
+
+- Added `experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max_m32.cu`.
+- Added `make tinygrad-ffn-down-bf16-m32-bench`.
+- This variant mutates `bf16_max` by computing one 32-row half of the original 64-row
+  tile per CTA. It removes the `acc_frag_1_*` half, avoids the unused A rows, and reduces
+  static shared memory from `49152 B` to `40960 B`.
+- Resource usage: `98` registers/thread, `40960 B` static shared memory/block.
+
+Command:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
+  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_m32_bench \
+  32,64,128,192,256,320 10 50 3
+```
+
+| M | tinygrad BF16 M32 median ms | cuBLASLt BF16 median ms | Speedup | Winner | Max abs |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 32 | 0.32951 | 0.33135 | 1.006x | tinygrad | 1 |
+| 64 | 0.33258 | 0.34164 | 1.027x | tinygrad | 1 |
+| 128 | 0.55674 | 0.35207 | 0.632x | cuBLASLt | 2 |
+| 192 | 0.90226 | 0.49165 | 0.545x | cuBLASLt | 1 |
+| 256 | 1.11075 | 0.50386 | 0.454x | cuBLASLt | 1 |
+| 320 | 1.43987 | 0.82116 | 0.570x | cuBLASLt | 2 |
+
+M32 conclusion:
+
+- Splitting `M` helps only the tiny cases that were already at or near a win.
+- For `M >= 128`, duplicated B tile loading dominates; the M32 split is much slower than
+  the original M64 tile and much slower than tuned cuBLASLt.
+
+Launch-bounds check:
+
+- Added a temporary manual `bf16_max_lb2` source with `__launch_bounds__(128, 2)`.
+- Resource usage remained unchanged at `148` registers/thread and `49152 B` shared
+  memory/block.
+
+Command:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
+  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_lb2_bench \
+  64,128,192,256,320 10 50 3
+```
+
+| M | tinygrad BF16 LB2 median ms | cuBLASLt BF16 median ms | Speedup | Winner | Max abs |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 64 | 0.33636 | 0.34197 | 1.017x | tinygrad | 1 |
+| 128 | 0.41138 | 0.35392 | 0.860x | cuBLASLt | 2 |
+| 192 | 0.58439 | 0.50280 | 0.860x | cuBLASLt | 1 |
+| 256 | 0.76209 | 0.51433 | 0.675x | cuBLASLt | 1 |
+| 320 | 1.11949 | 0.83936 | 0.750x | cuBLASLt | 2 |
+
+Launch-bounds conclusion:
+
+- Adding `minBlocksPerMultiprocessor=2` did not improve register allocation or runtime.
+- Leave the original `bf16_max` launch bound unchanged.
+
+Split-K partition sweep:
+
+- Split-K=2 had already shown that extra CTA count was not enough to pay for partial
+  writes plus a reduction pass.
+- Tested split-K=3 and split-K=4 with the same partial kernel to complete that axis.
+
+Commands:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
+  -DTINYGRAD_BF16 -DTINYGRAD_SPLITK_PARTS=3 \
+  -DTINYGRAD_KERNEL_NAME=tinygrad_bf16_splitk3_partial_kernel \
+  -DTINYGRAD_VARIANT_NAME='"bf16_splitk3"' \
+  -Dwmma_example=tinygrad_bf16_splitk3_partial_kernel \
+  experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
+  experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max_splitk_partial.cu \
+  -lcublas -lcublasLt \
+  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_splitk3_bench
+
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
+  -DTINYGRAD_BF16 -DTINYGRAD_SPLITK_PARTS=4 \
+  -DTINYGRAD_KERNEL_NAME=tinygrad_bf16_splitk4_partial_kernel \
+  -DTINYGRAD_VARIANT_NAME='"bf16_splitk4"' \
+  -Dwmma_example=tinygrad_bf16_splitk4_partial_kernel \
+  experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
+  experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max_splitk_partial.cu \
+  -lcublas -lcublasLt \
+  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_splitk4_bench
+```
+
+Each benchmark used:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
+  ./build/experiments/tinygrad/<binary> 64,128,192,256,320 10 50 3
+```
+
+| Variant | M=64 | M=128 | M=192 | M=256 | M=320 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `bf16_max` | 0.33516 | 0.38952 | 0.55607 | 0.71795 | 1.04997 |
+| `bf16_splitk2` | 0.34609 | 0.40396 | 0.56928 | n/a | n/a |
+| `bf16_splitk3` | 0.35457 | 0.40852 | 0.58423 | 0.74276 | 1.12005 |
+| `bf16_splitk4` | 0.36298 | 0.42713 | 0.60784 | 0.75694 | 1.13357 |
+
+Split-K conclusion:
+
+- Higher split-K degrees monotonically worsened this shape in the tested range.
+- The extra parallelism does not pay for the extra global partial writes and reduction.
+- Do not pursue split-K for this BF16 output contract unless the reduction can be fused
+  into a materially different persistent/stream-K design.
+
+ptxas load-cache policy check:
+
+- Tested `-Xptxas -dlcm=ca` and `-Xptxas -dlcm=cg` on the best `bf16_max` source.
+- These are static compiler-policy variants only; no Tinygrad codegen was used.
+- The runs below were sequential. An initial parallel launch was killed because it would
+  have contaminated GPU timings.
+
+Commands:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas -dlcm=ca -Isrc \
+  -DTINYGRAD_BF16 \
+  -DTINYGRAD_KERNEL_NAME=tinygrad_bf16_max_ca_kernel \
+  -DTINYGRAD_VARIANT_NAME='"bf16_max_ca"' \
+  -Dwmma_example=tinygrad_bf16_max_ca_kernel \
+  experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
+  experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max.cu \
+  -lcublas -lcublasLt \
+  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_ca_bench
+
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas -dlcm=cg -Isrc \
+  -DTINYGRAD_BF16 \
+  -DTINYGRAD_KERNEL_NAME=tinygrad_bf16_max_cg_kernel \
+  -DTINYGRAD_VARIANT_NAME='"bf16_max_cg"' \
+  -Dwmma_example=tinygrad_bf16_max_cg_kernel \
+  experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
+  experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max.cu \
+  -lcublas -lcublasLt \
+  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_cg_bench
+```
+
+Each benchmark used:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
+  ./build/experiments/tinygrad/<binary> 64,128,192,256,320 10 50 3
+```
+
+| Variant | M=64 | M=128 | M=192 | M=256 | M=320 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `bf16_max` | 0.33516 | 0.38952 | 0.55607 | 0.71795 | 1.04997 |
+| `bf16_max_ca` | 0.33632 | 0.39692 | 0.56981 | 0.73697 | 1.09925 |
+| `bf16_max_cg` | 0.33616 | 0.40489 | 0.57470 | 0.74982 | 1.09670 |
+
+Cache-policy conclusion:
+
+- Both cache policy variants were slower than the default compile.
+- Leave the default ptxas cache policy for this kernel.
+
+Final no-codegen retest:
+
+- Per the user correction, no Tinygrad codegen was used in this pass. The only attempted
+  new schedule change was a manual static CUDA edit.
+- Hardened `gemma4_ffn_down_tinygrad_bench.cu` so the cuBLASLt comparison filters
+  algorithms that return a runtime launch failure instead of aborting the whole
+  benchmark on one bad heuristic. cuBLASLt plan construction, heuristic search, and
+  warmup remain outside the timed CUDA-event/graph-replay region.
+- Retested the validated native BF16 `bf16_max` kernel on the requested large-M range:
+
+```bash
+make tinygrad-ffn-down-bf16-bench
+
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
+  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_bench \
+  1024,1536,1984 5 20 2
+```
+
+| M | tinygrad BF16 median ms | cuBLASLt BF16 median ms | Speedup | Winner | Max abs | cuBLASLt algo |
+| ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| 1024 | 2.78306 | 1.87530 | 0.674x | cuBLASLt | 1 | 1 |
+| 1536 | 4.33235 | 2.73662 | 0.632x | cuBLASLt | 2 | 0 |
+| 1984 | 5.85225 | 3.69111 | 0.631x | cuBLASLt | 1 | 1 |
+
+Manual N64 branch:
+
+- Tried a manual `64x64` output-tile variant to increase CTA count without split-K
+  reduction overhead.
+- The first epilogue edit wrote past the last 64-column tile. After constraining stores
+  to the first 64 columns and restoring the missing row stores, a one-block smoke harness
+  still reported a delayed illegal memory access from the kernel.
+- The N64 variant was discarded and not promoted to the Makefile.
+
+cuBLASLt workspace check:
+
+- Added `GEMMA4_PREFILL_CUBLASLT_WORKSPACE_MB` to the harness so the cuBLASLt baseline
+  can be tested with larger workspaces without changing the timed region.
+- Tested `32`, `128`, and `512` MiB with `GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64` and
+  graph replay. Larger workspaces did not improve the best cuBLASLt large-M result.
+
+| Workspace | M=1024 cuBLASLt ms | M=1536 cuBLASLt ms | M=1984 cuBLASLt ms |
+| ---: | ---: | ---: | ---: |
+| 32 MiB | 1.86400 | 2.73221 | 3.67780 |
+| 128 MiB | 1.88715 | 2.74786 | 3.69017 |
+| 512 MiB | 1.88933 | 2.75041 | 3.71312 |
+
+Large-M static variant check:
+
+```bash
+GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
+  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_<variant>_bench \
+  1024,1536,1984 5 20 2
+```
+
+| Variant | M=1024 tiny ms | M=1536 tiny ms | M=1984 tiny ms | Conclusion |
+| --- | ---: | ---: | ---: | --- |
+| `bf16_max` | 2.78079 | 4.31409 | 5.78123 | Best static baseline. |
+| `bf16_2_stage_swizzled_smem_input` | 2.80982 | 4.31478 | 5.81267 | Essentially tied/slightly worse. |
+| `bf16_swizzled_smem_input` | 3.40250 | 5.14542 | 6.79865 | Reject. |
+| `bf16_flat_smem_input` | 5.03938 | 7.48701 | 10.07056 | Reject. |
+
+Large-M split-K check:
+
+| Variant | M=1024 tiny ms | M=1536 tiny ms | M=1984 tiny ms | Conclusion |
+| --- | ---: | ---: | ---: | --- |
+| `bf16_splitk2` | 2.79765 | 4.34413 | 5.79682 | Still behind cuBLASLt. |
+| `bf16_splitk3` | 2.77403 | 4.25981 | 5.71401 | Best split-K point, still only `0.645x` at M=1984. |
+| `bf16_splitk4` | 2.83319 | 4.35334 | 5.77718 | Reject. |
+
+ptxas check:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas -v -Isrc \
+  -DTINYGRAD_BF16 \
+  -DTINYGRAD_KERNEL_NAME=tinygrad_bf16_max_v_kernel \
+  -DTINYGRAD_VARIANT_NAME='"bf16_max_v"' \
+  -Dwmma_example=tinygrad_bf16_max_v_kernel \
+  experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
+  experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max.cu \
+  -lcublas -lcublasLt \
+  -o /tmp/tiny_bf16_v
+```
+
+- `tinygrad_bf16_max_v_kernel`: `148` registers/thread, `49152` B shared memory,
+  `0` spill stores, `0` spill loads.
+- The current gap is not register spilling; it is the tile schedule/runtime efficiency
+  versus cuBLASLt.
+
+Final conclusion for this branch:
+
+- Native BF16 is implemented for the imported static Tinygrad `bf16_max` kernel and
+  compares correctly against BF16 cuBLASLt.
+- With cuBLASLt overhead factored out and up to 64 heuristics tested, cuBLASLt remains
+  much faster for `M=1000-2000`. The static Tinygrad schedule is only marginally useful
+  at very small `M`.
+
 ## 2026-05-20 - Tuna BF16 prefill GEMM adaptation baseline
 
 Runtime files:
@@ -4371,3 +5859,532 @@ Summary:
 
 Conclusion: h64 cuBLASLt remains the correct comparison target for this shape class, and
 the current custom candidates still do not produce the requested broad 15-20% win.
+
+## 2026-05-21 - Quack Python CuTe RMSNorm on Gemma 4 shapes
+
+Scope:
+
+- Download upstream `Dao-AILab/quack/quack/rmsnorm.py` directly into
+  `src/experiments/quack_rmsnorm/rmsnorm.py`.
+- Exercise that exact downloaded file through a small Gemma-specific Python benchmark
+  wrapper.
+- Tune the forward launch knobs that Quack exposes for the Gemma 4 A6000 target:
+  `num_threads`, `threads_per_row`, `reload_from`, and `delay_w_load`.
+- Compare against the current native CUDA RMSNorm benchmark.
+
+Environment:
+
+- GPU: NVIDIA RTX A6000, compute capability 8.6.
+- Driver: 580.126.16.
+- CUDA toolkit: 12.9, `nvcc V12.9.86`.
+- Python: 3.12.13.
+- Quack support package installed from GitHub main commit
+  `5e4d024e839bf851b820887c4c5b9656f206fa08`, because the downloaded `main`
+  file imports modules such as `quack.dsl` that are not present in the older PyPI
+  wheel.
+
+Files:
+
+- `src/experiments/quack_rmsnorm/rmsnorm.py`
+- `src/experiments/quack_rmsnorm/gemma4_quack_rmsnorm_bench.py`
+- Result CSVs under `/tmp/gemma4_quack_rmsnorm_20260521/`
+
+Commands:
+
+```bash
+python3 -m pip install --user quack-kernels
+python3 -m pip install --user --force-reinstall --no-deps \
+  git+https://github.com/Dao-AILab/quack.git
+
+python3 -m py_compile \
+  src/experiments/quack_rmsnorm/gemma4_quack_rmsnorm_bench.py
+
+python3 src/experiments/quack_rmsnorm/gemma4_quack_rmsnorm_bench.py \
+  --width 5376 --rows 1,64 \
+  --modes weighted,residual_quack_fused,residual_gemma_exact_split \
+  --iters 100 --warmup 10 --trials 2 \
+  --configs heuristic,128:64:none:0,128:128:none:0,256:64:none:0,256:128:none:0 \
+  > /tmp/gemma4_quack_rmsnorm_20260521/quack_w5376_sweep.csv
+
+python3 src/experiments/quack_rmsnorm/gemma4_quack_rmsnorm_bench.py \
+  --width 5376 --rows 1,64 \
+  --modes weighted,residual_quack_fused \
+  --iters 100 --warmup 10 --trials 2 \
+  --configs 128:64:none:1,128:64:smem:0,128:64:gmem:0,256:128:none:1,256:128:smem:0,256:128:gmem:0 \
+  > /tmp/gemma4_quack_rmsnorm_20260521/quack_w5376_reload_delay_sweep.csv
+
+python3 src/experiments/quack_rmsnorm/gemma4_quack_rmsnorm_bench.py \
+  --width 256 --rows 1,64 --modes weighted,scale_free \
+  --iters 100 --warmup 10 --trials 2 \
+  --configs 128:64:none:0,128:128:none:0 \
+  > /tmp/gemma4_quack_rmsnorm_20260521/quack_w256_best.csv
+
+make -B rmsnorm-bench
+GEMMA4_RMSNORM_BENCH_SEED=0x20260521 \
+  ./build/experiments/gemma4_rmsnorm_bench 100 10 2 64 5376 \
+  > /tmp/gemma4_quack_rmsnorm_20260521/native_w5376_rows64.csv
+GEMMA4_RMSNORM_BENCH_SEED=0x20260521 \
+  ./build/experiments/gemma4_rmsnorm_bench 100 10 2 64 256 \
+  > /tmp/gemma4_quack_rmsnorm_20260521/native_w256_rows64.csv
+```
+
+Correctness:
+
+- Quack weighted and scale-free outputs matched the BF16 PyTorch reference in these
+  runs with `max_abs <= 0.0009765625` and `rstd_max_abs <= 2.38419e-7`.
+- `residual_quack_fused` is not Gemma-exact: Quack normalizes the FP32 `x + residual`
+  value. The current CUDA fused kernel intentionally normalizes the BF16-rounded
+  residual to match standalone residual add followed by RMSNorm.
+- `residual_gemma_exact_split` models the Gemma-exact two-step semantics in Python,
+  but it is not a useful replacement kernel because it launches/copies separately.
+
+Best fixed Quack configs from the sweep:
+
+| Shape / mode | Rows | Best Quack config | Quack ms | Native graph ms | Slowdown |
+| --- | ---: | --- | ---: | ---: | ---: |
+| width 5376 weighted | 1 | `256:128:gmem:0` | 0.040568 | 0.002213 | 18.33x |
+| width 5376 weighted | 64 | `256:128:smem:0` | 0.039627 | 0.008176 | 4.85x |
+| width 5376 Quack residual fused | 1 | `256:128:smem:0` | 0.034151 | 0.002416 | 14.14x |
+| width 5376 Quack residual fused | 64 | `256:128:smem:0` | 0.033789 | 0.002925 | 11.55x |
+| width 256 weighted | 1 | `128:128:none:0` | 0.033301 | 0.001599 | 20.83x |
+| width 256 weighted | 64 | `128:128:none:0` | 0.037027 | 0.001804 | 20.53x |
+| width 256 scale-free | 1 | `128:64:none:0` | 0.027449 | 0.001383 | 19.85x |
+| width 256 scale-free | 64 | `128:64:none:0` | 0.030554 | 0.001421 | 21.50x |
+
+Conclusion:
+
+- The Quack Python CuTe RMSNorm source is now downloaded and runnable on this machine,
+  but it is not competitive with our native CUDA RMSNorm on RTX A6000/SM86.
+- The full Quack autotuner was not practical here: even a single `1 x 256` tuned run
+  compiled for over a minute before being killed. Fixed-config tuning was enough to
+  show a large gap.
+- Do not replace the current RMSNorm kernels with this Quack path. Keep it as an
+  experiment/reference for CuTe structure; the production path should remain the
+  specialized CUDA implementation.
+
+## 2026-05-22 - FlashAttention-2 SM80 sliding-attention extraction
+
+Runtime files:
+
+- `src/gemma4_flash_attention.cu`
+- `src/experiments/gemma4_flash_attention_bench.cu`
+- `src/third_party_stubs/ATen/cuda/detail/UnpackRaw.cuh`
+- `Makefile`
+- `experiments/flash-attention/csrc/flash_attn/src/*`
+- `experiments/flash-attention/csrc/cutlass/include/*`
+
+Change:
+
+- Added a raw CUDA Gemma 4 sliding-attention launcher around FlashAttention-2's SM80
+  forward device template.
+- The project-facing implementation stays in one translation unit:
+  `src/gemma4_flash_attention.cu`.
+- The path is specialized to the Gemma 4 31B sliding geometry:
+  - BF16
+  - batch-major `[B, S, H, D]`
+  - `Hq=32`
+  - `Hkv=16`
+  - `D=256`
+  - local causal sliding mask with `window_left=1024`, `window_right=0`
+- The launch shape follows the A6000/SM86 branch from FA2's `hdim256` launcher:
+  `Flash_fwd_kernel_traits<256, 64, 64, 4, false, false, bf16>`.
+- Added a benchmark with a small CPU BF16 reference check.
+
+Commands:
+
+```bash
+git -C experiments/flash-attention submodule update --init --recursive csrc/cutlass
+
+make flash-attn-bench
+
+./build/experiments/gemma4_flash_attention_bench 64 10 3 1 1 64
+
+./build/experiments/gemma4_flash_attention_bench 1024 100 20 3 1 64
+
+nvcc -std=c++17 -O3 -arch=sm_86 --expt-relaxed-constexpr -Xptxas -v \
+  -Isrc -Isrc/third_party_stubs \
+  -Iexperiments/flash-attention/csrc/flash_attn/src \
+  -Iexperiments/flash-attention/csrc/cutlass/include \
+  -c src/gemma4_flash_attention.cu \
+  -o /tmp/gemma4_flash_attention_resource.o
+
+ncu --metric gpu__time_duration.sum --target-processes all \
+  ./build/experiments/gemma4_flash_attention_bench 1024 10 5 1 1 0
+```
+
+Environment:
+
+- GPU: NVIDIA RTX A6000, compute capability 8.6
+- Driver: 580.126.16
+- CUDA/NVCC: 12.9.86
+- Clocks: not locked
+- Cache policy: repeated-buffer warm-cache benchmark
+- Official `flash_attn` Python package: not installed in system Python or uv env
+- Nsight Compute: installed, but the quick `ncu` probe above was interrupted after it
+  produced no output for roughly a minute. Re-run with fewer launches or an
+  ncu-specific harness that launches only one timed kernel.
+
+Correctness:
+
+- CPU reference check at `B=1, S=64, Hq=32, Hkv=16, D=256`, BF16 inputs:
+  - `max_abs=0.00390625`
+  - `mean_abs=7.7201e-05`
+  - `max_rel=0.00390625`
+
+Benchmark:
+
+| Shape | Warmup | Iters | Trials | Best ms | Avg ms | Approx TFLOP/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `B=1, S=64, Hq=32, Hkv=16, D=256` | 3 | 10 | 1 | 0.0094272 | 0.0094272 | 7.22987 |
+| `B=1, S=1024, Hq=32, Hkv=16, D=256` | 20 | 100 | 3 | 0.227083 | 0.234317 | 75.7286 |
+
+Resource usage from `ptxas`:
+
+| Kernel variant | Registers/thread | Stack bytes | Spill stores | Spill loads | Dynamic smem |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| uneven-M/N local sliding | 254 | 0 | 0 | 0 | 98304 |
+| even-M/N local sliding | 255 | 0 | 0 | 0 | 98304 |
+
+Conclusion:
+
+- This is now a compiling and numerically checked FA2-derived Gemma sliding-attention
+  path.
+- It is not yet a proof of 100% parity with the installed FlashAttention library because
+  `flash_attn` is not installed in this environment. The next comparison step is to
+  build/install the official package or add a local PyTorch extension comparator and run
+  the exact same tensors through both paths.
+- The implementation does not cover Gemma global attention (`D=512`); FA2's CUDA path
+  only has head dimensions up to 256.
+
+## 2026-05-22 - FlashAttention-2 sliding parity against upstream hdim256 source
+
+Runtime files:
+
+- `src/gemma4_flash_attention.cu`
+- `src/experiments/gemma4_flash_attention_reference.cu`
+- `src/experiments/gemma4_flash_attention_compare.py`
+- `src/third_party_stubs/ATen/cuda/CUDAGeneratorImpl.h`
+- `src/third_party_stubs/ATen/cuda/detail/UnpackRaw.cuh`
+- `src/third_party_stubs/c10/cuda/CUDAException.h`
+- `Makefile`
+
+Change:
+
+- Switched the project sliding-attention path from a hand-written `compute_attn`
+  kernel wrapper to FA2's upstream `flash_fwd_launch_template.h` launcher and
+  upstream `Flash_fwd_params` type under a project-local namespace.
+- Matched FA2's hdim256 local dispatch behavior: the local hdim256 path uses
+  `Is_even_MN=false` even for tile-aligned sequence lengths.
+- Matched upstream compile flags for this path:
+  `--expt-relaxed-constexpr --expt-extended-lambda --use_fast_math
+  -D_GLIBCXX_USE_CXX11_ABI=1`.
+- Added a small official-source reference shared library that calls
+  `run_mha_fwd_<cutlass::bfloat16_t, 256, false>` from upstream
+  `flash_fwd_hdim256_bf16_sm80.cu`.
+
+Commands:
+
+```bash
+make -B flash-attn-bench flash-attn-lib flash-attn-reference-lib
+
+./build/experiments/gemma4_flash_attention_bench 64 10 3 1 1 64
+
+./build/experiments/gemma4_flash_attention_bench 1024 100 20 3 1 1
+
+uv run python src/experiments/gemma4_flash_attention_compare.py \
+  --seq 1024 --warmup 20 --iters 100
+
+nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -Xptxas -v \
+  -Isrc -Isrc/third_party_stubs \
+  -Iexperiments/flash-attention/csrc/flash_attn/src \
+  -Iexperiments/flash-attention/csrc/cutlass/include \
+  -c src/gemma4_flash_attention.cu \
+  -o build/ptx/gemma4_flash_attention_custom.o \
+  2>&1 | tee build/ptx/gemma4_flash_attention_custom_ptxas.log
+
+nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -Xptxas -v \
+  -Iexperiments/flash-attention/csrc/flash_attn/src \
+  -Iexperiments/flash-attention/csrc/cutlass/include \
+  -I.venv/lib/python3.11/site-packages/torch/include \
+  -I.venv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include \
+  -I/usr/include/python3.11 \
+  -c experiments/flash-attention/csrc/flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu \
+  -o build/ptx/flash_fwd_hdim256_bf16_sm80_official.o \
+  2>&1 | tee build/ptx/flash_fwd_hdim256_bf16_sm80_official_ptxas.log
+```
+
+Results:
+
+- CPU reference check at `B=1, S=64`: `max_abs=0.00390625`,
+  `mean_abs=7.72008e-05`, `max_rel=0.00390625`.
+- C++ warm-cache benchmark at `B=1, S=1024`: best `0.227048 ms`,
+  avg `0.229142 ms`, approx `75.7402 TFLOP/s`.
+- Same-tensor Python comparison at `B=1, S=1024`:
+  - custom: `0.236691 ms`, approx `72.654 TFLOP/s`
+  - official-source reference: `0.236599 ms`, approx `72.683 TFLOP/s`
+  - `custom/ref=1.000387`
+  - output diff: `max_abs=0`, `mean_abs=0`, `max_rel=0`
+- Runtime launch resources reported by both wrappers:
+  - threads/block: `128`
+  - dynamic shared memory: `98304` bytes
+
+Resource parity for the selected local hdim256 BF16 kernel:
+
+| Source | Registers/thread | Stack bytes | Spill stores | Spill loads | cmem[0] |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| custom launcher-template path | 255 | 0 | 0 | 0 | 824 |
+| upstream `flash_fwd_hdim256_bf16_sm80.cu` | 255 | 0 | 0 | 0 | 824 |
+
+Notes:
+
+- Building the full editable Python `flash_attn` package was attempted in the uv
+  environment, but the build was interrupted and left orphaned NVCC children while
+  compiling unused backward/head-dim variants. Those processes were killed. The
+  Python package still does not import: `No module named 'flash_attn'`.
+- This proves parity against the upstream hdim256 BF16 CUDA source path, but not yet
+  against an installed full `flash_attn.flash_attn_func` package call.
+- Gemma global attention (`D=512`) is still uncovered. The upstream FA2 CUDA path does
+  not provide an SM80 hdim512 implementation; a separate design is needed for that
+  requirement.
+
+Deep verification rerun after adding direct `cudaFuncGetAttributes` checks:
+
+```bash
+make -B flash-attn-bench flash-attn-lib flash-attn-reference-lib
+
+./build/experiments/gemma4_flash_attention_bench 64 10 3 1 1 64
+
+./build/experiments/gemma4_flash_attention_bench 1024 100 20 3 1 64
+
+uv run python src/experiments/gemma4_flash_attention_compare.py \
+  --seq 1024 --warmup 50 --iters 1000 --trials 5 --skip-python-flash-attn
+```
+
+Results:
+
+- CPU reference check at `B=1, S=64`: `max_abs=0.00390625`,
+  `mean_abs=7.72008e-05`, `max_rel=0.00390625`.
+- C++ warm-cache benchmark at `B=1, S=1024`: best `0.228857 ms`,
+  avg `0.230685 ms`, approx `75.1416 TFLOP/s`.
+- Same-tensor Python comparison at `B=1, S=1024`, 5 trials of 1000 launches:
+  - custom median/min/max: `0.238173 / 0.236438 / 0.239902 ms`
+  - official-source reference median/min/max: `0.238188 / 0.237964 / 0.240831 ms`
+  - `custom/ref=0.999940` on median timing
+  - output diff: `max_abs=0`, `mean_abs=0`, `max_rel=0`
+
+Direct `cudaFuncGetAttributes` comparison for the exact selected kernel:
+
+| Attribute | Custom | Official-source ref | Match |
+| --- | ---: | ---: | ---: |
+| `sharedSizeBytes` | 0 | 0 | yes |
+| `constSizeBytes` | 0 | 0 | yes |
+| `localSizeBytes` | 0 | 0 | yes |
+| `maxThreadsPerBlock` | 256 | 256 | yes |
+| `numRegs` | 255 | 255 | yes |
+| `ptxVersion` | 86 | 86 | yes |
+| `binaryVersion` | 86 | 86 | yes |
+| `cacheModeCA` | 0 | 0 | yes |
+| `maxDynamicSharedSizeBytes` | 98304 | 98304 | yes |
+| `preferredShmemCarveout` | -1 | -1 | yes |
+| `clusterDimMustBeSet` | 0 | 0 | yes |
+| `requiredClusterWidth` | 0 | 0 | yes |
+| `requiredClusterHeight` | 0 | 0 | yes |
+| `requiredClusterDepth` | 0 | 0 | yes |
+| `clusterSchedulingPolicyPreference` | 0 | 0 | yes |
+| `nonPortableClusterSizeAllowed` | 0 | 0 | yes |
+
+Current-source `ptxas` comparison for the selected local hdim256 BF16 kernel:
+
+| Source | Registers/thread | Stack bytes | Spill stores | Spill loads | Barriers | cmem[0] |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| custom `src/gemma4_flash_attention.cu` | 255 | 0 | 0 | 0 | 1 | 824 |
+| upstream `flash_fwd_hdim256_bf16_sm80.cu` | 255 | 0 | 0 | 0 | 1 | 824 |
+
+Conclusion:
+
+- For Gemma sliding attention (`D=256`, BF16, local window 1024), the custom wrapper
+  now matches the upstream hdim256 BF16 source path on output, launch shape, dynamic
+  shared memory, direct CUDA function attributes, and selected ptxas resource stats.
+- Timing is not a bitwise statistic, but the longer CUDA-event run is effectively equal
+  (`custom/ref=0.999940` median). GPU clocks were not locked, so min/max should be
+  treated as noisy.
+
+Follow-up confirmation rerun:
+
+```bash
+uv run python src/experiments/gemma4_flash_attention_compare.py \
+  --seq 1024 --warmup 50 --iters 1000 --trials 5 --skip-python-flash-attn
+
+nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -Xptxas -v \
+  -Isrc -Isrc/third_party_stubs \
+  -Iexperiments/flash-attention/csrc/flash_attn/src \
+  -Iexperiments/flash-attention/csrc/cutlass/include \
+  -c src/gemma4_flash_attention.cu \
+  -o build/ptx/gemma4_flash_attention_custom.o \
+  2>&1 | tee build/ptx/gemma4_flash_attention_custom_ptxas.log
+
+nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -Xptxas -v \
+  -Iexperiments/flash-attention/csrc/flash_attn/src \
+  -Iexperiments/flash-attention/csrc/cutlass/include \
+  -I.venv/lib/python3.11/site-packages/torch/include \
+  -I.venv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include \
+  -c experiments/flash-attention/csrc/flash_attn/src/flash_fwd_hdim256_bf16_sm80.cu \
+  -o build/ptx/flash_fwd_hdim256_bf16_sm80_official.o \
+  2>&1 | tee build/ptx/flash_fwd_hdim256_bf16_sm80_official_ptxas.log
+```
+
+Rerun results:
+
+- Same-tensor output diff: `max_abs=0`, `mean_abs=0`, `max_rel=0`.
+- CUDA-event timing, `B=1`, `S=1024`, 5 trials of 1000 launches:
+  - custom median/min/max: `0.244411 / 0.243209 / 0.249125 ms`
+  - official-source reference median/min/max: `0.244946 / 0.243538 / 0.251055 ms`
+  - `custom/ref=0.997813` on median timing
+- Every direct `cudaFuncGetAttributes` field matched:
+  `sharedSizeBytes`, `constSizeBytes`, `localSizeBytes`, `maxThreadsPerBlock`,
+  `numRegs`, `ptxVersion`, `binaryVersion`, `cacheModeCA`,
+  `maxDynamicSharedSizeBytes`, `preferredShmemCarveout`, `clusterDimMustBeSet`,
+  `requiredClusterWidth`, `requiredClusterHeight`, `requiredClusterDepth`,
+  `clusterSchedulingPolicyPreference`, and `nonPortableClusterSizeAllowed`.
+- Selected local hdim256 BF16 ptxas resource line matched:
+  - custom: `255` regs/thread, `0` stack, `0` spill stores, `0` spill loads,
+    `1` barrier, `824` bytes `cmem[0]`
+  - upstream source: `255` regs/thread, `0` stack, `0` spill stores,
+    `0` spill loads, `1` barrier, `824` bytes `cmem[0]`
+
+Conclusion holds: all deterministic output, launch, runtime attribute, and selected
+compiler-resource statistics checked here match exactly. Timing remains within normal
+unlocked-clock noise.
+
+## 2026-05-22 - Python FlashAttention comparison for hdim256 BF16
+
+Goal:
+
+- Compare the Gemma sliding-attention wrapper against the installed Python
+  `flash_attn.flash_attn_func` path on the same tensors.
+
+Package setup:
+
+```bash
+FLASH_ATTENTION_FORCE_BUILD=TRUE \
+FLASH_ATTENTION_GEMMA_FWD_ONLY=TRUE \
+FLASH_ATTN_CUDA_ARCHS=80 \
+MAX_JOBS=4 \
+NVCC_THREADS=1 \
+uv pip install --reinstall --no-deps --no-build-isolation experiments/flash-attention
+```
+
+Notes:
+
+- No matching prebuilt wheel exists for `flash-attn 2.8.4`, Python 3.11,
+  Torch `2.11`, CUDA 12, CXX11 ABI true:
+  `flash_attn-2.8.4+cu12torch2.11cxx11abiTRUE-cp311-cp311-linux_x86_64.whl`
+  returned HTTP 404 from the upstream release URL.
+- A full unmodified source build was attempted with `FLASH_ATTN_CUDA_ARCHS=80`,
+  `MAX_JOBS=4`, and `NVCC_THREADS=1`, but it spent a long time compiling all
+  forward, backward, and split-KV instantiations. It was stopped after the
+  hdim256 forward path had compiled but before the full package finished.
+- For this comparison, the local upstream checkout was given a targeted
+  `FLASH_ATTENTION_GEMMA_FWD_ONLY` build mode. It keeps the public Python
+  `flash_attn_func` API but compiles only the BF16 hdim256 forward and causal
+  forward instantiations required by these Gemma sliding-attention benchmarks.
+  Unsupported dtypes/head dims/backward/split-KV paths intentionally fail.
+- Torch stayed at `2.11.0+cu128` after install.
+
+Verification:
+
+```bash
+uv run python - <<'PY'
+import torch
+import flash_attn
+import flash_attn_2_cuda
+from flash_attn import flash_attn_func
+print(torch.__version__, torch.version.cuda)
+print(flash_attn.__version__)
+print(flash_attn_2_cuda.__file__)
+print(flash_attn_func)
+PY
+```
+
+Import result:
+
+- Torch: `2.11.0+cu128`, CUDA runtime version reported by Torch: `12.8`.
+- `flash_attn`: `2.8.4`.
+- `flash_attn_2_cuda` loaded from the repo `.venv`.
+- `flash_attn_func` imported successfully.
+
+Smoke checks:
+
+```bash
+uv run python src/experiments/gemma4_flash_attention_compare.py \
+  --seq 1024 --warmup 5 --iters 20 --trials 2
+
+uv run python src/experiments/gemma4_flash_attention_compare.py \
+  --seq 2048 --warmup 5 --iters 10 --trials 2
+```
+
+Smoke results:
+
+- `S=1024`: `diff_vs_flash_attn max_abs=0 mean_abs=0 max_rel=0`.
+- `S=2048`: `diff_vs_flash_attn max_abs=0 mean_abs=0 max_rel=0`.
+
+Clean sequential timing runs:
+
+```bash
+uv run python src/experiments/gemma4_flash_attention_compare.py \
+  --seq 1024 --warmup 50 --iters 1000 --trials 5
+
+uv run python src/experiments/gemma4_flash_attention_compare.py \
+  --seq 2048 --warmup 50 --iters 500 --trials 5
+```
+
+Results at `B=1`, `S=1024`:
+
+- custom median/min/max: `0.236058 / 0.235717 / 0.238015 ms`
+- official-source reference median/min/max:
+  `0.237129 / 0.235751 / 0.239483 ms`
+- Python `flash_attn_func` median/min/max:
+  `0.234289 / 0.232250 / 0.237240 ms`
+- `diff_vs_official_source_ref max_abs=0 mean_abs=0 max_rel=0`
+- `diff_vs_flash_attn max_abs=0 mean_abs=0 max_rel=0`
+- `custom/python_flash_attn=1.007549` on median timing
+
+Results at `B=1`, `S=2048`:
+
+- custom median/min/max: `0.606319 / 0.605090 / 0.618479 ms`
+- official-source reference median/min/max:
+  `0.611226 / 0.609790 / 0.613673 ms`
+- Python `flash_attn_func` median/min/max:
+  `0.614401 / 0.613331 / 0.617600 ms`
+- `diff_vs_official_source_ref max_abs=0 mean_abs=0 max_rel=0`
+- `diff_vs_flash_attn max_abs=0 mean_abs=0 max_rel=0`
+- `custom/python_flash_attn=0.986845` on median timing
+
+Runtime attribute comparison in both runs:
+
+- Every queried `cudaFuncGetAttributes` field matched between the custom wrapper
+  and the official-source reference wrapper:
+  `sharedSizeBytes`, `constSizeBytes`, `localSizeBytes`, `maxThreadsPerBlock`,
+  `numRegs`, `ptxVersion`, `binaryVersion`, `cacheModeCA`,
+  `maxDynamicSharedSizeBytes`, `preferredShmemCarveout`, `clusterDimMustBeSet`,
+  `requiredClusterWidth`, `requiredClusterHeight`, `requiredClusterDepth`,
+  `clusterSchedulingPolicyPreference`, and `nonPortableClusterSizeAllowed`.
+
+Conclusion:
+
+- For the benchmarked Gemma sliding path (`BF16`, `D=256`, `32` Q heads,
+  `16` KV heads, local window left `1024`, right `0`), the custom wrapper
+  matches Python `flash_attn_func` numerically with exact zero output diff.
+- Clean sequential timing is within normal unlocked-clock noise of the Python
+  path: about `+0.75%` at `S=1024` and `-1.32%` at `S=2048`.
+- This satisfies parity for the Python API path used by these shapes. It is not
+  a full-package validation of every upstream FlashAttention feature because the
+  installed package was intentionally built in Gemma-only forward mode.
