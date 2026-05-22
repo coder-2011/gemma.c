@@ -10,12 +10,16 @@ constexpr int kFfnWarps = kFfnThreads / WARP_SIZE;
 constexpr int kIntermediateTile = 256;
 constexpr int kIntermediateTiles =
     GEMMA4_INTERMEDIATE_SIZE / kIntermediateTile;
-constexpr int kColsPerThread =
-    (GEMMA4_HIDDEN_SIZE + kFfnThreads - 1) / kFfnThreads;
+constexpr int kHiddenPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 static_assert((GEMMA4_INTERMEDIATE_SIZE % kIntermediateTile) == 0,
               "FFN intermediate width must divide the decode tile width");
+static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
+              "FFN hidden width must divide the 128-bit bf16 pack width");
 static_assert((kFfnThreads % WARP_SIZE) == 0,
               "FFN decode thread count must be a whole number of warps");
+
+using FfnBf16Pack = Bf16Packed128;
+using FfnFloatPack = Packed128<float>;
 
 __device__ inline float bf16_to_float(const floatX value) {
   return __bfloat162float(value);
@@ -27,6 +31,85 @@ __device__ inline float gelu_tanh(float x) {
   const float x2 = x * x;
   const float inner = kSqrtTwoOverPi * (x + kGeluCubic * x * x2);
   return 0.5f * x * (1.0f + tanhf(inner));
+}
+
+__device__ inline void accumulate_scaled_pack(
+    float scale,
+    const FfnBf16Pack &pack,
+    float (&values)[kBf16Packed128Elements]) {
+  const __nv_bfloat162 *pairs = gemma4_bf16_pack_pairs(pack);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    const float2 packed = __bfloat1622float2(pairs[p]);
+    values[2 * p] = fmaf(scale, packed.x, values[2 * p]);
+    values[2 * p + 1] = fmaf(scale, packed.y, values[2 * p + 1]);
+  }
+}
+
+__device__ inline void add_accum_pack(
+    const float *__restrict__ accum,
+    int col,
+    float (&values)[kBf16Packed128Elements]) {
+  const FfnFloatPack lo = load128(accum + col);
+  const FfnFloatPack hi = load128(accum + col + FfnFloatPack::size);
+#pragma unroll
+  for (int i = 0; i < FfnFloatPack::size; ++i) {
+    values[i] += lo[i];
+    values[i + FfnFloatPack::size] += hi[i];
+  }
+}
+
+__device__ inline void store_accum_pack(
+    float *__restrict__ accum,
+    int col,
+    const float (&values)[kBf16Packed128Elements]) {
+  FfnFloatPack lo;
+  FfnFloatPack hi;
+#pragma unroll
+  for (int i = 0; i < FfnFloatPack::size; ++i) {
+    lo[i] = values[i];
+    hi[i] = values[i + FfnFloatPack::size];
+  }
+  store128(accum + col, lo);
+  store128(accum + col + FfnFloatPack::size, hi);
+}
+
+__device__ inline void add_residual_store_pack(
+    const FfnBf16Pack &residual_pack,
+    float (&values)[kBf16Packed128Elements],
+    FfnBf16Pack &out_pack,
+    float &sum_sq) {
+  const __nv_bfloat162 *residual_pairs =
+      gemma4_bf16_pack_pairs(residual_pack);
+  __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(out_pack);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    const float2 residual = __bfloat1622float2(residual_pairs[p]);
+    const float x = values[2 * p] + residual.x;
+    const float y = values[2 * p + 1] + residual.y;
+    values[2 * p] = x;
+    values[2 * p + 1] = y;
+    sum_sq = fmaf(x, x, sum_sq);
+    sum_sq = fmaf(y, y, sum_sq);
+    out_pairs[p] = __floats2bfloat162_rn(x, y);
+  }
+}
+
+__device__ inline FfnBf16Pack rmsnorm_store_pack(
+    const float (&values)[kBf16Packed128Elements],
+    const FfnBf16Pack &gamma_pack,
+    float scale) {
+  const __nv_bfloat162 *gamma_pairs = gemma4_bf16_pack_pairs(gamma_pack);
+  FfnBf16Pack out_pack;
+  __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(out_pack);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    const float2 gamma = __bfloat1622float2(gamma_pairs[p]);
+    out_pairs[p] = __floats2bfloat162_rn(
+        values[2 * p] * scale * gamma.x,
+        values[2 * p + 1] * scale * gamma.y);
+  }
+  return out_pack;
 }
 
 __device__ inline float block_reduce_sum(float value,
@@ -105,19 +188,22 @@ gemma4_ffn_decode_fused_bf16_kernel(
     const floatX *__restrict__ w_down_row_major,
     Gemma4FfnDecodeScratch *__restrict__ scratch,
     float eps) {
-  __shared__ floatX s_x[GEMMA4_HIDDEN_SIZE];
+  __shared__ FfnBf16Pack s_x[kHiddenPacks];
   __shared__ float s_reduce_warp_sums[2][kFfnWarps];
   __shared__ float s_act;
   __shared__ float s_scale;
 
-  for (int i = threadIdx.x; i < GEMMA4_HIDDEN_SIZE; i += kFfnThreads) {
-    s_x[i] = loadg(x + i);
+  for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
+    s_x[pack] = load128g(x + pack * kBf16Packed128Elements);
   }
   __syncthreads();
 
-  float partial[kColsPerThread] = {};
+  float partial[kBf16Packed128Elements] = {};
   const int intermediate_begin =
       static_cast<int>(blockIdx.x) * kIntermediateTile;
+  const int hidden_pack = threadIdx.x;
+  const bool owns_hidden_pack = hidden_pack < kHiddenPacks;
+  const int hidden_col = hidden_pack * kBf16Packed128Elements;
 
   for (int local_col = 0; local_col < kIntermediateTile; ++local_col) {
     const int intermediate_col = intermediate_begin + local_col;
@@ -131,10 +217,13 @@ gemma4_ffn_decode_fused_bf16_kernel(
 
     float gate = 0.0f;
     float up = 0.0f;
-    for (int k = threadIdx.x; k < GEMMA4_HIDDEN_SIZE; k += kFfnThreads) {
-      const float xv = bf16_to_float(s_x[k]);
-      gate = fmaf(xv, bf16_to_float(loadg(gate_col + k)), gate);
-      up = fmaf(xv, bf16_to_float(loadg(up_col + k)), up);
+    for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
+      const int offset = pack * kBf16Packed128Elements;
+      const FfnBf16Pack x_pack = s_x[pack];
+      const FfnBf16Pack gate_pack = load128cs(gate_col + offset);
+      const FfnBf16Pack up_pack = load128cs(up_col + offset);
+      gemma4_bf16_pack_accumulate_dot(x_pack, gate_pack, gate);
+      gemma4_bf16_pack_accumulate_dot(x_pack, up_pack, up);
     }
 
     block_reduce_pair(gate, up, s_reduce_warp_sums[0],
@@ -148,34 +237,23 @@ gemma4_ffn_decode_fused_bf16_kernel(
         w_down_row_major +
         static_cast<int64_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE;
 
-#pragma unroll
-    for (int slot = 0; slot < kColsPerThread; ++slot) {
-      const int col = threadIdx.x + slot * kFfnThreads;
-      if (col < GEMMA4_HIDDEN_SIZE) {
-        partial[slot] =
-            fmaf(act, bf16_to_float(loadg(down_row + col)), partial[slot]);
-      }
+    if (owns_hidden_pack) {
+      const FfnBf16Pack down_pack = load128cs(down_row + hidden_col);
+      accumulate_scaled_pack(act, down_pack, partial);
     }
     __syncthreads();
   }
 
-  float merged[kColsPerThread] = {};
   const bool first = blockIdx.x == 0;
   const bool last = blockIdx.x == kIntermediateTiles - 1;
   wait_for_reduce_turn(&scratch->lock, static_cast<int>(blockIdx.x));
 
-#pragma unroll
-  for (int slot = 0; slot < kColsPerThread; ++slot) {
-    const int col = threadIdx.x + slot * kFfnThreads;
-    if (col < GEMMA4_HIDDEN_SIZE) {
-      float value = partial[slot];
-      if (!first) {
-        value += scratch->accum[col];
-      }
-      merged[slot] = value;
-      if (!last) {
-        scratch->accum[col] = value;
-      }
+  if (owns_hidden_pack) {
+    if (!first) {
+      add_accum_pack(scratch->accum, hidden_col, partial);
+    }
+    if (!last) {
+      store_accum_pack(scratch->accum, hidden_col, partial);
     }
   }
 
@@ -185,14 +263,11 @@ gemma4_ffn_decode_fused_bf16_kernel(
   }
 
   float sum_sq = 0.0f;
-#pragma unroll
-  for (int slot = 0; slot < kColsPerThread; ++slot) {
-    const int col = threadIdx.x + slot * kFfnThreads;
-    if (col < GEMMA4_HIDDEN_SIZE) {
-      const float value = merged[slot] + bf16_to_float(loadg(residual + col));
-      sum_sq = fmaf(value, value, sum_sq);
-      residual_out[col] = __float2bfloat16_rn(value);
-    }
+  if (owns_hidden_pack) {
+    FfnBf16Pack residual_pack = load128g(residual + hidden_col);
+    FfnBf16Pack residual_out_pack;
+    add_residual_store_pack(residual_pack, partial, residual_out_pack, sum_sq);
+    store128(residual_out + hidden_col, residual_out_pack);
   }
 
   const float total = block_reduce_sum(sum_sq, s_reduce_warp_sums[0]);
@@ -202,14 +277,11 @@ gemma4_ffn_decode_fused_bf16_kernel(
   }
   __syncthreads();
 
-#pragma unroll
-  for (int slot = 0; slot < kColsPerThread; ++slot) {
-    const int col = threadIdx.x + slot * kFfnThreads;
-    if (col < GEMMA4_HIDDEN_SIZE) {
-      const float value = merged[slot] + bf16_to_float(loadg(residual + col));
-      const float gamma = bf16_to_float(loadg(rms_weight + col));
-      normed_out[col] = __float2bfloat16_rn(value * s_scale * gamma);
-    }
+  if (owns_hidden_pack) {
+    const FfnBf16Pack gamma_pack = load128g(rms_weight + hidden_col);
+    const FfnBf16Pack normed_pack =
+        rmsnorm_store_pack(partial, gamma_pack, s_scale);
+    store128(normed_out + hidden_col, normed_pack);
   }
 }
 
