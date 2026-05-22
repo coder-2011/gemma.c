@@ -135,7 +135,6 @@ int main(int argc, char **argv) {
   DeviceBuffer<__nv_bfloat16> d_weight(width);
   DeviceBuffer<__nv_bfloat16> d_residual(max_elems);
   DeviceBuffer<__nv_bfloat16> d_normed(max_elems);
-  DeviceBuffer<float> d_rstd(max_rows);
 
   fill_random_bf16(d_inp1, max_elems, seed ^ 0x1001u, 1.0f, stream);
   fill_random_bf16(d_inp2, max_elems, seed ^ 0x2002u, 1.0f, stream);
@@ -157,11 +156,10 @@ int main(int argc, char **argv) {
 
   for (int rows : row_counts_up_to(max_rows)) {
     const double bytes =
-        double(rows) * width * sizeof(__nv_bfloat16) * 5.0 +
-        double(rows) * sizeof(float);
+        double(rows) * width * sizeof(__nv_bfloat16) * 5.0;
     auto run_fused = [&]() {
       CUDA_CHECK(gemma4_residual_add_rmsnorm_bf16(
-          d_residual, d_normed, d_rstd, d_inp1, d_inp2, d_weight, rows, width,
+          d_residual, d_normed, d_inp1, d_inp2, d_weight, rows, width,
           GEMMA4_RMS_NORM_EPS, stream));
     };
 

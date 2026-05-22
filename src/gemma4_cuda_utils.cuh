@@ -165,6 +165,21 @@ __device__ inline Bf16Packed128 gemma4_bf16_pack_apply_rmsnorm(
   return result;
 }
 
+__device__ inline Bf16Packed128 gemma4_bf16_pack_apply_scale(
+    const Bf16Packed128 &values,
+    float scale) {
+  const __nv_bfloat162 *value_pairs = gemma4_bf16_pack_pairs(values);
+  Bf16Packed128 result;
+  __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(result);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    float2 value = __bfloat1622float2(value_pairs[p]);
+    out_pairs[p] = __floats2bfloat162_rn(value.x * scale,
+                                         value.y * scale);
+  }
+  return result;
+}
+
 __device__ inline float warp_reduce_sum(float value) {
   for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
     value += __shfl_xor_sync(0xffffffffu, value, offset);

@@ -7,7 +7,6 @@
 // Learned-weight RMSNorm:
 // y = x * rsqrt(mean(x * x) + eps) * weight.
 cudaError_t gemma4_rmsnorm_bf16(__nv_bfloat16 *out,
-                                float *__restrict__ rstd,
                                 const __nv_bfloat16 *inp,
                                 const __nv_bfloat16 *__restrict__ weight,
                                 int rows,
@@ -16,7 +15,6 @@ cudaError_t gemma4_rmsnorm_bf16(__nv_bfloat16 *out,
                                 cudaStream_t stream);
 
 cudaError_t gemma4_rmsnorm_scale_free_bf16(__nv_bfloat16 *out,
-                                           float *__restrict__ rstd,
                                            const __nv_bfloat16 *inp,
                                            int rows,
                                            int width,
@@ -31,7 +29,6 @@ cudaError_t gemma4_residual_add_bf16(__nv_bfloat16 *out,
 
 cudaError_t gemma4_residual_add_rmsnorm_bf16(__nv_bfloat16 *residual,
                                              __nv_bfloat16 *normed,
-                                             float *__restrict__ rstd,
                                              const __nv_bfloat16 *inp1,
                                              const __nv_bfloat16 *inp2,
                                              const __nv_bfloat16 *__restrict__ weight,
