@@ -4,6 +4,10 @@
 
 // Gemma 4 31B dense projection kernels.
 
+#ifndef GEMMA4_DECODE_GEMV_BUFFER_STAGES
+#define GEMMA4_DECODE_GEMV_BUFFER_STAGES 1
+#endif
+
 namespace {
 
 constexpr int kDefaultThreads = 512;
@@ -92,16 +96,66 @@ __device__ inline void dot_cols(
 
   constexpr int packs_per_col = K / kBf16Packed128Elements;
 
+#if GEMMA4_DECODE_GEMV_BUFFER_STAGES <= 1
 #pragma unroll
   for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
     const int element_idx = pack_offset(pack_idx);
     const Bf16Packed128 x_pack = load_activation_pack(x, element_idx);
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      const Bf16Packed128 w_pack = load_weight_pack<K>(w_col_major, col0 + col, element_idx);
+      const Bf16Packed128 w_pack =
+          load_weight_pack<K>(w_col_major, col0 + col, element_idx);
       gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
     }
   }
+#else
+  constexpr int kStages = GEMMA4_DECODE_GEMV_BUFFER_STAGES;
+  static_assert(kStages > 1 && kStages <= 4,
+                "decode GEMV register buffering supports 2-4 stages");
+  Bf16Packed128 x_stage[kStages];
+  Bf16Packed128 w_stage[kStages][ColsPerBlock];
+
+  int pack_idx = thread_idx;
+#pragma unroll
+  for (int stage = 0; stage < kStages; ++stage) {
+    const int stage_pack_idx = thread_idx + stage * Threads;
+    if (stage_pack_idx < packs_per_col) {
+      const int element_idx = pack_offset(stage_pack_idx);
+      x_stage[stage] = load_activation_pack(x, element_idx);
+#pragma unroll
+      for (int col = 0; col < ColsPerBlock; ++col) {
+        w_stage[stage][col] =
+            load_weight_pack<K>(w_col_major, col0 + col, element_idx);
+      }
+    }
+  }
+
+  for (int iter = 0; pack_idx < packs_per_col; ++iter, pack_idx += Threads) {
+    const int stage = iter % kStages;
+    Bf16Packed128 x_pack = x_stage[stage];
+    Bf16Packed128 w_pack[ColsPerBlock];
+#pragma unroll
+    for (int col = 0; col < ColsPerBlock; ++col) {
+      w_pack[col] = w_stage[stage][col];
+    }
+
+    const int next_pack_idx = pack_idx + kStages * Threads;
+    if (next_pack_idx < packs_per_col) {
+      const int element_idx = pack_offset(next_pack_idx);
+      x_stage[stage] = load_activation_pack(x, element_idx);
+#pragma unroll
+      for (int col = 0; col < ColsPerBlock; ++col) {
+        w_stage[stage][col] =
+            load_weight_pack<K>(w_col_major, col0 + col, element_idx);
+      }
+    }
+
+#pragma unroll
+    for (int col = 0; col < ColsPerBlock; ++col) {
+      gemma4_bf16_pack_accumulate_dot(x_pack, w_pack[col], sums[col]);
+    }
+  }
+#endif
 }
 
 template <int K,
