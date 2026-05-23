@@ -18,10 +18,6 @@
 #define GEMMA4_FFN_DECODE_ASYNC_X 0
 #endif
 
-#ifndef GEMMA4_FFN_DECODE_ASYNC_WEIGHT_TILE
-#define GEMMA4_FFN_DECODE_ASYNC_WEIGHT_TILE 0
-#endif
-
 namespace {
 
 constexpr int kFfnThreads = 1024;
@@ -33,7 +29,6 @@ constexpr int kHiddenPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 constexpr int kActTile = GEMMA4_FFN_DECODE_ACT_TILE;
 constexpr int kSwizzleX = GEMMA4_FFN_DECODE_SWIZZLE_X;
 constexpr int kAsyncX = GEMMA4_FFN_DECODE_ASYNC_X;
-constexpr int kAsyncWeightTile = GEMMA4_FFN_DECODE_ASYNC_WEIGHT_TILE;
 static_assert((GEMMA4_INTERMEDIATE_SIZE % kIntermediateTile) == 0,
               "FFN intermediate width must divide the decode tile width");
 static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
@@ -49,16 +44,9 @@ static_assert(kSwizzleX == 0 || kSwizzleX == 1,
               "FFN x shared-memory swizzle must be 0 or 1");
 static_assert(kAsyncX == 0 || kAsyncX == 1,
               "FFN x async preload must be 0 or 1");
-static_assert(kAsyncWeightTile == 0 || kAsyncWeightTile == 1,
-              "FFN async weight tile path must be 0 or 1");
 
 using FfnBf16Pack = Bf16Packed128;
 using FfnFloatPack = Packed128<float>;
-constexpr int kAsyncWeightStages = 2;
-constexpr size_t kAsyncWeightStagePacks =
-    2 * kActTile * kHiddenPacks;
-constexpr size_t kAsyncWeightTileBytes =
-    kAsyncWeightStages * kAsyncWeightStagePacks * sizeof(FfnBf16Pack);
 
 __device__ inline int shared_x_chunk_index(int chunk) {
   if constexpr (kSwizzleX) {
@@ -69,39 +57,6 @@ __device__ inline int shared_x_chunk_index(int chunk) {
     return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
   }
   return chunk;
-}
-
-__device__ inline void prefetch_gate_up_weight_tile(
-    FfnBf16Pack *__restrict__ s_weight_tile,
-    const floatX *__restrict__ w_gate_up_col_major,
-    int intermediate_begin,
-    int local_col,
-    int stage) {
-  FfnBf16Pack *stage_tile =
-      s_weight_tile + static_cast<size_t>(stage) * kAsyncWeightStagePacks;
-  const int gate_col0 = intermediate_begin + local_col;
-  const int up_col0 = GEMMA4_INTERMEDIATE_SIZE + gate_col0;
-#pragma unroll
-  for (int t = 0; t < kActTile; ++t) {
-    const int gate_col = gate_col0 + t;
-    const int up_col = up_col0 + t;
-    for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
-      const int elem = pack * kBf16Packed128Elements;
-      const int smem_pack = shared_x_chunk_index(pack);
-      const int gate_index = (t * kHiddenPacks) + smem_pack;
-      const int up_index = ((kActTile + t) * kHiddenPacks) + smem_pack;
-      __pipeline_memcpy_async(
-          stage_tile + gate_index,
-          w_gate_up_col_major +
-              static_cast<int64_t>(gate_col) * GEMMA4_HIDDEN_SIZE + elem,
-          sizeof(FfnBf16Pack));
-      __pipeline_memcpy_async(
-          stage_tile + up_index,
-          w_gate_up_col_major +
-              static_cast<int64_t>(up_col) * GEMMA4_HIDDEN_SIZE + elem,
-          sizeof(FfnBf16Pack));
-    }
-  }
 }
 
 __device__ inline float gelu_tanh(float x) {
@@ -258,7 +213,6 @@ gemma4_ffn_decode_fused_bf16_kernel(
   __shared__ float s_rms_warp_sums[kFfnWarps];
   __shared__ float s_act[kActTile];
   __shared__ float s_scale;
-  extern __shared__ int4 s_dynamic_weight_tile[];
 
   for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
     if constexpr (kAsyncX) {
@@ -283,72 +237,6 @@ gemma4_ffn_decode_fused_bf16_kernel(
   const bool owns_hidden_pack = hidden_pack < kHiddenPacks;
   const int hidden_col = hidden_pack * kBf16Packed128Elements;
 
-  if constexpr (kAsyncWeightTile) {
-  FfnBf16Pack *s_weight_tile =
-      reinterpret_cast<FfnBf16Pack *>(s_dynamic_weight_tile);
-  prefetch_gate_up_weight_tile(s_weight_tile, w_gate_up_col_major,
-                               intermediate_begin, 0, 0);
-  __pipeline_commit();
-  for (int local_col = 0; local_col < kIntermediateTile;
-       local_col += kActTile) {
-    float gate[kActTile] = {};
-    float up[kActTile] = {};
-    const int stage = (local_col / kActTile) & 1;
-    const int next_local_col = local_col + kActTile;
-    __pipeline_wait_prior(0);
-    __syncthreads();
-    if (next_local_col < kIntermediateTile) {
-      prefetch_gate_up_weight_tile(s_weight_tile, w_gate_up_col_major,
-                                   intermediate_begin, next_local_col,
-                                   stage ^ 1);
-      __pipeline_commit();
-    }
-    const FfnBf16Pack *stage_tile =
-        s_weight_tile + static_cast<size_t>(stage) * kAsyncWeightStagePacks;
-
-    for (int t = 0; t < kActTile; ++t) {
-      float gate_partial = 0.0f;
-      float up_partial = 0.0f;
-      if (threadIdx.x < kHiddenPacks) {
-        const int smem_pack = shared_x_chunk_index(threadIdx.x);
-        const int gate_index = (t * kHiddenPacks) + smem_pack;
-        const int up_index = ((kActTile + t) * kHiddenPacks) + smem_pack;
-        const FfnBf16Pack x_pack = s_x[smem_pack];
-        const FfnBf16Pack gate_pack = stage_tile[gate_index];
-        const FfnBf16Pack up_pack = stage_tile[up_index];
-        gemma4_bf16_pack_accumulate_dot(x_pack, gate_pack, gate_partial);
-        gemma4_bf16_pack_accumulate_dot(x_pack, up_pack, up_partial);
-      }
-      gate[t] = block_reduce_sum(gate_partial, s_matmul_warp_sums[0][t]);
-      up[t] = block_reduce_sum(up_partial, s_matmul_warp_sums[1][t]);
-    }
-
-    if (threadIdx.x < WARP_SIZE) {
-#pragma unroll
-      for (int t = 0; t < kActTile; ++t) {
-        const float gate_t = __shfl_sync(0xffffffffu, gate[t], 0);
-        const float up_t = __shfl_sync(0xffffffffu, up[t], 0);
-        if (threadIdx.x == t) {
-          s_act[t] = gate_t * gelu_tanh(up_t);
-        }
-      }
-    }
-    __syncthreads();
-
-    if (owns_hidden_pack) {
-#pragma unroll
-      for (int t = 0; t < kActTile; ++t) {
-        const int intermediate_col = intermediate_begin + local_col + t;
-        const floatX *down_row =
-            w_down_row_major +
-            static_cast<int64_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE;
-        const FfnBf16Pack down_pack = load128cs(down_row + hidden_col);
-        accumulate_scaled_pack(s_act[t], down_pack, partial);
-      }
-    }
-    __syncthreads();
-  }
-  } else {
   for (int local_col = 0; local_col < kIntermediateTile;
        local_col += kActTile) {
     float gate[kActTile] = {};
@@ -385,7 +273,6 @@ gemma4_ffn_decode_fused_bf16_kernel(
       }
     }
     __syncthreads();
-  }
   }
 
   const bool first = blockIdx.x == 0;
@@ -464,7 +351,7 @@ cudaError_t check_resident_reduction_supported() {
   int active_blocks_per_sm = 0;
   status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &active_blocks_per_sm, gemma4_ffn_decode_fused_bf16_kernel,
-      kFfnThreads, kAsyncWeightTile ? kAsyncWeightTileBytes : 0);
+      kFfnThreads, 0);
   if (status != cudaSuccess) {
     return status;
   }
@@ -476,19 +363,7 @@ cudaError_t check_resident_reduction_supported() {
 }
 
 cudaError_t configure_dynamic_shared_memory() {
-  if constexpr (!kAsyncWeightTile) {
-    return cudaSuccess;
-  }
-  cudaError_t status = cudaFuncSetAttribute(
-      gemma4_ffn_decode_fused_bf16_kernel,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      static_cast<int>(kAsyncWeightTileBytes));
-  if (status != cudaSuccess) {
-    return status;
-  }
-  return cudaFuncSetAttribute(
-      gemma4_ffn_decode_fused_bf16_kernel,
-      cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+  return cudaSuccess;
 }
 
 }  // namespace
@@ -570,8 +445,7 @@ cudaError_t gemma4_ffn_decode_fused_bf16(
   }
 
   gemma4_ffn_decode_fused_bf16_kernel<<<
-      kIntermediateTiles, kFfnThreads,
-      kAsyncWeightTile ? kAsyncWeightTileBytes : 0, stream>>>(
+      kIntermediateTiles, kFfnThreads, 0, stream>>>(
       residual_out, normed_out, x, residual, rms_weight,
       w_gate_up_col_major, w_down_row_major, scratch, eps);
   return cudaGetLastError();
