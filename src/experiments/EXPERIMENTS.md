@@ -3,6 +3,320 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-05-23 - FFN decode activation-tile sweep
+
+Runtime files:
+
+- `src/gemma4_ffn_decode.cu`
+- `tests/test_ffn_decode.cu`
+- `src/experiments/gemma4_ffn_cudnn_bench.cu`
+
+Change:
+
+- Added `GEMMA4_FFN_DECODE_ACT_TILE` as a compile-time FFN decode hyperparameter.
+- Default is now `2`.
+- The tiled path is first-class in the main loop: each CTA computes `kActTile`
+  gate/up scalar pairs, reduces them, stores `s_act[kActTile]`, then streams the
+  matching down rows before advancing.
+- This keeps the fused single-token decode contract unchanged and does not add a
+  second special-case kernel path.
+
+Correctness:
+
+```text
+make test-ffn-decode
+ffn decode tests passed
+
+for tile in 2 4 8; do
+  nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
+    -DGEMMA4_FFN_DECODE_ACT_TILE=${tile} \
+    tests/test_ffn_decode.cu src/gemma4_ffn_decode.cu \
+    -o /tmp/test_ffn_decode_tile${tile}
+  /tmp/test_ffn_decode_tile${tile}
+done
+ffn decode tests passed
+ffn decode tests passed
+ffn decode tests passed
+```
+
+Resource sweep:
+
+```bash
+for tile in 1 2 4 8 16; do
+  nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+    -DGEMMA4_FFN_DECODE_ACT_TILE=${tile} \
+    -c src/gemma4_ffn_decode.cu -o /tmp/gemma4_ffn_decode_tile${tile}.o
+done
+```
+
+| Tile | Registers | Shared memory | Stack/spills |
+| ---: | ---: | ---: | --- |
+| 1 | 59 | 11016 B | 0 stack, 0 spills |
+| 2 | 59 | 11020 B | 0 stack, 0 spills |
+| 4 | 62 | 11028 B | 0 stack, 0 spills |
+| 8 | 62 | 11044 B | 16 B stack, 64 B spill stores, 64 B spill loads |
+| 16 | 64 | 11076 B | 88 B stack, 188 B spill stores, 212 B spill loads |
+
+Timing command:
+
+```bash
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  /tmp/gemma4_ffn_cudnn_bench_tile${tile} 100 20 3 1
+```
+
+GPU/tooling:
+
+- GPU: NVIDIA RTX A6000
+- CUDA target: `sm_86`
+- cuDNN version: `92200`
+- Warmup/timing: 20 warmup iterations, 100 timed iterations, 3 trials.
+- Timing uses CUDA events through the existing benchmark helper; CUDA graph timing is
+  used as the device-time comparison.
+- Clock policy: not locked.
+- Cache policy: normal benchmark warm-cache behavior.
+
+Tile sweep results:
+
+| Tile | custom graph best ms | custom direct best ms | cuDNN split graph best ms | custom/cuDNN speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1.137898 | 1.141672 | 1.000087 | 0.878890x |
+| 2 | 1.077307 | 1.078275 | 1.000453 | 0.928661x |
+| 4 | 1.080216 | 1.082335 | 1.001038 | 0.926701x |
+| 8 | 1.177239 | 1.175480 | 0.999530 | 0.849046x |
+
+Default tile-2 rerun through the checked-in `make ffn-cudnn-bench` binary after
+the scratch handoff fence fix:
+
+```text
+device=NVIDIA RTX A6000
+shape=tokens1,hidden5376,intermediate21504,seed=0x20260522
+iters=100,warmup_iters=20,trials=3
+cudnn_frontend=compiled
+cudnn_version=92200
+geglu_plus_down,11.606174,11.943123,1.000069,1.000217,55.669,4194560,
+custom_fused_decode,1.108576,1.114322,1.107599,1.108106,582.862,0,
+custom_scratch_clear,0.006160,0.007221,0.001077,0.001090,0.000,0,
+cudnn_split_device_ms,1.000069
+custom_device_ms,1.107599
+custom_minus_clear_device_ms,1.106522
+custom_vs_cudnn_split_speedup,0.902916
+custom_minus_clear_vs_cudnn_split_speedup,0.903795
+```
+
+Conclusion:
+
+- Activation tiling helps. Tile `2` reduces custom graph time from `1.137898 ms`
+  to `1.077307 ms` in the fixed-seed sweep, about a 5.3% custom-kernel improvement.
+- Tile `4` is close but slightly slower than tile `2` and increases register use to
+  62.
+- Tile `8` spills and regresses hard. Do not use spilling tiles without a deeper
+  schedule rewrite.
+- Manual race audit found that the global scratch handoff needed every writer thread
+  to execute a device fence before thread 0 advances the lock, and every reader thread
+  to perform an acquire load before reading `scratch->accum`. That fix preserves
+  correctness at the cost of about `0.032 ms` on the checked-in tile-2 rerun.
+- cuDNN split graph is still faster for this benchmark (`~1.0001 ms`) than the fused
+  custom decode (`~1.1076 ms`), but the gap remains smaller than the original tile-1
+  baseline.
+- Full cuDNN FFN graph is still unsupported by the frontend planner for this shape in
+  this harness; the supported cuDNN comparison remains split GeGLU plus down matmul.
+
+## 2026-05-22 - FFN decode cache-hint ablation
+
+Runtime files:
+
+- `src/gemma4_cuda_utils.cuh`
+- `src/gemma4_ffn_decode.cuh`
+- `src/gemma4_ffn_decode.cu`
+- `src/experiments/gemma4_ffn_cache_policy_bench.cu`
+- `Makefile`
+
+Policy IDs:
+
+- `0`: default aligned 128-bit load
+- `1`: `__ldg` read-only load, emitted as `ld.global.nc`
+- `2`: `__ldca`, emitted as `ld.global.ca`
+- `3`: `__ldcg`, emitted as `ld.global.cg`
+- `4`: `__ldcs`, emitted as `ld.global.cs`
+- `5`: `__ldlu`, emitted as `ld.global.lu`
+- `6`: `__ldcv`, emitted as `ld.global.cv`
+
+Default policy tuple remains:
+
+```text
+x=1, gate=4, up=4, down=4, residual=1, gamma=1, scratch=0
+```
+
+Reasoning:
+
+- `.cv` is only plausible for one-pass weight streams. I did not make it a default for
+  `x`, residual, gamma, or scratch because those are small/reused or L2-sensitive.
+- Scratch is the global FP32 handoff buffer between CTAs. It should stay cacheable and
+  L2-hot; the sweep confirmed non-default hints are harmful there.
+- Gamma is the learned RMSNorm weight vector `[5376]`, not the scalar RMS value.
+
+Commands:
+
+```bash
+make test-ffn-decode
+
+# Weight stream sweep: gate/up grouped, down independent.
+for gu in 0 1 2 3 4 5 6; do
+  for down in 0 1 2 3 4 5 6; do
+    nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
+      -DGEMMA4_FFN_GATE_LOAD_POLICY=${gu} \
+      -DGEMMA4_FFN_UP_LOAD_POLICY=${gu} \
+      -DGEMMA4_FFN_DOWN_LOAD_POLICY=${down} \
+      src/experiments/gemma4_ffn_cache_policy_bench.cu \
+      src/gemma4_ffn_decode.cu -o /tmp/gemma4_ffn_cache_gu${gu}_down${down}
+    /tmp/gemma4_ffn_cache_gu${gu}_down${down} 30 5 1
+  done
+done
+
+# Longer rerun of top candidates.
+/tmp/gemma4_ffn_cache_gu4_down4 200 20 5
+/tmp/gemma4_ffn_cache_gu5_down0 200 20 5
+```
+
+Correctness:
+
+```text
+ffn decode tests passed
+```
+
+Weight sweep:
+
+- First-pass fastest graph results were clustered around `1.140 ms` and did not show a
+  stable `.cv` win.
+- Top short-run candidates:
+  - `gate/up=1`, `down=2`: `1.140212 ms`
+  - `gate/up=5`, `down=0`: `1.140225 ms`
+  - `gate/up=3`, `down=3`: `1.140420 ms`
+  - `gate/up=4`, `down=6`: `1.140478 ms`
+  - current `gate/up/down=4`: `1.141032 ms`
+
+Longer candidate rerun:
+
+```text
+name,x,gate,up,down,residual,gamma,scratch,direct_best_ms,direct_avg_ms,graph_best_ms,graph_avg_ms
+current,1,4,4,4,1,1,0,1.141580,1.144403,1.140824,1.141919
+weight_best,1,5,5,0,1,1,0,1.145933,1.147701,1.140929,1.142647
+weight_plus_x,3,5,5,0,1,1,0,1.143503,1.145587,1.141257,1.141895
+weight_plus_residual,1,5,5,0,2,1,0,1.146148,1.148361,1.141838,1.142332
+weight_plus_gamma,1,5,5,0,1,2,0,1.144858,1.147096,1.142313,1.142973
+combined,3,5,5,0,2,2,0,1.145248,1.146566,1.140826,1.141441
+```
+
+Small-site one-at-a-time observations around `gate/up=5`, `down=0`:
+
+- `x=cg`, `residual=ca`, and `gamma=ca` looked best in short isolated sweeps, but
+  combining them did not produce a robust longer-run win.
+- Scratch must remain default. `scratch=cg`, `scratch=lu`, and `scratch=cv` regressed to
+  roughly `1.158-1.159 ms` graph time in the short sweep.
+
+Conclusion:
+
+- Keep current defaults for now: `x/residual/gamma=__ldg`, `gate/up/down=__ldcs`,
+  `scratch=default`.
+- `.cv` is not the best measured choice. It sometimes looked competitive for `down` in
+  short runs, but did not survive longer reruns or combination tests.
+- Cache hint choice is a noise-level lever for this kernel, roughly sub-1%. The real
+  bottleneck is still the scalar-FMA work decomposition, not cache operator selection.
+
+## 2026-05-22 - FFN decode 128-bit vectorized load pass
+
+Runtime files:
+
+- `src/gemma4_ffn_decode.cu`
+- `src/gemma4_ffn_decode.cuh`
+- `tests/test_ffn_decode.cu`
+- `src/experiments/gemma4_ffn_cudnn_bench.cu`
+
+Change:
+
+- Reworked the custom fused decode FFN kernel so each active thread owns one
+  hidden pack of `8 x bf16` instead of scalar hidden columns.
+- Used the existing `Bf16Packed128` / `Packed128<float>` helpers from
+  `gemma4_cuda_utils.cuh`, matching the RMSNorm, RoPE, embedding gather, and decode
+  GEMV style.
+- Vectorized the global BF16 paths for:
+  - token input `x` load into shared memory
+  - gate/up weight tile loads
+  - down weight tile loads
+  - residual and RMS gamma loads
+  - residual and normed output stores
+- Vectorized the FP32 scratch accumulator merge as two 128-bit float loads/stores per
+  hidden pack. The lock remains scalar by design.
+
+Commands:
+
+```bash
+make test-ffn-decode ffn-cudnn-bench
+
+mkdir -p build/ptx
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc -ptx src/gemma4_ffn_decode.cu \
+  -o build/ptx/gemma4_ffn_decode_vectorized.ptx
+nvcc -std=c++17 -O3 -arch=sm_86 -Isrc -Xptxas -v -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/gemma4_ffn_decode_vectorized.o
+
+rg -n "ld\\.global|st\\.global|\\.v4\\.u32" \
+  build/ptx/gemma4_ffn_decode_vectorized.ptx
+cuobjdump --dump-sass build/ptx/gemma4_ffn_decode_vectorized.o | rg -n "LDG|STG"
+
+./build/experiments/gemma4_ffn_cudnn_bench 20 5 2 1
+```
+
+PTX/compiler result:
+
+- PTX contains vector BF16 global loads/stores:
+  - `ld.global.nc.v4.s32`
+  - `ld.global.cs.v4.s32`
+  - `st.global.v4.u32`
+- PTX contains vector FP32 scratch accumulator loads/stores:
+  - `ld.global.v4.f32`
+  - `st.global.v4.u32`
+- The only scalar global operations left in the searched PTX are the reduction lock
+  acquire/add operations.
+- SASS contains `LDG.E.128` and `STG.E.128` for the vectorized global memory paths.
+- `ptxas`: `59` registers/thread, `0` stack bytes, `0` spill stores, `0` spill loads,
+  `11016` bytes shared memory, `1` barrier.
+
+Correctness:
+
+```text
+ffn decode tests passed
+```
+
+Benchmark:
+
+```text
+path,best_ms,avg_ms,graph_best_ms,graph_avg_ms,rough_gib_s,workspace_bytes,max_abs_vs_split
+geglu,9.746442,10.325469,0.662168,0.662480,44.193,0,
+down,0.658119,0.702142,0.337484,0.337537,327.269,4194560,
+geglu_plus_down,9.645019,10.781860,0.999732,1.000199,66.989,4194560,
+custom_fused_decode,1.142081,1.144371,1.138668,1.139212,565.762,0,
+custom_scratch_clear,0.006851,0.007631,0.001075,0.001096,0.000,0,
+overhead_factored_metric,value
+cudnn_split_device_ms,0.999732
+custom_device_ms,1.138668
+custom_scratch_clear_device_ms,0.001075
+custom_minus_clear_device_ms,1.137594
+custom_vs_cudnn_split_speedup,0.877983
+custom_minus_clear_vs_cudnn_split_speedup,0.878813
+```
+
+Conclusion:
+
+- The FFN decode kernel now emits 128-bit global memory ops for the meaningful BF16
+  and FP32 scratch traffic.
+- This is only a small speedup versus the prior custom graph timing (`~1.156 ms` ->
+  `~1.139 ms`). The small delta is plausible because the scalar version's adjacent
+  per-thread BF16 accesses were already warp-coalesced into the same 32-byte global
+  memory segments; vectorization reduced instruction count, not the total bytes or
+  memory transaction footprint.
+- The kernel is still slower than the cuDNN split graph replay baseline. The next wins
+  still need better work decomposition or tensor-core use.
+
 ## 2026-05-22 - cuDNN Frontend FFN decode graph probe
 
 Runtime files:
