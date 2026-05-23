@@ -1,5 +1,6 @@
 #include "gemma4_ffn_decode.cuh"
 #include "gemma4_cuda_utils.cuh"
+#include "gemma4_matmul_device.cuh"
 
 #include <algorithm>
 
@@ -39,9 +40,10 @@ using FfnFloatPack = Packed128<float>;
 __device__ inline int shared_x_chunk_index(int chunk) {
   if constexpr (kSwizzleX) {
     constexpr int kSwizzleChunks = 8;  // 8 x 128-bit chunks = one 128-byte row.
-    const int col = chunk & (kSwizzleChunks - 1);
-    const int row = (chunk / kSwizzleChunks) & (kSwizzleChunks - 1);
-    return (chunk & ~(kSwizzleChunks - 1)) | (col ^ row);
+    const unsigned u = static_cast<unsigned>(chunk);
+    const unsigned col = u & (kSwizzleChunks - 1);
+    const unsigned row = (u >> 3) & (kSwizzleChunks - 1);
+    return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
   }
   return chunk;
 }
@@ -151,29 +153,6 @@ __device__ inline float block_reduce_sum(float value,
   return value;
 }
 
-__device__ inline void block_reduce_pair(float &a,
-                                         float &b,
-                                         float *__restrict__ a_warp_sums,
-                                         float *__restrict__ b_warp_sums) {
-  const int lane = threadIdx.x & (WARP_SIZE - 1);
-  const int warp = threadIdx.x / WARP_SIZE;
-
-  a = warp_reduce_sum(a);
-  b = warp_reduce_sum(b);
-  if (lane == 0) {
-    a_warp_sums[warp] = a;
-    b_warp_sums[warp] = b;
-  }
-  __syncthreads();
-
-  a = threadIdx.x < kFfnWarps ? a_warp_sums[lane] : 0.0f;
-  b = threadIdx.x < kFfnWarps ? b_warp_sums[lane] : 0.0f;
-  if (warp == 0) {
-    a = warp_reduce_sum(a);
-    b = warp_reduce_sum(b);
-  }
-}
-
 __device__ inline void wait_for_reduce_turn(const int *__restrict__ lock,
                                             int turn) {
   if (threadIdx.x == 0) {
@@ -219,7 +198,8 @@ gemma4_ffn_decode_fused_bf16_kernel(
     Gemma4FfnDecodeScratch *__restrict__ scratch,
     float eps) {
   __shared__ FfnBf16Pack s_x[kHiddenPacks];
-  __shared__ float s_reduce_warp_sums[2][kFfnWarps];
+  __shared__ float s_matmul_warp_sums[2][kActTile][kFfnWarps];
+  __shared__ float s_rms_warp_sums[kFfnWarps];
   __shared__ float s_act[kActTile];
   __shared__ float s_scale;
 
@@ -240,36 +220,21 @@ gemma4_ffn_decode_fused_bf16_kernel(
        local_col += kActTile) {
     float gate[kActTile] = {};
     float up[kActTile] = {};
+    const int gate_col0 = intermediate_begin + local_col;
+    const int up_col0 = GEMMA4_INTERMEDIATE_SIZE + gate_col0;
 
-    for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
-      const int offset = pack * kBf16Packed128Elements;
-      const FfnBf16Pack x_pack = s_x[shared_x_chunk_index(pack)];
+    gemma4_matmul_device::dot_cols_pair_shared_x_reduce<
+        GEMMA4_HIDDEN_SIZE, kActTile, kFfnThreads, (kSwizzleX != 0)>(
+        s_x, w_gate_up_col_major, w_gate_up_col_major, gate_col0, up_col0,
+        threadIdx.x, s_matmul_warp_sums[0], s_matmul_warp_sums[1], gate, up);
+
+    if (threadIdx.x == 0) {
 #pragma unroll
       for (int t = 0; t < kActTile; ++t) {
-        const int intermediate_col = intermediate_begin + local_col + t;
-        const floatX *gate_col =
-            w_gate_up_col_major +
-            static_cast<int64_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE;
-        const floatX *up_col =
-            w_gate_up_col_major +
-            static_cast<int64_t>(GEMMA4_INTERMEDIATE_SIZE + intermediate_col) *
-                GEMMA4_HIDDEN_SIZE;
-        const FfnBf16Pack gate_pack = load128cs(gate_col + offset);
-        const FfnBf16Pack up_pack = load128cs(up_col + offset);
-        gemma4_bf16_pack_accumulate_dot(x_pack, gate_pack, gate[t]);
-        gemma4_bf16_pack_accumulate_dot(x_pack, up_pack, up[t]);
-      }
-    }
-
-#pragma unroll
-    for (int t = 0; t < kActTile; ++t) {
-      block_reduce_pair(gate[t], up[t], s_reduce_warp_sums[0],
-                        s_reduce_warp_sums[1]);
-      if (threadIdx.x == 0) {
         s_act[t] = gate[t] * gelu_tanh(up[t]);
       }
-      __syncthreads();
     }
+    __syncthreads();
 
     if (owns_hidden_pack) {
 #pragma unroll
@@ -311,7 +276,7 @@ gemma4_ffn_decode_fused_bf16_kernel(
     store128(residual_out + hidden_col, residual_out_pack);
   }
 
-  const float total = block_reduce_sum(sum_sq, s_reduce_warp_sums[0]);
+  const float total = block_reduce_sum(sum_sq, s_rms_warp_sums);
   if (threadIdx.x == 0) {
     s_scale =
         rsqrtf(total / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);

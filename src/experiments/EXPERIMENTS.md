@@ -3,6 +3,147 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-05-23 - Device-call matmul wrapper and FFN decode integration
+
+Runtime files:
+
+- `src/gemma4_matmul_device.cuh`
+- `src/experiments/gemma4_matmul_device_kernels.cu`
+- `src/experiments/gemma4_matmul_device_kernels.cuh`
+- `src/experiments/gemma4_decode_bench.cu`
+- `src/gemma4_ffn_decode.cu`
+- `Makefile`
+
+Change:
+
+- Copied the decode GEMV launch surface into an experiment source and moved the
+  kernel body into reusable `__device__` helpers.
+- Added a deliberately thin global wrapper around the device helper so it can be
+  compared directly with the original `src/gemma4_matmul_kernels.cu` kernels.
+- Added decode-bench timing and numerical checks for `device_wrapped` and
+  `device_wrapped_swizzle16`.
+- Wired the device matmul dot/reduce helper into the fused FFN decode gate/up
+  path. The FFN kernel still keeps the existing fused dataflow: shared-X load,
+  gate/up dot, GeGLU, down-row accumulation, residual add, and RMSNorm.
+
+Correctness:
+
+```bash
+make decode-bench test-ffn-decode
+```
+
+```text
+ffn decode tests passed
+```
+
+Device-wrapper matmul timing:
+
+```bash
+GEMMA4_DECODE_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_decode_bench ffn_gate_up 100 20 3
+GEMMA4_DECODE_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_decode_bench ffn_down 100 20 3
+```
+
+GPU/tooling:
+
+- GPU: NVIDIA RTX A6000
+- Driver: 580.126.16
+- CUDA/NVCC: CUDA 12.9, `nvcc` 12.9.86
+- CUDA target: `sm_86`
+- cuDNN version in FFN harness: `92200`
+- Warmup/timing: 20 warmup iterations, 100 timed iterations, 3 trials.
+- Timing uses CUDA events through the existing benchmark helper.
+- Clock policy: not locked.
+- Cache policy: normal benchmark warm-cache behavior.
+
+| Op | Original best ms | Device wrapper best ms | Device/original | Max abs diff |
+| --- | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.650478 | 0.650972 | 0.999241x | 0 |
+| `ffn_down` | 0.327827 | 0.327563 | 1.000807x | 0 |
+
+Swizzled variant:
+
+| Op | Original swizzle16 best ms | Device wrapper swizzle16 best ms | Device/original | Max abs diff |
+| --- | ---: | ---: | ---: | ---: |
+| `ffn_gate_up` | 0.650752 | 0.650858 | 0.999838x | 0 |
+| `ffn_down` | 0.327701 | 0.327575 | 1.000383x | 0 |
+
+ptxas resource check:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_matmul_kernels.cu \
+  -o /tmp/gemma4_device_matmul_stats/original_matmul.o
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/experiments/gemma4_matmul_device_kernels.cu \
+  -o /tmp/gemma4_device_matmul_stats/device_wrapped_matmul.o
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o /tmp/gemma4_device_matmul_stats/ffn_decode_device_matmul.o
+```
+
+For the original and device-wrapper matmul kernels, ptxas reported matching
+resource usage for the FFN shapes:
+
+| Kernel shape | Original regs | Wrapper regs | Shared memory | Spills |
+| --- | ---: | ---: | ---: | --- |
+| `K=5376,N=43008,identity` | 58 | 58 | 512 B | none |
+| `K=5376,N=43008,swizzle16` | 60 | 60 | 512 B | none |
+| `K=21504,N=5376,identity` | 58 | 58 | 1024 B | none |
+| `K=21504,N=5376,swizzle16` | 60 | 60 | 1024 B | none |
+
+FFN decode after integration:
+
+```bash
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 100 20 3
+```
+
+Baseline captured before the FFN edit:
+
+```text
+cudnn_split_device_ms,1.000036
+custom_device_ms,1.108929
+custom_scratch_clear_device_ms,0.001090
+custom_minus_clear_device_ms,1.107840
+custom_vs_cudnn_split_speedup,0.901803
+custom_minus_clear_vs_cudnn_split_speedup,0.902690
+```
+
+After using the device matmul helper inside FFN decode:
+
+```text
+cudnn_split_device_ms,1.000140
+custom_device_ms,1.106343
+custom_scratch_clear_device_ms,0.001086
+custom_minus_clear_device_ms,1.105257
+custom_vs_cudnn_split_speedup,0.904006
+custom_minus_clear_vs_cudnn_split_speedup,0.904894
+```
+
+FFN kernel resource stats after the change:
+
+```text
+Used 48 registers, used 1 barriers, 11404 bytes smem
+0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+```
+
+Conclusion:
+
+- The copied device-call matmul wrapper is effectively performance-neutral
+  versus the original global matmul kernel for the two FFN GEMV shapes and is
+  numerically identical.
+- ptxas stats match the original matmul kernels for those shapes.
+- Using the device matmul helper in the fused FFN decode gate/up path preserved
+  correctness and slightly improved graph-timed custom FFN decode from
+  `1.108929 ms` to `1.106343 ms`.
+- The FFN change reduced register allocation from the previous tile-2 swizzled
+  path's recorded `50` registers to `48`, with shared memory increasing from
+  about `11020 B` to `11404 B`, and no spills.
+- Keep this integrated path. The helper gives a reusable matmul-shaped
+  dot/reduce primitive without changing the fused FFN dataflow.
+
 ## 2026-05-23 - FFN decode activation-tile sweep
 
 Runtime files:
@@ -15,6 +156,11 @@ Change:
 
 - Added `GEMMA4_FFN_DECODE_ACT_TILE` as a compile-time FFN decode hyperparameter.
 - Default is now `2`.
+- Added `GEMMA4_FFN_DECODE_SWIZZLE_X` for the FFN decode shared activation
+  cache. Default is now enabled.
+- The shared activation swizzle XORs 128-bit chunk indices, not element indices:
+  one chunk is one `Bf16Packed128` / 16-byte lane, equivalent in size to
+  `4 x float`.
 - The tiled path is first-class in the main loop: each CTA computes `kActTile`
   gate/up scalar pairs, reduces them, stores `s_act[kActTile]`, then streams the
   matching down rows before advancing.
@@ -44,6 +190,7 @@ Resource sweep:
 ```bash
 for tile in 1 2 4 8 16; do
   nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+    -DGEMMA4_FFN_DECODE_SWIZZLE_X=0 \
     -DGEMMA4_FFN_DECODE_ACT_TILE=${tile} \
     -c src/gemma4_ffn_decode.cu -o /tmp/gemma4_ffn_decode_tile${tile}.o
 done
@@ -56,6 +203,70 @@ done
 | 4 | 62 | 11028 B | 0 stack, 0 spills |
 | 8 | 62 | 11044 B | 16 B stack, 64 B spill stores, 64 B spill loads |
 | 16 | 64 | 11076 B | 88 B stack, 188 B spill stores, 212 B spill loads |
+
+Chunk-swizzled shared activation resource sweep:
+
+```bash
+for swiz in 0 1; do
+  for tile in 1 2 4 8; do
+    nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+      -DGEMMA4_FFN_DECODE_SWIZZLE_X=${swiz} \
+      -DGEMMA4_FFN_DECODE_ACT_TILE=${tile} \
+      -c src/gemma4_ffn_decode.cu -o /tmp/gemma4_ffn_decode_swiz${swiz}_tile${tile}.o
+  done
+done
+```
+
+| Swizzle | Tile | Registers | Shared memory | Stack/spills |
+| ---: | ---: | ---: | ---: | --- |
+| 0 | 1 | 59 | 11016 B | 0 stack, 0 spills |
+| 0 | 2 | 59 | 11020 B | 0 stack, 0 spills |
+| 0 | 4 | 62 | 11028 B | 0 stack, 0 spills |
+| 0 | 8 | 62 | 11044 B | 16 B stack, 64 B spill stores, 64 B spill loads |
+| 1 | 1 | 51 | 11016 B | 0 stack, 0 spills |
+| 1 | 2 | 50 | 11020 B | 0 stack, 0 spills |
+| 1 | 4 | 62 | 11028 B | 0 stack, 0 spills |
+| 1 | 8 | 62 | 11044 B | 16 B stack, 64 B spill stores, 64 B spill loads |
+
+PTX/SASS dump for the tile-2 swizzle comparison:
+
+```bash
+mkdir -p build/ptx
+for swiz in 0 1; do
+  nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
+    -DGEMMA4_FFN_DECODE_SWIZZLE_X=${swiz} \
+    -DGEMMA4_FFN_DECODE_ACT_TILE=2 \
+    -ptx src/gemma4_ffn_decode.cu \
+    -o build/ptx/gemma4_ffn_decode_swiz${swiz}_tile2.ptx
+  nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -lineinfo -Isrc \
+    -DGEMMA4_FFN_DECODE_SWIZZLE_X=${swiz} \
+    -DGEMMA4_FFN_DECODE_ACT_TILE=2 \
+    -cubin src/gemma4_ffn_decode.cu \
+    -o /tmp/gemma4_ffn_decode_swiz${swiz}_tile2.cubin
+  cuobjdump --dump-sass /tmp/gemma4_ffn_decode_swiz${swiz}_tile2.cubin \
+    > build/ptx/gemma4_ffn_decode_swiz${swiz}_tile2.sass
+done
+```
+
+PTX/SASS notes:
+
+- PTX virtual register declarations are not the ptxas allocation result. Swizzle-off
+  emitted fewer virtual `.b32` PTX registers (`%r<346>`) than swizzle-on before the
+  unsigned cleanup (`%r<381>`), but ptxas still allocated more physical registers for
+  swizzle-off.
+- The physical SASS peak matched the ptxas report: swizzle-off used up to `R56`
+  and reported 59 registers; swizzle-on used up to `R47` and reported 50 registers.
+- The drop comes from the `s_x` load/store prologue. With identity indexing, ptxas
+  recognizes a simple linear shared-memory stream and aggressively unrolls/schedules
+  many 128-bit global loads and shared stores at once. That exposes many live address
+  and 128-bit payload registers.
+- With XOR chunk swizzling, the shared address is no longer a simple linear induction
+  variable. ptxas keeps the prologue in a much smaller loop shape, so fewer load
+  payloads and store addresses are simultaneously live. The register drop is mostly
+  a scheduling/strength-reduction side effect, not proof that XOR itself is cheaper.
+- I changed the swizzle helper to use unsigned chunk arithmetic. Since `pack` is
+  nonnegative, this removes unnecessary signed-division correction from the PTX
+  swizzle-index calculation while preserving the same chunk mapping.
 
 Timing command:
 
@@ -103,6 +314,36 @@ custom_vs_cudnn_split_speedup,0.902916
 custom_minus_clear_vs_cudnn_split_speedup,0.903795
 ```
 
+Chunk-swizzled shared activation timing, short sweep:
+
+iters=50,warmup_iters=10,trials=2
+
+| Swizzle | Tile | custom graph best ms | cuDNN split graph best ms | custom/cuDNN speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 1.165145 | 0.999914 | 0.858188x |
+| 1 | 2 | 1.103517 | 0.999734 | 0.905953x |
+| 1 | 4 | 1.103430 | 0.999462 | 0.905778x |
+| 1 | 8 | 1.199932 | 1.000461 | 0.833765x |
+| 0 | 2 | 1.107462 | 1.000806 | 0.903694x |
+| 1 | 2 | 1.107693 | 1.000389 | 0.903129x |
+
+Tile-2 versus tile-4 longer rerun with chunk swizzle enabled:
+
+iters=100,warmup_iters=20,trials=3
+
+| Tile | custom graph best ms | cuDNN split graph best ms | custom/cuDNN speedup |
+| ---: | ---: | ---: | ---: |
+| 2 | 1.107858 | 1.000124 | 0.902754x |
+| 4 | 1.109708 | 1.000656 | 0.901729x |
+
+Unsigned swizzle-index cleanup timing, short sanity run:
+
+iters=50,warmup_iters=10,trials=2
+
+| Variant | custom graph best ms | cuDNN split graph best ms | custom/cuDNN speedup |
+| --- | ---: | ---: | ---: |
+| unsigned chunk swizzle, tile 2 | 1.108769 | 0.999982 | 0.901885x |
+
 Conclusion:
 
 - Activation tiling helps. Tile `2` reduces custom graph time from `1.137898 ms`
@@ -111,6 +352,13 @@ Conclusion:
   62.
 - Tile `8` spills and regresses hard. Do not use spilling tiles without a deeper
   schedule rewrite.
+- The FFN decode path now uses chunk-granularity shared activation swizzling by
+  default. It is not a meaningful throughput win on this benchmark, but it is
+  correct, cheap at tile `2`, and reduced ptxas register allocation for the default
+  path from 59 to 50 registers.
+- The register drop is a ptxas scheduling artifact in the shared activation preload,
+  not a direct bank-conflict win. The unsigned index cleanup is the only code change
+  justified by the PTX dump itself.
 - Manual race audit found that the global scratch handoff needed every writer thread
   to execute a device fence before thread 0 advances the lock, and every reader thread
   to perform an acquire load before reading `scratch->accum`. That fix preserves
