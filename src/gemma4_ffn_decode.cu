@@ -3,6 +3,14 @@
 
 #include <algorithm>
 
+#ifndef GEMMA4_FFN_DECODE_ACT_TILE
+#define GEMMA4_FFN_DECODE_ACT_TILE 2
+#endif
+
+#ifndef GEMMA4_FFN_DECODE_SWIZZLE_X
+#define GEMMA4_FFN_DECODE_SWIZZLE_X 1
+#endif
+
 namespace {
 
 constexpr int kFfnThreads = 1024;
@@ -11,18 +19,31 @@ constexpr int kIntermediateTile = 256;
 constexpr int kIntermediateTiles =
     GEMMA4_INTERMEDIATE_SIZE / kIntermediateTile;
 constexpr int kHiddenPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+constexpr int kActTile = GEMMA4_FFN_DECODE_ACT_TILE;
+constexpr int kSwizzleX = GEMMA4_FFN_DECODE_SWIZZLE_X;
 static_assert((GEMMA4_INTERMEDIATE_SIZE % kIntermediateTile) == 0,
               "FFN intermediate width must divide the decode tile width");
 static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
               "FFN hidden width must divide the 128-bit bf16 pack width");
 static_assert((kFfnThreads % WARP_SIZE) == 0,
               "FFN decode thread count must be a whole number of warps");
+static_assert(kActTile >= 1, "FFN activation tile must be positive");
+static_assert((kIntermediateTile % kActTile) == 0,
+              "FFN activation tile must divide the CTA intermediate tile");
+static_assert(kSwizzleX == 0 || kSwizzleX == 1,
+              "FFN x shared-memory swizzle must be 0 or 1");
 
 using FfnBf16Pack = Bf16Packed128;
 using FfnFloatPack = Packed128<float>;
 
-__device__ inline float bf16_to_float(const floatX value) {
-  return __bfloat162float(value);
+__device__ inline int shared_x_chunk_index(int chunk) {
+  if constexpr (kSwizzleX) {
+    constexpr int kSwizzleChunks = 8;  // 8 x 128-bit chunks = one 128-byte row.
+    const int col = chunk & (kSwizzleChunks - 1);
+    const int row = (chunk / kSwizzleChunks) & (kSwizzleChunks - 1);
+    return (chunk & ~(kSwizzleChunks - 1)) | (col ^ row);
+  }
+  return chunk;
 }
 
 __device__ inline float gelu_tanh(float x) {
@@ -164,13 +185,22 @@ __device__ inline void wait_for_reduce_turn(const int *__restrict__ lock,
     } while (state != turn);
   }
   __syncthreads();
+
+  int state = -1;
+  do {
+    asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
+                 : "=r"(state)
+                 : "l"(lock));
+  } while (state != turn);
+  __syncthreads();
 }
 
 __device__ inline void release_reduce_turn(int *__restrict__ lock) {
   __syncthreads();
+  __threadfence();
+  __syncthreads();
   if (threadIdx.x == 0) {
     constexpr int one = 1;
-    asm volatile("fence.acq_rel.gpu;\n");
     asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n"
                  :
                  : "l"(lock), "r"(one));
@@ -190,11 +220,12 @@ gemma4_ffn_decode_fused_bf16_kernel(
     float eps) {
   __shared__ FfnBf16Pack s_x[kHiddenPacks];
   __shared__ float s_reduce_warp_sums[2][kFfnWarps];
-  __shared__ float s_act;
+  __shared__ float s_act[kActTile];
   __shared__ float s_scale;
 
   for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
-    s_x[pack] = load128g(x + pack * kBf16Packed128Elements);
+    s_x[shared_x_chunk_index(pack)] =
+        load128g(x + pack * kBf16Packed128Elements);
   }
   __syncthreads();
 
@@ -205,41 +236,51 @@ gemma4_ffn_decode_fused_bf16_kernel(
   const bool owns_hidden_pack = hidden_pack < kHiddenPacks;
   const int hidden_col = hidden_pack * kBf16Packed128Elements;
 
-  for (int local_col = 0; local_col < kIntermediateTile; ++local_col) {
-    const int intermediate_col = intermediate_begin + local_col;
-    const floatX *gate_col =
-        w_gate_up_col_major +
-        static_cast<int64_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE;
-    const floatX *up_col =
-        w_gate_up_col_major +
-        static_cast<int64_t>(GEMMA4_INTERMEDIATE_SIZE + intermediate_col) *
-            GEMMA4_HIDDEN_SIZE;
+  for (int local_col = 0; local_col < kIntermediateTile;
+       local_col += kActTile) {
+    float gate[kActTile] = {};
+    float up[kActTile] = {};
 
-    float gate = 0.0f;
-    float up = 0.0f;
     for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
       const int offset = pack * kBf16Packed128Elements;
-      const FfnBf16Pack x_pack = s_x[pack];
-      const FfnBf16Pack gate_pack = load128cs(gate_col + offset);
-      const FfnBf16Pack up_pack = load128cs(up_col + offset);
-      gemma4_bf16_pack_accumulate_dot(x_pack, gate_pack, gate);
-      gemma4_bf16_pack_accumulate_dot(x_pack, up_pack, up);
+      const FfnBf16Pack x_pack = s_x[shared_x_chunk_index(pack)];
+#pragma unroll
+      for (int t = 0; t < kActTile; ++t) {
+        const int intermediate_col = intermediate_begin + local_col + t;
+        const floatX *gate_col =
+            w_gate_up_col_major +
+            static_cast<int64_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE;
+        const floatX *up_col =
+            w_gate_up_col_major +
+            static_cast<int64_t>(GEMMA4_INTERMEDIATE_SIZE + intermediate_col) *
+                GEMMA4_HIDDEN_SIZE;
+        const FfnBf16Pack gate_pack = load128cs(gate_col + offset);
+        const FfnBf16Pack up_pack = load128cs(up_col + offset);
+        gemma4_bf16_pack_accumulate_dot(x_pack, gate_pack, gate[t]);
+        gemma4_bf16_pack_accumulate_dot(x_pack, up_pack, up[t]);
+      }
     }
 
-    block_reduce_pair(gate, up, s_reduce_warp_sums[0],
-                      s_reduce_warp_sums[1]);
-    if (threadIdx.x == 0) {
-      s_act = gate * gelu_tanh(up);
+#pragma unroll
+    for (int t = 0; t < kActTile; ++t) {
+      block_reduce_pair(gate[t], up[t], s_reduce_warp_sums[0],
+                        s_reduce_warp_sums[1]);
+      if (threadIdx.x == 0) {
+        s_act[t] = gate[t] * gelu_tanh(up[t]);
+      }
+      __syncthreads();
     }
-    __syncthreads();
-    const float act = s_act;
-    const floatX *down_row =
-        w_down_row_major +
-        static_cast<int64_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE;
 
     if (owns_hidden_pack) {
-      const FfnBf16Pack down_pack = load128cs(down_row + hidden_col);
-      accumulate_scaled_pack(act, down_pack, partial);
+#pragma unroll
+      for (int t = 0; t < kActTile; ++t) {
+        const int intermediate_col = intermediate_begin + local_col + t;
+        const floatX *down_row =
+            w_down_row_major +
+            static_cast<int64_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE;
+        const FfnBf16Pack down_pack = load128cs(down_row + hidden_col);
+        accumulate_scaled_pack(s_act[t], down_pack, partial);
+      }
     }
     __syncthreads();
   }
