@@ -7070,3 +7070,177 @@ Conclusion:
 - This satisfies parity for the Python API path used by these shapes. It is not
   a full-package validation of every upstream FlashAttention feature because the
   installed package was intentionally built in Gemma-only forward mode.
+## 2026-05-23 - FFN decode register prefetch vs 3-stage async weight staging
+
+Goal:
+
+- Test two decode-FFN GEMV scheduling variants for the gate/up projection:
+  direct register prefetch and shared-memory async staging.
+- Use the existing cuDNN split FFN benchmark harness for correctness and timing.
+- Do not keep multiple source-level selection flags for the variants.
+
+CUDA guide context:
+
+- The CUDA guide describes pipelines as a FIFO mechanism for sequencing
+  asynchronous copies and supporting double/multi-buffered producer-consumer
+  patterns (CUDA Programming Guide, p.129).
+- The LDGSTS async-copy path is specifically for global-to-shared copies on
+  CC 8.0+ and can keep global-memory loads in flight while reducing register
+  pressure (CUDA Programming Guide, p.300 and p.302).
+- The guide's multi-stage prefetch example blocks on the current batch,
+  computes it, and schedules a future batch (CUDA Programming Guide, p.312).
+
+Common benchmark setup:
+
+```bash
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/<binary> 100 20 3
+```
+
+- GPU: NVIDIA RTX A6000.
+- Shape: `tokens=1`, `hidden=5376`, `intermediate=21504`.
+- Iterations: `100` timed, `20` warmup, `3` trials.
+- cuDNN frontend version: `92200`.
+- Full fused cuDNN FFN graph had no valid execution plan, so the comparison is
+  against the benchmark's cuDNN split path.
+- All custom variants reported `max_abs_vs_split=0`.
+
+### Variant 1: direct register prefetch
+
+Implementation tested:
+
+- Kept `ACT_TILE=2`.
+- Removed the shared-memory weight pit stop for gate/up.
+- Each owning thread loaded current gate/up `Bf16Packed128` values directly
+  from global memory into registers.
+- Issued the next tile's vectorized global loads before consuming the current
+  tile's register values.
+- Swapped register sets after the current tile's math/down accumulation.
+
+Build and run:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
+  -Isrc -I/tmp/cudnn-frontend/include \
+  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/gemma4_ffn_decode.cu \
+  -lcudnn -lnvrtc -lcuda \
+  -o build/experiments/gemma4_ffn_cudnn_bench_regpipe
+
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench_regpipe 100 20 3
+```
+
+Compiler resource result:
+
+- FFN kernel: `64` registers/thread.
+- Spills: `0` spill stores, `0` spill loads.
+- Static shared memory: `11404` bytes.
+- Barriers: `1`.
+
+Timing:
+
+- `custom_device_ms`: `1.106724`
+- `custom_scratch_clear_device_ms`: `0.001092`
+- `custom_minus_clear_device_ms`: `1.105632`
+- `cudnn_split_device_ms`: `1.000129`
+- `custom_minus_clear_vs_cudnn_split_speedup`: `0.904577`
+- `max_abs_vs_split`: `0`
+
+### Variant 2: 3-stage shared async staging
+
+Implementation tested:
+
+- Used one active implementation, not an extra runtime flag.
+- Prologue issued async global-to-shared copies for tile `0` and tile `1`.
+- Main loop waited for the current tile, issued async copies for tile `k+2`
+  into the next rotating shared-memory stage, then computed tile `k`.
+- Used `__pipeline_memcpy_async`, `__pipeline_commit`, and
+  `__pipeline_wait_prior`.
+- Used `ACT_TILE=1` for this run. With `ACT_TILE=2`, the required dynamic
+  shared-memory staging size is
+  `3 * 2 * 2 * 672 * 16 = 129024` bytes before static shared memory, which is
+  too large for this target's per-block shared-memory budget.
+
+Build and run:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
+  -Isrc -I/tmp/cudnn-frontend/include \
+  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/gemma4_ffn_decode.cu \
+  -lcudnn -lnvrtc -lcuda \
+  -o build/experiments/gemma4_ffn_cudnn_bench_async3
+
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench_async3 100 20 3
+```
+
+Compiler resource result:
+
+- FFN kernel: `50` registers/thread.
+- Spills: `0` spill stores, `0` spill loads.
+- Static shared memory: `11152` bytes.
+- Dynamic shared-memory weight staging: `64512` bytes.
+- Barriers: `1`.
+
+Timing:
+
+- `custom_device_ms`: `1.116366`
+- `custom_scratch_clear_device_ms`: `0.001102`
+- `custom_minus_clear_device_ms`: `1.115264`
+- `cudnn_split_device_ms`: `1.000023`
+- `custom_minus_clear_vs_cudnn_split_speedup`: `0.896669`
+- `max_abs_vs_split`: `0`
+
+### Restored final source path: shared-X paired reducer
+
+After testing both requested variants, the source was restored to the previously
+fastest measured approach:
+
+- `ACT_TILE=2`.
+- Load `x` once into shared memory.
+- Use the paired shared-X reducer for gate/up.
+- Do not stage weights through dynamic shared memory.
+
+Build and run:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
+  -Isrc -I/tmp/cudnn-frontend/include \
+  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/gemma4_ffn_decode.cu \
+  -lcudnn -lnvrtc -lcuda \
+  -o build/experiments/gemma4_ffn_cudnn_bench_sharedx
+
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench_sharedx 100 20 3
+```
+
+Compiler resource result:
+
+- FFN kernel: `48` registers/thread.
+- Spills: `0` spill stores, `0` spill loads.
+- Static shared memory: `11404` bytes.
+- Barriers: `1`.
+
+Timing:
+
+- `custom_device_ms`: `1.106684`
+- `custom_scratch_clear_device_ms`: `0.001081`
+- `custom_minus_clear_device_ms`: `1.105603`
+- `cudnn_split_device_ms`: `1.001380`
+- `custom_minus_clear_vs_cudnn_split_speedup`: `0.905732`
+- `max_abs_vs_split`: `0`
+
+Conclusion:
+
+- Direct register prefetch and restored shared-X paired reduction are effectively
+  tied in this run: `1.105632 ms` vs `1.105603 ms` minus scratch clear.
+- The 3-stage shared async staging path was slower at `1.115264 ms` minus
+  scratch clear, even though it compiled without spills. It also required
+  dropping to `ACT_TILE=1` to fit shared memory, which increased loop/reduction
+  overhead.
+- For `tokens=1` decode FFN GEMV, staging gate/up weights through shared memory
+  does not currently pay off. The best source state after this experiment is
+  the shared-X paired reducer with direct coalesced weight reads.
