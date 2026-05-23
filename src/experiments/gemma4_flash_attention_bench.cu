@@ -12,22 +12,7 @@
 
 #include "gemma4.h"
 #include "gemma4_bench_utils.cuh"
-
-extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
-    __nv_bfloat16 *__restrict__ d_out,
-    float *__restrict__ d_softmax_lse,
-    const __nv_bfloat16 *__restrict__ d_q,
-    const __nv_bfloat16 *__restrict__ d_k,
-    const __nv_bfloat16 *__restrict__ d_v,
-    int batch_size,
-    int seqlen_q,
-    int seqlen_k,
-    int window_left,
-    float softmax_scale,
-    cudaStream_t stream);
-
-extern "C" size_t gemma4_flash_attention_sliding_smem_bytes();
-extern "C" int gemma4_flash_attention_sliding_threads_per_block();
+#include "gemma4_flash_attention.cuh"
 
 namespace {
 

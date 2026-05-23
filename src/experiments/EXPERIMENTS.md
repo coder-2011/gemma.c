@@ -3,6 +3,126 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-05-23 - Global FlashAttention option
+
+Runtime files:
+
+- `src/gemma4_flash_attention.cu`
+- `src/gemma4_flash_attention.cuh`
+- `src/experiments/gemma4_flash_attention_bench.cu`
+- `Makefile`
+
+Change:
+
+- Added a Gemma global-attention FA entrypoint:
+  `gemma4_flash_attention_global_fwd_bf16`.
+- The global path uses BF16, `head_dim=512`, `32` query heads, `4` KV heads,
+  and full bottom-right causal masking by setting the internal window to
+  `seqlen_k`.
+- Kept the existing sliding entrypoint unchanged.
+- Added a public CUDA header exposing both sliding and global FA options.
+- Added a reference global wrapper that directly instantiates the upstream FA2
+  kernel template at `head_dim=512`. The installed `flash_attn` package cannot
+  serve as the global baseline because it rejects `head_dim > 256`.
+
+Build:
+
+```bash
+make -B build/gemma4_flash_attention.o flash-attn-lib flash-attn-bench
+```
+
+GPU/tooling:
+
+- GPU: NVIDIA RTX A6000
+- Driver: 580.126.16
+- CUDA/NVCC: CUDA 12.9, `nvcc` 12.9.86
+- CUDA target: `sm_86`
+- Clock policy: not locked.
+
+Audits:
+
+```text
+dep_count 709
+fa2_source_count 0
+cutlass_cute_count 141
+```
+
+Exported symbols include both paths:
+
+```text
+gemma4_flash_attention_sliding_fwd_bf16
+gemma4_flash_attention_global_fwd_bf16
+```
+
+Correctness:
+
+Installed `flash_attn` check:
+
+```text
+RuntimeError FlashAttention forward only supports head dimension at most 256
+```
+
+Python probe against a PyTorch FP32 reference with GQA expansion and
+bottom-right causal masking:
+
+```text
+global threads 64 smem 98304
+global_correctness sq=64 sk=64 max_abs=0.015625 mean_abs=0.000255395
+global_correctness sq=1 sk=1024 max_abs=0.000976562 mean_abs=5.82829e-05
+```
+
+Sliding path still matches the upstream source ref and installed `flash_attn`
+exactly in the same-tensor comparator:
+
+```text
+diff_vs_official_source_ref max_abs=0 mean_abs=0 max_rel=0
+diff_vs_flash_attn max_abs=0 mean_abs=0 max_rel=0
+```
+
+Timing:
+
+Direct upstream FA2 `head_dim=512` reference comparison:
+
+```text
+case sq=64 sk=64
+  diff max_abs=0 mean_abs=0 lse_max_abs=0
+  custom median/min/max ms=0.034511/0.033782/0.057761
+  upstream_direct median/min/max ms=0.032795/0.030715/0.043902
+  custom/ref=1.052323
+
+case sq=1 sk=1024
+  diff max_abs=0 mean_abs=0 lse_max_abs=0
+  custom median/min/max ms=0.207234/0.205562/0.218658
+  upstream_direct median/min/max ms=0.209351/0.209320/0.209530
+  custom/ref=0.989888
+
+case sq=1024 sk=1024
+  diff_max=0 diff_mean=0 lse_max=0
+  custom median/min/max ms=1.610805/1.609355/1.645277
+  upstream_direct median/min/max ms=1.618664/1.614611/1.625269
+  custom/ref=0.995145
+```
+
+```text
+global_decode_timing sk=1024 avg_ms=0.239686
+```
+
+The sliding comparator in this run measured all implementations around
+`0.48 ms` at `seq=1024`, including installed `flash_attn`, whereas an earlier
+run measured all implementations around `0.234 ms`. Since the custom, upstream
+source ref, and installed package moved together, this looks like GPU clock or
+system state rather than a custom-only regression.
+
+Conclusion:
+
+- Global FA is now an explicit runtime option for the future layer runner.
+- Against a direct upstream FA2 `head_dim=512` baseline, the global path is exact
+  on output and effectively performance-parity on decode and larger prefill
+  shapes.
+- This is a correctness-oriented global path, not the final optimized
+  long-context global decode kernel. The `head_dim=512` tile is
+  `BlockM=32, BlockN=32, 2` warps, using `98304` bytes dynamic shared memory.
+
 ## 2026-05-23 - Device-call matmul wrapper and FFN decode integration
 
 Runtime files:
