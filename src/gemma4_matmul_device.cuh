@@ -277,29 +277,33 @@ __device__ inline void dot_cols_pair_shared_x_reduce(
       thread_idx, a_warp_sums, b_warp_sums, a_sums, b_sums);
 }
 
-template <int K, int ColsPerBlock, int Threads, bool SwizzleX>
-__device__ inline void dot_cols_pair_shared_x_reduce_to_smem(
-    const Bf16Packed128 *__restrict__ s_x,
-    const __nv_bfloat16 *__restrict__ w_a_col_major,
-    const __nv_bfloat16 *__restrict__ w_b_col_major,
-    int col0_a,
-    int col0_b,
-    int thread_idx,
-    float (&a_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
-    float (&b_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
-    float *__restrict__ s_a_out,
-    float *__restrict__ s_b_out) {
-  float a_sums[ColsPerBlock] = {};
-  float b_sums[ColsPerBlock] = {};
-  dot_cols_pair_shared_x_reduce<K, ColsPerBlock, Threads, SwizzleX>(
-      s_x, w_a_col_major, w_b_col_major, col0_a, col0_b, thread_idx,
-      a_warp_sums, b_warp_sums, a_sums, b_sums);
+template <int K,
+          int N,
+          int ColsPerBlock,
+          int Threads,
+          int SwizzleTileBlocks,
+          bool StoreOutput = true>
+__device__ inline void decode_gemv_cols_device(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int physical_block_idx,
+    float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&sums)[ColsPerBlock]) {
+  static_assert((N % ColsPerBlock) == 0,
+                "decode GEMV N must be divisible by columns per block");
 
-  if (thread_idx == 0) {
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      s_a_out[col] = a_sums[col];
-      s_b_out[col] = b_sums[col];
+  constexpr int blocks = N / ColsPerBlock;
+  const int logical_block =
+      swizzle_col_block<blocks, SwizzleTileBlocks>(physical_block_idx);
+  const int col0 = logical_block * ColsPerBlock;
+
+  dot_cols_reduce<K, ColsPerBlock, Threads>(
+      x, w_col_major, col0, threadIdx.x, warp_sums, sums);
+
+  if constexpr (StoreOutput) {
+    if (threadIdx.x == 0) {
+      store_cols<ColsPerBlock>(y + col0, sums);
     }
   }
 }
@@ -308,57 +312,18 @@ template <int K,
           int N,
           int ColsPerBlock,
           int Threads,
-          int SwizzleTileBlocks>
+          int SwizzleTileBlocks,
+          bool StoreOutput = true>
 __device__ inline void decode_gemv_cols_device(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major,
     __nv_bfloat16 *__restrict__ y,
     int physical_block_idx,
     float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE]) {
-  static_assert((N % ColsPerBlock) == 0,
-                "decode GEMV N must be divisible by columns per block");
-
-  constexpr int blocks = N / ColsPerBlock;
-  const int logical_block =
-      swizzle_col_block<blocks, SwizzleTileBlocks>(physical_block_idx);
-  const int col0 = logical_block * ColsPerBlock;
-
   float sums[ColsPerBlock] = {};
-  dot_cols_reduce<K, ColsPerBlock, Threads>(
-      x, w_col_major, col0, threadIdx.x, warp_sums, sums);
-
-  if (threadIdx.x == 0) {
-    store_cols<ColsPerBlock>(y + col0, sums);
-  }
-}
-
-template <int K,
-          int N,
-          int ColsPerBlock,
-          int Threads,
-          int SwizzleTileBlocks>
-__device__ inline int decode_gemv_cols_smem_device(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_col_major,
-    __nv_bfloat16 *__restrict__ s_y_tile,
-    int physical_block_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE]) {
-  static_assert((N % ColsPerBlock) == 0,
-                "decode GEMV N must be divisible by columns per block");
-
-  constexpr int blocks = N / ColsPerBlock;
-  const int logical_block =
-      swizzle_col_block<blocks, SwizzleTileBlocks>(physical_block_idx);
-  const int col0 = logical_block * ColsPerBlock;
-
-  float sums[ColsPerBlock] = {};
-  dot_cols_reduce<K, ColsPerBlock, Threads>(
-      x, w_col_major, col0, threadIdx.x, warp_sums, sums);
-
-  if (threadIdx.x == 0) {
-    store_cols<ColsPerBlock>(s_y_tile, sums);
-  }
-  return col0;
+  decode_gemv_cols_device<K, N, ColsPerBlock, Threads, SwizzleTileBlocks,
+                          StoreOutput>(
+      x, w_col_major, y, physical_block_idx, warp_sums, sums);
 }
 
 }  // namespace gemma4_matmul_device

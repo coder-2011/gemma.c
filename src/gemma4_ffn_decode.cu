@@ -31,6 +31,8 @@ static_assert((kFfnThreads % WARP_SIZE) == 0,
 static_assert(kActTile >= 1, "FFN activation tile must be positive");
 static_assert((kIntermediateTile % kActTile) == 0,
               "FFN activation tile must divide the CTA intermediate tile");
+static_assert(kActTile <= WARP_SIZE,
+              "FFN activation tile maps one GeGLU scalar to one warp lane");
 static_assert(kSwizzleX == 0 || kSwizzleX == 1,
               "FFN x shared-memory swizzle must be 0 or 1");
 
@@ -197,17 +199,10 @@ gemma4_ffn_decode_fused_bf16_kernel(
     const floatX *__restrict__ w_down_row_major,
     Gemma4FfnDecodeScratch *__restrict__ scratch,
     float eps) {
-  __shared__ FfnBf16Pack s_x[kHiddenPacks];
   __shared__ float s_matmul_warp_sums[2][kActTile][kFfnWarps];
   __shared__ float s_rms_warp_sums[kFfnWarps];
   __shared__ float s_act[kActTile];
   __shared__ float s_scale;
-
-  for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
-    s_x[shared_x_chunk_index(pack)] =
-        load128g(x + pack * kBf16Packed128Elements);
-  }
-  __syncthreads();
 
   float partial[kBf16Packed128Elements] = {};
   const int intermediate_begin =
@@ -223,15 +218,25 @@ gemma4_ffn_decode_fused_bf16_kernel(
     const int gate_col0 = intermediate_begin + local_col;
     const int up_col0 = GEMMA4_INTERMEDIATE_SIZE + gate_col0;
 
-    gemma4_matmul_device::dot_cols_pair_shared_x_reduce<
-        GEMMA4_HIDDEN_SIZE, kActTile, kFfnThreads, (kSwizzleX != 0)>(
-        s_x, w_gate_up_col_major, w_gate_up_col_major, gate_col0, up_col0,
-        threadIdx.x, s_matmul_warp_sums[0], s_matmul_warp_sums[1], gate, up);
+    gemma4_matmul_device::decode_gemv_cols_device<
+        GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE, kActTile, kFfnThreads, 1,
+        false>(
+        x, w_gate_up_col_major, nullptr, gate_col0 / kActTile,
+        s_matmul_warp_sums[0], gate);
+    gemma4_matmul_device::decode_gemv_cols_device<
+        GEMMA4_HIDDEN_SIZE, GEMMA4_PACKED_FFN_SIZE, kActTile, kFfnThreads, 1,
+        false>(
+        x, w_gate_up_col_major, nullptr, up_col0 / kActTile,
+        s_matmul_warp_sums[1], up);
 
-    if (threadIdx.x == 0) {
+    if (threadIdx.x < WARP_SIZE) {
 #pragma unroll
       for (int t = 0; t < kActTile; ++t) {
-        s_act[t] = gate[t] * gelu_tanh(up[t]);
+        const float gate_t = __shfl_sync(0xffffffffu, gate[t], 0);
+        const float up_t = __shfl_sync(0xffffffffu, up[t], 0);
+        if (threadIdx.x == t) {
+          s_act[t] = gate_t * gelu_tanh(up_t);
+        }
       }
     }
     __syncthreads();
