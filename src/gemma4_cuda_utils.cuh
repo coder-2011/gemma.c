@@ -112,6 +112,12 @@ __device__ inline void store128cs(
   __stcs(reinterpret_cast<int4 *>(address), value.bits());
 }
 
+template <typename ElementType>
+__device__ inline void store128wb(
+    ElementType *address, Packed128<ElementType> value) {
+  __stwb(reinterpret_cast<int4 *>(address), value.bits());
+}
+
 using Bf16Packed128 = Packed128<__nv_bfloat16>;
 static constexpr int kBf16Packed128Elements = Bf16Packed128::size;
 static constexpr int kBf16Packed128Pairs = kBf16Packed128Elements / 2;

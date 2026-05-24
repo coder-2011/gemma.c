@@ -323,7 +323,7 @@ gemma4_ffn_decode_fused_bf16_kernel(
     const FfnBf16Pack gamma_pack = load128g(rms_weight + hidden_col);
     const FfnBf16Pack normed_pack =
         rmsnorm_store_pack(partial, gamma_pack, s_scale);
-    store128(normed_out + hidden_col, normed_pack);
+    store128wb(normed_out + hidden_col, normed_pack);
   }
 }
 
