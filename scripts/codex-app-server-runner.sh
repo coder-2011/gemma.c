@@ -9,11 +9,11 @@ fi
 
 LISTEN_ADDR="${CODEX_APP_SERVER_LISTEN:-ws://0.0.0.0:8765}"
 WS_AUTH_MODE="${CODEX_APP_SERVER_WS_AUTH_MODE:-capability-token}"
-TOKEN_FILE="${CODex_APP_SERVER_TOKEN_FILE:-$HOME/.codex/app-server-control/remote-token}"
-SHARED_SECRET_FILE="${CODex_APP_SERVER_SHARED_SECRET_FILE:-}"
-ISSUER="${CODex_APP_SERVER_WS_ISSUER:-codex-app-server}"
-AUDIENCE="${CODex_APP_SERVER_WS_AUDIENCE:-codex}"
-MAX_CLOCK_SKEW_SECONDS="${CODex_APP_SERVER_WS_MAX_CLOCK_SKEW_SECONDS:-30}"
+TOKEN_FILE="${CODEX_APP_SERVER_TOKEN_FILE:-$HOME/.codex/app-server-control/remote-token}"
+SHARED_SECRET_FILE="${CODEX_APP_SERVER_SHARED_SECRET_FILE:-}"
+ISSUER="${CODEX_APP_SERVER_WS_ISSUER:-codex-app-server}"
+AUDIENCE="${CODEX_APP_SERVER_WS_AUDIENCE:-codex}"
+MAX_CLOCK_SKEW_SECONDS="${CODEX_APP_SERVER_WS_MAX_CLOCK_SKEW_SECONDS:-30}"
 
 if [[ "${WS_AUTH_MODE}" != "capability-token" && "${WS_AUTH_MODE}" != "signed-bearer-token" ]]; then
   echo "Unsupported WS_AUTH_MODE: ${WS_AUTH_MODE}. Use capability-token or signed-bearer-token."
@@ -41,4 +41,4 @@ else
   ARGS+=(--ws-max-clock-skew-seconds "${MAX_CLOCK_SKEW_SECONDS}")
 fi
 
-  exec "${CODEX_BIN}" "${ARGS[@]}"
+exec "${CODEX_BIN}" "${ARGS[@]}"
