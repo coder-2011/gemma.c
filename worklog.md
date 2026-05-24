@@ -38,3 +38,11 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 - I have discovered that the line is much finer between slop and useful software w/ CUDA. You have to really tighten the agency you give agents compared to programming at a higher level. Kinda wasted time due to this. 
 
 -Micro-optimizations on RoPE: Ofc there is not much point to it, bc RoPE is so extremely cheap anyways, but it was fun, so I did it. Added packed 128-bit Q/K loads/stores, compact sin/cos tables, cache hints, one-warp tiling, and verified FP32 FMA consistency.
+
+-Flash attn has been implemented. Matches Flash Attention pretty much perfectly. There's a couple of optimizations I can pull from FA3 and FA4 that are not architecture specific. Mainly:
+- the software emulation of the exponential function
+- conditional online softmax rescaling.
+
+-Fused FFN decode using the custom matmul gemv kernels. implementation was clean, outperforming cuDNN by ~15 percent (factoring out overhead). Agents make alot of silly mistakes still.  I plan on experimenting with different agent harnesses for optimizing kernels. [Kernel Design Agents]([url](https://github.com/mit-han-lab/kernel-design-agents)) seems promising.
+
+-GEMM+epilogue is pretty much what I am doing. the tri dao paper reperameterized it w/ a neat mathematical framework accounting for a whole transformer layer. It is a really impressive feat of engineering to fuse the entire transformer block without touching HBM. my ffn-decode kernel is there rn, but I have to fuse it w/ flash attn.
