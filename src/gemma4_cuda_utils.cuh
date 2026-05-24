@@ -7,6 +7,10 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifndef GEMMA4_WEIGHT_LOAD_POLICY
+#define GEMMA4_WEIGHT_LOAD_POLICY 1
+#endif
+
 static constexpr int WARP_SIZE = 32;
 
 using floatX = __nv_bfloat16;
@@ -64,6 +68,31 @@ template <typename ElementType>
 __device__ inline Packed128<ElementType>
 load128cs(const ElementType *address) {
   return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4 *>(address))};
+}
+
+template <typename ElementType>
+__device__ inline Packed128<ElementType>
+load128cg(const ElementType *address) {
+  int4 bits;
+  asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
+               : "l"(address));
+  return Packed128<ElementType>{bits};
+}
+
+template <typename ElementType>
+__device__ inline Packed128<ElementType>
+load128weight(const ElementType *address) {
+  static_assert(GEMMA4_WEIGHT_LOAD_POLICY >= 0 &&
+                    GEMMA4_WEIGHT_LOAD_POLICY <= 2,
+                "GEMMA4_WEIGHT_LOAD_POLICY must be 0=cs, 1=cg, or 2=ldg");
+  if constexpr (GEMMA4_WEIGHT_LOAD_POLICY == 0) {
+    return load128cs(address);
+  } else if constexpr (GEMMA4_WEIGHT_LOAD_POLICY == 1) {
+    return load128cg(address);
+  } else {
+    return load128g(address);
+  }
 }
 
 template <typename ElementType>

@@ -66,6 +66,29 @@ void fill_random_bf16(__nv_bfloat16 *ptr,
   CUDA_CHECK(cudaGetLastError());
 }
 
+__global__ void flush_cache_kernel(const uint32_t *__restrict__ in,
+                                   uint32_t *__restrict__ out,
+                                   size_t count) {
+  uint32_t acc = 0;
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+       i += size_t(blockDim.x) * gridDim.x) {
+    acc ^= in[i] + uint32_t(i);
+  }
+  if ((blockIdx.x * blockDim.x + threadIdx.x) < gridDim.x * blockDim.x) {
+    out[blockIdx.x * blockDim.x + threadIdx.x] = acc;
+  }
+}
+
+void flush_cache(const uint32_t *in,
+                 uint32_t *out,
+                 size_t count,
+                 cudaStream_t stream) {
+  constexpr int threads = 256;
+  constexpr int blocks = 4096;
+  flush_cache_kernel<<<blocks, threads, 0, stream>>>(in, out, count);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 uint64_t make_seed() {
   if (const char *env = std::getenv("GEMMA4_FFN_CUDNN_BENCH_SEED")) {
     return std::strtoull(env, nullptr, 0);
@@ -106,6 +129,22 @@ class DeviceBuffer {
 double gib_per_second(double bytes, float ms) {
   const double gib = bytes / (1024.0 * 1024.0 * 1024.0);
   return gib / (static_cast<double>(ms) / 1000.0);
+}
+
+template <typename Fn>
+TimingStats time_ms_cold(Fn &&fn,
+                         cudaStream_t stream,
+                         int warmup,
+                         int iters,
+                         int trials,
+                         const uint32_t *flush_in,
+                         uint32_t *flush_out,
+                         size_t flush_count) {
+  auto run_cold = [&]() {
+    flush_cache(flush_in, flush_out, flush_count, stream);
+    fn();
+  };
+  return time_ms(run_cold, stream, warmup, iters, trials);
 }
 
 #if GEMMA4_HAS_CUDNN_FRONTEND
@@ -357,9 +396,12 @@ int main(int argc, char **argv) {
   DeviceBuffer<__nv_bfloat16> d_x(x_elems);
   DeviceBuffer<__nv_bfloat16> d_w_gate(gate_weight_elems);
   DeviceBuffer<__nv_bfloat16> d_w_up(up_weight_elems);
+  DeviceBuffer<__nv_bfloat16> d_w_gate_up_col_major_src(
+      gate_weight_elems + up_weight_elems);
   DeviceBuffer<__nv_bfloat16> d_w_gate_up_col_major(
       gate_weight_elems + up_weight_elems);
   DeviceBuffer<__nv_bfloat16> d_w_down(down_weight_elems);
+  DeviceBuffer<__nv_bfloat16> d_w_down_swizzled(down_weight_elems);
   DeviceBuffer<__nv_bfloat16> d_residual(x_elems);
   DeviceBuffer<__nv_bfloat16> d_rms_weight(kHidden);
   DeviceBuffer<__nv_bfloat16> d_act(act_elems);
@@ -372,11 +414,15 @@ int main(int argc, char **argv) {
   fill_random_bf16(d_x, x_elems, seed ^ 0x1001u, 0.05f, stream);
   fill_random_bf16(d_w_gate, gate_weight_elems, seed ^ 0x2002u, 0.01f, stream);
   fill_random_bf16(d_w_up, up_weight_elems, seed ^ 0x3003u, 0.01f, stream);
-  fill_random_bf16(d_w_gate_up_col_major, gate_weight_elems + up_weight_elems,
-                   seed ^ 0x5005u, 0.01f, stream);
+  fill_random_bf16(d_w_gate_up_col_major_src,
+                   gate_weight_elems + up_weight_elems, seed ^ 0x5005u,
+                   0.01f, stream);
   fill_random_bf16(d_w_down, down_weight_elems, seed ^ 0x4004u, 0.01f, stream);
   fill_random_bf16(d_residual, x_elems, seed ^ 0x6006u, 0.05f, stream);
   fill_random_bf16(d_rms_weight, kHidden, seed ^ 0x7007u, 1.0f, stream);
+  CUDA_CHECK(gemma4_ffn_decode_swizzle_weights_bf16(
+      d_w_gate_up_col_major, d_w_gate_up_col_major_src, d_w_down_swizzled,
+      d_w_down, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
   CUDA_CHECK(gemma4_ffn_decode_configure_scratch_l2(d_custom_scratch, stream));
 
@@ -384,6 +430,17 @@ int main(int argc, char **argv) {
   cudaDeviceProp prop{};
   CUDA_CHECK(cudaGetDevice(&device));
   CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+  const size_t flush_bytes =
+      std::max<size_t>(256ull * 1024ull * 1024ull,
+                       static_cast<size_t>(prop.l2CacheSize) * 4ull);
+  const size_t flush_count = flush_bytes / sizeof(uint32_t);
+  DeviceBuffer<uint32_t> d_flush_in(flush_count);
+  DeviceBuffer<uint32_t> d_flush_out(size_t(4096) * 256);
+  CUDA_CHECK(cudaMemsetAsync(d_flush_in, 0x5a, flush_bytes, stream));
+  CUDA_CHECK(cudaMemsetAsync(d_flush_out, 0, size_t(4096) * 256 *
+                                             sizeof(uint32_t), stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
   const double geglu_bytes =
       double(x_elems) * sizeof(__nv_bfloat16) * 2.0 +
@@ -403,6 +460,7 @@ int main(int argc, char **argv) {
               tokens, kHidden, kIntermediate,
               static_cast<unsigned long long>(seed));
   std::printf("iters=%d,warmup_iters=%d,trials=%d\n", iters, warmup, trials);
+  std::printf("cache_flush_bytes=%zu\n", flush_bytes);
   std::printf("cudnn_frontend=%s\n",
 #if GEMMA4_HAS_CUDNN_FRONTEND
               "compiled"
@@ -435,8 +493,8 @@ int main(int argc, char **argv) {
     auto run_custom = [&]() {
       CUDA_CHECK(gemma4_ffn_decode_fused_bf16(
           d_custom_residual_out, d_custom_normed_out, d_x, d_residual,
-          d_rms_weight, d_w_gate_up_col_major, d_w_down, d_custom_scratch,
-          GEMMA4_RMS_NORM_EPS, stream));
+          d_rms_weight, d_w_gate_up_col_major, d_w_down_swizzled,
+          d_custom_scratch, GEMMA4_RMS_NORM_EPS, stream));
     };
     auto run_custom_clear = [&]() {
       CUDA_CHECK(cudaMemsetAsync(d_custom_scratch, 0,
@@ -457,6 +515,16 @@ int main(int argc, char **argv) {
         time_ms(run_custom, stream, warmup, iters, trials);
     const TimingStats custom_clear_stats =
         time_ms(run_custom_clear, stream, warmup, iters, trials);
+    const TimingStats cold_custom_stats =
+        time_ms_cold(run_custom, stream, warmup, iters, trials, d_flush_in,
+                     d_flush_out, flush_count);
+    const TimingStats cold_custom_clear_stats =
+        time_ms_cold(run_custom_clear, stream, warmup, iters, trials,
+                     d_flush_in, d_flush_out, flush_count);
+    const TimingStats cold_flush_stats =
+        time_ms([&]() { flush_cache(d_flush_in, d_flush_out, flush_count,
+                                    stream); },
+                stream, warmup, iters, trials);
 
     TimingStats geglu_graph_stats{-1.0f, -1.0f};
     TimingStats down_graph_stats{-1.0f, -1.0f};
@@ -565,6 +633,16 @@ int main(int argc, char **argv) {
                 custom_clear_stats.best_ms, custom_clear_stats.avg_ms,
                 custom_clear_graph_stats.best_ms,
                 custom_clear_graph_stats.avg_ms);
+    std::printf("custom_fused_decode_cold,%.6f,%.6f,-1.000000,-1.000000,"
+                "%.3f,0,\n",
+                cold_custom_stats.best_ms, cold_custom_stats.avg_ms,
+                gib_per_second(custom_bytes, cold_custom_stats.best_ms));
+    std::printf("custom_scratch_clear_cold,%.6f,%.6f,-1.000000,-1.000000,"
+                "0.000,0,\n",
+                cold_custom_clear_stats.best_ms,
+                cold_custom_clear_stats.avg_ms);
+    std::printf("cache_flush_only,%.6f,%.6f,-1.000000,-1.000000,0.000,0,\n",
+                cold_flush_stats.best_ms, cold_flush_stats.avg_ms);
     std::printf("full_ffn,%.6f,,%.6f,,%.3f,,%.6g\n",
                 full_ms, full_graph_ms,
                 full_ms > 0.0f ? gib_per_second(split_bytes, full_ms) : 0.0,
@@ -576,6 +654,24 @@ int main(int argc, char **argv) {
     const float custom_minus_clear_ms =
         custom_device_ms > 0.0f && custom_clear_device_ms > 0.0f
             ? std::max(custom_device_ms - custom_clear_device_ms, 0.0f)
+            : -1.0f;
+    const float cold_custom_minus_flush_ms =
+        cold_custom_stats.best_ms > 0.0f && cold_flush_stats.best_ms > 0.0f
+            ? std::max(cold_custom_stats.best_ms - cold_flush_stats.best_ms,
+                       0.0f)
+            : -1.0f;
+    const float cold_clear_minus_flush_ms =
+        cold_custom_clear_stats.best_ms > 0.0f &&
+                cold_flush_stats.best_ms > 0.0f
+            ? std::max(cold_custom_clear_stats.best_ms -
+                           cold_flush_stats.best_ms,
+                       0.0f)
+            : -1.0f;
+    const float cold_custom_minus_flush_clear_ms =
+        cold_custom_minus_flush_ms > 0.0f && cold_clear_minus_flush_ms > 0.0f
+            ? std::max(cold_custom_minus_flush_ms -
+                           cold_clear_minus_flush_ms,
+                       0.0f)
             : -1.0f;
     const float custom_speedup =
         cudnn_device_ms > 0.0f && custom_device_ms > 0.0f
@@ -601,6 +697,12 @@ int main(int argc, char **argv) {
                 custom_clear_device_ms);
     std::printf("custom_minus_clear_device_ms,%.6f\n",
                 custom_minus_clear_ms);
+    std::printf("cold_custom_minus_flush_ms,%.6f\n",
+                cold_custom_minus_flush_ms);
+    std::printf("cold_clear_minus_flush_ms,%.6f\n",
+                cold_clear_minus_flush_ms);
+    std::printf("cold_custom_minus_flush_clear_ms,%.6f\n",
+                cold_custom_minus_flush_clear_ms);
     std::printf("custom_vs_cudnn_split_speedup,%.6f\n", custom_speedup);
     std::printf("custom_minus_clear_vs_cudnn_split_speedup,%.6f\n",
                 custom_minus_clear_speedup);

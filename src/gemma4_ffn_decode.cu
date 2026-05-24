@@ -7,7 +7,7 @@
 #include <algorithm>
 
 #ifndef GEMMA4_FFN_DECODE_ACT_TILE
-#define GEMMA4_FFN_DECODE_ACT_TILE 2
+#define GEMMA4_FFN_DECODE_ACT_TILE 4
 #endif
 
 #ifndef GEMMA4_FFN_DECODE_SWIZZLE_X
@@ -18,11 +18,19 @@
 #define GEMMA4_FFN_DECODE_ASYNC_X 0
 #endif
 
+#ifndef GEMMA4_FFN_DECODE_THREADS
+#define GEMMA4_FFN_DECODE_THREADS 256
+#endif
+
+#ifndef GEMMA4_FFN_DECODE_INTERMEDIATE_TILE
+#define GEMMA4_FFN_DECODE_INTERMEDIATE_TILE 512
+#endif
+
 namespace {
 
-constexpr int kFfnThreads = 1024;
+constexpr int kFfnThreads = GEMMA4_FFN_DECODE_THREADS;
 constexpr int kFfnWarps = kFfnThreads / WARP_SIZE;
-constexpr int kIntermediateTile = 256;
+constexpr int kIntermediateTile = GEMMA4_FFN_DECODE_INTERMEDIATE_TILE;
 constexpr int kIntermediateTiles =
     GEMMA4_INTERMEDIATE_SIZE / kIntermediateTile;
 constexpr int kHiddenPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
@@ -211,7 +219,6 @@ gemma4_ffn_decode_fused_bf16_kernel(
   __shared__ FfnBf16Pack s_x[kHiddenPacks];
   __shared__ float s_matmul_warp_sums[2][kActTile][kFfnWarps];
   __shared__ float s_rms_warp_sums[kFfnWarps];
-  __shared__ float s_act[kActTile];
   __shared__ float s_scale;
 
   for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
@@ -255,7 +262,7 @@ gemma4_ffn_decode_fused_bf16_kernel(
         const float gate_t = __shfl_sync(0xffffffffu, gate[t], 0);
         const float up_t = __shfl_sync(0xffffffffu, up[t], 0);
         if (threadIdx.x == t) {
-          s_act[t] = gate_t * gelu_tanh(up_t);
+          s_matmul_warp_sums[0][t][0] = gate_t * gelu_tanh(up_t);
         }
       }
     }
@@ -265,11 +272,15 @@ gemma4_ffn_decode_fused_bf16_kernel(
 #pragma unroll
       for (int t = 0; t < kActTile; ++t) {
         const int intermediate_col = intermediate_begin + local_col + t;
+        const int swizzled_hidden_col =
+            shared_x_chunk_index(hidden_pack) * kBf16Packed128Elements;
         const floatX *down_row =
             w_down_row_major +
             static_cast<int64_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE;
-        const FfnBf16Pack down_pack = load128cs(down_row + hidden_col);
-        accumulate_scaled_pack(s_act[t], down_pack, partial);
+        const FfnBf16Pack down_pack =
+            load128weight(down_row + swizzled_hidden_col);
+        accumulate_scaled_pack(s_matmul_warp_sums[0][t][0], down_pack,
+                               partial);
       }
     }
     __syncthreads();
@@ -366,7 +377,57 @@ cudaError_t configure_dynamic_shared_memory() {
   return cudaSuccess;
 }
 
+__global__ void swizzle_hidden_packs_kernel(
+    floatX *__restrict__ dst,
+    const floatX *__restrict__ src,
+    int rows) {
+  const int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int row = static_cast<int>(blockIdx.y);
+  if (pack >= kHiddenPacks) {
+    return;
+  }
+
+  const int src_col = pack * kBf16Packed128Elements;
+  const int dst_col = shared_x_chunk_index(pack) * kBf16Packed128Elements;
+  const int64_t row_offset = static_cast<int64_t>(row) * GEMMA4_HIDDEN_SIZE;
+  const FfnBf16Pack pack_value = load128g(src + row_offset + src_col);
+  store128(dst + row_offset + dst_col, pack_value);
+}
+
 }  // namespace
+
+cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
+    floatX *__restrict__ w_gate_up_swizzled,
+    const floatX *__restrict__ w_gate_up_col_major,
+    floatX *__restrict__ w_down_swizzled,
+    const floatX *__restrict__ w_down_row_major,
+    cudaStream_t stream) {
+  if (w_gate_up_swizzled == nullptr || w_gate_up_col_major == nullptr ||
+      w_down_swizzled == nullptr || w_down_row_major == nullptr ||
+      !is_aligned_16(w_gate_up_swizzled) ||
+      !is_aligned_16(w_gate_up_col_major) ||
+      !is_aligned_16(w_down_swizzled) ||
+      !is_aligned_16(w_down_row_major)) {
+    return cudaErrorInvalidValue;
+  }
+
+  constexpr int threads = 256;
+  const dim3 block_dim(threads);
+  const dim3 gate_up_grid_dim(div_up(kHiddenPacks, threads),
+                              GEMMA4_PACKED_FFN_SIZE);
+  swizzle_hidden_packs_kernel<<<gate_up_grid_dim, block_dim, 0, stream>>>(
+      w_gate_up_swizzled, w_gate_up_col_major, GEMMA4_PACKED_FFN_SIZE);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  const dim3 down_grid_dim(div_up(kHiddenPacks, threads),
+                           GEMMA4_INTERMEDIATE_SIZE);
+  swizzle_hidden_packs_kernel<<<down_grid_dim, block_dim, 0, stream>>>(
+      w_down_swizzled, w_down_row_major, GEMMA4_INTERMEDIATE_SIZE);
+  return cudaGetLastError();
+}
 
 cudaError_t gemma4_ffn_decode_configure_scratch_l2(
     Gemma4FfnDecodeScratch *scratch,

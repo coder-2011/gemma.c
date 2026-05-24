@@ -39,7 +39,7 @@ template <int K>
 __device__ inline Bf16Packed128
 load_weight_pack(
     const __nv_bfloat16 *__restrict__ w_col_major, int col, int element_idx) {
-  return load128cs(w_col_major + weight_offset<K>(col, element_idx));
+  return load128weight(w_col_major + weight_offset<K>(col, element_idx));
 }
 
 template <int ColsPerBlock>
@@ -150,13 +150,17 @@ __device__ inline void dot_cols_pair_shared_x(
 #pragma unroll
   for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
     const int element_idx = pack_offset(pack_idx);
-    const Bf16Packed128 x_pack = s_x[shared_pack_index<SwizzleX>(pack_idx)];
+    const int swizzled_pack_idx = shared_pack_index<SwizzleX>(pack_idx);
+    const int swizzled_element_idx = pack_offset(swizzled_pack_idx);
+    const Bf16Packed128 x_pack = s_x[swizzled_pack_idx];
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
       const Bf16Packed128 a_pack =
-          load_weight_pack<K>(w_a_col_major, col0_a + col, element_idx);
+          load_weight_pack<K>(
+              w_a_col_major, col0_a + col, swizzled_element_idx);
       const Bf16Packed128 b_pack =
-          load_weight_pack<K>(w_b_col_major, col0_b + col, element_idx);
+          load_weight_pack<K>(
+              w_b_col_major, col0_b + col, swizzled_element_idx);
       gemma4_bf16_pack_accumulate_dot(x_pack, a_pack, a_sums[col]);
       gemma4_bf16_pack_accumulate_dot(x_pack, b_pack, b_sums[col]);
     }
