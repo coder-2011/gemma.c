@@ -46,3 +46,5 @@ This one is human maintained, and lightly AI formatted, as well as more relevant
 -Fused FFN decode using the custom matmul gemv kernels. implementation was clean, outperforming cuDNN by ~15 percent (factoring out overhead). Agents make alot of silly mistakes still.  I plan on experimenting with different agent harnesses for optimizing kernels. [Kernel Design Agents]([url](https://github.com/mit-han-lab/kernel-design-agents)) seems promising.
 
 -GEMM+epilogue is pretty much what I am doing. the tri dao paper reperameterized it w/ a neat mathematical framework accounting for a whole transformer layer. It is a really impressive feat of engineering to fuse the entire transformer block without touching HBM. my ffn-decode kernel is there rn, but I have to fuse it w/ flash attn.
+
+-  I feel like I'm about 60% there, but I've felt this way so many • in so many projects, and I'm always like 20% there (fingers crossed) this time is different.
