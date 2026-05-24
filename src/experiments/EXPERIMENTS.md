@@ -7244,3 +7244,443 @@ Conclusion:
 - For `tokens=1` decode FFN GEMV, staging gate/up weights through shared memory
   does not currently pay off. The best source state after this experiment is
   the shared-X paired reducer with direct coalesced weight reads.
+## 2026-05-24 - FFN decode offline hidden-pack weight swizzle
+
+Goal:
+
+- Pre-swizzle FFN decode weights offline so the hidden-dimension weight packs
+  match the shared-memory swizzle used for `x`.
+- Keep the best measured decode topology: shared-X paired gate/up reduction,
+  direct coalesced weight reads, and no dynamic shared-memory weight staging.
+
+Implementation:
+
+- Added `gemma4_ffn_decode_swizzle_weights_bf16()` as an offline preparation
+  helper.
+- The helper rewrites each contiguous hidden row/column in 128-bit bf16 packs:
+  source pack `p` is stored at `shared_x_chunk_index(p)`.
+- Updated the FFN decode contract so `w_gate_up_col_major` and
+  `w_down_row_major` are expected to have their hidden dimension pre-swizzled.
+- Updated the gate/up shared-X dot path to read weight pack
+  `shared_pack_index(pack_idx)` while reading `s_x` at the same swizzled pack.
+- Updated the down projection to read the swizzled hidden pack while accumulating
+  and storing output in the original hidden order.
+- The benchmark now keeps canonical cuDNN weights separate and passes swizzled
+  copies only to the custom fused decode path.
+
+Build and run:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
+  -Isrc -I/tmp/cudnn-frontend/include \
+  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/gemma4_ffn_decode.cu \
+  -lcudnn -lnvrtc -lcuda \
+  -o build/experiments/gemma4_ffn_cudnn_bench_swizzled
+
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench_swizzled 100 20 3
+```
+
+Compiler resource result:
+
+- Offline swizzle kernel: `16` registers/thread, `0` spills.
+- FFN decode kernel: `46` registers/thread, `0` spills.
+- FFN static shared memory: `11404` bytes.
+- FFN barriers: `1`.
+
+Timing:
+
+- `custom_device_ms`: `1.103116`
+- `custom_scratch_clear_device_ms`: `0.001129`
+- `custom_minus_clear_device_ms`: `1.101987`
+- `cudnn_split_device_ms`: `1.000330`
+- `custom_minus_clear_vs_cudnn_split_speedup`: `0.907751`
+- `max_abs_vs_split`: `0`
+
+Comparison:
+
+- Previous restored shared-X paired reducer run:
+  `custom_minus_clear_device_ms = 1.105603`
+- Offline hidden-pack weight swizzle:
+  `custom_minus_clear_device_ms = 1.101987`
+- Delta: about `0.003616 ms` faster, roughly `0.33%`.
+
+Conclusion:
+
+- Pre-swizzling the hidden weight packs is a small win. It reduces FFN decode
+  register use from the prior `48` registers/thread to `46` and slightly
+  improves measured runtime.
+- The dominant limit is still HBM traffic; this is an indexing/layout cleanup,
+  not a bandwidth reduction.
+## 2026-05-24 - FFN decode canonical vs pre-swizzled weight rerun
+
+Goal:
+
+- Benchmark the canonical hidden-pack weight layout and the offline pre-swizzled
+  hidden-pack layout back to back under the same harness settings.
+
+Common setup:
+
+```bash
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/<binary> 100 20 3
+```
+
+- GPU: NVIDIA RTX A6000.
+- Shape: `tokens=1`, `hidden=5376`, `intermediate=21504`.
+- cuDNN split graph timing remained about `1.0 ms`.
+- Both custom paths reported `max_abs_vs_split=0`.
+
+Canonical hidden-pack layout:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
+  -Isrc -I/tmp/cudnn-frontend/include \
+  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/gemma4_ffn_decode.cu \
+  -lcudnn -lnvrtc -lcuda \
+  -o build/experiments/gemma4_ffn_cudnn_bench_unswizzled
+```
+
+- FFN registers/thread: `48`
+- FFN spills: `0`
+- `custom_device_ms`: `1.111296`
+- `custom_scratch_clear_device_ms`: `0.001084`
+- `custom_minus_clear_device_ms`: `1.110212`
+- `custom_minus_clear_vs_cudnn_split_speedup`: `0.900500`
+
+Pre-swizzled hidden-pack layout:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
+  -Isrc -I/tmp/cudnn-frontend/include \
+  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/gemma4_ffn_decode.cu \
+  -lcudnn -lnvrtc -lcuda \
+  -o build/experiments/gemma4_ffn_cudnn_bench_swizzled
+```
+
+- FFN registers/thread: `46`
+- FFN spills: `0`
+- `custom_device_ms`: `1.104086`
+- `custom_scratch_clear_device_ms`: `0.001077`
+- `custom_minus_clear_device_ms`: `1.103009`
+- `custom_minus_clear_vs_cudnn_split_speedup`: `0.906560`
+
+Conclusion:
+
+- The pre-swizzled layout was faster in this rerun:
+  `1.103009 ms` vs `1.110212 ms` after scratch-clear subtraction.
+- Delta: `0.007203 ms`, about `0.65%` faster.
+- Source was left on the pre-swizzled implementation.
+## 2026-05-24 - FFN decode compile-time ablation sweep
+
+Goal:
+
+- Sweep the main FFN decode tuning knobs to find a better operating point:
+  activation tile width, weight load policy, CTA thread count, and intermediate
+  tile width.
+- Keep pre-swizzled hidden-pack weights enabled.
+- Leave the source defaults on the best measured configuration.
+
+Benchmark setup:
+
+```bash
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/<binary> <iters> <warmup> <trials>
+```
+
+- GPU: NVIDIA RTX A6000.
+- Shape: `tokens=1`, `hidden=5376`, `intermediate=21504`.
+- Cache policy: warm-cache repeated-buffer benchmark, matching the existing
+  FFN/cuDNN harness behavior.
+- Weight load policy values:
+  `0 = __ldcs`, `1 = inline PTX ld.global.cg.v4.u32`, `2 = __ldg`.
+
+First pass: `ACT_TILE x weight load policy`, with `THREADS=1024`,
+`INTERMEDIATE_TILE=256`, `iters=50`, `warmup=10`, `trials=2`.
+
+```text
+ACT_TILE  policy  custom_minus_clear_ms
+1         0       1.166585
+1         1       1.168792
+1         2       1.164948
+2         0       1.105258
+2         1       1.101761
+2         2       1.102541
+4         0       1.102608
+4         1       1.104081
+4         2       1.103259
+8         0       1.525499
+8         1       1.527742
+8         2       1.634939
+```
+
+Conclusion from first pass:
+
+- `ACT_TILE=2`, `.cg` was best in the original `1024`-thread,
+  `256`-column CTA shape.
+- `ACT_TILE=1` had too much loop/reduction overhead.
+- `ACT_TILE=8` was bad at `1024` threads.
+
+Second pass: thread count and intermediate tile width, with `ACT_TILE=2`,
+`.cg`, `iters=50`, `warmup=10`, `trials=2`.
+
+```text
+THREADS  INTERMEDIATE_TILE  custom_minus_clear_ms
+512      128                1.127623
+512      256                1.012838
+512      512                0.979793
+1024     128                unsupported/no parsed timing
+1024     256                1.098981
+1024     512                1.046427
+```
+
+Broader cheap pass around larger intermediate tiles, with `ACT_TILE=2`, `.cg`,
+`iters=25`, `warmup=5`, `trials=1`.
+
+```text
+THREADS  INTERMEDIATE_TILE  custom_minus_clear_ms
+256      512                0.890807
+256      768                1.119968
+256      1024               1.452534
+512      512                0.984314
+512      768                1.142086
+512      1024               1.424081
+768      512                1.045551
+768      768                1.104881
+768      1024               1.364287
+```
+
+Conclusion from CTA-shape passes:
+
+- `INTERMEDIATE_TILE=512` is much better than `256` for this benchmark.
+- `256` threads was best at `INTERMEDIATE_TILE=512`.
+- Larger intermediate tiles underutilized the GPU and slowed down.
+
+Activation tile check around the new best CTA shape, `.cg`,
+`INTERMEDIATE_TILE=512`, `iters=25`, `warmup=5`, `trials=1`.
+
+```text
+THREADS  ACT_TILE  regs/thread  custom_minus_clear_ms
+256      1         48           1.082970
+256      2         48           0.897487
+256      4         67           0.832521
+256      8         107          0.828842
+256      16        147          0.912013
+512      1         48           1.064396
+512      2         46           0.982698
+512      4         67           0.965788
+```
+
+Full finalist runs, `iters=100`, `warmup=20`, `trials=3`.
+
+```text
+THREADS  INTERMEDIATE_TILE  ACT_TILE  regs/thread  custom_minus_clear_ms  speedup_vs_cudnn_split
+256      512                8         107          0.830063              1.205208
+256      512                4         67           0.833452              1.200626
+512      512                4         67           0.964612              1.036290
+```
+
+Final default-source confirmation, no tuning flags:
+
+```text
+THREADS=256
+INTERMEDIATE_TILE=512
+ACT_TILE=8
+WEIGHT_LOAD_POLICY=1
+regs/thread=107
+spills=0
+custom_device_ms=0.829718
+custom_scratch_clear_device_ms=0.001067
+custom_minus_clear_device_ms=0.828651
+custom_minus_clear_vs_cudnn_split_speedup=1.206244
+```
+
+Conclusion:
+
+- Best measured default is now `THREADS=256`, `INTERMEDIATE_TILE=512`,
+  `ACT_TILE=8`, pre-swizzled hidden-pack weights, and inline PTX `.cg` weight
+  loads.
+- This improves the previously best pre-swizzled path from about `1.103 ms` to
+  about `0.829 ms` after scratch-clear subtraction in this warm-cache harness.
+- The speedup comes mainly from changing the CTA/reduction shape, not from the
+  cache operator. Fewer CTA reduction turns plus larger per-CTA activation work
+  beats the original high-thread-count shape.
+## 2026-05-24 - FFN decode cold-cache flush benchmark
+
+Goal:
+
+- Re-run the current best FFN decode configuration without relying on warm L2.
+- Nsight Compute was unavailable, so the benchmark was extended with an explicit
+  cache flush buffer.
+
+Implementation:
+
+- Added a benchmark-only `flush_cache_kernel`.
+- Allocated a flush buffer of `268435456` bytes, which is larger than A6000 L2.
+- Timed three paths:
+  - `flush + custom_fused_decode`
+  - `flush + custom_scratch_clear`
+  - `flush_only`
+- Reported cold custom time as:
+  `cold_custom_minus_flush_clear_ms =
+   (flush + custom - flush_only) - (flush + clear - flush_only)`.
+
+Build and run:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
+  -Isrc -I/tmp/cudnn-frontend/include \
+  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/gemma4_ffn_decode.cu \
+  -lcudnn -lnvrtc -lcuda \
+  -o build/experiments/ffn_ablate/ffn_best_cold
+
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/ffn_ablate/ffn_best_cold 20 5 2
+```
+
+Results:
+
+```text
+cache_flush_bytes=268435456
+custom_fused_decode graph_best_ms=0.830672
+custom_scratch_clear graph_best_ms=0.001339
+custom_minus_clear_device_ms=0.829333
+
+custom_fused_decode_cold best_ms=1.236142
+custom_scratch_clear_cold best_ms=0.400528
+cache_flush_only best_ms=0.398603
+
+cold_custom_minus_flush_ms=0.837539
+cold_clear_minus_flush_ms=0.001925
+cold_custom_minus_flush_clear_ms=0.835614
+```
+
+Conclusion:
+
+- Explicit cache flushing only increased the scratch/fused adjusted custom
+  decode time from `0.829333 ms` warm to `0.835614 ms` cold in this run.
+- The current best kernel is not getting most of its speed from repeated-buffer
+  warm-L2 reuse. It remains mostly bounded by streaming bandwidth and CTA
+  scheduling/reduction shape.
+## 2026-05-24 - FFN decode live-range ptxas analysis
+
+Goal:
+
+- Check whether unnecessary live ranges were inflating register pressure in the
+  current FFN decode kernel.
+- Use ptxas/resource output and SASS/PTX dumps because Nsight Compute is not
+  available on this machine.
+
+Dump commands:
+
+```bash
+mkdir -p build/ptx/ffn_live
+
+nvcc -std=c++17 -O3 -arch=sm_86 -lineinfo -Xptxas=-v \
+  -Isrc -cubin src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_live/gemma4_ffn_decode.cubin \
+  > build/ptx/ffn_live/ptxas.log 2>&1
+
+nvcc -std=c++17 -O3 -arch=sm_86 -lineinfo \
+  -Isrc -ptx src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_live/gemma4_ffn_decode.ptx
+
+cuobjdump --dump-sass build/ptx/ffn_live/gemma4_ffn_decode.cubin \
+  > build/ptx/ffn_live/gemma4_ffn_decode.sass
+
+cuobjdump --dump-resource-usage build/ptx/ffn_live/gemma4_ffn_decode.cubin \
+  > build/ptx/ffn_live/resource.txt
+```
+
+Initial active-kernel ptxas result with `ACT_TILE=8`:
+
+```text
+REG:107
+STACK:0
+LOCAL:0
+SHARED:11332
+spill stores:0
+spill loads:0
+```
+
+SASS/PTX notes:
+
+- Highest physical register observed in SASS was `R104`, matching the
+  `107`-register ptxas allocation.
+- No `LDL` or `STL` local-memory spill traffic was observed.
+- PTX retained the intended inline cache-global loads:
+  `ld.global.cg.v4.u32`.
+- The high-register region lined up with the unrolled dot/reduce body, not
+  obvious stale address temporaries.
+
+Attempted reorder:
+
+- Removed the separate `s_act[ACT_TILE]` shared array.
+- Wrote each GeGLU scalar into existing shared reduction storage and consumed
+  it directly for the down accumulation.
+
+ptxas result after that reorder:
+
+```text
+REG:107
+STACK:0
+LOCAL:0
+SHARED:11300
+spill stores:0
+spill loads:0
+```
+
+Benchmark after the attempted reorder:
+
+```text
+custom_fused_decode graph_best_ms=0.831002
+custom_scratch_clear graph_best_ms=0.001129
+custom_minus_clear_device_ms=0.829873
+cold_custom_minus_flush_clear_ms=0.830545
+```
+
+Conclusion from the failed reorder:
+
+- `s_act` was not the register limiter.
+- The main simultaneous live values are the gate/up accumulators and unpacked
+  bf16 intermediates created by `ACT_TILE=8`.
+- Reducing live ranges in a meaningful way requires reducing the activation
+  tile width.
+
+Final live-range-oriented source setting:
+
+```text
+ACT_TILE=4
+THREADS=256
+INTERMEDIATE_TILE=512
+WEIGHT_LOAD_POLICY=1
+```
+
+ptxas result with `ACT_TILE=4`:
+
+```text
+REG:67
+STACK:0
+LOCAL:0
+SHARED:11044
+spill stores:0
+spill loads:0
+```
+
+Tradeoff:
+
+- Earlier full finalist timing for `ACT_TILE=8`:
+  `custom_minus_clear_device_ms=0.830063`, `107` registers/thread.
+- Earlier full finalist timing for `ACT_TILE=4`:
+  `custom_minus_clear_device_ms=0.833452`, `67` registers/thread.
+
+Conclusion:
+
+- `ACT_TILE=4` is slightly slower in the warm-cache harness but cuts register
+  pressure by about `37%` without spilling.
+- Source was left on `ACT_TILE=4` because the immediate goal was to minimize
+  simultaneously live values rather than maximize the last few microseconds.
