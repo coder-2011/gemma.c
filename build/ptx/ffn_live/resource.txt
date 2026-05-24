@@ -1,0 +1,8 @@
+
+Resource usage:
+ Common:
+  GLOBAL:0
+ Function _ZN53_GLOBAL__N__f3bd97e8_20_gemma4_ffn_decode_cu_f296799827swizzle_hidden_packs_kernelEP13__nv_bfloat16PKS0_i:
+  REG:16 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:372 TEXTURE:0 SURFACE:0 SAMPLER:0
+ Function _ZN53_GLOBAL__N__f3bd97e8_20_gemma4_ffn_decode_cu_f296799835gemma4_ffn_decode_fused_bf16_kernelEP13__nv_bfloat16S1_PKS0_S3_S3_S3_S3_P22Gemma4FfnDecodeScratchf:
+  REG:107 STACK:0 SHARED:11332 LOCAL:0 CONSTANT[0]:420 TEXTURE:0 SURFACE:0 SAMPLER:0

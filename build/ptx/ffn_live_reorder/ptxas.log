@@ -1,0 +1,11 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN53_GLOBAL__N__f3bd97e8_20_gemma4_ffn_decode_cu_f296799827swizzle_hidden_packs_kernelEP13__nv_bfloat16PKS0_i' for 'sm_86'
+ptxas info    : Function properties for _ZN53_GLOBAL__N__f3bd97e8_20_gemma4_ffn_decode_cu_f296799827swizzle_hidden_packs_kernelEP13__nv_bfloat16PKS0_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 16 registers, used 0 barriers, 372 bytes cmem[0]
+ptxas info    : Compile time = 3.062 ms
+ptxas info    : Compiling entry function '_ZN53_GLOBAL__N__f3bd97e8_20_gemma4_ffn_decode_cu_f296799835gemma4_ffn_decode_fused_bf16_kernelEP13__nv_bfloat16S1_PKS0_S3_S3_S3_S3_P22Gemma4FfnDecodeScratchf' for 'sm_86'
+ptxas info    : Function properties for _ZN53_GLOBAL__N__f3bd97e8_20_gemma4_ffn_decode_cu_f296799835gemma4_ffn_decode_fused_bf16_kernelEP13__nv_bfloat16S1_PKS0_S3_S3_S3_S3_P22Gemma4FfnDecodeScratchf
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 107 registers, used 1 barriers, 11300 bytes smem, 420 bytes cmem[0]
+ptxas info    : Compile time = 230.786 ms
