@@ -7684,3 +7684,2296 @@ Conclusion:
   pressure by about `37%` without spilling.
 - Source was left on `ACT_TILE=4` because the immediate goal was to minimize
   simultaneously live values rather than maximize the last few microseconds.
+
+## 2026-05-24 - FFN decode HBM load and CTA-shape sweep
+
+Goal:
+
+- Explore whether earlier HBM load issue, async shared-memory preload, cache
+  policy, shared-memory swizzle, or CTA geometry can produce a serious FFN
+  decode improvement.
+- Keep the default path numerically correct for all `5376` hidden columns.
+
+Implementation:
+
+- Fixed the default `256`-thread path bug where only the first `256` of `672`
+  hidden 128-bit packs were owned by threads. Threads now cover hidden packs
+  in rounds.
+- Added a focused custom-only benchmark:
+  `src/experiments/gemma4_ffn_decode_load_bench.cu`.
+- Added compile-time experiment toggles:
+  - `GEMMA4_FFN_DECODE_PRELOAD_DOWN`
+  - `GEMMA4_MATMUL_DEVICE_PRELOAD_PAIR_COLS`
+- Removed the second all-thread global acquire spin in the scratch reduction
+  turn wait; thread 0 waits for the lock, then the CTA synchronizes.
+- Set the default FFN decode CTA size to `672` threads, one thread per hidden
+  bf16 pack.
+
+Guide/context:
+
+- CUDA guide query used:
+  `python3 scripts/query.py "CUDA asynchronous copy global memory to shared memory cp.async pipeline cache global loads L2 persisting cache occupancy memory throughput" --top-k 10`
+- DSMEM/thread-block cluster query used:
+  `python3 scripts/query.py "CUDA distributed shared memory thread block clusters compute capability" --top-k 8`
+- Relevant guide notes:
+  - async copies can keep global-to-shared memory operations in flight and
+    reduce register staging when copying global memory to shared memory;
+  - `memcpy_async`/hardware async copies require waiting before reading copied
+    shared memory and are best with 16-byte aligned global/shared addresses;
+  - occupancy is constrained by registers, shared memory, resident blocks, and
+    resident warps, so load overlap must be evaluated with resource usage.
+  - thread-block clusters and distributed shared memory are compute capability
+    `9.0+` features, so they are not a direct fit for the target `sm_86`
+    RTX A6000 path.
+- Exa searches looked at comparable GEMV fusion/vector-load work:
+  - llama.cpp general GEMV fusion PR
+  - llama.cpp vectorized CUDA dmmv load PR
+  - FlashInfer cp.async helper
+
+Build and verification:
+
+```bash
+make test-ffn-decode
+
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_load_play/ffn_decode_final_default.o
+
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+GPU/tooling:
+
+- GPU: NVIDIA RTX A6000
+- CUDA target: `sm_86`
+- cuDNN version in full harness: `92200`
+- Clock policy: not locked.
+- Cache policy: both normal warm-cache graph replay and explicit 256 MiB
+  cache-flush timing were measured.
+
+Correctness:
+
+```text
+ffn decode tests passed
+```
+
+ptxas final default:
+
+```text
+Used 67 registers
+Used 11512 bytes smem
+Spill stores: 0
+Spill loads: 0
+```
+
+Corrected baseline before tuning:
+
+```text
+THREADS=256
+ACT_TILE=4
+INTERMEDIATE_TILE=512
+custom_minus_clear_device_ms=1.058389
+cold_custom_minus_flush_clear_ms=1.058719
+```
+
+Selected sweep results from the focused load bench, `iters=12`,
+`warmup=4`, `trials=2` unless noted:
+
+```text
+variant                 warm_minus_clear_ms  cold_minus_flush_clear_ms
+threads256_act8         1.072496             1.073171
+threads512_act4         1.215563             1.207904
+threads512_act8         1.062747             1.063147
+threads1024_act4        1.048056             1.041696
+threads672_act4         1.042429             1.037168
+threads704_act4         1.043683             1.037499
+threads768_act4         1.044232             1.046008
+threads672_act1         1.120125             1.124309
+threads672_act2         1.047235             1.048011
+threads672_act8         1.219259             1.223941
+threads672_tile256      1.093696             1.094483
+threads672_tile384      1.066768             1.064235
+threads672_tile448      1.053429             1.055384
+threads672_tile1024     1.337568             1.339309
+threads672_async_x      1.043688             1.044981
+threads672_no_swizzle   1.044600             1.045237
+threads672_ldg          1.036069             1.037611
+threads672_lock_wait    1.031494             1.034042
+gate_up_preload_pairs   1.032064             1.033283
+```
+
+Final focused benchmark with default source, `iters=30`, `warmup=8`,
+`trials=3`:
+
+```text
+custom_graph best_ms=1.032352
+scratch_clear_graph best_ms=0.001279
+warm_minus_clear best_ms=1.031073
+cold_minus_flush_clear best_ms=1.032096
+```
+
+Full cuDNN comparison harness, `iters=50`, `warmup=10`, `trials=3`:
+
+```text
+cudnn_split_device_ms=1.000082
+custom_device_ms=1.033747
+custom_scratch_clear_device_ms=0.001171
+custom_minus_clear_device_ms=1.032577
+cold_custom_minus_flush_clear_ms=1.034404
+custom_minus_clear_vs_cudnn_split_speedup=0.968530
+```
+
+Attempted focused Nsight Compute command:
+
+```bash
+ncu --target-processes all --kernel-name-base demangled \
+  --kernel-name regex:gemma4_ffn_decode_fused_bf16_kernel \
+  --metrics gpu__time_duration.sum,dram__bytes_read.sum,dram__bytes_write.sum \
+  --csv --log-file build/analysis/ffn_load_play/final_default_ncu.csv \
+  build/experiments/gemma4_ffn_decode_load_bench 1 0 1
+```
+
+The `ncu` run was stopped after several minutes without returning useful
+output. Follow-up profiling should use a narrower standalone harness or a lower
+replay-overhead section set.
+
+Conclusion:
+
+- A serious `>5%` HBM/load-scheduling improvement was not found in this
+  realistic sweep.
+- The best safe source change is still useful: the default path is now correct
+  and improves the corrected `256`-thread baseline by about `2.4-2.6%`.
+- Explicit async preload of `x`, disabling hidden-pack swizzle, smaller/larger
+  intermediate tiles, manual down-weight preload, and manual gate/up preload
+  did not beat the `672`-thread one-pack-per-thread shape.
+- The warm and cold times are nearly identical after subtracting flush/clear,
+  so this kernel is not primarily winning from repeated-buffer L2 warmth.
+
+## 2026-05-24 - FFN decode memory access and race audit
+
+Goal:
+
+- Check for obvious race conditions, shared-memory bank conflicts, and global
+  memory coalescing issues in the current FFN decode kernel.
+- Revisit the scratch reduction lock after the prior lock-wait optimization.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA memory model acquire release atomic threadfence synchronization between thread blocks global memory visibility" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA shared memory bank conflicts coalesced global memory access warp contiguous addresses" \
+  --top-k 10
+python3 scripts/query.py \
+  "PTX red release gpu global atomic add memory order acquire release" \
+  --top-k 8
+exa-ai search \
+  "CUDA GEMV kernel shared memory bank conflicts coalesced global memory loads LLM inference optimization" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "CUDA warp coalescing vectorized 128 bit loads GEMV optimization bank conflicts" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant guide notes:
+
+- Coalesced global memory access is the right first-order check for HBM loads.
+  The guide's examples show consecutive warp addresses as the desired pattern.
+- Shared-memory bank conflicts depend on per-warp bank mapping; padding or
+  swizzling is a standard fix when stride patterns collide.
+- The local guide results for exact PTX release/acquire details were weak, so
+  the scratch lock was kept conservative.
+
+Changes:
+
+- Restored per-thread acquire polling after thread 0 observes the scratch lock
+  turn. This gives each thread an acquire load before it reads
+  `scratch->accum`, while preserving the initial thread-0-only wait.
+
+Static memory access audit:
+
+- Dominant HBM streams are fully coalesced by address pattern:
+  - `x` load into shared memory: one 16-byte bf16 pack per thread.
+  - gate/up weights: fixed column, consecutive hidden packs across a warp.
+  - down weights: fixed intermediate row, consecutive hidden packs across a
+    warp.
+  - residual, RMS gamma, residual output, normed output: consecutive bf16
+    packs across a warp.
+- With `672` threads there are exactly `21` full warps, so there is no partial
+  final warp in the hidden-pack loops.
+- The hidden-pack XOR swizzle permutes 16-byte chunks inside each 128-byte
+  group. It preserves the same four aligned 128-byte segments per warp for
+  HBM coalescing.
+- For the shared `s_x` 128-bit vector access, each 8-lane 128-byte
+  subtransaction has no duplicate bank for any 32-bit subword under the current
+  swizzle.
+- The one non-fully-coalesced global pattern is scratch accumulation:
+  `add_accum_pack`/`store_accum_pack` issue two 16-byte float-vector operations
+  per thread for 8 float columns. Each individual instruction is stride-32B
+  across lanes, so it has about 50% segment utilization. Combined lo+hi covers
+  the full contiguous 1024B warp span. This traffic is small compared with
+  weight streaming.
+
+SASS/resource check:
+
+```bash
+nvcc -std=c++17 -O3 -arch=sm_86 -lineinfo -Xptxas=-v -Isrc \
+  -cubin src/gemma4_ffn_decode.cu \
+  -o build/analysis/ffn_decode_audit.cubin
+cuobjdump --dump-sass build/analysis/ffn_decode_audit.cubin \
+  > build/analysis/ffn_decode_audit.sass
+```
+
+ptxas:
+
+```text
+Used 67 registers
+Used 11512 bytes smem
+Spill stores: 0
+Spill loads: 0
+```
+
+SASS includes vectorized global/shared operations such as:
+
+```text
+LDG.E.128.CONSTANT
+LDG.E.128.STRONG.GPU
+STS.128
+LDS.128
+STG.E.128
+RED.E.ADD.S32.STRONG.GPU
+MEMBAR.SC.GPU
+```
+
+Runtime checks:
+
+```bash
+make test-ffn-decode
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+```
+
+Results:
+
+```text
+ffn decode tests passed
+
+custom_graph best_ms=1.040187
+scratch_clear_graph best_ms=0.001248
+warm_minus_clear best_ms=1.038939
+cold_minus_flush_clear best_ms=1.040181
+```
+
+`compute-sanitizer`/`ncu` caveat:
+
+- `compute-sanitizer` is installed, but in this Thunder environment it aborts
+  in the CUDA interposition layer with:
+  `Unimplemented CUDA export table function: Table=cupti_device_query`.
+- Nsight Compute had previously failed to return useful output promptly in this
+  environment. This audit therefore relies on source/SASS/static address
+  analysis plus CUDA-event timing rather than sanitizer or NCU counters.
+
+Conclusion:
+
+- No obvious shared-memory race or divergent-barrier issue was found in the
+  source audit.
+- The scratch global-memory protocol is now conservative again: every thread
+  executes an acquire lock load before reading `scratch->accum`.
+- Dominant HBM weight/input/output streams are fully coalesced by static address
+  analysis and compile to 128-bit global/shared operations.
+- Scratch float accumulation is the main imperfect coalescing pattern, but its
+  byte volume is much smaller than the streamed FFN weights.
+
+## 2026-05-24 - FFN decode scratch coalescing and cold-load follow-up
+
+Goal:
+
+- Continue optimizing the fully cold FFN decode path without exceeding the
+  `67` register count, increasing scratch storage, or making a weaker
+  correctness tradeoff.
+- Focus on the one imperfect coalescing pattern found in the prior audit:
+  scratch accumulation.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA coalesced global memory vectorized stores structure of arrays memory coalescing" \
+  --top-k 8
+exa-ai search \
+  "CUDA GEMV scratch accumulation coalesced float4 stores structure of arrays optimization" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "PTX release acquire global atomic red.release.gpu.global.add.s32 documentation" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide query again emphasized maximizing used bytes per transferred
+  segment for global-memory coalescing.
+- Exa surfaced NVIDIA global-memory guidance and PTX ISA docs. The release-only
+  lock variant compiled, but it was rejected because thread 0's release atomic
+  would not order every other thread's prior scratch stores.
+
+Implementation:
+
+- Changed `Gemma4FfnDecodeScratch` from one linear `float accum[5376]` into two
+  float4 planes:
+  - `accum_lo[672][4]`
+  - `accum_hi[672][4]`
+- This keeps scratch float storage unchanged while making each lo/hi vector
+  instruction contiguous across warp lanes.
+- Changed FFN decode's default weight load policy in this translation unit to
+  streaming `.cs` (`GEMMA4_WEIGHT_LOAD_POLICY=0`) so the enormous one-use FFN
+  weights do not compete as aggressively for cache.
+- Changed the default intermediate tile from `512` to `672`, reducing scratch
+  reduction turns from `42` to `32`.
+
+Correctness/resource checks:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_continue/ffn_decode_final_pass.o
+```
+
+```text
+ffn decode tests passed
+Used 67 registers
+Spill stores: 0
+Spill loads: 0
+Used 11512 bytes smem
+```
+
+Selected variants, focused load bench:
+
+```text
+variant                     regs  warm_minus_clear_ms  cold_minus_flush_clear_ms  decision
+scratch_soa_tile512         67    1.032123             1.034466                  useful, not final
+release_only_lock           67    1.028434             1.029839                  rejected, unsafe ordering
+sync_trim                   67    1.032714             1.034198                  not retained
+scratch_load_cg             67    1.033592             1.034893                  not retained
+scratch_store_wb            67    1.034762             1.034850                  not retained
+scratch_loadcg_storewb      67    1.033448             1.036307                  not retained
+tile672_default_policy      67    1.023106             1.024330                  useful
+tile672_ldg                 67    1.022832             1.024498                  not retained
+tile672_cs                  67    1.021870             1.022774                  retained
+tile896                    67    1.143920             1.081221                  not retained
+tile672_act3                56    1.026600             1.024475                  not retained
+tile672_act6                78    1.104712             1.105141                  rejected, spills/registers
+tile672_act7                80    1.171859             1.176675                  rejected, spills/registers
+t512_tile672_act3           64    1.166597             1.159491                  not retained
+t384_tile672_act3           64    1.059312             1.041632                  not retained
+t704_tile672                67    1.026203             1.028035                  not retained
+t768_tile672                67    1.026997             1.028285                  not retained
+t1024_tile672               63    1.027472             1.027472                  not retained
+```
+
+Final focused source timing:
+
+```bash
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+```
+
+```text
+custom_graph best_ms=1.022462
+scratch_clear_graph best_ms=0.001311
+warm_minus_clear best_ms=1.021151
+cold_minus_flush_clear best_ms=1.023045
+```
+
+Full cuDNN comparison harness:
+
+```bash
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+```text
+cudnn_split_device_ms=1.000451
+custom_device_ms=1.023697
+custom_scratch_clear_device_ms=0.001218
+custom_minus_clear_device_ms=1.022479
+cold_custom_minus_flush_clear_ms=1.023745
+custom_minus_clear_vs_cudnn_split_speedup=0.978456
+```
+
+Conclusion:
+
+- The retained changes lower the audited cold path from `1.040181 ms` to
+  `1.023745 ms`, about `1.6%` faster, while staying at `67` registers and
+  keeping scratch storage size unchanged.
+- The custom path is now about `2.2%` behind the warmed cuDNN split baseline in
+  this harness.
+- The tempting release-only lock increment was not retained because it would not
+  safely order scratch stores from all threads in the CTA.
+
+## 2026-05-25 - FFN decode HBM coalescing and lock-handoff audit
+
+Question:
+
+- Check whether the retained FFN decode path has obvious shared-memory bank
+  conflicts, inter-block race hazards, fatal launch/resource issues, or
+  uncoalesced HBM pulls.
+- Re-check the benchmark accounting after changing the launcher to clear only
+  `scratch->lock` instead of the whole scratch accumulator.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA shared memory bank conflicts 128-bit vector loads consecutive threads transaction 128 bytes" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA global memory coalescing 32-byte segments aligned sequential threads 128-bit loads" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA memory synchronization global acquire release __threadfence __syncthreads inter block communication" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA volatile global memory threadfence visibility partial sums atomic counter" \
+  --top-k 8
+exa-ai search \
+  "CUDA GEMV memory coalescing LLM decode optimization persistent kernel HBM" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide page 60/61 describes coalescing as using all bytes in the required
+  32-byte global-memory segments; it does not require strictly increasing lane
+  order if the warp touches the same segments.
+- CUDA guide page 67/68 describes shared-memory banks as 32 banks with
+  successive 32-bit words in successive banks; stride-one row access is
+  conflict-free, while stride-32 column access is a 32-way conflict.
+- CUDA guide page 534 warns that inter-block producer/consumer code needs a
+  fence before signaling a counter/flag. It also notes that fences alone are not
+  a complete visibility mechanism, so the lock handoff should remain
+  conservative.
+- Exa surfaced FlashDecoding++ and CUTLASS material. The relevant ideas for
+  this kernel remain flat-GEMM/GEMV double buffering, persistent scheduling,
+  coalesced global access, shared-memory staging, and cache-policy selection.
+
+Implementation updates:
+
+- Updated `gemma4_ffn_decode_fused_bf16` to clear only
+  `Gemma4FfnDecodeScratch::lock` with `cudaMemsetAsync` before launch. Tile 0
+  overwrites all accumulator packs, so clearing the whole accumulator was setup
+  overhead only.
+- Updated both FFN decode benchmark harnesses to time the same lock-only clear,
+  avoiding an apples-to-oranges subtraction.
+- Tightened `release_reduce_turn` from `red.relaxed.gpu.global.add.s32` to
+  `red.release.gpu.global.add.s32` while keeping the all-thread
+  `__syncthreads(); __threadfence(); __syncthreads();` sequence. This is a small
+  performance cost, but it removes an unnecessary weak-signal concern in the
+  inter-block scratch handoff.
+
+Correctness/resource checks:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_continue/gemma4_ffn_decode.o
+```
+
+```text
+ffn decode tests passed
+Used 67 registers
+Spill stores: 0
+Spill loads: 0
+Used 11512 bytes smem
+```
+
+Focused load bench after lock-only clear accounting and release handoff:
+
+```bash
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+```
+
+```text
+custom_graph best_ms=1.024590
+scratch_clear_graph best_ms=0.001625
+warm_minus_clear best_ms=1.022965
+cold_custom best_ms=1.424242
+cold_clear best_ms=0.399728
+flush_only best_ms=0.398495
+cold_minus_flush_clear best_ms=1.024514
+```
+
+Full cuDNN comparison after release handoff:
+
+```bash
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+```text
+cudnn_split_device_ms=1.000134
+custom_device_ms=1.027281
+custom_scratch_clear_device_ms=0.001955
+custom_minus_clear_device_ms=1.025326
+cold_custom_minus_flush_ms=1.028109
+cold_clear_minus_flush_ms=0.001313
+cold_custom_minus_flush_clear_ms=1.026796
+custom_minus_clear_vs_cudnn_split_speedup=0.975430
+```
+
+Memory-access audit:
+
+- HBM loads/stores that walk hidden packs (`x`, residual, RMS weight,
+  residual_out, normed_out, scratch lo/hi planes) use one 128-bit vector per
+  lane over contiguous hidden-pack addresses. With 32 lanes, each warp covers a
+  dense 512-byte span, so the 32-byte segment utilization is full when the base
+  pointer is aligned.
+- Gate/up and down weight loads use the hidden-pack XOR swizzle. Within each
+  warp the lane order is permuted inside each eight-pack group, but the warp
+  still touches the same dense 512-byte span per column/row. This should remain
+  coalesced by the guide's 32-byte segment criterion.
+- The current scratch layout is better than the old linear `accum[5376]` for
+  coalescing: `accum_lo[pack][4]` and `accum_hi[pack][4]` make each 128-bit
+  scratch vector instruction contiguous across lanes instead of striding by one
+  full hidden pack.
+- Shared `s_x` accesses are swizzled in 8 x 128-bit groups. A warp accesses one
+  dense group of 16-byte chunks, permuted inside the group, so the static bank
+  map does not show the stride-32 pattern that causes the classic 32-way bank
+  conflict.
+- The shared warp-sum arrays are written by lane 0 of each warp and read by the
+  first `kFfnWarps` lanes as contiguous floats, so no obvious shared-bank
+  conflict pattern is visible there either.
+
+Tooling caveat:
+
+- `compute-sanitizer --tool memcheck ./build/tests/test_ffn_decode` could not
+  produce findings in Thunder. It timed out attaching and the target aborted
+  through unsupported CUPTI `cupti_device_query`.
+- `ncu --query-metrics --devices 0` reported `Invalid device ID 0` in this
+  environment, so bank conflicts were not measured directly with Nsight Compute.
+  The current conclusion is based on static address analysis, ptxas, SASS spot
+  checks, and correctness/benchmark runs.
+
+Conclusion:
+
+- No fatal launch/resource issue found: the kernel validates resident-block
+  support, clears the lock each launch, checks launches, passes the FFN decode
+  tests, and still has zero spills at the 67-register target.
+- No concrete race was found in the retained code. The lock handoff is now more
+  conservative than before: all producer threads fence before the block releases
+  a device-scope global lock, and consumers use acquire loads before reading
+  scratch.
+- The main HBM pulls are fully coalesced by the 32-byte segment criterion. The
+  only caveat is that Nsight Compute could not be used here to verify actual
+  bank-conflict counters.
+
+## 2026-05-25 - FFN decode post-audit cold-load optimization sweep
+
+Goal:
+
+- Continue looking for cold-load improvements without exceeding `67`
+  registers, adding meaningful scratch/storage, or weakening the conservative
+  lock handoff.
+- Use the current `672`-thread, `672`-intermediate-tile, scratch-SoA, `.cs`
+  weight-load path as the source baseline.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA occupancy memory bandwidth more thread blocks per SM register pressure memory bound kernels" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA instruction level parallelism memory bound kernel unroll independent loads registers occupancy" \
+  --top-k 10
+python3 scripts/query.py \
+  "cudaFuncSetCacheConfig cudaFuncCachePreferL1 shared memory carveout performance" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA GEMV memory bandwidth warp reduction split K occupancy optimization" \
+  --top-k 8
+exa-ai search \
+  "CUDA GEMV LLM decode memory bandwidth optimization occupancy register pressure persistent threads" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "LLM decode GEMV CUDA optimization split K warp reduction memory bandwidth" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide page 71 again points at occupancy as a latency-hiding tool, but
+  also ties it directly to register/shared/thread limits. This made tile-count
+  and launch-bound sweeps worth testing, but ptxas/timing remained the deciding
+  evidence.
+- CUDA guide page 526 describes launch bounds as a register-pressure control.
+  For this kernel, requesting two resident CTAs per SM forced spills and was
+  much slower.
+- CUDA guide page 134 warns that `cudaFuncSetCacheConfig` creates hard
+  shared/L1 requirements and can serialize launches when configurations change;
+  I did not put it in the hot launch path.
+- Exa surfaced K-split GEMV work, including a reported `GEMV/GEMV+Add`
+  decode speedup. That is a plausible next larger design direction, but it is
+  not a small patch here because gate/up partials would need an additional
+  cross-CTA reduction before the down projection.
+
+Commands:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_final_check/gemma4_ffn_decode.o
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+```
+
+Source baseline recheck:
+
+```text
+ffn decode tests passed
+Used 67 registers
+Spill stores: 0
+Spill loads: 0
+Used 11512 bytes smem
+```
+
+```text
+iters=30,warmup=8,trials=3
+custom_graph best_ms=1.025887
+scratch_clear_graph best_ms=0.002982
+warm_minus_clear best_ms=1.022905
+cold_minus_flush_clear best_ms=1.025677
+
+iters=80,warmup=12,trials=5
+custom_graph best_ms=1.024337
+scratch_clear_graph best_ms=0.001441
+warm_minus_clear best_ms=1.022896
+cold_minus_flush_clear best_ms=1.025257
+```
+
+Rejected variants, focused load bench:
+
+```text
+variant                  regs  spills       warm_minus_clear_ms  cold_minus_flush_clear_ms  decision
+tile448                  67    0/0          1.045233             1.046975                  reject
+tile384                  67    0/0          1.056563             1.058801                  reject
+tile336                  67    0/0          1.075157             1.077094                  reject
+tile256                  67    0/0          1.094603             1.095850                  reject
+weight_plain             68    0/0          1.025137             1.027255                  reject, over cap
+weight_cg                67    0/0          1.025749             1.027136                  reject
+weight_ldg               67    0/0          1.025751             1.026879                  reject
+act3                     56    0/0          1.026138             1.027738                  reject
+act2                     46    0/0          1.033358             1.035883                  reject
+regcap64                 67    0/0          1.024177             1.026101                  no useful cap
+regcap60                 67    0/0          1.024859             1.026315                  no useful cap
+regcap56                 67    0/0          1.024621             1.026256                  no useful cap
+one_pack_specialized     64    0/0          1.024240             1.026752                  reject, slower
+specialized_act6         77    48B/48B      1.107958             1.110202                  reject, spills
+specialized_act7         78    96B/96B      1.166462             1.170752                  reject, spills
+min_blocks_2             40    228B/200B    1.643979             1.647881                  reject, spills
+min_blocks_3             62    0/0          1.026586             1.027457                  reject, ignored/s lower
+preload_down             67    0/0          1.023137             1.024421                  inconclusive short
+preload_down_long        67    0/0          1.024983             1.026329                  reject
+```
+
+Conclusion:
+
+- No new source change was retained from this sweep. The current source path is
+  still the best measured safe path.
+- More CTAs did not improve cold loads; added reduction/fence overhead and
+  smaller per-CTA work dominated any extra SM spread.
+- Forcing lower registers was not beneficial. Real launch-bound pressure
+  spilled badly; the one-pack specialization saved registers but still slowed
+  down the kernel.
+- The next potentially meaningful direction is a larger K-split or multi-stage
+  GEMV design, but that needs a deliberate scratch/reduction design rather than
+  a small tweak to the current ordered-reduction kernel.
+
+## 2026-05-25 - FFN decode shared activation barrier trim
+
+Goal:
+
+- Continue improving the fully cold FFN decode path while preserving the
+  conservative lock handoff, staying at or below `67` registers, and avoiding
+  meaningful persistent scratch growth.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA GEMV memory bandwidth warp reduction split K occupancy optimization" \
+  --top-k 8
+exa-ai search \
+  "LLM decode GEMV CUDA optimization split K warp reduction memory bandwidth" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide excerpts again point at occupancy/register/shared-memory limits,
+  but the useful change here was synchronization pressure, not occupancy.
+- Exa surfaced K-split GEMV work as the next larger direction. I did not
+  implement that here because it would need a new cross-CTA partial reduction
+  design for gate/up before the down projection.
+
+Implementation:
+
+- Added a tiny `__shared__ float s_act[kActTile]` array for the GeGLU
+  activation scalars.
+- Previously those scalars were stored in `s_matmul_warp_sums[0][t][0]`,
+  forcing a full CTA tail barrier after every down-accumulation step before the
+  next gate/up reduction could overwrite the warp-sum storage.
+- With separate `s_act`, the next gate/up reduction can reuse
+  `s_matmul_warp_sums` immediately. The next reduction's internal CTA barrier
+  occurs before `s_act` is rewritten, so the old loop-tail barrier is not
+  needed.
+- Shared memory grows by only `kActTile * sizeof(float) = 16` bytes for the
+  default path.
+
+Correctness/resource checks:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_final_sact/gemma4_ffn_decode.o
+```
+
+```text
+ffn decode tests passed
+Used 67 registers
+Spill stores: 0
+Spill loads: 0
+Used 11528 bytes smem
+```
+
+Focused load bench:
+
+```bash
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+```
+
+```text
+prior source baseline:
+custom_graph best_ms=1.024337
+scratch_clear_graph best_ms=0.001441
+warm_minus_clear best_ms=1.022896
+cold_minus_flush_clear best_ms=1.025257
+
+shared-activation final source:
+custom_graph best_ms=1.024175
+scratch_clear_graph best_ms=0.001275
+warm_minus_clear best_ms=1.022900
+cold_minus_flush_clear best_ms=1.024132
+```
+
+Full cuDNN comparison harness:
+
+```bash
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+```text
+shared-activation source:
+cudnn_split_device_ms=0.999687
+custom_device_ms=1.024297
+custom_scratch_clear_device_ms=0.001544
+custom_minus_clear_device_ms=1.022753
+cold_custom_minus_flush_ms=1.026110
+cold_clear_minus_flush_ms=0.001363
+cold_custom_minus_flush_clear_ms=1.024747
+custom_minus_clear_vs_cudnn_split_speedup=0.977447
+```
+
+Follow-up variants after the `s_act` change:
+
+```text
+variant                 regs  smem    warm_minus_clear_ms  cold_minus_flush_clear_ms  decision
+preload_down_short      67    11528   1.022813             1.024174                  reject/no clear win
+gate_up_preload_short   66    11528   1.021861             1.022943                  promising short
+gate_up_preload_long    66    11528   1.022636             1.023892                  not clearly better
+gate_up_preload_full    66    11528   1.023057             1.024124                  mixed
+gate_up_source_full     66    11528   1.023816             1.025231                  reject
+```
+
+Conclusion:
+
+- Retained the separate shared activation storage and removed the old
+  down-loop tail barrier.
+- Did not retain gate/up register preloading as a default. It lowered ptxas to
+  `66` registers and had one promising short run, but current-source full
+  timing and focused long timing were not consistently better than the plain
+  `s_act` path.
+- The retained change is small, keeps the kernel at `67` registers with zero
+  spills, increases shared memory by only `16` bytes, and improves the focused
+  fully cold long metric from `1.025257 ms` to `1.024132 ms`.
+
+## 2026-05-25 - FFN decode coalescing and race audit
+
+Goal:
+
+- Audit the retained FFN decode HBM load layout, shared-memory access pattern,
+  ordered scratch reduction, and obvious failure modes after the shared
+  activation change.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA one thread computes activation then shared memory versus warp parallel tanh register pressure memory bound kernel" \
+  --top-k 5
+exa-ai search \
+  "CUDA GEMV optimization coalesced loads register pressure FFN inference" \
+  --num-results 5 --summary --output-format toon
+```
+
+Also checked NVIDIA's CUDA Programming Guide, the NVIDIA fully-connected layer
+optimization guide, CUTLASS efficient GEMM notes, and FlashDecoding++ for
+decode-phase GEMV/flat-GEMM optimization context.
+
+Audit notes:
+
+- HBM loads in the hot kernel use 128-bit bf16/float packs. For `x`,
+  residual, RMS weight, scratch accum, and output stores, consecutive warp
+  lanes own consecutive hidden packs, so each warp request covers contiguous
+  128-byte segments with no stride waste.
+- Gate/up and down weights are pre-swizzled in 128-bit hidden packs. The
+  current `shared_x_chunk_index()` only permutes the eight 16-byte packs inside
+  each 128-byte row, so a warp still touches the same contiguous cache-line
+  segments even though lane order is permuted inside the segment.
+- Shared `s_x` accesses use one 16-byte pack per thread. The 8-pack row swizzle
+  keeps each 128-byte row covered exactly once by an eight-lane group. `s_act`
+  is written by one thread and read uniformly by the CTA; uniform same-word
+  shared reads are broadcast rather than a multi-bank conflict.
+- The cross-CTA scratch reduction still uses the conservative lock handoff:
+  each tile waits for its turn, reads/writes scratch, runs CTA-wide fences, and
+  releases with a global release reduction. The launcher rejects devices that
+  cannot keep all reduction CTAs resident, avoiding spin-wait deadlock from
+  under-residency.
+
+Implementation retained:
+
+- Tightened the scratch pointer validation from 16-byte alignment to 128-byte
+  alignment to match `alignas(128) Gemma4FfnDecodeScratch`.
+- Added a unit-test check that a 16-byte-but-not-128-byte scratch pointer is
+  rejected before launch.
+- Kept the thread0 `s_act` writer. It avoids the previous warp-shuffle
+  activation broadcast, has a single writer for the activation scalars, and was
+  essentially neutral to slightly better on fully cold timing.
+- Kept the `GEMMA4_MATMUL_DEVICE_PRELOAD_PAIR_COLS` compile-time toggle
+  defaulted off. The preload variant reduced registers but did not beat the
+  default path consistently.
+
+Commands:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_final/gemma4_ffn_decode.o
+cuobjdump --dump-sass build/ptx/ffn_final/gemma4_ffn_decode.o | \
+  grep -E "LDG|LDGSTS|STG|LDS|STS|RED" | head -80
+compute-sanitizer --tool racecheck ./build/tests/test_ffn_decode
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+make ffn-cudnn-bench
+GEMMA4_FFN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+Correctness/resource checks:
+
+```text
+ffn decode tests passed
+Used 67 registers
+Spill stores: 0
+Spill loads: 0
+Used 11528 bytes smem
+SASS includes LDG.E.128 / LDG.E.EF.128, STG.E.128, LDS.128, STS.128
+```
+
+`compute-sanitizer --tool racecheck` was not usable on this Thunder machine:
+the target aborted in the platform shim with `Unimplemented CUDA export table
+function: Table=cupti_device_query, Index=7`. Treat the race result as
+unverified by sanitizer; the regular CUDA test passed and the synchronization
+audit above did not find a race.
+
+Thread0 activation writer measurements:
+
+```text
+focused, iters=30,warmup=8,trials=3:
+custom_graph best_ms=1.022806
+scratch_clear_graph best_ms=0.001357
+warm_minus_clear best_ms=1.021450
+cold_minus_flush_clear best_ms=1.023595
+
+focused, iters=80,warmup=12,trials=5:
+custom_graph best_ms=1.023252
+scratch_clear_graph best_ms=0.001424
+warm_minus_clear best_ms=1.021829
+cold_minus_flush_clear best_ms=1.024028
+
+full cuDNN harness, iters=50,warmup=10,trials=3:
+cudnn_split_device_ms=0.999998
+custom_device_ms=1.024863
+custom_scratch_clear_device_ms=0.001356
+custom_minus_clear_device_ms=1.023507
+cold_custom_minus_flush_clear_ms=1.024686
+custom_minus_clear_vs_cudnn_split_speedup=0.977031
+
+final source after alignment guard, focused iters=30,warmup=8,trials=3:
+custom_graph best_ms=1.023542
+scratch_clear_graph best_ms=0.001446
+warm_minus_clear best_ms=1.022096
+cold_minus_flush_clear best_ms=1.024101
+```
+
+Rejected variants:
+
+```text
+variant                         regs  cold_minus_flush_clear_ms  decision
+one_pack_helper                 58    1.024144 focused long      reject; full cold 1.025253
+one_pack_helper_gate_preload    57    1.024121 focused long      reject; no clear win
+gate_up_preload_default_source  66    1.025231 full              reject
+```
+
+Conclusion:
+
+- No bank-conflict or race-condition bug was found in the source audit.
+- The HBM pull pattern is fully coalesced by cache-line segment for the current
+  128-bit pack layout; Nsight Compute would still be needed for hardware
+  counter proof, but `ncu`/sanitizer tooling remains blocked in this runtime.
+- The only correctness hardening retained from this audit is the 128-byte
+  scratch alignment guard and test.
+
+## 2026-05-25 - FFN decode 896-tile cold-load sweep
+
+Goal:
+
+- Continue reducing the fully cold FFN decode time without exceeding `67`
+  registers, adding meaningful memory, or weakening the conservative scratch
+  reduction synchronization.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA GEMV one thread per output hidden pack specialize compile time remove loop integer overhead register pressure" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA memory bound kernel reduce instruction overhead loop hoisting integer address calculation register pressure" \
+  --top-k 8
+exa-ai search \
+  "CUDA GEMV LLM decode one thread per output vector coalesced BF16 optimization" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide page 519 again makes the useful tradeoff explicit: compiler
+  common-subexpression and cached-load optimizations can reduce work but raise
+  register pressure. This showed up directly: the gate/up pointer-base helper
+  and one-pack kernel specialization both increased ptxas register count.
+- CUDA guide pages 28 and 119 tie occupancy to registers, shared memory, and
+  resident warps/blocks. The larger intermediate tile reduces CTA count and
+  ordered scratch-reduction work while keeping one 672-thread CTA resident per
+  scheduled SM.
+- CUDA guide page 67 keeps the coalescing requirement front and center. The
+  retained tile-size change does not alter the 128-bit hidden-pack load layout.
+- Exa surfaced current GEMV/decode optimization work in `mistral.rs`,
+  `llama.cpp`, and FP4 GEMV writeups. The useful local takeaway was to test
+  address-arithmetic and tile-count changes before attempting a larger split-K
+  redesign.
+
+Implementation retained:
+
+- Changed the default `GEMMA4_FFN_DECODE_INTERMEDIATE_TILE` from `672` to
+  `896`. This reduces the ordered intermediate-tile reduction from `32` CTAs
+  to `24` CTAs.
+- Kept `GEMMA4_FFN_DECODE_THREADS=672`, `ACT_TILE=4`, `.cs` weight loads,
+  the SoA scratch layout, lock-only scratch clear, and conservative release
+  handoff unchanged.
+- In down accumulation, compute `down_row0` once per activation group and use
+  unrolled `t * GEMMA4_HIDDEN_SIZE` offsets for the four down-weight rows.
+  This does not change the HBM access pattern or scratch footprint.
+
+Commands:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_tile896_default/gemma4_ffn_decode.o
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+make ffn-cudnn-bench
+GEMMA4_FFN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+Correctness/resource checks:
+
+```text
+ffn decode tests passed
+Used 67 registers
+Spill stores: 0
+Spill loads: 0
+Used 11528 bytes smem
+```
+
+Focused load-bench results:
+
+```text
+previous retained source, focused iters=80,warmup=12,trials=5:
+custom_graph best_ms=1.023252
+scratch_clear_graph best_ms=0.001424
+warm_minus_clear best_ms=1.021829
+cold_minus_flush_clear best_ms=1.024028
+
+down-row base only, focused iters=80,warmup=12,trials=5:
+custom_graph best_ms=1.022539
+scratch_clear_graph best_ms=0.001215
+warm_minus_clear best_ms=1.021324
+cold_minus_flush_clear best_ms=1.023419
+
+tile896 default source, focused iters=80,warmup=12,trials=5:
+custom_graph best_ms=1.016745
+scratch_clear_graph best_ms=0.001229
+warm_minus_clear best_ms=1.015516
+cold_minus_flush_clear best_ms=1.016316
+```
+
+Full cuDNN comparison harness:
+
+```text
+tile896 default source, iters=50,warmup=10,trials=3:
+cudnn_split_device_ms=1.000357
+custom_device_ms=1.022643
+custom_scratch_clear_device_ms=0.001528
+custom_minus_clear_device_ms=1.021115
+cold_custom_minus_flush_ms=1.022621
+cold_clear_minus_flush_ms=0.001129
+cold_custom_minus_flush_clear_ms=1.021492
+custom_minus_clear_vs_cudnn_split_speedup=0.979671
+max_abs_vs_split=0
+```
+
+Rejected variants:
+
+```text
+variant                        regs/spills        cold_minus_flush_clear_ms  decision
+one_pack_kernel_specialized    68, 0/0            not timed                 reject; over cap
+one_pack_maxrregcount67        72, 0/0            not timed                 reject; cap made worse
+gate_up_pointer_base           68, 0/0            not timed                 reject; over cap
+tile768                        67, 0/0            1.021229 long             reject; slower than tile896
+tile1024                       67, 0/0            1.021745 short            reject; slower than tile896
+tile1344                       67, 0/0            1.226100 short            reject; too few CTAs
+gate_up_preload_tile896        66, 0/0            1.017170 short            reject; slower
+down_preload_tile896           67, 0/0            1.016330 long             reject; tie/slightly slower
+act8_tile896                   80, 140B/140B      1.160775 short            reject; spills and slow
+```
+
+Conclusion:
+
+- Retained `INTERMEDIATE_TILE=896` and the down-row base address cleanup.
+- The retained source stays at `67` registers, has zero spills, does not grow
+  scratch, and keeps the same coalesced 128-bit HBM load layout.
+- Fully cold focused timing improved from the prior retained long result
+  `1.024028 ms` to `1.016316 ms`.
+
+## 2026-05-25 - FFN decode direct-x and one-pack helper
+
+Goal:
+
+- Keep pushing the fully cold FFN decode path without exceeding the register
+  cap, growing scratch, or changing the lock/reduction safety model.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA warp shuffle sync mask active lanes divergent branch requirements" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA tanhf latency warp parallel compute independent scalar operations register pressure" \
+  --top-k 8
+exa-ai search \
+  "CUDA warp shuffle active mask __shfl_sync optimization GEMV activation tanh" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide pages 550-551 describe the `__shfl_sync` mask contract: only
+  non-exited participating lanes named in the mask can be safely used. The
+  narrow-lane activation writer was correct under that rule, but it timed
+  slower than the single-thread writer.
+- CUDA guide page 117 notes SIMT divergence masking. That makes tiny-lane
+  activation parallelism a measurement question rather than an obvious win.
+- CUDA guide pages 28, 119, and 519 were again the guardrails: avoid trading
+  instruction savings for register blowups unless timing proves it.
+- Exa surfaced GEMV/decode kernels and warp-shuffle discussions; the useful
+  local tests were the prologue specialization and helper specialization below.
+
+Implementation retained:
+
+- Specialized the `x` shared-memory preload for the default one-thread-per-pack
+  geometry (`672` threads, `672` hidden packs). The generic path remains for
+  non-default compile-time thread sweeps.
+- Split the shared-`x` gate/up dot body into a per-pack helper and let the
+  caller bypass the `pack_idx += Threads` loop when `Threads == packs_per_col`.
+  This keeps the helper reusable and drops the hot kernel from `67` to `57`
+  registers.
+- Kept `.cs` weight loads, `THREADS=672`, `INTERMEDIATE_TILE=896`,
+  `ACT_TILE=4`, `PRELOAD_DOWN=0`, and the conservative ordered scratch
+  handoff.
+
+Commands:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_final_helper_directx/gemma4_ffn_decode.o
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+make ffn-cudnn-bench
+GEMMA4_FFN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+Correctness/resource checks:
+
+```text
+ffn decode tests passed
+Used 57 registers
+Spill stores: 0
+Spill loads: 0
+Used 11528 bytes smem
+```
+
+Focused load-bench results:
+
+```text
+tile896 previous retained source, focused iters=80,warmup=12,trials=5:
+custom_graph best_ms=1.016745
+scratch_clear_graph best_ms=0.001229
+warm_minus_clear best_ms=1.015516
+cold_minus_flush_clear best_ms=1.016316
+
+direct-x only, focused iters=80,warmup=12,trials=5:
+custom_graph best_ms=1.016912
+scratch_clear_graph best_ms=0.001206
+warm_minus_clear best_ms=1.015706
+cold_minus_flush_clear best_ms=1.015453
+
+direct-x plus one-pack helper, focused iters=80,warmup=12,trials=5:
+custom_graph best_ms=1.015880
+scratch_clear_graph best_ms=0.001193
+warm_minus_clear best_ms=1.014687
+cold_minus_flush_clear best_ms=1.014572
+```
+
+Full cuDNN comparison harness:
+
+```text
+direct-x plus one-pack helper, iters=50,warmup=10,trials=3:
+cudnn_split_device_ms=0.999928
+custom_device_ms=1.021978
+custom_scratch_clear_device_ms=0.001324
+custom_minus_clear_device_ms=1.020653
+cold_custom_minus_flush_ms=1.022648
+cold_clear_minus_flush_ms=0.001460
+cold_custom_minus_flush_clear_ms=1.021188
+custom_minus_clear_vs_cudnn_split_speedup=0.979694
+max_abs_vs_split=0
+```
+
+Rejected variants:
+
+```text
+variant                    regs/spills      cold_minus_flush_clear_ms  decision
+narrow-mask warp s_act     67, 0/0          1.017355 short            reject; slower
+helper_gate_preload        57, 0/0          1.015617 long             reject; slower
+helper_down_preload        57, 0/0          1.015224 short            reject; no clear win
+threads640                 76, 0/0          1.390937 short            reject; over cap/slow
+threads704                 67, 0/0          1.015276 short            reject; slower than default
+weight_policy_cg           57, 0/0          1.023766 short            reject; slower
+weight_policy_ldg          57, 0/0          1.021502 short            reject; slower
+```
+
+Note:
+
+- An initial parallel `.cg`/`ldg` policy run overlapped two GPU benchmarks and
+  was discarded. The logged cache-policy numbers above are sequential reruns.
+
+Conclusion:
+
+- Retained direct `x` preload specialization and the reusable one-pack
+  shared-`x` dot helper.
+- The retained path keeps the same scratch footprint and HBM layout, drops the
+  hot kernel to `57` registers, and improves the focused fully cold long metric
+  from `1.016316 ms` to `1.014572 ms`.
+
+## 2026-05-25 - FFN decode post-helper rejection sweep
+
+Goal:
+
+- Use the new `57`-register headroom to retest variants that were previously
+  blocked by register pressure, while keeping scratch, HBM layout, and the
+  conservative ordered reduction unchanged.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA GEMV columns per block tradeoff register pressure reductions shared memory fewer synchronizations" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA occupancy register pressure memory bandwidth instruction level parallelism fewer barriers" \
+  --top-k 8
+exa-ai search \
+  "CUDA GEMV columns per thread register pressure reduction barrier optimization" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide page 71 describes occupancy as a latency-hiding tool, but bounded
+  by register/shared/thread resources. The `ACT_TILE` variants still hit the
+  register wall even after the helper lowered the default path.
+- CUDA guide page 526 keeps launch bounds/register pressure in play; I did not
+  retain a min-blocks experiment because the compile-time define was not wired
+  into source and the produced binary was just the default launch-bounds path.
+- CUDA guide page 67 and the Exa GEMV references reinforced that coalescing and
+  reduction shape remain the important levers. The tested variants below did
+  not improve the measured cold path.
+
+Commands:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_final_recheck/gemma4_ffn_decode.o
+```
+
+Final source recheck:
+
+```text
+ffn decode tests passed
+Used 57 registers
+Spill stores: 0
+Spill loads: 0
+Used 11528 bytes smem
+```
+
+Rejected variants:
+
+```text
+variant                    regs/spills  smem       cold_minus_flush_clear_ms  decision
+act7                       80, 0/0      12044 B    not timed                 reject; over cap
+act8                       80, 0/0      12216 B    not timed                 reject; over cap
+act14                      80, 0/0      13248 B    not timed                 reject; over cap
+tile1024                   57, 0/0      11528 B    1.018123 short            reject; slower
+tile768                    57, 0/0      11528 B    1.019013 short            reject; slower
+preload_gate_and_down      57, 0/0      11528 B    1.015743 short            reject; slower
+one_pack_kernel_retry      60, 0/0      11528 B    1.015970 short            reject; slower
+hoist_swizzled_hidden_col  57, 0/0      11528 B    1.016038 short            reject; slower
+```
+
+Conclusion:
+
+- No new source optimization was retained from this sweep.
+- The current best source remains the direct-`x` preload plus one-pack
+  shared-`x` dot helper path from the previous entry: `57` registers, zero
+  spills, same scratch size, and focused fully cold long metric `1.014572 ms`.
+
+## 2026-05-25 - FFN decode extended HBM-load rejection sweep
+
+Goal:
+
+- Recheck bank-conflict, race, and HBM coalescing concerns after the direct-`x`
+  and one-pack helper changes.
+- Use the remaining `57`-register default path to try a few more low-growth
+  load-shaping variants before declaring the current source best-known.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA shared memory bank conflicts coalesced global memory 128-byte warp access optimization" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA global memory visibility between blocks acquire release atomic threadfence synchronization" \
+  --top-k 8
+python3 scripts/query.py \
+  "What does __threadfence guarantee global memory writes visible other thread blocks" \
+  --top-k 8
+exa-ai search \
+  "CUDA GEMV HBM coalescing shared memory bank conflicts optimization register pressure" \
+  --num-results 5 --summary --output-format toon
+```
+
+Useful reference points:
+
+- CUDA guide pages 60 and 67: global-memory coalescing and shared-memory bank
+  conflicts are separate checks. The current HBM load streams remain contiguous
+  16-byte pack streams across each warp.
+- CUDA guide pages 532-533: `__threadfence()` orders the releasing block's
+  prior global writes before the lock handoff. The retained code keeps all
+  threads synchronized around the fence and keeps per-thread acquire polling
+  before reading scratch.
+- NVIDIA CUDA Best Practices 13.2 says cc 6.0+ coalescing maps a warp request
+  to the required 32-byte transactions, and shared-memory bank conflicts
+  serialize same-bank requests. The static address pattern was checked against
+  those rules; final proof still needs Nsight Compute conflict/transaction
+  metrics.
+- Exa surfaced NVIDIA's current global-memory-access article, CUDA Best
+  Practices, and KBLAS GEMV work. The practical advice matched the local tests:
+  keep warp addresses contiguous, avoid stride-heavy HBM streams, and profile
+  with NCU before believing a micro-optimization.
+
+Rejected variants:
+
+```text
+variant                    regs/spills  smem       cold_minus_flush_clear_ms  decision
+act6_tile672               72, 0/0      11872 B    not timed                 reject; over cap
+act6_tile768               72, 0/0      11872 B    not timed                 reject; over cap
+act7_tile896               80, 0/0      12044 B    not timed                 reject; over cap
+act8_tile896               80, 0/0      12216 B    not timed                 reject; over cap
+act14_tile896              80, 0/0      13248 B    not timed                 reject; over cap
+tile512                    57, 0/0      11528 B    1.036881 short            reject; slower
+tile768                    57, 0/0      11528 B    1.019013 short            reject; slower
+tile1024                   57, 0/0      11528 B    1.018123 short            reject; slower
+async_x                    57, 0/0      11528 B    1.016876 short            reject; slower
+no_swizzle                 62, 0/0      11528 B    1.014982 long             reject; slower
+preload_gate_and_down      57, 0/0      11528 B    1.015743 short            reject; slower
+one_pack_kernel_retry      60, 0/0      11528 B    1.015970 short            reject; slower
+hoist_swizzled_hidden_col  57, 0/0      11528 B    1.016038 short            reject; slower
+global_x_gemv              57, 0/0        776 B    1.017591 short            reject; slower
+```
+
+Attempted NCU metric checks:
+
+```bash
+timeout 120s ncu --target-processes all --kernel-name-base demangled \
+  --kernel-name regex:gemma4_ffn_decode_fused_bf16_kernel \
+  --metrics l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,\
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,\
+l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,\
+l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
+dram__sectors_read.sum,dram__sectors_write.sum \
+  --csv build/experiments/gemma4_ffn_decode_load_bench 1 0 1
+timeout 90s ncu --target-processes all --launch-count 1 \
+  --print-summary per-kernel ./build/tests/test_ffn_decode
+```
+
+Both attempts timed out with `==WARNING== No kernels were profiled.` Treat the
+bank-conflict and transaction conclusions here as a static address-pattern
+audit until a narrower standalone NCU harness returns metrics.
+
+Notes:
+
+- The `-DGEMMA4_FFN_DECODE_MIN_BLOCKS_PER_SM=2` compile was discarded because
+  that define is not wired into the source, so it was not a real experiment.
+- The `global_x_gemv` branch cut shared memory sharply but reloaded `x` from
+  global memory in the gate/up loop and lost time; its source code was removed.
+- No new source optimization was retained. Current best remains
+  direct-`x` preload plus one-pack shared-`x` helper: `57` registers, zero
+  spills, `11528 B` shared memory, focused fully cold long metric
+  `1.014572 ms`.
+
+## 2026-05-25 - FFN decode two-kernel atomic reduction
+
+Goal:
+
+- Stop only tuning small cache/thread knobs and revisit the larger reduction
+  shape. The old kernel computed one partial hidden vector per intermediate
+  tile, then serialized those vectors through a global lock before the final
+  residual/RMSNorm pass.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA reduce partial sums across thread blocks global memory second kernel versus atomics performance synchronization" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA cooperative groups grid synchronization resident blocks inter block reduction single kernel" \
+  --top-k 10
+exa-ai search \
+  "CUDA GEMV fusion two stage reduction intermediate partials LLM FFN decode optimization" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "single token FFN decode CUDA GEMV optimization down projection fused activation" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide page 70 warns that atomics should be used sparingly because they
+  synchronize memory updates. Here the contended atomic traffic is only the
+  final `5376`-float scratch vector, while the dominant HBM work remains
+  streaming gate/up/down weights.
+- CUDA guide pages 238, 241, and 627 cover cooperative groups/grid sync. A
+  cooperative single-kernel version compiled, but this Thunder prototyping
+  instance rejects `cuLaunchCooperativeKernel`, so it could not be measured
+  here.
+- Exa surfaced llama.cpp GEMV fusion work, FlashDecoding++/full-block decode
+  work, and CODA-style epilogue fusion. The applicable idea for this kernel was
+  to remove the serialized inter-CTA lock and let a later stage consume global
+  partials.
+
+Retained implementation:
+
+- Replaced the lock-ordered in-kernel reduction with:
+  - `gemma4_ffn_decode_accumulate_bf16_kernel`: each intermediate-tile CTA
+    computes its hidden-vector partial and atomically adds it into the existing
+    scratch accumulator.
+  - `gemma4_ffn_decode_finalize_bf16_kernel`: one CTA reads the accumulated
+    scratch vector, adds residual, computes RMSNorm scale, and writes normed
+    output.
+- Removed the scratch `lock` and padding fields. Scratch is now just the SoA
+  float accumulator and remains `alignas(128)`.
+- Removed the old resident-grid safety check; it was only needed to avoid
+  deadlock in the serialized-lock kernel. The two-kernel atomic path is safe
+  with multiple waves because the kernel boundary is the inter-block
+  synchronization point.
+- Updated focused/full FFN benchmarks so `custom_scratch_clear` measures the
+  same full-scratch clear that the new path uses.
+- Retuned `INTERMEDIATE_TILE` after the reduction change. The old `896` tile
+  used only `24` CTAs. The retained `168` tile uses `128` CTAs, improving SM
+  coverage enough to beat the extra atomic updates.
+
+Rejected/diagnostic variants:
+
+```text
+variant                    regs/spills  smem       cold_minus_flush_clear_ms  decision
+coop_atomic_grid_sync       57, 0/0      11528 B    not runnable              rejected here; cuLaunchCooperativeKernel unsupported
+atomic_tile896              64, 0/0      11440 B    0.987878 long             good, but tile retune wins
+atomic_tile1024             64, 0/0      11440 B    0.998512 short            reject; slower
+atomic_tile768              64, 0/0      11440 B    0.985942 short            reject; slower
+atomic_tile672              64, 0/0      11440 B    0.983177 long             reject; slower than 168
+atomic_tile512              64, 0/0      11440 B    0.987258 short            reject; slower
+atomic_tile448              64, 0/0      11440 B    0.985877 short            reject; slower
+atomic_tile384              64, 0/0      11440 B    0.985117 short            reject; slower
+atomic_tile336              64, 0/0      11440 B    0.982257 long             reject; near tie/slower
+atomic_tile256              64, 0/0      11440 B    0.984130 short            reject; slower
+atomic_tile224              64, 0/0      11440 B    1.059134 short            reject; much slower
+atomic_tile192              64, 0/0      11440 B    0.984500 short            reject; slower
+atomic_threads704           64, 0/0      11472 B    0.990002 short            reject; slower
+atomic_threads736           64, 0/0      11504 B    0.989048 short            reject; slower
+atomic_threads800           64, 0/0      11568 B    0.990722 short            reject; slower
+```
+
+Final validation:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_atomic_tile168_final/gemma4_ffn_decode.o
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+Additional diagnostic:
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode 99 \
+  build/tests/test_ffn_decode
+```
+
+This could not run on the Thunder instance. The sanitizer path aborted through an
+unsupported CUPTI/device-query export (`cupti_device_query`), then left the target
+process waiting under the sanitizer launcher. The stuck sanitizer process was
+terminated manually. Treat this as an unavailable tool result, not as either a
+clean sanitizer pass or a detected kernel fault.
+
+Final resource check:
+
+```text
+ffn decode tests passed
+accumulate kernel: 64 registers, 0 spills, 11440 B smem
+finalize kernel:   26 registers, 0 spills,    88 B smem
+```
+
+Focused fully cold load bench, `iters=80,warmup=12,trials=5`:
+
+```text
+custom_graph best_ms=0.980793
+scratch_clear_graph best_ms=0.001108
+warm_minus_clear best_ms=0.979685
+cold_custom best_ms=1.381653
+cold_clear best_ms=0.399534
+flush_only best_ms=0.397676
+cold_minus_flush_clear best_ms=0.982118
+```
+
+Full cuDNN comparison harness, `iters=50,warmup=10,trials=3`:
+
+```text
+cudnn_split_device_ms=0.998766
+custom_device_ms=0.980579
+custom_scratch_clear_device_ms=0.001130
+custom_minus_clear_device_ms=0.979448
+cold_custom_minus_flush_clear_ms=0.981459
+custom_vs_cudnn_split_speedup=1.018548
+custom_minus_clear_vs_cudnn_split_speedup=1.019723
+max_abs_vs_split=0
+```
+
+Conclusion:
+
+- Retained the two-kernel atomic reduction and `INTERMEDIATE_TILE=168`.
+- Fully cold focused timing improved from the previous retained `1.014572 ms`
+  to `0.982118 ms` (`~3.2%`).
+- The full harness now puts the custom path ahead of the cuDNN split baseline
+  on the graph/device metric while preserving correctness (`max_abs_vs_split=0`).
+
+## 2026-05-25 - FFN decode component-major scratch and direct x loads
+
+Goal:
+
+- Continue looking for larger fully-cold FFN decode wins after the two-kernel
+  atomic reduction. Keep the register count below `67`, avoid extra persistent
+  memory, and remove dead experimental code where possible.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA global memory atomic add performance contention reduction across thread blocks second kernel memory coalescing" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA global memory coalescing 32 byte transactions sequential 16 byte loads warp" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA shared memory bank conflicts 128 bit access swizzle warp" \
+  --top-k 8
+exa-ai search \
+  "CUDA single token FFN decode GEMV atomic reduction optimization LLM inference" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "CUDA split K reduction GEMV atomics second kernel performance optimization" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "LLM decode GEMV optimization cold weights memory bandwidth CUDA" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide page 60: global-memory requests coalesce into the 32-byte
+  transactions needed for the warp address distribution; maximize useful bytes
+  per transaction.
+- CUDA guide page 61: consecutive thread addresses are the typical coalescing
+  pattern, but a permutation that stays within the same segments can still
+  coalesce.
+- CUDA guide pages 67-69: shared-memory bank conflicts are a separate issue
+  from HBM coalescing, and atomics should be used sparingly because they
+  synchronize memory updates.
+- Exa again pointed at split-K/GEMV and decode-fusion work. The practical local
+  move was to make the remaining atomic streams more warp-contiguous, then
+  retune the split-K tile size.
+
+Retained implementation:
+
+- Changed `Gemma4FfnDecodeScratch` from pack-major SoA:
+  `accum_lo[hidden_pack][4]` / `accum_hi[hidden_pack][4]`
+  to component-major `accum[8][hidden_pack]`.
+  This keeps the scratch footprint at `21,504 B`, but for each atomic component
+  a warp now writes consecutive `float` addresses instead of a 16-byte stride.
+- Retuned the default FFN decode geometry to `INTERMEDIATE_TILE=2` and
+  `ACT_TILE=2`. This creates many more CTAs, but drops the accumulate kernel
+  register count and gives better SM coverage on the fully cold metric.
+- Removed shared-memory staging for `x` in the accumulate kernel. At tile `2`,
+  `x` is not reused inside a CTA, so staging all hidden packs through shared
+  memory only adds a barrier and shared traffic. The retained path now loads
+  `x` directly and uses the same pre-swizzled weight layout.
+- Removed the unused one-pack shared-`x` matmul helper from
+  `src/gemma4_matmul_device.cuh`; no retained code calls it after direct `x`
+  loads.
+
+Rejected/diagnostic variants:
+
+```text
+variant                         regs/spills  smem       cold_minus_flush_clear_ms  decision
+component_tile168                64, 0/0        11440 B  0.980680 long             good, but tile retune wins
+component_tile128                64, 0/0        11440 B  0.983216 short            reject; slower
+component_tile112                64, 0/0        11440 B  0.981282 short            reject; slower
+component_tile96                 64, 0/0        11440 B  0.982692 short            reject; slower
+component_tile84                 64, 0/0        11440 B  1.030398 short            reject; much slower
+component_tile56                 64, 0/0        11440 B  0.979840 long             reject; slower than tile2
+component_tile24                 64, 0/0        11440 B  0.979423 long             reject; slower than tile2
+component_tile4_act4             50, 0/0        11440 B  0.978434 long             reject; slower than tile2
+component_tile2_act2             34, 0/0        11096 B  0.978144 long             good, direct x wins
+component_tile1_act1             26, 0/0        10924 B  0.979583 short            reject; too many CTAs
+component_threads512             37, 0/0        11016 B  0.980375 short            reject; fewer threads lose
+component_threads448             37, 0/0        10984 B  0.982145 short            reject; slower
+component_threads384             37, 0/0        10952 B  0.985186 short            reject; slower
+component_threads256             40, 0/0        10888 B  0.983360 short            reject; slower
+direct_x_tile2_act2              40, 0/0          344 B  0.977318 long             retained
+direct_x_tile4_act2              50, 0/0          344 B  0.978383 short            reject; slower
+direct_x_tile4_act4              64, 0/0          688 B  0.978186 short            reject; slower
+direct_x_tile6_act2              50, 0/0          344 B  0.978328 short            reject; slower
+direct_x_tile6_act3              64, 0/0          516 B  0.978962 short            reject; slower
+direct_x_no_swizzle              40, 0/0          344 B  0.977545 long             reject; slower
+direct_x_weight_policy_cg        40, 0/0          344 B  0.977894 short            reject; slower
+direct_x_weight_policy_ldg       40, 0/0          344 B  0.977842 short            reject; slower
+direct_x_preload_down            40, 0/0          344 B  0.977484 short            reject; slower
+direct_x_launch_bounds_min2      36, 0/0          344 B  0.977376 long             reject; lower regs but slower
+direct_x_tile12_act4             72, 0/0          688 B  0.979446 short            reject; over 67-reg cap
+direct_x_tile24_act4             72, 0/0          688 B  0.979414 short            reject; over 67-reg cap
+```
+
+Final validation:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_direct_final/gemma4_ffn_decode.o
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+Final resource check:
+
+```text
+ffn decode tests passed
+accumulate kernel: 40 registers, 0 spills, 344 B smem
+finalize kernel:   26 registers, 0 spills,  88 B smem
+```
+
+Focused fully cold load bench, `iters=80,warmup=12,trials=5`:
+
+```text
+custom_graph best_ms=0.976600
+scratch_clear_graph best_ms=0.001088
+warm_minus_clear best_ms=0.975512
+cold_custom best_ms=1.376668
+cold_clear best_ms=0.399349
+flush_only best_ms=0.397513
+cold_minus_flush_clear best_ms=0.977318
+```
+
+Full cuDNN comparison harness, `iters=50,warmup=10,trials=3`:
+
+```text
+cudnn_split_device_ms=0.998332
+custom_device_ms=0.976398
+custom_scratch_clear_device_ms=0.001107
+custom_minus_clear_device_ms=0.975291
+cold_custom_minus_flush_clear_ms=0.977360
+custom_vs_cudnn_split_speedup=1.022464
+custom_minus_clear_vs_cudnn_split_speedup=1.023624
+```
+
+Conclusion:
+
+- Retained component-major scratch, direct `x` gate/up loads, and
+  `INTERMEDIATE_TILE=2` / `ACT_TILE=2`.
+- The focused fully cold metric improved from the previous retained
+  `0.982118 ms` to `0.977318 ms` (`~0.5%`) without increasing scratch memory.
+- Compared with the pre-atomic retained baseline (`1.014572 ms`), the current
+  focused fully cold path is now about `3.7%` faster.
+
+## 2026-05-25 - FFN decode one-pack specialization
+
+Goal:
+
+- Continue reducing fully-cold FFN decode time without crossing the `67`
+  register cap or growing persistent memory. The current direct-`x` kernel uses
+  `672` threads, exactly one thread per hidden bf16 pack, so this round tested
+  whether making that measured shape explicit improves the hot path.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA device tanhf __tanhf fast approximate intrinsic performance accuracy" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA launch bounds register pressure occupancy performance maxrregcount tradeoff" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA memory coalescing contiguous per warp global stores atomics performance" \
+  --top-k 8
+exa-ai search \
+  "CUDA GELU tanh approximation kernel optimization __tanhf LLM inference" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "CUDA GEMV LLM decode optimize register pressure launch bounds atomics" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide pages 605-606 document `__tanhf` and note that `--use_fast_math`
+  maps `tanhf` to the intrinsic form. It passed the local BF16 correctness test
+  but did not improve the long fully-cold metric.
+- CUDA guide pages 70-72 and 525-527 cover occupancy, register pressure, and
+  launch-bounds tradeoffs. Lowering registers alone was not enough reason to
+  retain a variant when fully-cold time regressed.
+- Exa surfaced LLM GELU kernels using faster tanh/MUFU-style approximations and
+  GEMV decode discussions. The useful local action was to test the special
+  function path and then specialize the measured one-pack threading shape.
+
+Retained implementation:
+
+- Added a compile-time requirement that the FFN decode CTA maps exactly one
+  thread to each hidden bf16 pack: `THREADS == HIDDEN_PACKS == 672`.
+- Removed the generic hidden-pack round loops from the hot accumulate/finalize
+  paths and made the one-pack path explicit.
+- Kept the direct `x` load path and component-major scratch layout from the
+  previous round.
+
+Rejected/diagnostic variants:
+
+```text
+variant                         regs/spills  smem       cold_minus_flush_clear_ms  decision
+fast_tanh_intrinsic              38, 0/0        344 B    0.977441 long             reject; correct but slower
+x_load_normal                    40, 0/0        344 B    0.977363 long             reject; slower than retained
+x_load_cg                        40, 0/0        344 B    0.977351 short            reject; no win
+int32_hot_offsets                38, 0/0        344 B    0.977495 long             reject; lower regs but slower
+threads512                       40, 0/0        264 B    0.982346 short            reject; slower
+threads576                       40, 0/0        296 B    0.978621 short            reject; slower
+threads608                       40, 0/0        312 B    0.978406 short            reject; slower
+threads640                       40, 0/0        328 B    0.979277 short            reject; slower
+threads704                       40, 0/0        360 B    0.977477 short            reject; slower
+threads736                       40, 0/0        376 B    0.977695 short            reject; slower
+threads768                       40, 0/0        392 B    0.977641 short            reject; slower
+threads800                       40, 0/0        408 B    0.977324 long             reject; near tie/slower
+threads832                       40, 0/0        424 B    0.977582 long             reject; slower
+one_pack_forceinline             34, 0/0        344 B    0.977287 long             good, full specialization wins
+static_one_pack                  34, 0/0        344 B    0.977116 long             retained
+```
+
+Discarded data:
+
+- A first long run of `threads768/800/832` was accidentally launched in
+  parallel on the same GPU, producing multi-millisecond timings. Those numbers
+  were discarded and the nearest candidates were rerun serially before making a
+  decision.
+
+Final validation:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_static_one_pack/gemma4_ffn_decode.o
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+Final resource check:
+
+```text
+ffn decode tests passed
+accumulate kernel: 34 registers, 0 spills, 344 B smem
+finalize kernel:   25 registers, 0 spills,  88 B smem
+```
+
+Focused fully cold load bench, `iters=80,warmup=12,trials=5`:
+
+```text
+custom_graph best_ms=0.976389
+scratch_clear_graph best_ms=0.001121
+warm_minus_clear best_ms=0.975268
+cold_custom best_ms=1.376650
+cold_clear best_ms=0.399534
+flush_only best_ms=0.397623
+cold_minus_flush_clear best_ms=0.977116
+```
+
+Full cuDNN comparison harness, `iters=50,warmup=10,trials=3`:
+
+```text
+cudnn_split_device_ms=0.998921
+custom_device_ms=0.976564
+custom_scratch_clear_device_ms=0.001131
+custom_minus_clear_device_ms=0.975433
+cold_custom_minus_flush_clear_ms=0.977228
+custom_vs_cudnn_split_speedup=1.022894
+custom_minus_clear_vs_cudnn_split_speedup=1.024080
+```
+
+Conclusion:
+
+- Retained the one-pack specialization.
+- Focused fully-cold timing improved from the previous retained `0.977318 ms`
+  to `0.977116 ms` with lower register count.
+- This is a small win, not a new big structural jump, but it removes slower
+  generic code from the hot path and does not increase scratch or shared memory.
+
+## 2026-05-25 - FFN decode post-one-pack rejection sweep
+
+Goal:
+
+- Continue looking for a larger fully-cold win after the one-pack specialization
+  while keeping registers below `67`, avoiding extra persistent memory, and
+  keeping the retained FFN decode source tight.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA global memory load cache operators ldg cg ca streaming read only data kernel performance coalesced" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA atomic add performance many thread blocks same addresses reduction alternatives global memory coalesced" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA kernel launch overhead CUDA graphs persistent kernel cooperative groups reduction performance" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA split K reduction tile size atomics occupancy tradeoff global memory reduction" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA atomicAdd memory order relaxed device scope kernel completion visibility atomic operations" \
+  --top-k 10
+exa-ai search \
+  "CUDA LLM decode FFN GEMV optimization fused GeGLU down projection atomics cold HBM" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "CUDA persistent thread block GEMV reduction avoid atomics LLM inference FFN" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "CUDA split-K GEMV tile size atomic reduction occupancy LLM decode" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide page 60/61 again points to useful bytes per memory transaction as
+  the first-order HBM check. The retained gate/up/down streams remain
+  warp-contiguous 128-bit pack loads.
+- CUDA guide page 70 warns that atomics should be used sparingly; this motivated
+  a larger-tile sweep to reduce scratch atomic frequency without changing the
+  scratch layout.
+- CUDA guide pages 71 and 526 cover the occupancy/register/launch-bounds
+  tradeoff. The larger tiles stayed under the register cap, but lower CTA
+  coverage and higher register count outweighed fewer atomics.
+- CUDA guide page 536 says legacy atomics provide atomicity but do not add
+  fences. An inline relaxed-RED experiment was not retained because SASS was
+  identical to default `atomicAdd` codegen for this kernel.
+- Exa surfaced split-K GEMV and LLM decode work. The actionable local test was
+  to retune the split-K/intermediate tile and preload scheduling while keeping
+  the memory layout fixed.
+
+Rejected/diagnostic variants:
+
+```text
+variant                         regs/spills  smem       cold_minus_flush_clear_ms  decision
+activation_parallel              34, 0/0        344 B    0.977037 short            reject; tie/no long win
+activation_parallel_unroll       34, 0/0        344 B    0.977174 short            reject; slower
+forceinline_hot_helpers          34, 0/0        344 B    0.977136 short            reject; no win
+launch_bounds_min2               34, 0/0        344 B    0.977034 short            reject; define works, no real win
+swizzle_chunks4                  34, 0/0        344 B    0.977368 short            reject; slower
+swizzle_chunks16                 34, 0/0        344 B    0.977178 short            reject; slower/tie
+swizzle_chunks32                 34, 0/0        344 B    0.978150 short            reject; slower
+tile2_act1                       not logged     344 B    0.977515 short            reject; slower
+tile3_act1                       not logged     344 B    0.977754 short            reject; slower
+tile3_act3                       not logged     516 B    0.977195 short            reject; slower/tie
+init_partial_from_down0          38, 0/0        344 B    0.977216 short            reject; higher regs and slower
+all_lane_gate_up_reduce          34, 0/0        344 B    0.977358 short            reject; slower
+inline_red_global                34, 0/0        344 B    0.977028 short            reject; SASS same as default
+inline_red_relaxed               34, 0/0        344 B    0.977042 long             reject; SASS same as default
+early_preload_down               38, 0/0        344 B    0.977104 long             reject; tie with higher regs
+preload_gate_up                  34, 0/0        344 B    0.977080 short            reject; tie/no win
+weight_policy_cg                 34, 0/0        344 B    0.977644 short            reject; slower
+weight_policy_ldg                34, 0/0        344 B    0.977429 short            reject; slower
+tile8_act2                       48, 0/0        344 B    0.979051 short            reject; slower
+tile12_act2                      48, 0/0        344 B    0.978430 short            reject; slower
+tile16_act2                      48, 0/0        344 B    0.980790 short            reject; slower
+tile24_act2                      48, 0/0        344 B    0.978715 short            reject; slower
+tile32_act2                      48, 0/0        344 B    0.980407 short            reject; slower
+tile64_act2                      48, 0/0        344 B    0.982238 short            reject; slower
+tile12_act3                      56, 0/0        516 B    0.979040 short            reject; slower
+tile24_act3                      56, 0/0        516 B    0.978781 short            reject; slower
+tile48_act3                      56, 0/0        516 B    0.979649 short            reject; slower
+tile8_act4                       62, 0/0        688 B    0.978762 short            reject; slower
+```
+
+NCU diagnostic:
+
+```bash
+timeout 90s ncu --target-processes all --kernel-name-base demangled \
+  --kernel-name regex:.*gemma4_ffn_decode_accumulate.* --launch-count 1 \
+  --metrics gpu__time_duration.sum,dram__bytes_read.sum,dram__bytes_write.sum,\
+l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,\
+l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,\
+l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum \
+  --csv build/experiments/gemma4_ffn_decode_load_bench 1 0 1
+```
+
+The NCU command again timed out with `==WARNING== No kernels were profiled.`
+Treat the conflict/coalescing conclusions as static address-pattern checks plus
+CUDA-event timing until a narrower profiler harness is available.
+
+Final validation:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_final_after_sweep/gemma4_ffn_decode.o
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+Final resource check:
+
+```text
+ffn decode tests passed
+accumulate kernel: 34 registers, 0 spills, 344 B smem
+finalize kernel:   25 registers, 0 spills,  88 B smem
+```
+
+Focused fully cold load bench, `iters=80,warmup=12,trials=5`:
+
+```text
+custom_graph best_ms=0.976384
+scratch_clear_graph best_ms=0.001090
+warm_minus_clear best_ms=0.975295
+cold_custom best_ms=1.376530
+cold_clear best_ms=0.399482
+flush_only best_ms=0.397604
+cold_minus_flush_clear best_ms=0.977048
+```
+
+Full cuDNN comparison harness, `iters=50,warmup=10,trials=3`:
+
+```text
+cudnn_split_device_ms=0.998058
+custom_device_ms=0.976499
+custom_scratch_clear_device_ms=0.001139
+custom_minus_clear_device_ms=0.975360
+cold_custom_minus_flush_clear_ms=0.977031
+custom_vs_cudnn_split_speedup=1.022077
+custom_minus_clear_vs_cudnn_split_speedup=1.023271
+```
+
+Conclusion:
+
+- No new source optimization was retained from this sweep.
+- The current best source remains the one-pack direct-`x`,
+  component-major-scratch path with `INTERMEDIATE_TILE=2`, `ACT_TILE=2`, and
+  `.cs` weight loads.
+- Larger intermediate tiles with `ACT_TILE=2/3/4` reduce scratch atomic count,
+  but lose enough CTA coverage and register headroom that fully-cold time
+  regresses.
+- Preload and inline-RED variants did not create a defensible improvement, so
+  they were removed to keep `ffn-decode` tight.
+
+## 2026-05-25 - FFN decode interleaved gate/up prepared layout
+
+Goal:
+
+- Continue searching for a fully-cold improvement without changing scratch
+  size, exceeding the `67` register cap, or adding a broad abstraction.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA bfloat16 bf16 vector intrinsic accumulate float fma __nv_bfloat162 performance" \
+  --top-k 10
+python3 scripts/query.py \
+  "CUDA bf16 tensor cores wmma mma single row GEMV performance bfloat16" \
+  --top-k 10
+exa-ai search \
+  "CUDA bfloat16 GEMV scalar dot __nv_bfloat162 fma FP32 accumulate optimization" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide pages 576-577 confirm BF16 tensor-core WMMA supports BF16 inputs
+  with FP32 accumulators, but the fragment shapes are 2D matrix tiles. A
+  tensor-core rewrite would be a larger custom GEMM/GEMV path, not a tight
+  change to this fused scalar-GEMV kernel.
+- CUDA guide page 592 covers floating-point intrinsic tradeoffs. A local
+  BF16x2 `__hfma2` partial-dot experiment reduced registers but weakened
+  accumulation precision and slowed the measured path.
+- Exa surfaced BF16 math API references and GEMV kernels. The practical local
+  move was to test whether keeping each gate/up pair adjacent in the prepared
+  decode layout improves the current HBM stream.
+
+Retained implementation:
+
+- Changed the prepared `w_gate_up` layout written by
+  `gemma4_ffn_decode_swizzle_weights_bf16()` from gate rows followed by up rows
+  to interleaved rows: `gate0, up0, gate1, up1, ...`.
+- Updated the hot dot path to derive `up_ptr` from `gate_ptr + hidden_size` and
+  step by two rows per local activation column.
+- Updated `tests/test_ffn_decode.cu` to exercise the documented prepared-weight
+  path by filling raw source weights and calling
+  `gemma4_ffn_decode_swizzle_weights_bf16()` before the fused decode kernel.
+- Updated the header comments to document the decode-prepared interleaved
+  gate/up layout.
+
+Rejected/diagnostic variants:
+
+```text
+variant                         regs/spills  smem       cold_minus_flush_clear_ms  decision
+gate_up_interleaved_macro        34, 0/0        344 B    0.976867 long             good; promoted cleanly
+bf16x2_local_dot                 32, 0/0        344 B    0.977490 short            reject; slower and weaker precision
+```
+
+Final validation:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_interleave_retained/gemma4_ffn_decode.o
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+Final resource check:
+
+```text
+ffn decode tests passed
+accumulate kernel: 34 registers, 0 spills, 344 B smem
+finalize kernel:   25 registers, 0 spills,  88 B smem
+gate/up swizzle:   18 registers, 0 spills
+```
+
+Focused fully cold load bench, `iters=80,warmup=12,trials=5`:
+
+```text
+custom_graph best_ms=0.976280
+scratch_clear_graph best_ms=0.001097
+warm_minus_clear best_ms=0.975182
+cold_custom best_ms=1.376348
+cold_clear best_ms=0.399382
+flush_only best_ms=0.397508
+cold_minus_flush_clear best_ms=0.976965
+```
+
+Repeat focused long run:
+
+```text
+custom_graph best_ms=0.976388
+scratch_clear_graph best_ms=0.001091
+warm_minus_clear best_ms=0.975298
+cold_custom best_ms=1.376519
+cold_clear best_ms=0.399527
+flush_only best_ms=0.397574
+cold_minus_flush_clear best_ms=0.976992
+```
+
+Full cuDNN comparison harness, `iters=50,warmup=10,trials=3`:
+
+```text
+cudnn_split_device_ms=0.998234
+custom_device_ms=0.976525
+custom_scratch_clear_device_ms=0.001167
+custom_minus_clear_device_ms=0.975357
+cold_custom_minus_flush_clear_ms=0.977042
+custom_vs_cudnn_split_speedup=1.022231
+custom_minus_clear_vs_cudnn_split_speedup=1.023455
+max_abs_vs_split=0
+```
+
+Conclusion:
+
+- Retained the interleaved gate/up prepared layout.
+- Focused fully-cold timing improved from the prior retained `0.977048 ms` to
+  `0.976965-0.976992 ms` in two long runs. This is a small layout win, not a
+  structural jump.
+- Full cuDNN harness correctness remains exact against the split baseline
+  (`max_abs_vs_split=0`) and keeps the custom path about `2.3%` ahead of the
+  cuDNN split graph metric after scratch clear subtraction.
+
+## 2026-05-25 - FFN decode partial grid-stride atomic reduction
+
+Goal:
+
+- Revisit a larger reduction-shape move without growing scratch memory or
+  crossing the `67` register cap. The retained tile-2 path has excellent HBM
+  coalescing but still launches one CTA per two FFN columns, so every tile does
+  a full component-major scratch atomic pass.
+
+Guide and outside references:
+
+```bash
+python3 scripts/query.py \
+  "CUDA global memory coalescing contiguous 16 byte per thread memory transaction warp access" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA atomics performance use sparingly atomicAdd global memory reduction optimization" \
+  --top-k 8
+python3 scripts/query.py \
+  "CUDA occupancy register pressure launch bounds blocks per multiprocessor performance" \
+  --top-k 8
+exa-ai search \
+  "CUDA single token FFN decode GEMV optimization split K atomics reduction LLM inference" \
+  --num-results 5 --summary --output-format toon
+exa-ai search \
+  "CUDA GEMV optimization small m large n vector matrix multiplication memory bandwidth coalescing" \
+  --num-results 5 --summary --output-format toon
+```
+
+Relevant notes:
+
+- CUDA guide pages 60-61 again point at useful bytes per memory transaction.
+  The retained path keeps the warp-contiguous 128-bit gate/up/down HBM streams.
+- CUDA guide page 70 says atomics should be used sparingly; this pass tried to
+  cut only a small number of atomic waves while preserving high CTA count.
+- CUDA guide pages 71 and 526 frame the register/occupancy tradeoff. The
+  retained shape raises the accumulate kernel from `34` to `48` registers, still
+  below the `67` cap and with zero spills.
+- Exa surfaced split-K/GEMV and persistent/decode-fusion work. The practical
+  local adaptation was a partial grid-stride reduction, not a broad tensor-core
+  rewrite.
+
+Retained implementation:
+
+- Added `GEMMA4_FFN_DECODE_ACCUM_BLOCKS` and changed the default accumulated
+  CTA count from one CTA per intermediate tile (`10752`) to
+  `kIntermediateTiles - kHiddenPacks` (`10080`).
+- The first `672` CTAs fold one extra 2-column tile into their local partial
+  before issuing scratch atomics; the remaining CTAs still process one tile.
+  This cuts one hidden-pack wave of scratch atomics while keeping most of the
+  original grid density.
+- Factored the per-tile body into `accumulate_intermediate_tile()` so the
+  default two-visit path and override paths share the same load/reduction logic.
+- Scratch size and HBM weight layout are unchanged.
+
+Rejected/diagnostic variants:
+
+```text
+variant                         regs/spills  smem   cold_minus_flush_clear_ms  decision
+tile4_act2                       48, 0/0      344 B  0.977838 short            reject; slower
+tile4_act4                       50, 0/0      688 B  0.977978 short            reject; slower
+tile14_act2                      48, 0/0      344 B  0.978778 short            reject; slower
+tile7_act1                       39, 0/0      172 B  0.977832 short            reject; slower
+x_regular_load                   34, 0/0      344 B  0.977386 short            reject; slower
+x_cg_load                        34, 0/0      344 B  0.977169 long             reject; short win did not hold
+launch_bounds_min2               34, 0/0      344 B  0.977469 short            reject; slower
+maxrregcount32                   31, 0/0      344 B  0.977106 long             reject; lower regs did not win
+unpack_x_once                    34, 0/0      344 B  0.976912/0.977039 long   reject; SASS same aside from metadata
+activation_parallel_unsafe       34, 0/0      344 B  invalid                  reject; lane 1 lacked final reduction
+activation_parallel_shfl         34, 0/0      344 B  0.977107 short            reject; correct but slower
+grid5376                         48, 0/0      344 B  0.977235 short            reject; slower
+grid2688                         48, 0/0      344 B  0.978525 short            reject; slower
+grid8064_generic                 48, 0/0      344 B  0.977054 long             reject; generic loop lost cold metric
+grid8064_twopass                 48, 0/0      344 B  0.976649/0.976769 long   good, but 10080 wins
+grid9216_twopass                 48, 0/0      344 B  0.976499 long             reject; slower than 10080 repeat
+grid10080_twopass                48, 0/0      344 B  0.976340/0.976696 long   retained
+```
+
+Final validation:
+
+```bash
+make test-ffn-decode
+nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
+  -c src/gemma4_ffn_decode.cu \
+  -o build/ptx/ffn_goal_variants/gemma4_ffn_decode_default_grid.o
+make ffn-decode-load-bench
+GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+make ffn-cudnn-bench
+GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
+  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+```
+
+Final resource check:
+
+```text
+ffn decode tests passed
+accumulate kernel: 48 registers, 0 spills, 344 B smem
+finalize kernel:   25 registers, 0 spills,  88 B smem
+gate/up swizzle:   18 registers, 0 spills
+```
+
+Focused fully cold load bench, `iters=80,warmup=12,trials=5`, promoted source:
+
+```text
+custom_graph best_ms=0.975748
+scratch_clear_graph best_ms=0.001106
+warm_minus_clear best_ms=0.974642
+cold_custom best_ms=1.376473
+cold_clear best_ms=0.400001
+flush_only best_ms=0.397651
+cold_minus_flush_clear best_ms=0.976472
+```
+
+Full cuDNN comparison harness, `iters=50,warmup=10,trials=3`, promoted source:
+
+```text
+cudnn_split_device_ms=0.998656
+custom_device_ms=0.975663
+custom_scratch_clear_device_ms=0.001116
+custom_minus_clear_device_ms=0.974547
+cold_custom_minus_flush_clear_ms=0.976290
+custom_vs_cudnn_split_speedup=1.023567
+custom_minus_clear_vs_cudnn_split_speedup=1.024739
+max_abs_vs_split=0
+```
+
+Conclusion:
+
+- Retained the partial two-visit accumulate grid. It gives a small but
+  repeatable fully-cold improvement without changing scratch memory or HBM
+  coalescing.
+- Focused fully-cold timing moved from the previous retained `0.976965-0.976992
+  ms` band to `0.976472 ms` in the promoted-source validation run.
+- Full cuDNN harness correctness remains exact (`max_abs_vs_split=0`), and the
+  full cold metric improved from the prior retained `0.977042 ms` to
+  `0.976290 ms`.
