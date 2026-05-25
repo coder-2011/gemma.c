@@ -1,29 +1,42 @@
 #include "gemma4_ffn_decode.cuh"
+
+#ifndef GEMMA4_WEIGHT_LOAD_POLICY
+#define GEMMA4_WEIGHT_LOAD_POLICY 0
+#endif
+
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_matmul_device.cuh"
 
-#include <cuda_pipeline.h>
-
-#include <algorithm>
-
 #ifndef GEMMA4_FFN_DECODE_ACT_TILE
-#define GEMMA4_FFN_DECODE_ACT_TILE 4
+#define GEMMA4_FFN_DECODE_ACT_TILE 2
 #endif
 
 #ifndef GEMMA4_FFN_DECODE_SWIZZLE_X
 #define GEMMA4_FFN_DECODE_SWIZZLE_X 1
 #endif
 
-#ifndef GEMMA4_FFN_DECODE_ASYNC_X
-#define GEMMA4_FFN_DECODE_ASYNC_X 0
-#endif
-
 #ifndef GEMMA4_FFN_DECODE_THREADS
-#define GEMMA4_FFN_DECODE_THREADS 256
+#define GEMMA4_FFN_DECODE_THREADS 672
 #endif
 
 #ifndef GEMMA4_FFN_DECODE_INTERMEDIATE_TILE
-#define GEMMA4_FFN_DECODE_INTERMEDIATE_TILE 512
+#define GEMMA4_FFN_DECODE_INTERMEDIATE_TILE 2
+#endif
+
+#ifndef GEMMA4_FFN_DECODE_PRELOAD_DOWN
+#define GEMMA4_FFN_DECODE_PRELOAD_DOWN 0
+#endif
+
+#ifndef GEMMA4_FFN_DECODE_ACCUM_BLOCKS
+#define GEMMA4_FFN_DECODE_ACCUM_BLOCKS 0
+#endif
+
+#ifndef GEMMA4_FFN_DECODE_REDUCTION_POLICY
+#define GEMMA4_FFN_DECODE_REDUCTION_POLICY 0
+#endif
+
+#ifndef GEMMA4_FFN_DECODE_PARTIAL_GROUPS
+#define GEMMA4_FFN_DECODE_PARTIAL_GROUPS 1344
 #endif
 
 namespace {
@@ -36,27 +49,49 @@ constexpr int kIntermediateTiles =
 constexpr int kHiddenPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 constexpr int kActTile = GEMMA4_FFN_DECODE_ACT_TILE;
 constexpr int kSwizzleX = GEMMA4_FFN_DECODE_SWIZZLE_X;
-constexpr int kAsyncX = GEMMA4_FFN_DECODE_ASYNC_X;
+constexpr int kPreloadDown = GEMMA4_FFN_DECODE_PRELOAD_DOWN;
+constexpr int kReductionPolicy = GEMMA4_FFN_DECODE_REDUCTION_POLICY;
+constexpr int kPartialGroups = GEMMA4_FFN_DECODE_PARTIAL_GROUPS;
+constexpr int kAccumBlocksOverride = GEMMA4_FFN_DECODE_ACCUM_BLOCKS;
+// Keep most CTAs one tile wide, while one hidden-pack wave folds a second tile.
+constexpr int kDefaultAccumBlocks = kIntermediateTiles - kHiddenPacks;
+constexpr int kAccumBlocks =
+    kAccumBlocksOverride == 0 ? kDefaultAccumBlocks : kAccumBlocksOverride;
 static_assert((GEMMA4_INTERMEDIATE_SIZE % kIntermediateTile) == 0,
               "FFN intermediate width must divide the decode tile width");
 static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
               "FFN hidden width must divide the 128-bit bf16 pack width");
+static_assert(kHiddenPacks == GEMMA4_FFN_DECODE_HIDDEN_PACKS,
+              "FFN scratch hidden-pack shape must match bf16 pack width");
+static_assert(kFfnThreads == kHiddenPacks,
+              "FFN decode maps one CTA thread to one hidden bf16 pack");
 static_assert((kFfnThreads % WARP_SIZE) == 0,
               "FFN decode thread count must be a whole number of warps");
 static_assert(kActTile >= 1, "FFN activation tile must be positive");
 static_assert((kIntermediateTile % kActTile) == 0,
               "FFN activation tile must divide the CTA intermediate tile");
 static_assert(kActTile <= WARP_SIZE,
-              "FFN activation tile maps one GeGLU scalar to one warp lane");
+              "FFN activation tile must fit the warp-local reduction helper");
 static_assert(kSwizzleX == 0 || kSwizzleX == 1,
-              "FFN x shared-memory swizzle must be 0 or 1");
-static_assert(kAsyncX == 0 || kAsyncX == 1,
-              "FFN x async preload must be 0 or 1");
+              "FFN hidden-pack swizzle must be 0 or 1");
+static_assert(kPreloadDown == 0 || kPreloadDown == 1,
+              "FFN down-weight preload must be 0 or 1");
+static_assert(kReductionPolicy == 0 || kReductionPolicy == 1,
+              "FFN reduction policy must be 0=atomic or 1=partial groups");
+static_assert(kPartialGroups > 0 && kPartialGroups <= kIntermediateTiles,
+              "FFN partial groups must be within the intermediate tile count");
+static_assert(kDefaultAccumBlocks > 0,
+              "FFN default accumulate grid must be positive");
+static_assert(kAccumBlocks > 0 && kAccumBlocks <= kIntermediateTiles,
+              "FFN accumulate grid must be within the intermediate tile count");
 
 using FfnBf16Pack = Bf16Packed128;
-using FfnFloatPack = Packed128<float>;
 
-__device__ inline int shared_x_chunk_index(int chunk) {
+inline bool is_aligned_128(const void *ptr) {
+  return (reinterpret_cast<uintptr_t>(ptr) & 0x7fu) == 0;
+}
+
+__device__ inline int hidden_pack_swizzle_index(int chunk) {
   if constexpr (kSwizzleX) {
     constexpr int kSwizzleChunks = 8;  // 8 x 128-bit chunks = one 128-byte row.
     const unsigned u = static_cast<unsigned>(chunk);
@@ -88,32 +123,60 @@ __device__ inline void accumulate_scaled_pack(
   }
 }
 
-__device__ inline void add_accum_pack(
-    const float *__restrict__ accum,
-    int col,
+__device__ inline void load_accum_pack(
+    const Gemma4FfnDecodeScratch *__restrict__ scratch,
+    int hidden_pack,
     float (&values)[kBf16Packed128Elements]) {
-  const FfnFloatPack lo = load128(accum + col);
-  const FfnFloatPack hi = load128(accum + col + FfnFloatPack::size);
 #pragma unroll
-  for (int i = 0; i < FfnFloatPack::size; ++i) {
-    values[i] += lo[i];
-    values[i + FfnFloatPack::size] += hi[i];
+  for (int i = 0; i < kBf16Packed128Elements; ++i) {
+    values[i] = scratch->accum[i][hidden_pack];
   }
 }
 
-__device__ inline void store_accum_pack(
-    float *__restrict__ accum,
-    int col,
+__device__ inline void atomic_add_accum_pack(
+    Gemma4FfnDecodeScratch *__restrict__ scratch,
+    int hidden_pack,
     const float (&values)[kBf16Packed128Elements]) {
-  FfnFloatPack lo;
-  FfnFloatPack hi;
 #pragma unroll
-  for (int i = 0; i < FfnFloatPack::size; ++i) {
-    lo[i] = values[i];
-    hi[i] = values[i + FfnFloatPack::size];
+  for (int i = 0; i < kBf16Packed128Elements; ++i) {
+    atomicAdd(&scratch->accum[i][hidden_pack], values[i]);
   }
-  store128(accum + col, lo);
-  store128(accum + col + FfnFloatPack::size, hi);
+}
+
+__device__ inline void store_partial_pack(
+    Gemma4FfnDecodeScratch *__restrict__ scratch,
+    int group,
+    int hidden_pack,
+    const float (&values)[kBf16Packed128Elements]) {
+#if GEMMA4_FFN_DECODE_REDUCTION_POLICY == 1
+#pragma unroll
+  for (int i = 0; i < kBf16Packed128Elements; ++i) {
+    scratch->partials[group][i][hidden_pack] = values[i];
+  }
+#else
+  (void)scratch;
+  (void)group;
+  (void)hidden_pack;
+  (void)values;
+#endif
+}
+
+__device__ inline void load_partial_sum_pack(
+    const Gemma4FfnDecodeScratch *__restrict__ scratch,
+    int hidden_pack,
+    float (&values)[kBf16Packed128Elements]) {
+#if GEMMA4_FFN_DECODE_REDUCTION_POLICY == 1
+  for (int group = 0; group < kPartialGroups; ++group) {
+#pragma unroll
+    for (int i = 0; i < kBf16Packed128Elements; ++i) {
+      values[i] += scratch->partials[group][i][hidden_pack];
+    }
+  }
+#else
+  (void)scratch;
+  (void)hidden_pack;
+  (void)values;
+#endif
 }
 
 __device__ inline void add_residual_store_pack(
@@ -172,145 +235,198 @@ __device__ inline float block_reduce_sum(float value,
   return value;
 }
 
-__device__ inline void wait_for_reduce_turn(const int *__restrict__ lock,
-                                            int turn) {
-  if (threadIdx.x == 0) {
-    int state = -1;
-    do {
-      asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
-                   : "=r"(state)
-                   : "l"(lock));
-    } while (state != turn);
-  }
-  __syncthreads();
-
-  int state = -1;
-  do {
-    asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
-                 : "=r"(state)
-                 : "l"(lock));
-  } while (state != turn);
-  __syncthreads();
-}
-
-__device__ inline void release_reduce_turn(int *__restrict__ lock) {
-  __syncthreads();
-  __threadfence();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    constexpr int one = 1;
-    asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n"
-                 :
-                 : "l"(lock), "r"(one));
-  }
-}
-
-__global__ __launch_bounds__(kFfnThreads, 1) void
-gemma4_ffn_decode_fused_bf16_kernel(
-    floatX *__restrict__ residual_out,
-    floatX *__restrict__ normed_out,
+__device__ __forceinline__ void dot_gate_up_pack(
     const floatX *__restrict__ x,
-    const floatX *__restrict__ residual,
-    const floatX *__restrict__ rms_weight,
+    const floatX *__restrict__ w_gate_up_col_major,
+    int gate_col0,
+    int pack_idx,
+    float (&gate)[kActTile],
+    float (&up)[kActTile]) {
+  const int x_col = pack_idx * kBf16Packed128Elements;
+  const int weight_col =
+      hidden_pack_swizzle_index(pack_idx) * kBf16Packed128Elements;
+  const FfnBf16Pack x_pack = load128g(x + x_col);
+  const floatX *gate_ptr =
+      w_gate_up_col_major +
+      static_cast<int64_t>(2 * gate_col0) * GEMMA4_HIDDEN_SIZE + weight_col;
+  const floatX *up_ptr = gate_ptr + GEMMA4_HIDDEN_SIZE;
+#pragma unroll
+  for (int t = 0; t < kActTile; ++t) {
+    const FfnBf16Pack gate_pack =
+        load128weight(gate_ptr + static_cast<int64_t>(2 * t) *
+                                     GEMMA4_HIDDEN_SIZE);
+    const FfnBf16Pack up_pack =
+        load128weight(up_ptr + static_cast<int64_t>(2 * t) *
+                                 GEMMA4_HIDDEN_SIZE);
+    gemma4_bf16_pack_accumulate_dot(x_pack, gate_pack, gate[t]);
+    gemma4_bf16_pack_accumulate_dot(x_pack, up_pack, up[t]);
+  }
+}
+
+__device__ inline void dot_gate_up_swizzled_x_reduce(
+    const floatX *__restrict__ x,
+    const floatX *__restrict__ w_gate_up_col_major,
+    int gate_col0,
+    float (&gate)[kActTile],
+    float (&up)[kActTile],
+    float (&gate_warp_sums)[kActTile][kFfnWarps],
+    float (&up_warp_sums)[kActTile][kFfnWarps]) {
+  dot_gate_up_pack(
+      x, w_gate_up_col_major, gate_col0, threadIdx.x, gate, up);
+
+  gemma4_matmul_device::reduce_cols_pair<kActTile, kFfnThreads>(
+      threadIdx.x, gate_warp_sums, up_warp_sums, gate, up);
+}
+
+__device__ inline void accumulate_intermediate_tile(
+    const floatX *__restrict__ x,
     const floatX *__restrict__ w_gate_up_col_major,
     const floatX *__restrict__ w_down_row_major,
-    Gemma4FfnDecodeScratch *__restrict__ scratch,
-    float eps) {
-  __shared__ FfnBf16Pack s_x[kHiddenPacks];
-  __shared__ float s_matmul_warp_sums[2][kActTile][kFfnWarps];
-  __shared__ float s_rms_warp_sums[kFfnWarps];
-  __shared__ float s_scale;
-
-  for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
-    if constexpr (kAsyncX) {
-      __pipeline_memcpy_async(&s_x[shared_x_chunk_index(pack)],
-                              x + pack * kBf16Packed128Elements,
-                              sizeof(FfnBf16Pack));
-    } else {
-      s_x[shared_x_chunk_index(pack)] =
-          load128g(x + pack * kBf16Packed128Elements);
-    }
-  }
-  if constexpr (kAsyncX) {
-    __pipeline_commit();
-    __pipeline_wait_prior(0);
-  }
-  __syncthreads();
-
-  float partial[kBf16Packed128Elements] = {};
-  const int intermediate_begin =
-      static_cast<int>(blockIdx.x) * kIntermediateTile;
-  const int hidden_pack = threadIdx.x;
-  const bool owns_hidden_pack = hidden_pack < kHiddenPacks;
-  const int hidden_col = hidden_pack * kBf16Packed128Elements;
-
+    int intermediate_begin,
+    int swizzled_hidden_col,
+    float (&partial)[kBf16Packed128Elements],
+    float (&s_matmul_warp_sums)[2][kActTile][kFfnWarps],
+    float (&s_act)[kActTile]) {
   for (int local_col = 0; local_col < kIntermediateTile;
        local_col += kActTile) {
     float gate[kActTile] = {};
     float up[kActTile] = {};
     const int gate_col0 = intermediate_begin + local_col;
-    const int up_col0 = GEMMA4_INTERMEDIATE_SIZE + gate_col0;
 
-    gemma4_matmul_device::dot_cols_pair_shared_x_reduce<
-        GEMMA4_HIDDEN_SIZE, kActTile, kFfnThreads, (kSwizzleX != 0)>(
-        s_x, w_gate_up_col_major, w_gate_up_col_major, gate_col0, up_col0,
-        threadIdx.x, s_matmul_warp_sums[0], s_matmul_warp_sums[1], gate, up);
+    dot_gate_up_swizzled_x_reduce(
+        x, w_gate_up_col_major, gate_col0, gate, up,
+        s_matmul_warp_sums[0], s_matmul_warp_sums[1]);
 
-    if (threadIdx.x < WARP_SIZE) {
+    if (threadIdx.x == 0) {
 #pragma unroll
       for (int t = 0; t < kActTile; ++t) {
-        const float gate_t = __shfl_sync(0xffffffffu, gate[t], 0);
-        const float up_t = __shfl_sync(0xffffffffu, up[t], 0);
-        if (threadIdx.x == t) {
-          s_matmul_warp_sums[0][t][0] = gate_t * gelu_tanh(up_t);
-        }
+        s_act[t] = gate[t] * gelu_tanh(up[t]);
       }
     }
     __syncthreads();
 
-    if (owns_hidden_pack) {
+    const floatX *down_row0 =
+        w_down_row_major +
+        static_cast<int64_t>(intermediate_begin + local_col) *
+            GEMMA4_HIDDEN_SIZE +
+        swizzled_hidden_col;
+    if constexpr (kPreloadDown) {
+      FfnBf16Pack down_packs[kActTile];
 #pragma unroll
       for (int t = 0; t < kActTile; ++t) {
-        const int intermediate_col = intermediate_begin + local_col + t;
-        const int swizzled_hidden_col =
-            shared_x_chunk_index(hidden_pack) * kBf16Packed128Elements;
-        const floatX *down_row =
-            w_down_row_major +
-            static_cast<int64_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE;
+        down_packs[t] =
+            load128weight(down_row0 + t * GEMMA4_HIDDEN_SIZE);
+      }
+#pragma unroll
+      for (int t = 0; t < kActTile; ++t) {
+        accumulate_scaled_pack(s_act[t], down_packs[t], partial);
+      }
+    } else {
+#pragma unroll
+      for (int t = 0; t < kActTile; ++t) {
         const FfnBf16Pack down_pack =
-            load128weight(down_row + swizzled_hidden_col);
-        accumulate_scaled_pack(s_matmul_warp_sums[0][t][0], down_pack,
-                               partial);
+            load128weight(down_row0 + t * GEMMA4_HIDDEN_SIZE);
+        accumulate_scaled_pack(s_act[t], down_pack, partial);
       }
     }
-    __syncthreads();
+    // The next gate/up reducer reaches a CTA barrier before rewriting s_act, so
+    // down accumulation does not need a separate tail barrier here.
   }
+}
 
-  const bool first = blockIdx.x == 0;
-  const bool last = blockIdx.x == kIntermediateTiles - 1;
-  wait_for_reduce_turn(&scratch->lock, static_cast<int>(blockIdx.x));
+__global__ __launch_bounds__(kFfnThreads, 1) void
+gemma4_ffn_decode_accumulate_bf16_kernel(
+    const floatX *__restrict__ x,
+    const floatX *__restrict__ w_gate_up_col_major,
+    const floatX *__restrict__ w_down_row_major,
+    Gemma4FfnDecodeScratch *__restrict__ scratch) {
+  __shared__ float s_matmul_warp_sums[2][kActTile][kFfnWarps];
+  __shared__ float s_act[kActTile];
 
-  if (owns_hidden_pack) {
-    if (!first) {
-      add_accum_pack(scratch->accum, hidden_col, partial);
+  float partial[kBf16Packed128Elements] = {};
+  const int hidden_pack = threadIdx.x;
+  const int swizzled_hidden_col =
+      hidden_pack_swizzle_index(hidden_pack) * kBf16Packed128Elements;
+
+  if constexpr (kAccumBlocks == kIntermediateTiles) {
+    const int intermediate_begin =
+        static_cast<int>(blockIdx.x) * kIntermediateTile;
+    accumulate_intermediate_tile(
+        x, w_gate_up_col_major, w_down_row_major, intermediate_begin,
+        swizzled_hidden_col, partial, s_matmul_warp_sums, s_act);
+  } else if constexpr (kAccumBlocks * 2 > kIntermediateTiles) {
+    const int tile0 = static_cast<int>(blockIdx.x);
+    accumulate_intermediate_tile(
+        x, w_gate_up_col_major, w_down_row_major, tile0 * kIntermediateTile,
+        swizzled_hidden_col, partial, s_matmul_warp_sums, s_act);
+
+    const int tile1 = tile0 + kAccumBlocks;
+    if (tile1 < kIntermediateTiles) {
+      accumulate_intermediate_tile(
+          x, w_gate_up_col_major, w_down_row_major, tile1 * kIntermediateTile,
+          swizzled_hidden_col, partial, s_matmul_warp_sums, s_act);
     }
-    if (!last) {
-      store_accum_pack(scratch->accum, hidden_col, partial);
+  } else {
+    for (int tile = static_cast<int>(blockIdx.x); tile < kIntermediateTiles;
+         tile += kAccumBlocks) {
+      const int intermediate_begin = tile * kIntermediateTile;
+      accumulate_intermediate_tile(
+          x, w_gate_up_col_major, w_down_row_major, intermediate_begin,
+          swizzled_hidden_col, partial, s_matmul_warp_sums, s_act);
     }
   }
 
-  if (!last) {
-    release_reduce_turn(&scratch->lock);
-    return;
+  atomic_add_accum_pack(scratch, hidden_pack, partial);
+}
+
+__global__ __launch_bounds__(kFfnThreads, 1) void
+gemma4_ffn_decode_accumulate_partials_bf16_kernel(
+    const floatX *__restrict__ x,
+    const floatX *__restrict__ w_gate_up_col_major,
+    const floatX *__restrict__ w_down_row_major,
+    Gemma4FfnDecodeScratch *__restrict__ scratch) {
+  __shared__ float s_matmul_warp_sums[2][kActTile][kFfnWarps];
+  __shared__ float s_act[kActTile];
+
+  float partial[kBf16Packed128Elements] = {};
+  const int hidden_pack = threadIdx.x;
+  const int swizzled_hidden_col =
+      hidden_pack_swizzle_index(hidden_pack) * kBf16Packed128Elements;
+  const int group = static_cast<int>(blockIdx.x);
+
+  for (int tile = group; tile < kIntermediateTiles; tile += kPartialGroups) {
+    accumulate_intermediate_tile(
+        x, w_gate_up_col_major, w_down_row_major, tile * kIntermediateTile,
+        swizzled_hidden_col, partial, s_matmul_warp_sums, s_act);
   }
 
+  store_partial_pack(scratch, group, hidden_pack, partial);
+}
+
+__global__ __launch_bounds__(kFfnThreads, 1) void
+gemma4_ffn_decode_finalize_bf16_kernel(
+    floatX *__restrict__ residual_out,
+    floatX *__restrict__ normed_out,
+    const floatX *__restrict__ residual,
+    const floatX *__restrict__ rms_weight,
+    const Gemma4FfnDecodeScratch *__restrict__ scratch,
+    float eps) {
+  float partial[kBf16Packed128Elements] = {};
   float sum_sq = 0.0f;
-  if (owns_hidden_pack) {
-    FfnBf16Pack residual_pack = load128g(residual + hidden_col);
-    FfnBf16Pack residual_out_pack;
-    add_residual_store_pack(residual_pack, partial, residual_out_pack, sum_sq);
-    store128(residual_out + hidden_col, residual_out_pack);
+  __shared__ float s_rms_warp_sums[kFfnWarps];
+  __shared__ float s_scale;
+
+  const int hidden_pack = threadIdx.x;
+  if constexpr (kReductionPolicy == 1) {
+    load_partial_sum_pack(scratch, hidden_pack, partial);
+  } else {
+    load_accum_pack(scratch, hidden_pack, partial);
   }
+  const int hidden_col = hidden_pack * kBf16Packed128Elements;
+  FfnBf16Pack residual_pack = load128g(residual + hidden_col);
+  FfnBf16Pack residual_out_pack;
+  add_residual_store_pack(residual_pack, partial, residual_out_pack, sum_sq);
+  store128(residual_out + hidden_col, residual_out_pack);
 
   const float total = block_reduce_sum(sum_sq, s_rms_warp_sums);
   if (threadIdx.x == 0) {
@@ -319,12 +435,10 @@ gemma4_ffn_decode_fused_bf16_kernel(
   }
   __syncthreads();
 
-  if (owns_hidden_pack) {
-    const FfnBf16Pack gamma_pack = load128g(rms_weight + hidden_col);
-    const FfnBf16Pack normed_pack =
-        rmsnorm_store_pack(partial, gamma_pack, s_scale);
-    store128wb(normed_out + hidden_col, normed_pack);
-  }
+  const FfnBf16Pack gamma_pack = load128g(rms_weight + hidden_col);
+  const FfnBf16Pack normed_pack =
+      rmsnorm_store_pack(partial, gamma_pack, s_scale);
+  store128wb(normed_out + hidden_col, normed_pack);
 }
 
 bool ffn_decode_args_valid(const floatX *residual_out,
@@ -342,35 +456,7 @@ bool ffn_decode_args_valid(const floatX *residual_out,
          is_aligned_16(normed_out) && is_aligned_16(x) &&
          is_aligned_16(residual) && is_aligned_16(rms_weight) &&
          is_aligned_16(w_gate_up_col_major) &&
-         is_aligned_16(w_down_row_major) && is_aligned_16(scratch);
-}
-
-cudaError_t check_resident_reduction_supported() {
-  int device = 0;
-  cudaError_t status = cudaGetDevice(&device);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  int sm_count = 0;
-  status = cudaDeviceGetAttribute(
-      &sm_count, cudaDevAttrMultiProcessorCount, device);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  int active_blocks_per_sm = 0;
-  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_blocks_per_sm, gemma4_ffn_decode_fused_bf16_kernel,
-      kFfnThreads, 0);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  if (sm_count * active_blocks_per_sm < kIntermediateTiles) {
-    return cudaErrorNotSupported;
-  }
-  return cudaSuccess;
+         is_aligned_16(w_down_row_major) && is_aligned_128(scratch);
 }
 
 cudaError_t configure_dynamic_shared_memory() {
@@ -388,10 +474,33 @@ __global__ void swizzle_hidden_packs_kernel(
   }
 
   const int src_col = pack * kBf16Packed128Elements;
-  const int dst_col = shared_x_chunk_index(pack) * kBf16Packed128Elements;
+  const int dst_col = hidden_pack_swizzle_index(pack) * kBf16Packed128Elements;
   const int64_t row_offset = static_cast<int64_t>(row) * GEMMA4_HIDDEN_SIZE;
   const FfnBf16Pack pack_value = load128g(src + row_offset + src_col);
   store128(dst + row_offset + dst_col, pack_value);
+}
+
+__global__ void swizzle_gate_up_interleaved_kernel(
+    floatX *__restrict__ dst,
+    const floatX *__restrict__ src) {
+  const int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int dst_row = static_cast<int>(blockIdx.y);
+  if (pack >= kHiddenPacks) {
+    return;
+  }
+
+  const int src_row =
+      (dst_row & 1) == 0 ? dst_row / 2
+                         : GEMMA4_INTERMEDIATE_SIZE + dst_row / 2;
+  const int src_col = pack * kBf16Packed128Elements;
+  const int dst_col = hidden_pack_swizzle_index(pack) * kBf16Packed128Elements;
+  const int64_t src_row_offset =
+      static_cast<int64_t>(src_row) * GEMMA4_HIDDEN_SIZE;
+  const int64_t dst_row_offset =
+      static_cast<int64_t>(dst_row) * GEMMA4_HIDDEN_SIZE;
+  const FfnBf16Pack pack_value =
+      load128g(src + src_row_offset + src_col);
+  store128(dst + dst_row_offset + dst_col, pack_value);
 }
 
 }  // namespace
@@ -415,8 +524,9 @@ cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
   const dim3 block_dim(threads);
   const dim3 gate_up_grid_dim(div_up(kHiddenPacks, threads),
                               GEMMA4_PACKED_FFN_SIZE);
-  swizzle_hidden_packs_kernel<<<gate_up_grid_dim, block_dim, 0, stream>>>(
-      w_gate_up_swizzled, w_gate_up_col_major, GEMMA4_PACKED_FFN_SIZE);
+  swizzle_gate_up_interleaved_kernel<<<
+      gate_up_grid_dim, block_dim, 0, stream>>>(
+      w_gate_up_swizzled, w_gate_up_col_major);
   cudaError_t status = cudaGetLastError();
   if (status != cudaSuccess) {
     return status;
@@ -432,45 +542,11 @@ cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
 cudaError_t gemma4_ffn_decode_configure_scratch_l2(
     Gemma4FfnDecodeScratch *scratch,
     cudaStream_t stream) {
-  if (scratch == nullptr || !is_aligned_16(scratch)) {
+  (void)stream;
+  if (scratch == nullptr || !is_aligned_128(scratch)) {
     return cudaErrorInvalidValue;
   }
-
-  int device = 0;
-  cudaError_t status = cudaGetDevice(&device);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  cudaDeviceProp prop = {};
-  status = cudaGetDeviceProperties(&prop, device);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  if (prop.persistingL2CacheMaxSize == 0 ||
-      prop.accessPolicyMaxWindowSize == 0) {
-    return cudaSuccess;
-  }
-
-  const size_t requested_set_aside =
-      std::min(static_cast<size_t>(prop.l2CacheSize * 3 / 4),
-               static_cast<size_t>(prop.persistingL2CacheMaxSize));
-  status = cudaDeviceSetLimit(
-      cudaLimitPersistingL2CacheSize, requested_set_aside);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  cudaStreamAttrValue attr = {};
-  attr.accessPolicyWindow.base_ptr = scratch;
-  attr.accessPolicyWindow.num_bytes =
-      std::min(sizeof(Gemma4FfnDecodeScratch),
-               static_cast<size_t>(prop.accessPolicyMaxWindowSize));
-  attr.accessPolicyWindow.hitRatio = 1.0;
-  attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
-  attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
-  return cudaStreamSetAttribute(
-      stream, cudaStreamAttributeAccessPolicyWindow, &attr);
+  return cudaSuccess;
 }
 
 cudaError_t gemma4_ffn_decode_fused_bf16(
@@ -495,19 +571,26 @@ cudaError_t gemma4_ffn_decode_fused_bf16(
     return status;
   }
 
-  status = check_resident_reduction_supported();
+  status = cudaMemsetAsync(scratch, 0, sizeof(*scratch), stream);
   if (status != cudaSuccess) {
     return status;
   }
 
-  status = cudaMemsetAsync(scratch, 0, sizeof(Gemma4FfnDecodeScratch), stream);
+  if constexpr (kReductionPolicy == 1) {
+    gemma4_ffn_decode_accumulate_partials_bf16_kernel<<<
+        kPartialGroups, kFfnThreads, 0, stream>>>(
+        x, w_gate_up_col_major, w_down_row_major, scratch);
+  } else {
+    gemma4_ffn_decode_accumulate_bf16_kernel<<<
+        kAccumBlocks, kFfnThreads, 0, stream>>>(
+        x, w_gate_up_col_major, w_down_row_major, scratch);
+  }
+  status = cudaGetLastError();
   if (status != cudaSuccess) {
     return status;
   }
 
-  gemma4_ffn_decode_fused_bf16_kernel<<<
-      kIntermediateTiles, kFfnThreads, 0, stream>>>(
-      residual_out, normed_out, x, residual, rms_weight,
-      w_gate_up_col_major, w_down_row_major, scratch, eps);
+  gemma4_ffn_decode_finalize_bf16_kernel<<<1, kFfnThreads, 0, stream>>>(
+      residual_out, normed_out, residual, rms_weight, scratch, eps);
   return cudaGetLastError();
 }

@@ -140,16 +140,18 @@ void run_sparse_case() {
   DeviceBuffer<__nv_bfloat16> d_gamma(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_residual_out(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_normed_out(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_gate_up_src(gate_up_count);
   DeviceBuffer<__nv_bfloat16> d_gate_up(gate_up_count);
+  DeviceBuffer<__nv_bfloat16> d_down_src(down_count);
   DeviceBuffer<__nv_bfloat16> d_down(down_count);
   DeviceBuffer<Gemma4FfnDecodeScratch> d_scratch(1);
 
   d_x.copy_from(x);
   d_residual.copy_from(residual);
   d_gamma.copy_from(gamma);
-  CHECK_CUDA(cudaMemset(d_gate_up.get(), 0,
+  CHECK_CUDA(cudaMemset(d_gate_up_src.get(), 0,
                         gate_up_count * sizeof(__nv_bfloat16)));
-  CHECK_CUDA(cudaMemset(d_down.get(), 0,
+  CHECK_CUDA(cudaMemset(d_down_src.get(), 0,
                         down_count * sizeof(__nv_bfloat16)));
 
   std::vector<__nv_bfloat16> gate_col(GEMMA4_HIDDEN_SIZE);
@@ -171,12 +173,12 @@ void run_sparse_case() {
     up_col[x_index] = up_weight;
 
     CHECK_CUDA(cudaMemcpy(
-        d_gate_up.get() +
+        d_gate_up_src.get() +
             static_cast<size_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE,
         gate_col.data(), gate_col.size() * sizeof(__nv_bfloat16),
         cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(
-        d_gate_up.get() +
+        d_gate_up_src.get() +
             static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE + intermediate_col) *
                 GEMMA4_HIDDEN_SIZE,
         up_col.data(), up_col.size() * sizeof(__nv_bfloat16),
@@ -186,7 +188,7 @@ void run_sparse_case() {
       down_row[col] = make_down_value(tile, col);
     }
     CHECK_CUDA(cudaMemcpy(
-        d_down.get() +
+        d_down_src.get() +
             static_cast<size_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE,
         down_row.data(), down_row.size() * sizeof(__nv_bfloat16),
         cudaMemcpyHostToDevice));
@@ -216,6 +218,9 @@ void run_sparse_case() {
     expected_normed[col] = __float2bfloat16_rn(value);
   }
 
+  CHECK_CUDA(gemma4_ffn_decode_swizzle_weights_bf16(
+      d_gate_up.get(), d_gate_up_src.get(), d_down.get(), d_down_src.get(),
+      0));
   CHECK_CUDA(gemma4_ffn_decode_configure_scratch_l2(d_scratch.get(), 0));
   CHECK_CUDA(gemma4_ffn_decode_fused_bf16(
       d_residual_out.get(), d_normed_out.get(), d_x.get(), d_residual.get(),
@@ -228,6 +233,20 @@ void run_sparse_case() {
                "fused FFN residual");
   compare_bf16(actual_normed, expected_normed, 0.03125f,
                "fused FFN normed");
+
+  DeviceBuffer<unsigned char> d_scratch_bytes(
+      sizeof(Gemma4FfnDecodeScratch) + 128);
+  auto *misaligned_scratch = reinterpret_cast<Gemma4FfnDecodeScratch *>(
+      d_scratch_bytes.get() + 16);
+  cudaError_t invalid_scratch = gemma4_ffn_decode_fused_bf16(
+      d_residual_out.get(), d_normed_out.get(), d_x.get(), d_residual.get(),
+      d_gamma.get(), d_gate_up.get(), d_down.get(), misaligned_scratch,
+      GEMMA4_RMS_NORM_EPS, 0);
+  if (invalid_scratch != cudaErrorInvalidValue) {
+    std::fprintf(stderr,
+                 "expected cudaErrorInvalidValue for misaligned scratch\n");
+    std::exit(1);
+  }
 }
 
 }  // namespace
