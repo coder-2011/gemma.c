@@ -103,7 +103,7 @@ struct Gemma4FlashFwdKernelTraits {
   // Shared-memory layouts use a CUTE swizzle to make tensor-core LDSM loads
   // bank-conflict-friendly. Q, K, and V share the same logical tile shape, but
   // V also gets a transposed view for the P*V multiply.
-  using SmemLayoutAtomQ = decltype(composition(Swizzle<kSwizzle, 3, 3>{}, Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
+  using SmemLayoutAtomQ = decltype(composition(Swizzle<kSwizzle, 3, 3>{}, Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{})); // 3, 3 changes, if we adjust layout
   using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
   using SmemLayoutKV = decltype(tile_to_shape(SmemLayoutAtomQ{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
@@ -986,6 +986,146 @@ cudaError_t launch_global(
       params, batch_size, stream);
 }
 
+constexpr int kSlidingNormRopeThreads = GEMMA4_SLIDING_HEAD_DIM;
+static_assert(kSlidingNormRopeThreads % kWarpSize == 0);
+static_assert(GEMMA4_SLIDING_HEAD_DIM == 256);
+constexpr int kSlidingNormRopeHeadsPerBlock =
+    kSlidingNormRopeThreads / kWarpSize;
+constexpr int kSlidingNormRopeValuesPerLane =
+    GEMMA4_SLIDING_HEAD_DIM / kWarpSize;
+constexpr int kSlidingNormRopePairsPerLane =
+    kSlidingNormRopeValuesPerLane / 2;
+static_assert(GEMMA4_NUM_QUERY_HEADS % kSlidingNormRopeHeadsPerBlock == 0);
+
+__device__ __forceinline__ float sliding_prep_warp_sum(float value) {
+  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    value += __shfl_xor_sync(0xffffffffu, value, offset);
+  }
+  return value;
+}
+
+__device__ __forceinline__ float sliding_prep_head_rms_scale(
+    const __nv_bfloat16 *__restrict__ in,
+    int lane,
+    float (&values)[kSlidingNormRopeValuesPerLane]) {
+  float sum = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kSlidingNormRopeValuesPerLane; ++i) {
+    values[i] = __bfloat162float(in[lane + i * kWarpSize]);
+    sum = fmaf(values[i], values[i], sum);
+  }
+  sum = sliding_prep_warp_sum(sum);
+  return rsqrtf(sum / float(GEMMA4_SLIDING_HEAD_DIM) + GEMMA4_RMS_NORM_EPS);
+}
+
+__device__ __forceinline__ void sliding_prep_weighted_rope_head(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ in,
+    const __nv_bfloat16 *__restrict__ weight,
+    const float *__restrict__ cos_row,
+    const float *__restrict__ sin_row,
+    int lane) {
+  constexpr int kRotaryHalf = GEMMA4_SLIDING_HEAD_DIM / 2;
+  float values[kSlidingNormRopeValuesPerLane];
+  const float scale = sliding_prep_head_rms_scale(in, lane, values);
+#pragma unroll
+  for (int i = 0; i < kSlidingNormRopePairsPerLane; ++i) {
+    const int dim = lane + i * kWarpSize;
+    const float lo = values[i] * scale * __bfloat162float(weight[dim]);
+    const float hi = values[i + kSlidingNormRopePairsPerLane] * scale *
+                     __bfloat162float(weight[kRotaryHalf + dim]);
+    const float c = __ldg(cos_row + dim);
+    const float s = __ldg(sin_row + dim);
+    out[dim] = __float2bfloat16_rn(fmaf(-hi, s, lo * c));
+    out[kRotaryHalf + dim] = __float2bfloat16_rn(fmaf(lo, s, hi * c));
+  }
+}
+
+__device__ __forceinline__ void sliding_prep_scale_head(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ in,
+    int lane) {
+  float values[kSlidingNormRopeValuesPerLane];
+  const float scale = sliding_prep_head_rms_scale(in, lane, values);
+#pragma unroll
+  for (int i = 0; i < kSlidingNormRopeValuesPerLane; ++i) {
+    out[lane + i * kWarpSize] = __float2bfloat16_rn(values[i] * scale);
+  }
+}
+
+__global__ __launch_bounds__(kSlidingNormRopeThreads)
+void gemma4_sliding_qkv_norm_rope_kernel(
+    __nv_bfloat16 *__restrict__ q_prepared,
+    __nv_bfloat16 *__restrict__ k_prepared,
+    __nv_bfloat16 *__restrict__ v_prepared,
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
+    const __nv_bfloat16 *__restrict__ q_norm_weight,
+    const __nv_bfloat16 *__restrict__ k_norm_weight,
+    const float *__restrict__ cos,
+    const float *__restrict__ sin,
+    int seq_len) {
+  constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
+  constexpr int kKvHeads = GEMMA4_SLIDING_KV_HEADS;
+  constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
+  constexpr int kRotaryHalf = kHeadDim / 2;
+
+  const int row = blockIdx.x;
+  const int lane = threadIdx.x & (kWarpSize - 1);
+  const int warp = threadIdx.x / kWarpSize;
+  const int head = blockIdx.y * kSlidingNormRopeHeadsPerBlock + warp;
+  const int seq = row % seq_len;
+  const float *cos_row = cos + int64_t(seq) * kRotaryHalf;
+  const float *sin_row = sin + int64_t(seq) * kRotaryHalf;
+
+  const int64_t q_offset = (int64_t(row) * kQHeads + head) * kHeadDim;
+  sliding_prep_weighted_rope_head(q_prepared + q_offset, q + q_offset,
+                                  q_norm_weight, cos_row, sin_row,
+                                  lane);
+
+  if (head < kKvHeads) {
+    const int64_t kv_offset = (int64_t(row) * kKvHeads + head) * kHeadDim;
+    sliding_prep_weighted_rope_head(k_prepared + kv_offset, k + kv_offset,
+                                    k_norm_weight, cos_row, sin_row,
+                                    lane);
+    sliding_prep_scale_head(v_prepared + kv_offset, v + kv_offset, lane);
+  }
+}
+
+cudaError_t prepare_sliding_qkv_norm_rope(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_k_prepared,
+    __nv_bfloat16 *__restrict__ d_v_prepared,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    int batch_size,
+    int seq_len,
+    cudaStream_t stream) {
+  if (d_q_prepared == nullptr || d_k_prepared == nullptr ||
+      d_v_prepared == nullptr || d_q == nullptr || d_k == nullptr ||
+      d_v == nullptr || d_q_norm_weight == nullptr ||
+      d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr ||
+      batch_size <= 0 || seq_len <= 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  constexpr int kHeadGroups =
+      (GEMMA4_NUM_QUERY_HEADS + kSlidingNormRopeHeadsPerBlock - 1) /
+      kSlidingNormRopeHeadsPerBlock;
+  const dim3 grid_dim(batch_size * seq_len, kHeadGroups);
+  constexpr dim3 block_dim(kSlidingNormRopeThreads);
+  gemma4_sliding_qkv_norm_rope_kernel<<<grid_dim, block_dim, 0, stream>>>(
+      d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, seq_len);
+  return cudaGetLastError();
+}
+
 // Small diagnostic helper for tests/benchmarks that want register count,
 // dynamic shared memory, binary target, and related CUDA function attributes.
 template <typename KernelTraits, bool IsLocal>
@@ -1047,6 +1187,58 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
       gemma4_flash_attention::make_params(d_out, d_softmax_lse, d_q, d_k, d_v,
                                           seqlen_q, seqlen_k, window_left,
                                           softmax_scale);
+  return gemma4_flash_attention::launch_sliding(params, batch_size, stream);
+}
+
+// Gemma sliding prefill helper: Q/K get learned RMSNorm then RoPE; V gets
+// scale-free RMSNorm. The prepared tensors keep the normal FA layout:
+//   Q: [batch, seq, 32, 256], K/V: [batch, seq, 16, 256].
+extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_softmax_lse,
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_k_prepared,
+    __nv_bfloat16 *__restrict__ d_v_prepared,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    int batch_size,
+    int seqlen_q,
+    int seqlen_k,
+    int window_left,
+    float softmax_scale,
+    cudaStream_t stream) {
+  if (d_out == nullptr || d_softmax_lse == nullptr ||
+      d_q_prepared == nullptr || d_k_prepared == nullptr ||
+      d_v_prepared == nullptr || d_q == nullptr || d_k == nullptr ||
+      d_v == nullptr || d_q_norm_weight == nullptr ||
+      d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0 ||
+      window_left < 0) {
+    return cudaErrorInvalidValue;
+  }
+  // ponytail: prefill-only until the paged decode cache lands; decode should
+  // prep just the appended token and write Layout-A cache pages once.
+  if (seqlen_q != seqlen_k) {
+    return cudaErrorInvalidValue;
+  }
+
+  cudaError_t status = gemma4_flash_attention::prepare_sliding_qkv_norm_rope(
+      d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seqlen_q,
+      stream);
+  if (status != cudaSuccess) return status;
+
+  gemma4_flash_attention::Gemma4FlashFwdParams params =
+      gemma4_flash_attention::make_params(
+          d_out, d_softmax_lse, d_q_prepared, d_k_prepared, d_v_prepared,
+          seqlen_q, seqlen_k, window_left, softmax_scale);
   return gemma4_flash_attention::launch_sliding(params, batch_size, stream);
 }
 
