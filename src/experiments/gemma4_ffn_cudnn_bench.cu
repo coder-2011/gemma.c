@@ -470,9 +470,11 @@ int main(int argc, char **argv) {
   );
 
 #if !GEMMA4_HAS_CUDNN_FRONTEND
-  std::fprintf(stderr, "cuDNN Frontend headers were not found at compile time\n");
+  std::fprintf(stderr,
+               "cuDNN Frontend headers were not found at compile time; "
+               "skipping cuDNN FFN comparison\n");
   CUDA_CHECK(cudaStreamDestroy(stream));
-  return 1;
+  return 0;
 #else
   std::printf("cudnn_version=%zu\n", cudnnGetVersion());
 
