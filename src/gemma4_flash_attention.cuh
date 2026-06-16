@@ -19,6 +19,26 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     float softmax_scale,
     cudaStream_t stream);
 
+extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_softmax_lse,
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_k_prepared,
+    __nv_bfloat16 *__restrict__ d_v_prepared,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    int batch_size,
+    int seqlen_q,
+    int seqlen_k,
+    int window_left,
+    float softmax_scale,
+    cudaStream_t stream);
+
 extern "C" size_t gemma4_flash_attention_sliding_smem_bytes();
 extern "C" int gemma4_flash_attention_sliding_threads_per_block();
 extern "C" cudaError_t gemma4_flash_attention_sliding_kernel_attributes(

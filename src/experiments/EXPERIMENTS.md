@@ -3,6 +3,163 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-16 - Benchmark harness source cleanup
+
+Runtime files:
+
+- `Makefile`
+- `src/experiments/gemma4_decode_bench.cu`
+- `src/experiments/gemma4_ffn_cudnn_bench.cu`
+
+Change:
+
+- Removed the `decode-bench` measurement path for
+  `src/experiments/gemma4_matmul_device_kernels.cu`.
+- Deleted the experiment-only matmul wrapper source/header. Decode benchmark
+  now measures the production launchers from `src/gemma4_matmul_kernels.cu`:
+  `gemma4_projection_decode` and `gemma4_projection_decode_swizzled`.
+- Kept benchmark-only utility kernels for random-fill/cache-flush because they
+  are input setup and cache-state controls, not duplicated inference kernels.
+- Added explicit CUDA/cuDNN include and rpath variables so benchmark binaries
+  run without relying on ambient `LD_LIBRARY_PATH`.
+- `ffn-cudnn-bench` now exits successfully when cuDNN Frontend headers are not
+  available at compile time, marking the optional comparison as skipped instead
+  of failing the whole benchmark smoke.
+
+Verification:
+
+```bash
+make -B decode-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_decode_bench global_k 1 0 1
+
+make -B embedding-gather-bench rmsnorm-hidden-fused-bench rope-bench \
+  ffn-decode-load-bench flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+
+make -B rmsnorm-bench ffn-cudnn-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Smoke runs completed for decode, flash-attn, RoPE, RMSNorm, hidden fused
+RMSNorm, embedding gather, FFN load bench, and FFN cuDNN skip behavior.
+
+## 2026-06-16 - Sliding FA QKV norm plus RoPE prep
+
+Runtime files:
+
+- `src/gemma4_flash_attention.cu`
+- `src/gemma4_flash_attention.cuh`
+- `src/experiments/gemma4_flash_attention_bench.cu`
+
+Change:
+
+- Added `gemma4_flash_attention_sliding_fwd_bf16_norm_rope`, a prefill-only
+  helper in the flash-attention module.
+- The helper prepares Q/K/V once, then calls the existing tensor-core sliding
+  FA kernel:
+  - Q: learned RMSNorm, then split-half RoPE.
+  - K: learned RMSNorm, then split-half RoPE.
+  - V: scale-free RMSNorm.
+- Kept the FA kernel itself unchanged. Recomputing K/V norm and RoPE inside
+  each FA K/V tile load would repeat the prep for every query block.
+- KV cache layout was not implemented in this patch. The next paged cache path
+  should use Layout A:
+  `[num_layers, num_pages, page_size, num_heads, head_dim]`.
+
+Build:
+
+```bash
+make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+GPU/tooling:
+
+- GPU: NVIDIA RTX A6000, bus `00000000:0D:00.0`
+- Driver: 580.126.16
+- NVCC: CUDA 13.0, `nvcc` 13.0.48
+- CUDA target: `sm_86`
+- Clock policy: not locked.
+- Cache policy: warm-cache repeated buffers.
+- Timing: CUDA events on the benchmark stream.
+- Nsight Compute: unavailable (`ncu: command not found`).
+- Note: CUDA 13.0 is a deviation from the project preference for CUDA 12.x;
+  no CUDA 12 NVCC was installed under `/usr/local`.
+
+Correctness smoke:
+
+```bash
+./build/experiments/gemma4_flash_attention_bench 1024 100 20 3 1 64
+```
+
+```text
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+```
+
+Benchmark contract:
+
+- Baseline: existing sliding FA on already-prepared Q/K/V.
+- New path: Q/K learned RMSNorm + V scale-free RMSNorm + Q/K RoPE + the same
+  sliding FA.
+- Warmup/timing at `seq=1024`: 50 warmups, 500 timed iterations, 5 trials,
+  repeated across 5 fresh processes.
+- Warmup/timing at `seq=4096`: 50 warmups, 200 timed iterations, 3 trials,
+  repeated across 3 fresh processes.
+
+Raw `seq=1024`, `batch=1`, `window_left=1024` samples:
+
+```text
+prepared_fa best_ms=0.230605 avg_ms=0.231656
+norm_rope_plus_fa best_ms=0.331543 avg_ms=0.333089 overhead_best_ms=0.100938 overhead_best_pct=43.7709
+
+prepared_fa best_ms=0.230439 avg_ms=0.232190
+norm_rope_plus_fa best_ms=0.333398 avg_ms=0.334182 overhead_best_ms=0.102958 overhead_best_pct=44.6792
+
+prepared_fa best_ms=0.229852 avg_ms=0.232230
+norm_rope_plus_fa best_ms=0.333469 avg_ms=0.334841 overhead_best_ms=0.103618 overhead_best_pct=45.0802
+
+prepared_fa best_ms=0.229796 avg_ms=0.232688
+norm_rope_plus_fa best_ms=0.333412 avg_ms=0.335302 overhead_best_ms=0.103616 overhead_best_pct=45.0906
+
+prepared_fa best_ms=0.231061 avg_ms=0.233694
+norm_rope_plus_fa best_ms=0.334066 avg_ms=0.335673 overhead_best_ms=0.103005 overhead_best_pct=44.5792
+```
+
+`seq=1024` summary:
+
+- Prepared FA median best: `0.230439 ms`.
+- Norm+RoPE+FA median best: `0.333412 ms`.
+- Median best overhead: `0.103005 ms`, about `44.7%`.
+- Attention-only throughput from prepared FA: about `74.6 TFLOP/s`.
+
+Raw `seq=4096`, `batch=1`, `window_left=1024` samples:
+
+```text
+prepared_fa best_ms=1.44497 avg_ms=1.45688
+norm_rope_plus_fa best_ms=1.84029 avg_ms=1.84921 overhead_best_ms=0.395325 overhead_best_pct=27.3587
+
+prepared_fa best_ms=1.44508 avg_ms=1.45923
+norm_rope_plus_fa best_ms=1.84469 avg_ms=1.85295 overhead_best_ms=0.399602 overhead_best_pct=27.6525
+
+prepared_fa best_ms=1.45549 avg_ms=1.46709
+norm_rope_plus_fa best_ms=1.85052 avg_ms=1.85474 overhead_best_ms=0.395034 overhead_best_pct=27.1410
+```
+
+`seq=4096` summary:
+
+- Prepared FA median best: `1.44508 ms`.
+- Norm+RoPE+FA median best: `1.84469 ms`.
+- Median best overhead: `0.395325 ms`, about `27.4%`.
+- Attention-only throughput from prepared FA: about `83.3 TFLOP/s`.
+
+Conclusion:
+
+- The prefill helper is correct against the CPU reference and keeps the existing
+  FA kernel on the fast tensor-core path.
+- The prep-once kernel is not free: roughly `0.10 ms` at `seq=1024`, and
+  `0.40 ms` at `seq=4096`.
+- That is still better than doing K/V norm and RoPE inside repeated FA tile
+  loads for prefill. For decode, the paged KV-cache write path should prep only
+  the appended token and store it once in Layout-A cache pages.
+
 ## 2026-05-23 - Global FlashAttention option
 
 Runtime files:
@@ -9977,3 +10134,250 @@ Conclusion:
 - Full cuDNN harness correctness remains exact (`max_abs_vs_split=0`), and the
   full cold metric improved from the prior retained `0.977042 ms` to
   `0.976290 ms`.
+
+## 2026-06-16 - Ponytail FlashAttention cleanup
+
+Scope:
+
+- Cleaned the custom Gemma 4 BF16 FlashAttention kernel for the fixed
+  RTX A6000/sm86 target.
+- Removed dead generic paths instead of adding abstractions: local `round_up`,
+  unused params, pre-SM80 fallbacks, half-precision trait plumbing, copied
+  base-trait aliases, `void *` input storage, the block-info wrapper, and the
+  local/global mask wrapper.
+- Kept comments, including `ponytail:` comments that mark intentional fixed-path
+  assumptions.
+
+Build:
+
+```bash
+make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Benchmark contract:
+
+- Harness: `build/experiments/gemma4_flash_attention_bench`
+- Command per process:
+  `./build/experiments/gemma4_flash_attention_bench 1024 500 50 1 1 64`
+- Measures custom sliding BF16 attention with CUDA events in the harness.
+- Shape: `batch=1`, `seq=1024`, `window_left=1024`; correctness reference uses
+  `seq=64`.
+- Warmup/timing: `50` warmup iterations, `500` timed iterations, `trials=1`,
+  repeated across `9` fresh processes.
+- Cache policy: warm-cache repeated buffers; launch included in the measured
+  event window.
+- Clock policy: clocks were not locked.
+
+Environment:
+
+```text
+GPU: NVIDIA RTX A6000
+Driver: 580.126.16
+CUDA/NVCC: CUDA 13.0, V13.0.48
+Build arch: sm_86
+Persistence: Enabled
+ECC: Disabled
+MIG: N/A
+Power limit: 300 W
+Pre-run telemetry: 690 MHz SM, 810 MHz memory, 29 C, 33.55 W, 0% util
+Commit: e77022a plus local working tree changes
+```
+
+Before cleanup baseline, same command and process repetition:
+
+```text
+raw_ms = 0.232100, 0.234383, 0.234037, 0.234784, 0.235245,
+         0.233095, 0.233433, 0.234248, 0.235153
+median = 0.234248 ms
+mean   = 0.234053 ms
+```
+
+After cleanup:
+
+```text
+raw_ms = 0.229678, 0.229017, 0.231791, 0.229811, 0.229841,
+         0.229190, 0.229540, 0.230041, 0.230285
+median = 0.229811 ms
+mean   = 0.229910 ms
+min    = 0.229017 ms
+max    = 0.231791 ms
+approx_tflops range = 74.1902-75.0891
+```
+
+Correctness for every after sample:
+
+```text
+max_abs = 0.00390625
+mean_abs = 7.72008e-05
+max_rel = 0.00390625
+```
+
+Conclusion:
+
+- The source is simpler and more fixed-path: fewer params, fewer traits, fewer
+  fallbacks, no custom rounding helper, no input `const_cast`.
+- Timing is slightly faster in this run, but the main claim is cleanup with no
+  regression. Clocks were not locked, and earlier telemetry in this session
+  reported different bus IDs, so treat the small delta as neutral-to-positive
+  unless repeated under locked clocks.
+
+## 2026-06-16 - Additional FlashAttention micro-cleanups
+
+Scope:
+
+- Removed runtime Q/KV head count and GQA-ratio params from the device params.
+  The sliding/global ratios are model constants, so the kernel now uses
+  compile-time `2` or `8`.
+- Hoisted per-CTA arithmetic for batch offsets, query tile start/remaining,
+  sequence delta, and mask row offset.
+- Removed contiguous tensor stride params. Row/head strides are fixed by the
+  Gemma layout and kernel trait.
+- Simplified LSE tile construction to a direct pointer plus `[BlockM]` tensor,
+  then kept batch size on the host launcher instead of copying it into device
+  params.
+- Hoisted duplicated query-to-key offset arithmetic in local/global mask
+  helpers.
+
+Build:
+
+```bash
+make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Benchmark contract:
+
+- Same as the prior FlashAttention cleanup entry:
+  `./build/experiments/gemma4_flash_attention_bench 1024 500 50 1 1 64`
+- Warm-cache repeated buffers, CUDA-event timing in the harness, launch
+  included, `9` fresh processes per retained step.
+- Clocks were not locked.
+
+Baseline from the prior cleanup:
+
+```text
+raw_ms = 0.229678, 0.229017, 0.231791, 0.229811, 0.229841,
+         0.229190, 0.229540, 0.230041, 0.230285
+median = 0.229811 ms
+mean   = 0.229910 ms
+```
+
+After compile-time GQA ratio and CTA arithmetic hoist:
+
+```text
+raw_ms = 0.229429, 0.228381, 0.230113, 0.226982, 0.228221,
+         0.228584, 0.229043, 0.227851, 0.230002
+median = 0.228584 ms
+mean   = 0.228734 ms
+```
+
+After fixed contiguous strides:
+
+```text
+raw_ms = 0.228801, 0.228456, 0.227953, 0.227999, 0.228939,
+         0.228987, 0.227270, 0.228647, 0.228365
+median = 0.228456 ms
+mean   = 0.228380 ms
+```
+
+After mask arithmetic hoist:
+
+```text
+raw_ms = 0.226781, 0.226593, 0.227552, 0.227764, 0.226285,
+         0.228099, 0.228871, 0.228722, 0.228360
+median = 0.227764 ms
+mean   = 0.227670 ms
+```
+
+After direct LSE tile and host-only batch size:
+
+```text
+raw_ms = 0.226992, 0.226784, 0.226852, 0.227711, 0.227270,
+         0.228066, 0.226680, 0.228802, 0.228254
+median = 0.227270 ms
+mean   = 0.227490 ms
+min    = 0.226680 ms
+max    = 0.228802 ms
+```
+
+Correctness for every retained sample stayed:
+
+```text
+max_abs = 0.00390625
+mean_abs = 7.72008e-05
+max_rel = 0.00390625
+```
+
+Conclusion:
+
+- Kept all four micro-cleanups. They delete params and repeated arithmetic, and
+  the final median improved from `0.229811 ms` to `0.227270 ms` under the same
+  unlocked-clock warm-cache contract.
+- Treat the delta as a small same-machine win, not a locked-clock claim.
+
+## 2026-06-16 - Split QK and PV TiledMMA aliases
+
+Scope:
+
+- Split the forward attention MMA type into `TiledMmaQK` and `TiledMmaPV`.
+- Kept QK row-split because softmax state is row-owned.
+- Tried a true/wider PV variant for better head-dim coverage, then rejected it
+  because it regressed the warm-cache benchmark.
+- Retained the split abstraction with the row-compatible PV tile so future PV
+  ablations are localized.
+
+Rejected variants:
+
+- `TiledMmaPV = Layout<Shape<2,2,1>>, Tile<32,32,16>` for sliding and
+  `Layout<Shape<1,2,1>>, Tile<16,32,16>` for global did not compile. The QK
+  probability fragment is not directly compatible with the N-split PV A
+  operand; it would need explicit P staging or a larger cross-warp retile.
+- Row-compatible PV with `Tile<16*kNWarps,32,16>` compiled and was correct, but
+  was slower:
+
+```text
+raw_ms = 0.230811, 0.230364, 0.231751, 0.230840, 0.228249,
+         0.227993, 0.229381, 0.227745, 0.229930
+median = 0.229930 ms
+mean   = 0.229674 ms
+```
+
+Retained split:
+
+```text
+TiledMmaQK = Layout<Shape<kNWarps,1,1>>, Tile<16*kNWarps,16,16>
+TiledMmaPV = Layout<Shape<kNWarps,1,1>>, Tile<16*kNWarps,16,16>
+```
+
+Validation:
+
+```bash
+make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_flash_attention_bench 1024 500 50 1 1 64
+```
+
+Retained split benchmark, `9` fresh processes, same warm-cache CUDA-event
+contract as above:
+
+```text
+raw_ms = 0.226513, 0.226714, 0.228271, 0.228916, 0.226390,
+         0.228534, 0.227730, 0.229035, 0.227525
+median = 0.227730 ms
+mean   = 0.227736 ms
+min    = 0.226390 ms
+max    = 0.229035 ms
+```
+
+Correctness for every retained sample:
+
+```text
+max_abs = 0.00390625
+mean_abs = 7.72008e-05
+max_rel = 0.00390625
+```
+
+Conclusion:
+
+- Retained the QK/PV type split because it makes the two phases explicit and
+  keeps the measured path neutral under the existing benchmark.
+- Did not retain a different PV warp layout; true N-split is not a cheap
+  one-line CUTE change for this SM80 row-owned softmax pipeline.
