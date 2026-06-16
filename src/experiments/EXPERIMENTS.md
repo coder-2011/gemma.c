@@ -10156,3 +10156,71 @@ Conclusion:
   the final median improved from `0.229811 ms` to `0.227270 ms` under the same
   unlocked-clock warm-cache contract.
 - Treat the delta as a small same-machine win, not a locked-clock claim.
+
+## 2026-06-16 - Split QK and PV TiledMMA aliases
+
+Scope:
+
+- Split the forward attention MMA type into `TiledMmaQK` and `TiledMmaPV`.
+- Kept QK row-split because softmax state is row-owned.
+- Tried a true/wider PV variant for better head-dim coverage, then rejected it
+  because it regressed the warm-cache benchmark.
+- Retained the split abstraction with the row-compatible PV tile so future PV
+  ablations are localized.
+
+Rejected variants:
+
+- `TiledMmaPV = Layout<Shape<2,2,1>>, Tile<32,32,16>` for sliding and
+  `Layout<Shape<1,2,1>>, Tile<16,32,16>` for global did not compile. The QK
+  probability fragment is not directly compatible with the N-split PV A
+  operand; it would need explicit P staging or a larger cross-warp retile.
+- Row-compatible PV with `Tile<16*kNWarps,32,16>` compiled and was correct, but
+  was slower:
+
+```text
+raw_ms = 0.230811, 0.230364, 0.231751, 0.230840, 0.228249,
+         0.227993, 0.229381, 0.227745, 0.229930
+median = 0.229930 ms
+mean   = 0.229674 ms
+```
+
+Retained split:
+
+```text
+TiledMmaQK = Layout<Shape<kNWarps,1,1>>, Tile<16*kNWarps,16,16>
+TiledMmaPV = Layout<Shape<kNWarps,1,1>>, Tile<16*kNWarps,16,16>
+```
+
+Validation:
+
+```bash
+make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_flash_attention_bench 1024 500 50 1 1 64
+```
+
+Retained split benchmark, `9` fresh processes, same warm-cache CUDA-event
+contract as above:
+
+```text
+raw_ms = 0.226513, 0.226714, 0.228271, 0.228916, 0.226390,
+         0.228534, 0.227730, 0.229035, 0.227525
+median = 0.227730 ms
+mean   = 0.227736 ms
+min    = 0.226390 ms
+max    = 0.229035 ms
+```
+
+Correctness for every retained sample:
+
+```text
+max_abs = 0.00390625
+mean_abs = 7.72008e-05
+max_rel = 0.00390625
+```
+
+Conclusion:
+
+- Retained the QK/PV type split because it makes the two phases explicit and
+  keeps the measured path neutral under the existing benchmark.
+- Did not retain a different PV warp layout; true N-split is not a cheap
+  one-line CUTE change for this SM80 row-owned softmax pipeline.

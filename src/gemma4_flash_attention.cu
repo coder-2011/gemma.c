@@ -89,7 +89,13 @@ struct Gemma4FlashFwdKernelTraits {
                 "FA head dim must be a multiple of vector load width");
   static_assert(kNThreads % kGmemThreadsPerRow == 0, "FA thread count must divide row load layout");
 
-  using TiledMma = TiledMMA<
+  // QK stays row-split because softmax state is row-owned. P*V gets a separate
+  // MMA type but keeps the same row ownership; true N-splits need P staging.
+  using TiledMmaQK = TiledMMA< // ablate layout and tile size/shape
+      MMA_Atom_Arch,
+      Layout<Shape<Int<kNWarps>, _1, _1>>,
+      Tile<Int<16 * kNWarps>, _16, _16>>;
+  using TiledMmaPV = TiledMMA<
       MMA_Atom_Arch,
       Layout<Shape<Int<kNWarps>, _1, _1>>,
       Tile<Int<16 * kNWarps>, _16, _16>>;
@@ -699,26 +705,28 @@ inline __device__ void gemma4_compute_attn_1rowblock(
 
   // Partition tensor-core MMA fragments. acc_o stays in FP32 registers across
   // all streamed K/V blocks.
-  typename KernelTraits::TiledMma tiled_mma;
-  auto thr_mma = tiled_mma.get_thread_slice(tidx);
-  Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
-  Tensor tSrK = thr_mma.partition_fragment_B(sK);
-  Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);
+  typename KernelTraits::TiledMmaQK tiled_mma_qk;
+  typename KernelTraits::TiledMmaPV tiled_mma_pv;
+  auto thr_mma_qk = tiled_mma_qk.get_thread_slice(tidx);
+  auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tidx);
+  Tensor tSrQ = thr_mma_qk.partition_fragment_A(sQ);
+  Tensor tSrK = thr_mma_qk.partition_fragment_B(sK);
+  Tensor tOrVt = thr_mma_pv.partition_fragment_B(sVtNoSwizzle);
   Tensor acc_o =
-      partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+      partition_fragment_C(tiled_mma_pv, Shape<Int<kBlockM>, Int<kHeadDim>>{});
 
   auto smem_tiled_copy_Q =
-      make_tiled_copy_A(typename KernelTraits::SmemCopyAtom{}, tiled_mma);
+      make_tiled_copy_A(typename KernelTraits::SmemCopyAtom{}, tiled_mma_qk);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
   Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
 
   auto smem_tiled_copy_K =
-      make_tiled_copy_B(typename KernelTraits::SmemCopyAtom{}, tiled_mma);
+      make_tiled_copy_B(typename KernelTraits::SmemCopyAtom{}, tiled_mma_qk);
   auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
   Tensor tSsK = smem_thr_copy_K.partition_S(sK);
 
   auto smem_tiled_copy_V =
-      make_tiled_copy_B(typename KernelTraits::SmemCopyAtomTransposed{}, tiled_mma);
+      make_tiled_copy_B(typename KernelTraits::SmemCopyAtomTransposed{}, tiled_mma_pv);
   auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
   Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
 
@@ -754,7 +762,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
        masking_step < kMaskingSteps;
        ++masking_step, --n_block) {
     Tensor acc_s =
-        partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_s);
     gemma4_fa_cp_async_wait<0>();
     __syncthreads();
@@ -773,7 +781,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     cute::cp_async_fence();
 
     gemma4_fa_gemm</*AInRegs=*/false>(
-        acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q,
+        acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_qk, smem_tiled_copy_Q,
         smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
 
     // Boundary blocks need either sliding-window or full-causal masking before
@@ -807,8 +815,8 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     Tensor rP = gemma4_fa_convert_type<Element>(acc_s);
     Tensor tOrP = make_tensor(
         rP.data(),
-        gemma4_fa_acc_Aregs<typename KernelTraits::TiledMma>(rP.layout()));
-    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma,
+        gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
+    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv,
                       smem_tiled_copy_V, smem_thr_copy_V);
 
     if (kMaskingSteps > 1 && n_block <= n_block_min) {
@@ -821,7 +829,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   // still checks the left side of the sliding window.
   for (; n_block >= n_block_min; --n_block) {
     Tensor acc_s =
-        partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_s);
     gemma4_fa_cp_async_wait<0>();
     __syncthreads();
@@ -830,7 +838,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     cute::cp_async_fence();
 
     gemma4_fa_gemm</*AInRegs=*/false>(
-        acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q,
+        acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma_qk, smem_tiled_copy_Q,
         smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
 
     gemma4_fa_cp_async_wait<0>();
@@ -852,8 +860,8 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     Tensor rP = gemma4_fa_convert_type<Element>(acc_s);
     Tensor tOrP = make_tensor(
         rP.data(),
-        gemma4_fa_acc_Aregs<typename KernelTraits::TiledMma>(rP.layout()));
-    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma,
+        gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
+    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv,
                       smem_tiled_copy_V, smem_thr_copy_V);
   }
 
@@ -863,7 +871,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   Tensor rO = gemma4_fa_convert_type<Element>(acc_o);
   Tensor sO = make_tensor(sQ.data(), typename KernelTraits::SmemLayoutO{});
   auto smem_tiled_copy_O =
-      make_tiled_copy_C(typename KernelTraits::SmemCopyAtomO{}, tiled_mma);
+      make_tiled_copy_C(typename KernelTraits::SmemCopyAtomO{}, tiled_mma_pv);
   auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
   Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
   Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
@@ -890,7 +898,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   // One lane group writes the per-row LSE values. OOB rows in the final tile are
   // skipped by comparing against the remaining sequence length.
   Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
-  Tensor taccOcO = thr_mma.partition_C(caccO);
+  Tensor taccOcO = thr_mma_pv.partition_C(caccO);
   Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
   if (get<1>(taccOcO_row(0)) == 0) {
 #pragma unroll
