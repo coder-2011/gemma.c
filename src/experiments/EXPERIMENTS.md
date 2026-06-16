@@ -3,6 +3,163 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-16 - Benchmark harness source cleanup
+
+Runtime files:
+
+- `Makefile`
+- `src/experiments/gemma4_decode_bench.cu`
+- `src/experiments/gemma4_ffn_cudnn_bench.cu`
+
+Change:
+
+- Removed the `decode-bench` measurement path for
+  `src/experiments/gemma4_matmul_device_kernels.cu`.
+- Deleted the experiment-only matmul wrapper source/header. Decode benchmark
+  now measures the production launchers from `src/gemma4_matmul_kernels.cu`:
+  `gemma4_projection_decode` and `gemma4_projection_decode_swizzled`.
+- Kept benchmark-only utility kernels for random-fill/cache-flush because they
+  are input setup and cache-state controls, not duplicated inference kernels.
+- Added explicit CUDA/cuDNN include and rpath variables so benchmark binaries
+  run without relying on ambient `LD_LIBRARY_PATH`.
+- `ffn-cudnn-bench` now exits successfully when cuDNN Frontend headers are not
+  available at compile time, marking the optional comparison as skipped instead
+  of failing the whole benchmark smoke.
+
+Verification:
+
+```bash
+make -B decode-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_decode_bench global_k 1 0 1
+
+make -B embedding-gather-bench rmsnorm-hidden-fused-bench rope-bench \
+  ffn-decode-load-bench flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+
+make -B rmsnorm-bench ffn-cudnn-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Smoke runs completed for decode, flash-attn, RoPE, RMSNorm, hidden fused
+RMSNorm, embedding gather, FFN load bench, and FFN cuDNN skip behavior.
+
+## 2026-06-16 - Sliding FA QKV norm plus RoPE prep
+
+Runtime files:
+
+- `src/gemma4_flash_attention.cu`
+- `src/gemma4_flash_attention.cuh`
+- `src/experiments/gemma4_flash_attention_bench.cu`
+
+Change:
+
+- Added `gemma4_flash_attention_sliding_fwd_bf16_norm_rope`, a prefill-only
+  helper in the flash-attention module.
+- The helper prepares Q/K/V once, then calls the existing tensor-core sliding
+  FA kernel:
+  - Q: learned RMSNorm, then split-half RoPE.
+  - K: learned RMSNorm, then split-half RoPE.
+  - V: scale-free RMSNorm.
+- Kept the FA kernel itself unchanged. Recomputing K/V norm and RoPE inside
+  each FA K/V tile load would repeat the prep for every query block.
+- KV cache layout was not implemented in this patch. The next paged cache path
+  should use Layout A:
+  `[num_layers, num_pages, page_size, num_heads, head_dim]`.
+
+Build:
+
+```bash
+make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+GPU/tooling:
+
+- GPU: NVIDIA RTX A6000, bus `00000000:0D:00.0`
+- Driver: 580.126.16
+- NVCC: CUDA 13.0, `nvcc` 13.0.48
+- CUDA target: `sm_86`
+- Clock policy: not locked.
+- Cache policy: warm-cache repeated buffers.
+- Timing: CUDA events on the benchmark stream.
+- Nsight Compute: unavailable (`ncu: command not found`).
+- Note: CUDA 13.0 is a deviation from the project preference for CUDA 12.x;
+  no CUDA 12 NVCC was installed under `/usr/local`.
+
+Correctness smoke:
+
+```bash
+./build/experiments/gemma4_flash_attention_bench 1024 100 20 3 1 64
+```
+
+```text
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+```
+
+Benchmark contract:
+
+- Baseline: existing sliding FA on already-prepared Q/K/V.
+- New path: Q/K learned RMSNorm + V scale-free RMSNorm + Q/K RoPE + the same
+  sliding FA.
+- Warmup/timing at `seq=1024`: 50 warmups, 500 timed iterations, 5 trials,
+  repeated across 5 fresh processes.
+- Warmup/timing at `seq=4096`: 50 warmups, 200 timed iterations, 3 trials,
+  repeated across 3 fresh processes.
+
+Raw `seq=1024`, `batch=1`, `window_left=1024` samples:
+
+```text
+prepared_fa best_ms=0.230605 avg_ms=0.231656
+norm_rope_plus_fa best_ms=0.331543 avg_ms=0.333089 overhead_best_ms=0.100938 overhead_best_pct=43.7709
+
+prepared_fa best_ms=0.230439 avg_ms=0.232190
+norm_rope_plus_fa best_ms=0.333398 avg_ms=0.334182 overhead_best_ms=0.102958 overhead_best_pct=44.6792
+
+prepared_fa best_ms=0.229852 avg_ms=0.232230
+norm_rope_plus_fa best_ms=0.333469 avg_ms=0.334841 overhead_best_ms=0.103618 overhead_best_pct=45.0802
+
+prepared_fa best_ms=0.229796 avg_ms=0.232688
+norm_rope_plus_fa best_ms=0.333412 avg_ms=0.335302 overhead_best_ms=0.103616 overhead_best_pct=45.0906
+
+prepared_fa best_ms=0.231061 avg_ms=0.233694
+norm_rope_plus_fa best_ms=0.334066 avg_ms=0.335673 overhead_best_ms=0.103005 overhead_best_pct=44.5792
+```
+
+`seq=1024` summary:
+
+- Prepared FA median best: `0.230439 ms`.
+- Norm+RoPE+FA median best: `0.333412 ms`.
+- Median best overhead: `0.103005 ms`, about `44.7%`.
+- Attention-only throughput from prepared FA: about `74.6 TFLOP/s`.
+
+Raw `seq=4096`, `batch=1`, `window_left=1024` samples:
+
+```text
+prepared_fa best_ms=1.44497 avg_ms=1.45688
+norm_rope_plus_fa best_ms=1.84029 avg_ms=1.84921 overhead_best_ms=0.395325 overhead_best_pct=27.3587
+
+prepared_fa best_ms=1.44508 avg_ms=1.45923
+norm_rope_plus_fa best_ms=1.84469 avg_ms=1.85295 overhead_best_ms=0.399602 overhead_best_pct=27.6525
+
+prepared_fa best_ms=1.45549 avg_ms=1.46709
+norm_rope_plus_fa best_ms=1.85052 avg_ms=1.85474 overhead_best_ms=0.395034 overhead_best_pct=27.1410
+```
+
+`seq=4096` summary:
+
+- Prepared FA median best: `1.44508 ms`.
+- Norm+RoPE+FA median best: `1.84469 ms`.
+- Median best overhead: `0.395325 ms`, about `27.4%`.
+- Attention-only throughput from prepared FA: about `83.3 TFLOP/s`.
+
+Conclusion:
+
+- The prefill helper is correct against the CPU reference and keeps the existing
+  FA kernel on the fast tensor-core path.
+- The prep-once kernel is not free: roughly `0.10 ms` at `seq=1024`, and
+  `0.40 ms` at `seq=4096`.
+- That is still better than doing K/V norm and RoPE inside repeated FA tile
+  loads for prefill. For decode, the paged KV-cache write path should prep only
+  the appended token and store it once in Layout-A cache pages.
+
 ## 2026-05-23 - Global FlashAttention option
 
 Runtime files:
