@@ -5,6 +5,7 @@
 // be compared against the same FA2 source path.
 
 #include <cuda_bf16.h>
+#include <cuda/cmath>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -29,11 +30,6 @@ using ReferenceSlidingSmem128 =
 using ReferenceGlobal =
     Flash_fwd_kernel_traits<
         GEMMA4_GLOBAL_HEAD_DIM, 32, 32, 2, false, false, ReferenceElement>;
-
-template <typename T>
-constexpr T round_up(T value, T multiple) {
-  return ((value + multiple - 1) / multiple) * multiple;
-}
 
 bool upstream_uses_128k_trait() {
   int device = 0;
@@ -83,8 +79,8 @@ void set_reference_params(
   params.h_h_k_ratio = q_heads / kv_heads;
   params.seqlen_q = seqlen_q;
   params.seqlen_k = seqlen_k;
-  params.seqlen_q_rounded = round_up(seqlen_q, 128);
-  params.seqlen_k_rounded = round_up(seqlen_k, 128);
+  params.seqlen_q_rounded = cuda::round_up(seqlen_q, 128);
+  params.seqlen_k_rounded = cuda::round_up(seqlen_k, 128);
   params.d = head_dim;
   params.d_rounded = head_dim;
   params.total_q = batch_size * seqlen_q;

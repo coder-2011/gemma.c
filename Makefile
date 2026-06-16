@@ -70,7 +70,7 @@ $(BUILD_DIR)/libgemma4_flash_attention.so: src/gemma4_flash_attention.cu src/gem
 	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) -Xcompiler -fPIC -shared $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) src/gemma4_flash_attention.cu -o $@
 
 $(BUILD_DIR)/libgemma4_flash_attention_reference.so: src/experiments/gemma4_flash_attention_reference.cu src/gemma4.h $(FLASH_ATTN_SRC_DIR)/flash_fwd_hdim256_bf16_sm80.cu | $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) -Xcompiler -fPIC -shared $(CPPFLAGS) -I$(FLASH_ATTN_SRC_DIR) -I$(FLASH_ATTN_CUTLASS_INCLUDE) -I$(TORCH_INCLUDE) -I$(TORCH_API_INCLUDE) -I$(PYTHON_INCLUDE) src/experiments/gemma4_flash_attention_reference.cu $(FLASH_ATTN_SRC_DIR)/flash_fwd_hdim256_bf16_sm80.cu -L$(TORCH_LIB) -Xlinker -rpath -Xlinker $(abspath $(TORCH_LIB)) -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -o $@
+	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) -Xcompiler -fPIC -shared $(CPPFLAGS) -Isrc/third_party_stubs -I$(FLASH_ATTN_SRC_DIR) -I$(FLASH_ATTN_CUTLASS_INCLUDE) -I$(TORCH_INCLUDE) -I$(TORCH_API_INCLUDE) -I$(PYTHON_INCLUDE) src/experiments/gemma4_flash_attention_reference.cu $(FLASH_ATTN_SRC_DIR)/flash_fwd_hdim256_bf16_sm80.cu -L$(TORCH_LIB) -Xlinker -rpath -Xlinker $(abspath $(TORCH_LIB)) -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -o $@
 
 $(BUILD_DIR)/experiments:
 	mkdir -p $(BUILD_DIR)/experiments
