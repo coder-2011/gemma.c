@@ -16,6 +16,10 @@ namespace {
 constexpr int kKvWriteThreads = 256;
 constexpr int kKvWriteVecThreads = 128;
 
+struct SumOp {
+  __device__ float operator()(float a, float b) const { return a + b; }
+};
+
 int attention_threads_for_head_dim(int32_t head_dim) {
   return head_dim <= 256 ? 256 : 512;
 }
@@ -32,26 +36,25 @@ bool valid_config(const Gemma4KvCacheConfig &config) {
   return config.max_pages_per_seq >= min_window_pages;
 }
 
-template <int BlockThreads>
-__device__ inline float block_sum(float value) {
+template <int BlockThreads, typename Op>
+__device__ inline float block_reduce(float value, Op op) {
   using BlockReduce = cub::BlockReduce<float, BlockThreads>;
   __shared__ typename BlockReduce::TempStorage temp_storage;
   __shared__ float result;
-  float thread0_result = BlockReduce(temp_storage).Sum(value);
+  float thread0_result = BlockReduce(temp_storage).Reduce(value, op);
   if (threadIdx.x == 0) result = thread0_result;
   __syncthreads();
   return result;
 }
 
 template <int BlockThreads>
+__device__ inline float block_sum(float value) {
+  return block_reduce<BlockThreads>(value, SumOp{});
+}
+
+template <int BlockThreads>
 __device__ inline float block_max(float value) {
-  using BlockReduce = cub::BlockReduce<float, BlockThreads>;
-  __shared__ typename BlockReduce::TempStorage temp_storage;
-  __shared__ float result;
-  float thread0_result = BlockReduce(temp_storage).Reduce(value, cuda::maximum<>{});
-  if (threadIdx.x == 0) result = thread0_result;
-  __syncthreads();
-  return result;
+  return block_reduce<BlockThreads>(value, cuda::maximum<>{});
 }
 
 __device__ inline int32_t physical_page_for_position(
