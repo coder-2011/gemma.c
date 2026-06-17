@@ -3,6 +3,271 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-17 - FA benchmark uses real Norm/RoPE path only
+
+Runtime file:
+
+- `src/experiments/gemma4_flash_attention_bench.cu`
+
+Change:
+
+- Removed the timed `prepared_fa` benchmark lane from the FlashAttention bench.
+- The benchmark now measures only `norm_rope_plus_fa`, which matches the
+  inference-facing sliding prefill wrapper: Q/K learned RMSNorm, RoPE, V
+  scale-free RMSNorm, and FlashAttention.
+- The no-LSE correctness check now calls the same norm/RoPE+FA wrapper with
+  `d_softmax_lse=nullptr`, instead of checking the prepared-QKV control path.
+- The low-level prepared-QKV launcher remains available as an attention-only
+  primitive for control tests and future decode/cache paths; it is no longer
+  presented as the default prefill benchmark result.
+
+Verification:
+
+```bash
+make flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_flash_attention_bench 256 20 10 5 1 64 cold 64
+./build/experiments/gemma4_flash_attention_bench 1024 50 20 10 1 0 cold 64
+```
+
+Result:
+
+```text
+seq=64 correctness:
+max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+
+seq=256 cold:
+norm_rope_plus_fa median_ms=0.064472 p95_ms=0.0652912 p99_ms=0.0653731
+
+seq=1024 cold:
+norm_rope_plus_fa median_ms=0.334232 p95_ms=0.336217 p99_ms=0.33691
+```
+
+Notes:
+
+- The seq1024 cold samples were bimodal under unlocked clocks, matching the
+  earlier benchmark caveat. The point of this pass was benchmark contract
+  cleanup, not a new speed claim.
+
+## 2026-06-17 - Sliding FA softmax exp/sum fusion
+
+Runtime file:
+
+- `src/gemma4_flash_attention.cu`
+
+Change:
+
+- Added `gemma4_fa_scale_apply_exp2_sum`, which applies `exp2(score - row_max)`
+  and accumulates the per-thread softmax denominator in one pass over the score
+  fragment.
+- Used it for both first and later online-softmax blocks in sliding attention.
+  The max pass stays separate because the final row max must be known before the
+  score fragment can be converted into probabilities for `P * V`.
+- Gated the helper with `UseFusedExpSum=IsLocal`. A first ungated build made the
+  global `head_dim=512` specialization spill more, so global attention keeps the
+  old exp-then-sum path until it has its own benchmark.
+
+Benchmark contract:
+
+- Benchmark commit: `c10fb36` with a dirty working tree.
+- GPU: NVIDIA RTX A6000, bus `00000000:08:00.0`.
+- Driver: `580.126.16`.
+- NVCC: `/usr/local/cuda/bin/nvcc`, CUDA `13.0`, `V13.0.48`.
+- CUDA target/flags: `sm_86`, `-O3`,
+  `--expt-relaxed-constexpr --expt-extended-lambda --use_fast_math`,
+  `_GLIBCXX_USE_CXX11_ABI=1`.
+- Timing: CUDA events on the benchmark stream; launch overhead included.
+- Shapes: BF16 sliding attention, `batch=1`, `Q heads=32`, `KV heads=16`,
+  `head_dim=256`, `window_left=1024`, `return_lse=false`.
+- Cache: warm repeated-buffer runs plus one cold-cache run with a 64 MiB L2
+  flush before each measured iteration. The flush kernel is outside the timed
+  event window.
+- Clock policy: persistence mode enabled. Clock lock was attempted with
+  `sudo -n nvidia-smi -ac 8001,1410`, but this user lacks permission to change
+  clocks, so these are unlocked-clock results.
+- Correctness tolerance: existing CPU reference envelope. Final default-binary
+  smoke preserved `seq=64 max_abs=0.015625 mean_abs=0.000260142`.
+
+Build commands:
+
+```bash
+# Run once before the source change with <tag>=baseline, then again after the
+# source change with <tag>=fused.
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -Xptxas=-v \
+  -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
+  src/experiments/gemma4_flash_attention_bench.cu \
+  src/gemma4_flash_attention.cu \
+  -o build/experiments/gemma4_flash_attention_bench_softmax_<tag>
+
+make flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Representative warm A/B:
+
+```text
+seq=1024, warm, 200 iters/sample, 15 samples
+baseline prepared_fa      median=0.233697 ms p95=0.234260 p99=0.234276
+fused    prepared_fa      median=0.230594 ms p95=0.231232 p99=0.231470
+baseline norm_rope_plus_fa median=0.334231 ms p95=0.336509 p99=0.337147
+fused    norm_rope_plus_fa median=0.331348 ms p95=0.334153 p99=0.335040
+
+final gated paired rerun, seq=1024, warm, 100 iters/sample, 8 samples
+baseline prepared_fa       median=0.239141 ms
+fused    prepared_fa       median=0.235388 ms
+baseline norm_rope_plus_fa median=0.337252 ms
+fused    norm_rope_plus_fa median=0.335739 ms
+
+seq=4096, warm, 100 iters/sample, 10 samples
+baseline prepared_fa       median=1.45665 ms
+fused    prepared_fa       median=1.44146 ms
+baseline norm_rope_plus_fa median=1.85276 ms
+fused    norm_rope_plus_fa median=1.84375 ms
+```
+
+Cold-cache note:
+
+```text
+seq=1024, cold, 50 iters/sample, 10 samples
+baseline prepared_fa       median=0.228554 ms
+fused    prepared_fa       median=0.227252 ms  # conservative rerun; samples were bimodal
+baseline norm_rope_plus_fa median=0.335721 ms
+fused    norm_rope_plus_fa median=0.321124 ms
+```
+
+ptxas check:
+
+```text
+Sliding head_dim=256 ReturnLse=true:
+  baseline: 245 regs, 0 spill stores, 0 spill loads
+  fused:    247 regs, 0 spill stores, 0 spill loads
+Sliding head_dim=256 ReturnLse=false:
+  baseline: 246 regs, 0 spill stores, 0 spill loads
+  fused:    246 regs, 0 spill stores, 0 spill loads
+Global head_dim=512 after IsLocal gate:
+  same spill counts as baseline: ReturnLse=true 1512/1692, false 1476/1652
+```
+
+Conclusion:
+
+- Keep the sliding-only fusion. It removes one pass over the score fragment in
+  the softmax path and repeatedly showed a small warm-cache win, roughly
+  1-1.6% for prepared sliding FA and 0.45-0.9% for fused norm/RoPE+FA in paired
+  runs.
+- Do not claim a large win: clocks were unlocked and some cold/prepared samples
+  were bimodal. The stronger result is that the local path stayed spill-free
+  while the global path was protected from the ungated spill regression.
+
+## 2026-06-17 - Forward-only dependency cleanup
+
+Scope:
+
+- `src/gemma4_flash_attention.cu`
+- `src/experiments/gemma4_flash_attention_compare.py`
+- `src/experiments/gemma4_flash_attention_reference.cu`
+- `experiments/flash-attention/`
+- stale experiment checkouts under `experiments/` and `src/experiments/`
+
+Change:
+
+- Removed stale training/reverse-mode experiment trees:
+  `src/experiments/quack_rmsnorm`, `src/experiments/llama_cpp_refs`,
+  `experiments/tinygrad`, and `src/experiments/tinygrad_late_eval_bench.py`.
+- Trimmed the upstream FlashAttention checkout to the forward CUDA source slice,
+  the local CUTLASS/CuTe include provider, and the upstream license file.
+- Removed unused reverse-mode declarations and source files from the kept
+  FlashAttention source slice.
+- Replaced CUTLASS sync logging with a no-op compatibility shim so CuTe headers
+  still compile without bringing in device-enumerating debug code.
+- Removed launch-cluster attribute reporting from the FA diagnostic helpers and
+  comparator.
+
+Verification:
+
+```bash
+make -B flash-attn-bench flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_flash_attention_bench 256 10 3 1 1 64 warm 64
+```
+
+Result:
+
+```text
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+prepared_fa median_ms=0.0373472
+norm_rope_plus_fa median_ms=0.063584
+```
+
+Notes:
+
+- Audit scans over active source, experiments, and the trimmed dependency tree
+  returned no reverse-mode or multi-device leftovers outside generated build
+  outputs and the local CUDA guide document.
+- `flash-attn-reference-lib` was not completed in this pass; the main forward
+  bench and shared library rebuilt successfully, then the reference target was
+  interrupted after its template instantiation ran too long.
+
+## 2026-06-17 - FlashAttention cleanup fixes
+
+Runtime files:
+
+- `src/gemma4_flash_attention.cu`
+- `src/gemma4_flash_attention.cuh`
+- `src/experiments/gemma4_flash_attention_bench.cu`
+
+Change:
+
+- Restored the FA2 shared-memory GEMM helper after the reduction cleanup had
+  accidentally dropped the first A-fragment preload and closed the helper early.
+- Replaced the local recursive max/sum operator structs with direct 4-lane
+  max/sum shuffle reductions.
+- Added a no-LSE specialization selected by passing `nullptr` for
+  `d_softmax_lse`; inference paths can skip `__logf` and LSE global stores while
+  existing tests/callers that pass an LSE buffer keep the old behavior.
+- Cached `cudaFuncSetAttribute(...MaxDynamicSharedMemorySize...)` per kernel
+  specialization instead of setting it on every launch.
+- Added full-visibility checks before applying causal/local masks. Fully visible
+  score tiles now skip mask writes and use the no-`CheckInf` softmax path.
+- Changed the fused sliding QKV norm/RoPE prep grid from flattened
+  `batch * seq` plus `% seq_len` to explicit `(seq, head_group, batch)` launch
+  dimensions.
+- The benchmark's timed path now passes `nullptr` for LSE and reports
+  `return_lse=false`; the correctness path checks both LSE and no-LSE output
+  against the CPU reference.
+
+Verification:
+
+```bash
+make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+make -B flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_flash_attention_bench 256 10 3 1 1 64 warm 64
+./build/experiments/gemma4_flash_attention_bench 1024 50 20 5 1 64 warm 64
+```
+
+Smoke results:
+
+```text
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+
+seq=1024 return_lse=false warm:
+prepared_fa median_ms=0.23913
+norm_rope_plus_fa median_ms=0.340449
+overhead_vs_prepared median_ms=0.101318 median_pct=42.3695
+```
+
+Conclusion:
+
+- The FA source builds again.
+- LSE is now optional for inference.
+- Fully visible local/global score tiles avoid unnecessary mask logic.
+- The `seq=1024` smoke is in the same ballpark as the previous warm runs; this
+  was a focused fix/smoke pass, not a rigorous locked-clock benchmark.
+
 ## 2026-06-16 - Benchmark harness source cleanup
 
 Runtime files:
@@ -159,6 +424,223 @@ Conclusion:
 - That is still better than doing K/V norm and RoPE inside repeated FA tile
   loads for prefill. For decode, the paged KV-cache write path should prep only
   the appended token and store it once in Layout-A cache pages.
+
+## 2026-06-16 - Shared RoPE primitive inside fused sliding FA prep
+
+Runtime files:
+
+- `src/gemma4_rope.cuh`
+- `src/gemma4_rope.cu`
+- `src/gemma4_flash_attention.cu`
+- `Makefile`
+
+Change:
+
+- Moved the standalone RoPE pair/pack/head device math into
+  `gemma4_rope.cuh`.
+- Updated the standalone RoPE kernels to call the shared head helper with
+  explicit lane/thread-count arguments.
+- Updated the fused sliding FA prep kernel to call
+  `gemma4_rope::store_rotated_pair_bf16` while normalized Q/K values are still
+  in registers.
+- No separate RoPE launch was added; Q/K RMSNorm, RoPE, V RMSNorm, and FA remain
+  fused at the wrapper level.
+- The shared head helper still supports partial/p-RoPE through the caller-owned
+  `rotary_half`; trailing dimensions are untouched by design.
+
+Validation:
+
+```bash
+make -B test-rope flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_flash_attention_bench 1024 200 30 5 1 64
+```
+
+Result:
+
+```text
+rope tests passed
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+```
+
+Benchmark contract:
+
+- Benchmark commit: `c10fb36` with a dirty working tree.
+- GPU: NVIDIA RTX A6000.
+- Driver: `580.126.16`.
+- NVCC: CUDA `13.0`, `nvcc` `13.0.48`.
+- CUDA target/flags: `sm_86`, `-O3`, FlashAttention flags
+  `--expt-relaxed-constexpr --expt-extended-lambda --use_fast_math`.
+- Timing: CUDA events from the existing C++ harness, same stream as kernels;
+  launch overhead included.
+- Cache policy: warm-cache repeated buffers.
+- Clock policy: not locked. Earlier clock-lock attempts on this machine were
+  permission denied; not retried for this small refactor.
+- Shape: sliding prefill, `batch=1`, `seq=1024`, `window_left=1024`,
+  `Q heads=32`, `KV heads=16`, `D=256`, BF16.
+- Warmup/timing: `30` warmups, `200` iterations per trial, `5` trials.
+- Environment caveat: `nvidia-smi` bus IDs varied between snapshots
+  (`07:00.0` before, `04:00.0` after), same telemetry wrinkle seen in the KV
+  cache runs.
+
+Before:
+
+```text
+prepared_fa best_ms=0.225734 avg_ms=0.231372
+norm_rope_plus_fa best_ms=0.333442 avg_ms=0.334411
+overhead_best_ms=0.107708 overhead_best_pct=47.7147
+```
+
+After:
+
+```text
+prepared_fa best_ms=0.224975 avg_ms=0.226767
+norm_rope_plus_fa best_ms=0.327444 avg_ms=0.328244
+overhead_best_ms=0.102469 overhead_best_pct=45.5468
+```
+
+Conclusion:
+
+- Sharing the standalone RoPE primitive did not break standalone RoPE or fused
+  sliding FA correctness.
+- The after run is slightly faster, but this is below the threshold for a real
+  performance claim without locked clocks and repeated process-level runs.
+- The useful outcome is structural: there is now one RoPE device implementation
+  for standalone kernels and the fused FlashAttention prep path.
+
+## 2026-06-16 - Shared RoPE helper rigorous FA benchmark
+
+Runtime files:
+
+- `src/gemma4_flash_attention.cu`
+- `src/experiments/gemma4_flash_attention_bench.cu`
+- `src/experiments/results/2026-06-16_fa_rope_helper_*.txt`
+
+Change:
+
+- Added `GEMMA4_FA_USE_SHARED_ROPE_HELPER`, defaulting to `1`, so the normal
+  FlashAttention source can be compiled as:
+  - shared helper: `-DGEMMA4_FA_USE_SHARED_ROPE_HELPER=1`
+  - inline control: `-DGEMMA4_FA_USE_SHARED_ROPE_HELPER=0`
+- Tightened the FA benchmark harness to report median, mean, 10% trimmed mean,
+  min, max, p95, p99, standard deviation, IQR, and raw sample arrays.
+- Added explicit `warm`/`cold` cache modes. Cold mode launches a 64 MiB L2
+  flush before each measured operation; the CUDA event timing starts after the
+  flush, so the reported time excludes the flush kernel.
+
+Build commands:
+
+```bash
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_USE_SHARED_ROPE_HELPER=1 \
+  -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
+  src/experiments/gemma4_flash_attention_bench.cu \
+  src/gemma4_flash_attention.cu \
+  -o build/experiments/gemma4_flash_attention_bench_shared
+
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_USE_SHARED_ROPE_HELPER=0 \
+  -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
+  src/experiments/gemma4_flash_attention_bench.cu \
+  src/gemma4_flash_attention.cu \
+  -o build/experiments/gemma4_flash_attention_bench_inline
+```
+
+Correctness:
+
+Both binaries reported:
+
+```text
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+```
+
+Benchmark contract:
+
+- Question: does importing the standalone RoPE device primitive into fused
+  sliding FA prep change runtime?
+- Timing scope: CUDA-event GPU timeline on the benchmark stream; launch
+  overhead included; allocation/setup excluded.
+- Main metric: typical latency, reported by median and 10% trimmed mean.
+- Tail metrics: p95/p99, stddev, IQR, raw samples saved.
+- Stability target: same process plus process repeats for close `seq=1024`
+  results; minimum effect size for a performance claim: `5%`.
+- Cache states:
+  - warm: repeated buffers, no flush;
+  - cold: 64 MiB L2 flush before each measured operation.
+- Inputs: fixed random seeds in the harness; BF16, batch `1`, sliding attention,
+  `Q heads=32`, `KV heads=16`, `D=256`, `window_left=1024`.
+- GPU: NVIDIA RTX A6000, `49140 MiB`, driver `580.126.16`, CUDA `13.0`,
+  persistence enabled, ECC disabled, MIG N/A, power limit `300 W`.
+- NVCC: CUDA `13.0`, `nvcc` `13.0.48`.
+- Clock policy: not locked. `sudo -n nvidia-smi -ac 8001,1800` and
+  `sudo -n nvidia-smi -lgc 1800,1800` were denied.
+- Nsight Compute: unavailable (`ncu: command not found`).
+- Contention check: `nvidia-smi --query-compute-apps=...` showed no compute
+  apps after the run; `nvidia-smi pmon` is unsupported here.
+- Telemetry: one-second `nvidia-smi` sampling saved to
+  `src/experiments/results/2026-06-16_fa_rope_helper_telemetry.txt`. The runs
+  are short enough that most samples caught idle clocks; one loaded sample saw
+  about `1800 MHz` SM and `7601 MHz` memory.
+
+Persisted raw outputs:
+
+```text
+src/experiments/results/2026-06-16_fa_rope_helper_shared_warm_1024_rep1.txt
+src/experiments/results/2026-06-16_fa_rope_helper_inline_warm_1024_rep1.txt
+src/experiments/results/2026-06-16_fa_rope_helper_inline_warm_1024_rep2.txt
+src/experiments/results/2026-06-16_fa_rope_helper_shared_warm_1024_rep2.txt
+src/experiments/results/2026-06-16_fa_rope_helper_shared_warm_4096.txt
+src/experiments/results/2026-06-16_fa_rope_helper_inline_warm_4096.txt
+src/experiments/results/2026-06-16_fa_rope_helper_shared_cold_1024.txt
+src/experiments/results/2026-06-16_fa_rope_helper_inline_cold_1024.txt
+src/experiments/results/2026-06-16_fa_rope_helper_inline_cold_1024_rep2.txt
+src/experiments/results/2026-06-16_fa_rope_helper_shared_cold_1024_rep2.txt
+src/experiments/results/2026-06-16_fa_rope_helper_telemetry.txt
+```
+
+Warm cache, `seq=1024`, `warmup=50`, `iters=100`, `samples=31` per process,
+process order shared/inline/inline/shared:
+
+```text
+shared norm_rope_plus_fa median_ms: 0.329229, 0.329984
+inline norm_rope_plus_fa median_ms: 0.328916, 0.329836
+shared average of process medians: 0.3296065 ms
+inline average of process medians: 0.3293760 ms
+delta shared-vs-inline: +0.0002305 ms, about +0.07%
+```
+
+Warm cache, `seq=4096`, `warmup=50`, `iters=50`, `samples=31`:
+
+```text
+shared norm_rope_plus_fa median_ms=1.82804 trimmed_mean_ms=1.82666 p95_ms=1.83274 p99_ms=1.83279
+inline norm_rope_plus_fa median_ms=1.83008 trimmed_mean_ms=1.83055 p95_ms=1.83739 p99_ms=1.84098
+delta shared-vs-inline: -0.00204 ms, about -0.11%
+```
+
+Cold cache, `seq=1024`, `warmup=30`, `iters=50`, `samples=31`, 64 MiB L2
+flush before every measured operation, process order shared/inline/inline/shared:
+
+```text
+shared norm_rope_plus_fa median_ms: 0.319142, 0.317812
+inline norm_rope_plus_fa median_ms: 0.332833, 0.332837
+shared average of process medians: 0.318477 ms
+inline average of process medians: 0.332835 ms
+delta shared-vs-inline: -0.014358 ms, about -4.31%
+```
+
+Conclusion:
+
+- Warm-cache performance is a tie. The shared-helper path changes maintainability
+  and single-sources RoPE math; it does not measurably change warm-cache FA prep
+  runtime.
+- Cold-cache results consistently favored the shared-helper binary by about
+  `4.3%`, but the pre-declared threshold was `5%` and clocks were not locked.
+  Treat this as possible upside, not a hard performance claim.
+- There is no evidence of a regression from using the standalone RoPE primitive
+  inside the fused sliding FA prep path.
 
 ## 2026-05-23 - Global FlashAttention option
 
@@ -6982,7 +7464,7 @@ Notes:
 
 - Building the full editable Python `flash_attn` package was attempted in the uv
   environment, but the build was interrupted and left orphaned NVCC children while
-  compiling unused backward/head-dim variants. Those processes were killed. The
+  compiling unused training/head-dim variants. Those processes were killed. The
   Python package still does not import: `No module named 'flash_attn'`.
 - This proves parity against the upstream hdim256 BF16 CUDA source path, but not yet
   against an installed full `flash_attn.flash_attn_func` package call.
@@ -7029,12 +7511,6 @@ Direct `cudaFuncGetAttributes` comparison for the exact selected kernel:
 | `cacheModeCA` | 0 | 0 | yes |
 | `maxDynamicSharedSizeBytes` | 98304 | 98304 | yes |
 | `preferredShmemCarveout` | -1 | -1 | yes |
-| `clusterDimMustBeSet` | 0 | 0 | yes |
-| `requiredClusterWidth` | 0 | 0 | yes |
-| `requiredClusterHeight` | 0 | 0 | yes |
-| `requiredClusterDepth` | 0 | 0 | yes |
-| `clusterSchedulingPolicyPreference` | 0 | 0 | yes |
-| `nonPortableClusterSizeAllowed` | 0 | 0 | yes |
 
 Current-source `ptxas` comparison for the selected local hdim256 BF16 kernel:
 
@@ -7090,9 +7566,7 @@ Rerun results:
 - Every direct `cudaFuncGetAttributes` field matched:
   `sharedSizeBytes`, `constSizeBytes`, `localSizeBytes`, `maxThreadsPerBlock`,
   `numRegs`, `ptxVersion`, `binaryVersion`, `cacheModeCA`,
-  `maxDynamicSharedSizeBytes`, `preferredShmemCarveout`, `clusterDimMustBeSet`,
-  `requiredClusterWidth`, `requiredClusterHeight`, `requiredClusterDepth`,
-  `clusterSchedulingPolicyPreference`, and `nonPortableClusterSizeAllowed`.
+  `maxDynamicSharedSizeBytes`, and `preferredShmemCarveout`.
 - Selected local hdim256 BF16 ptxas resource line matched:
   - custom: `255` regs/thread, `0` stack, `0` spill stores, `0` spill loads,
     `1` barrier, `824` bytes `cmem[0]`
@@ -7129,13 +7603,13 @@ Notes:
   returned HTTP 404 from the upstream release URL.
 - A full unmodified source build was attempted with `FLASH_ATTN_CUDA_ARCHS=80`,
   `MAX_JOBS=4`, and `NVCC_THREADS=1`, but it spent a long time compiling all
-  forward, backward, and split-KV instantiations. It was stopped after the
-  hdim256 forward path had compiled but before the full package finished.
+  forward and split-KV instantiations. It was stopped after the hdim256 forward
+  path had compiled but before the full package finished.
 - For this comparison, the local upstream checkout was given a targeted
   `FLASH_ATTENTION_GEMMA_FWD_ONLY` build mode. It keeps the public Python
   `flash_attn_func` API but compiles only the BF16 hdim256 forward and causal
   forward instantiations required by these Gemma sliding-attention benchmarks.
-  Unsupported dtypes/head dims/backward/split-KV paths intentionally fail.
+  Unsupported dtypes/head dims/split-KV paths intentionally fail.
 - Torch stayed at `2.11.0+cu128` after install.
 
 Verification:
@@ -7213,9 +7687,7 @@ Runtime attribute comparison in both runs:
   and the official-source reference wrapper:
   `sharedSizeBytes`, `constSizeBytes`, `localSizeBytes`, `maxThreadsPerBlock`,
   `numRegs`, `ptxVersion`, `binaryVersion`, `cacheModeCA`,
-  `maxDynamicSharedSizeBytes`, `preferredShmemCarveout`, `clusterDimMustBeSet`,
-  `requiredClusterWidth`, `requiredClusterHeight`, `requiredClusterDepth`,
-  `clusterSchedulingPolicyPreference`, and `nonPortableClusterSizeAllowed`.
+  `maxDynamicSharedSizeBytes`, and `preferredShmemCarveout`.
 
 Conclusion:
 
@@ -7870,8 +8342,8 @@ Guide/context:
 
 - CUDA guide query used:
   `python3 scripts/query.py "CUDA asynchronous copy global memory to shared memory cp.async pipeline cache global loads L2 persisting cache occupancy memory throughput" --top-k 10`
-- DSMEM/thread-block cluster query used:
-  `python3 scripts/query.py "CUDA distributed shared memory thread block clusters compute capability" --top-k 8`
+- DSMEM query used:
+  `python3 scripts/query.py "CUDA distributed shared memory compute capability" --top-k 8`
 - Relevant guide notes:
   - async copies can keep global-to-shared memory operations in flight and
     reduce register staging when copying global memory to shared memory;
@@ -7879,9 +8351,8 @@ Guide/context:
     shared memory and are best with 16-byte aligned global/shared addresses;
   - occupancy is constrained by registers, shared memory, resident blocks, and
     resident warps, so load overlap must be evaluated with resource usage.
-  - thread-block clusters and distributed shared memory are compute capability
-    `9.0+` features, so they are not a direct fit for the target `sm_86`
-    RTX A6000 path.
+  - distributed shared memory is a compute capability `9.0+` feature, so it is
+    not a direct fit for the target `sm_86` RTX A6000 path.
 - Exa searches looked at comparable GEMV fusion/vector-load work:
   - llama.cpp general GEMV fusion PR
   - llama.cpp vectorized CUDA dmmv load PR
@@ -10381,3 +10852,415 @@ Conclusion:
   keeps the measured path neutral under the existing benchmark.
 - Did not retain a different PV warp layout; true N-split is not a cheap
   one-line CUTE change for this SM80 row-owned softmax pipeline.
+
+## 2026-06-16 - Paged KV cache decode baseline
+
+Scope:
+
+- Added Layout-A paged KV cache metadata and address helper:
+  `[layers, pages, page_size, kv_heads, head_dim]`.
+- Added host monotonic/free-list page allocator and sliding-window slot reuse.
+- Added prepared-K/V cache write kernel for both prefill-style bulk writes and
+  one-token decode appends.
+- Added paged decode attention with split-KV partial softmax states and a
+  second reduction kernel.
+- Added global and sliding correctness coverage for non-contiguous physical
+  pages, page boundaries, mixed batch lengths, split-KV, and sliding wraparound.
+- RoPE and Q/K/V norms are intentionally outside this cache module; the cache
+  receives already prepared K/V from the FlashAttention preparation path.
+
+Validation:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc test-kv-cache
+```
+
+Result:
+
+```text
+kv cache tests passed
+```
+
+Optimization passes after the first correct baseline:
+
+- Vectorized BF16 cache writes as aligned 128-bit `int4` chunks.
+- Switched decode attention read-only scalar loads to `loadg`/`__ldg`.
+- Added early neutral-state return for empty splits.
+- Hoisted repeated Q, partial, and row-base offset arithmetic.
+- Reused the K/V cache base offset inside the attention loop.
+- Reduced vectorized-write launch width from 256 to 128 threads.
+- Added launch bounds for write, split, and reduce kernels.
+- Swept split size `32/64/128/256` at `S=4096`.
+- Kept split size `64` as the benchmark default after the sweep.
+- Re-ran correctness and benchmark after the retained changes.
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, SM86, 50.90 GB.
+- Driver/runtime from benchmark: CUDA driver `13000`, runtime `13000`.
+- `nvidia-smi`: driver `580.126.16`, persistence enabled, ECC disabled, power
+  limit `300 W`, idle post-run clocks `210/405 MHz`, temp `31 C`.
+- Clocks: not locked. Warm-cache repeated-buffer benchmark.
+- Timing: CUDA events on the same stream; launch overhead included.
+- Shape: global Gemma decode, `B=1`, `S=4096`, `Q heads=32`,
+  `KV heads=4`, `D=512`, BF16, page size `64`.
+- Warmup/samples: `25` warmups, `100` iterations per sample, `15` samples.
+- Nsight Compute: unavailable in this environment (`ncu` not found).
+
+Custom paged KV command:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc kv-cache-bench
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 25 100 15
+```
+
+Custom paged KV result:
+
+```text
+correctness max_abs=0.000244 mean_abs=0.000000
+prefill_cache_write median_ms=0.102940 mean_ms=0.102942 min_ms=0.102660 max_ms=0.103254
+decode_cache_write median_ms=0.016391 mean_ms=0.015526 min_ms=0.011094 max_ms=0.018428
+paged_decode_attention median_ms=0.792760 mean_ms=0.794010 min_ms=0.786287 max_ms=0.800686
+paged_full_decode_write_plus_attention median_ms=0.799518 mean_ms=0.799313 min_ms=0.794992 max_ms=0.801205
+```
+
+Split-size sweep, same shape with `5` warmups, `20` iterations, `5` samples:
+
+```text
+split=32  attention median_ms=0.798474 full_decode median_ms=0.801403
+split=64  attention median_ms=0.790414 full_decode median_ms=0.770339
+split=128 attention median_ms=0.822251 full_decode median_ms=0.824173
+split=256 attention median_ms=0.926520 full_decode median_ms=0.927453
+```
+
+PyTorch comparable baseline:
+
+```bash
+python3 src/experiments/gemma4_kv_cache_torch_bench.py \
+  --seq-len 4096 --warmup 25 --iters 100 --samples 15
+```
+
+PyTorch SDPA result:
+
+```text
+torch=2.11.0+cu130 cuda_runtime=13.0
+attention_only median_ms=3.305070 mean_ms=3.305947 min_ms=3.304270 max_ms=3.315057
+full_decode_write_plus_attention median_ms=3.314501 mean_ms=3.315363 min_ms=3.311447 max_ms=3.320166
+```
+
+Conclusion:
+
+- The first paged decode path is correct under the targeted boundary tests.
+- On this warm-cache decode shape, custom paged attention is about `4.17x`
+  faster than PyTorch SDPA attention-only median (`3.305070 / 0.792760`).
+- The comparison is useful but not final: clocks were not locked, cache state is
+  warm, PyTorch uses contiguous K/V rather than paged K/V, and `ncu` counters
+  are unavailable here.
+
+## 2026-06-16 - Paged KV cache primitive simplification
+
+Scope:
+
+- Replaced hand-rolled warp/block max and sum reductions in
+  `gemma4_kv_cache.cu` with CUDA-bundled CUB/CCCL `cub::BlockReduce`.
+- Kept the file out of CUTE/FlashAttention layout machinery. CUB is the smaller
+  primitive for this scalar block reduction job.
+- CUB block reductions return the aggregate on thread 0, so the wrapper keeps a
+  single shared-float broadcast to preserve the old all-thread return behavior.
+
+Validation:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc test-kv-cache
+```
+
+Result:
+
+```text
+kv cache tests passed
+```
+
+Quick benchmark, same warm-cache CUDA-event contract as the split sweep above:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc kv-cache-bench
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 5 20 5
+```
+
+Result:
+
+```text
+correctness max_abs=0.000244 mean_abs=0.000000
+prefill_cache_write median_ms=0.104445 mean_ms=0.104372 min_ms=0.103626 max_ms=0.104725
+decode_cache_write median_ms=0.017589 mean_ms=0.019281 min_ms=0.015480 max_ms=0.024451
+paged_decode_attention median_ms=0.772422 mean_ms=0.772215 min_ms=0.771488 max_ms=0.772638
+paged_full_decode_write_plus_attention median_ms=0.740006 mean_ms=0.743295 min_ms=0.736562 max_ms=0.755912
+```
+
+Conclusion:
+
+- The primitive version is simpler and did not regress the quick benchmark.
+- The quick `paged_decode_attention` median improved versus the prior split-64
+  quick run (`0.790414 ms` -> `0.772422 ms`), but this is not a locked-clock
+  claim.
+
+## 2026-06-16 - Paged KV cache thread I/O primitives
+
+Scope:
+
+- Replaced raw `int4` loads/stores in the vectorized KV-cache write kernel with
+  CUB/CCCL `cub::ThreadLoad<cub::LOAD_LDG>` and
+  `cub::ThreadStore<cub::STORE_CG>`.
+- Kept `loadg` for scalar BF16 attention loads because the project helper is
+  already the smallest useful primitive there.
+- Rejected CUB block load/store for this pass: each active thread already moves
+  one 128-bit vector, so block-level staging would add temp storage and
+  ceremony without simplifying the code.
+
+Validation:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc test-kv-cache
+```
+
+Result:
+
+```text
+kv cache tests passed
+```
+
+Quick benchmark, same warm-cache CUDA-event contract:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc kv-cache-bench
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 5 20 5
+```
+
+Result:
+
+```text
+correctness max_abs=0.000244 mean_abs=0.000000
+prefill_cache_write median_ms=0.104182 mean_ms=0.105215 min_ms=0.103317 max_ms=0.109918
+decode_cache_write median_ms=0.015653 mean_ms=0.017941 min_ms=0.013117 max_ms=0.030126
+paged_decode_attention median_ms=0.772646 mean_ms=0.773900 min_ms=0.771898 max_ms=0.779840
+paged_full_decode_write_plus_attention median_ms=0.736677 mean_ms=0.746361 min_ms=0.735594 max_ms=0.775341
+```
+
+Conclusion:
+
+- The thread I/O primitive makes the write cache policy explicit and did not
+  regress the quick run.
+- The larger primitive candidates left on the table are not good fits yet:
+  CuTe/CUTLASS layout primitives are useful for tensor-core tiled attention,
+  not scalar paged gather, and CUB block load/store would be more code here.
+
+## 2026-06-16 - Paged KV primitive research pass
+
+Scope:
+
+- Used Exa plus read-only subagents to scan CUDA, CCCL/CUB, CuTE/CUTLASS,
+  cuBLAS/cuDNN, FlashInfer, vLLM, TensorRT-LLM, SGLang, flash-attn, and xFormers
+  for primitives that could simplify or speed up the paged KV path.
+- Kept the current CUB `BlockReduce` and CUB `ThreadLoad`/`ThreadStore` changes
+  from the previous pass.
+- Tested two tiny CUDA-native changes and rejected both when benchmark evidence
+  did not support keeping them:
+  - `__grid_constant__` for the small `Gemma4KvCacheConfig` kernel parameter;
+  - log2-domain `exp2f` softmax in the paged decode path.
+
+Useful references found:
+
+- CUDA `__grid_constant__` parameters avoid per-thread copies for const kernel
+  parameters, but the benefit depends on how the compiler uses the small struct.
+- CUDA `cuda::memcpy_async`, `cooperative_groups::memcpy_async`, and CuTE
+  `Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>>` are good when staging
+  global-memory tiles through shared memory, but not for the current
+  global-to-global KV write or scalar paged gather.
+- CUB `BlockLoad`, `BlockStore`, `WarpReduce`, `BlockScan`,
+  `BlockExchange`, and `DeviceSegmentedReduce` are not drop-ins here:
+  they either add temp storage/synchronization around an already simple 128-bit
+  lane copy, or add extra launches where the kernel currently fuses the work.
+- cuDNN paged SDPA is a useful future baseline, but Gemma global attention uses
+  head dim `512` on Ampere/A6000, which is outside the documented practical
+  cuDNN/FlashAttention-style limits for many current kernels.
+- FlashInfer/vLLM/TensorRT-LLM/SGLang agree on the higher-value structural
+  work: CSR-style page metadata, LSE merge state, page/block-tiled decode,
+  GQA/XQA reuse, separate sliding/global pools, and later FP8 cache storage.
+
+Baseline before this pass, warm-cache CUDA-event quick contract:
+
+```bash
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 10 100 5
+```
+
+```text
+correctness max_abs=0.000244 mean_abs=0.000000
+prefill_cache_write median_ms=0.102862 mean_ms=0.102869 min_ms=0.102813 max_ms=0.102936
+decode_cache_write median_ms=0.016253 mean_ms=0.016768 min_ms=0.015819 max_ms=0.018959
+paged_decode_attention median_ms=0.735881 mean_ms=0.743909 min_ms=0.731225 max_ms=0.770315
+paged_full_decode_write_plus_attention median_ms=0.736858 mean_ms=0.737554 min_ms=0.736727 max_ms=0.738781
+```
+
+`__grid_constant__` plus log2/`exp2f` trial:
+
+```text
+correctness max_abs=0.000244 mean_abs=0.000000
+prefill_cache_write median_ms=0.102947 mean_ms=0.103017 min_ms=0.102834 max_ms=0.103350
+decode_cache_write median_ms=0.013807 mean_ms=0.012778 min_ms=0.009708 max_ms=0.014800
+paged_decode_attention median_ms=0.741351 mean_ms=0.742217 min_ms=0.736021 max_ms=0.747805
+paged_full_decode_write_plus_attention median_ms=0.743927 mean_ms=0.743703 min_ms=0.742481 max_ms=0.744246
+```
+
+`__grid_constant__` only on the cache-write kernels, longer contract:
+
+```bash
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 25 100 15
+```
+
+```text
+correctness max_abs=0.000244 mean_abs=0.000000
+prefill_cache_write median_ms=0.103114 mean_ms=0.104676 min_ms=0.102901 max_ms=0.115319
+decode_cache_write median_ms=0.017865 mean_ms=0.018163 min_ms=0.011573 max_ms=0.036119
+paged_decode_attention median_ms=0.771727 mean_ms=0.771888 min_ms=0.756163 max_ms=0.780257
+paged_full_decode_write_plus_attention median_ms=0.770110 mean_ms=0.770526 min_ms=0.765271 max_ms=0.775802
+```
+
+Validation:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc test-kv-cache
+```
+
+```text
+kv cache tests passed
+```
+
+Conclusion:
+
+- Rejected both new micro-edits. They are valid CUDA ideas, but not measured wins
+  for this exact kernel shape.
+- Keep the current primitive level: CUB for block reductions and thread I/O,
+  project `loadg` helpers for scalar BF16 loads, and explicit cache/page math.
+- Next code worth writing is not another local primitive swap. It is a real
+  decode design step: CSR page tables, LSE state, page-tiled split-KV, and
+  GQA-grouped global decode.
+
+## 2026-06-16 - KV cache benchmark contract tightening
+
+Scope:
+
+- Upgraded the C++ paged-KV benchmark harness to report:
+  median, mean, 10% trimmed mean, min, max, p95, p99, stddev, IQR, and raw
+  sample arrays.
+- Added explicit `--cache warm|cold` handling.
+- Added cold-cache timing via a 64 MiB L2-flush kernel. The flush is launched on
+  the same stream before each measured iteration, and the timed CUDA start event
+  is recorded after the flush, so reported kernel time excludes flush overhead.
+- Upgraded the PyTorch SDPA comparator to report the same tail stats and raw
+  samples, with matching warm/cold cache modes.
+- Persisted raw-sample outputs under `src/experiments/results/`.
+
+Clock and environment controls:
+
+```bash
+sudo -n nvidia-smi -pm 1
+sudo -n nvidia-smi -ac 8001,1800
+sudo -n nvidia-smi -lgc 1800,1800
+```
+
+Result:
+
+- Persistence mode was already enabled.
+- Both clock-lock attempts failed with:
+  `The current user does not have permission to change clocks`.
+- `nvidia-smi dmon` is not supported in this environment, so a one-second
+  `nvidia-smi --query-gpu` loop was used for observed telemetry.
+- Observed load clocks were not locked; they floated around `1800-1935 MHz` SM
+  and `7601 MHz` memory, with power up to roughly the `300 W` cap in parts of
+  the run and temperatures up to about `61 C`.
+- `nvidia-smi` bus-id reporting varied between point queries despite reporting a
+  single RTX A6000. Treat this as a provider/virtualization telemetry wrinkle
+  and do not compare against other machines without rerunning.
+
+Validation:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc kv-cache-bench
+make NVCC=/usr/local/cuda/bin/nvcc test-kv-cache
+```
+
+Result:
+
+```text
+kv cache tests passed
+```
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, SM86, 50.90 GB.
+- Driver/runtime: CUDA driver/runtime `13000`; `nvidia-smi` driver
+  `580.126.16`.
+- Timing: CUDA events on the same stream; host wall time excluded.
+- Scope: single-process typical kernel microbenchmark.
+- Shape: global Gemma decode, `B=1`, `S=4096`, `Q heads=32`,
+  `KV heads=4`, `D=512`, BF16, page size `64`, split size `64`.
+- Counts: `warmup=50`, `iters_per_sample=100`, `samples=31`.
+- Cold-cache mode: 64 MiB L2 flush before each measured iteration.
+- Minimum effect size for claims: `5%`; closer results need repeated
+  process-level runs under locked clocks.
+
+Persisted outputs:
+
+```text
+src/experiments/results/2026-06-16_kv_cache_custom_warm.txt
+src/experiments/results/2026-06-16_kv_cache_custom_cold.txt
+src/experiments/results/2026-06-16_kv_cache_torch_warm.json
+src/experiments/results/2026-06-16_kv_cache_torch_cold.json
+```
+
+Custom paged KV, warm cache:
+
+```text
+prefill_cache_write                 median=0.103031 ms p95=0.103359 ms p99=0.103493 ms
+decode_cache_write                  median=0.014139 ms p95=0.018111 ms p99=0.019492 ms
+paged_decode_attention              median=0.734263 ms p95=0.737304 ms p99=0.739022 ms
+paged_full_decode_write_plus_attention median=0.737860 ms p95=0.740120 ms p99=0.740949 ms
+```
+
+Custom paged KV, cold cache with L2 flush:
+
+```text
+prefill_cache_write                 median=0.104614 ms p95=0.105390 ms p99=0.108006 ms
+decode_cache_write                  median=0.004984 ms p95=0.006706 ms p99=0.010823 ms
+paged_decode_attention              median=0.712841 ms p95=0.719988 ms p99=0.733747 ms
+paged_full_decode_write_plus_attention median=0.721089 ms p95=0.723958 ms p99=0.724766 ms
+```
+
+PyTorch SDPA comparator, warm cache:
+
+```text
+attention_only                      median=3.306480 ms p95=3.310470 ms p99=3.319482 ms
+full_decode_write_plus_attention    median=3.315389 ms p95=3.318946 ms p99=3.339498 ms
+```
+
+PyTorch SDPA comparator, cold cache with L2 flush:
+
+```text
+attention_only                      median=3.371345 ms p95=3.463470 ms p99=3.473572 ms
+full_decode_write_plus_attention    median=3.509788 ms p95=3.537339 ms p99=3.554004 ms
+```
+
+Conclusion:
+
+- The benchmark now follows the GPU benchmark checklist much more closely:
+  correctness first, explicit contract, raw samples, p95/p99, warm/cold cache
+  separation, L2 flush, and environment telemetry.
+- The main missing control is clock locking, which this environment denies.
+- Warm-cache median speedup versus PyTorch SDPA is about `4.50x` for
+  attention-only (`3.306480 / 0.734263`) and `4.49x` for full decode
+  (`3.315389 / 0.737860`), with the same caveat as before: PyTorch uses
+  contiguous K/V, not paged K/V.
+- The cold-cache custom numbers are not directly comparable to the warm-cache
+  batched tiny-write numbers because cold mode records per-iteration CUDA events
+  after each flush. Use the attention/full-decode rows as the more meaningful
+  comparison points.

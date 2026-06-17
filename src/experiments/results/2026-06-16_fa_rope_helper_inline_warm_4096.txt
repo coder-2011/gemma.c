@@ -1,0 +1,7 @@
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+benchmark batch=1 seq=4096 window_left=1024 warmup=50 iters=50 samples=31 cache=warm flush_bytes=0 timing=cuda_events_same_stream launch_overhead=included
+prepared_fa median_ms=1.43353 mean_ms=1.43768 trimmed_mean_ms=1.43554 min_ms=1.42668 max_ms=1.48176 p95_ms=1.458 p99_ms=1.47624 stddev_ms=0.0112155 iqr_ms=0.00685596 samples_ms=[1.43266,1.42733,1.43548,1.43243,1.42965,1.42668,1.43236,1.42902,1.42953,1.42768,1.43493,1.48176,1.44737,1.43489,1.43059,1.43586,1.46337,1.43323,1.43233,1.43763,1.43307,1.43325,1.43283,1.43928,1.45263,1.44856,1.44338,1.43353,1.43913,1.43981,1.43782]
+norm_rope_plus_fa median_ms=1.83008 mean_ms=1.83079 trimmed_mean_ms=1.83055 min_ms=1.82374 max_ms=1.84246 p95_ms=1.83739 p99_ms=1.84098 stddev_ms=0.00447673 iqr_ms=0.00665379 samples_ms=[1.82629,1.82374,1.82743,1.82865,1.83458,1.83619,1.83041,1.82779,1.83069,1.82714,1.82553,1.82785,1.82573,1.83008,1.83549,1.83726,1.82987,1.82919,1.8301,1.82966,1.82428,1.82648,1.82726,1.83178,1.83213,1.83752,1.83681,1.8368,1.84246,1.83341,1.83183]
+overhead_vs_prepared median_ms=0.396556 median_pct=27.663 approx_tflops_attention_only_median=83.9723
+kernel threads_per_block=128 dynamic_smem_bytes=98304
