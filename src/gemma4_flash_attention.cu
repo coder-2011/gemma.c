@@ -440,8 +440,7 @@ struct Gemma4FlashSoftmax {
       gemma4_fa_quad_reduce_max(row_max, row_max);
       if constexpr (UseFusedExpSum) {
         // Sliding attention measured best when exp2 and local sum share a pass.
-        gemma4_fa_scale_apply_exp2_sum</*ZeroInit=*/true>(
-            scores, row_max, row_sum, softmax_scale_log2);
+        gemma4_fa_scale_apply_exp2_sum</*ZeroInit=*/true>(scores, row_max, row_sum, softmax_scale_log2);
       } else {
         // Global attention keeps the older two-pass path to avoid extra spills.
         gemma4_fa_scale_apply_exp2(scores, row_max, softmax_scale_log2);
