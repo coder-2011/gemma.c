@@ -14,6 +14,10 @@
 - Fuse token embedding gather with the first matrix multiplication in the language path once the unfused baseline is correct.
   - Avoid materializing the initial `[M, 5376]` hidden buffer when the first projection can consume embedding rows directly.
   - Benchmark against the standalone embedding gather plus cuBLAS/cuBLASLt baseline before keeping the fusion.
+- Write a custom projection GEMM/GEMV path that emits paged K/V directly.
+  - Target decode first: `x @ Wk` / `x @ Wv` should produce final cache values without a contiguous K/V scratch buffer.
+  - The epilogue must preserve Gemma semantics: K gets per-head RMSNorm plus RoPE, V gets scale-free RMSNorm, then both scatter into Layout-A paged cache.
+  - Benchmark against the lazier baseline first: cuBLAS/cuBLASLt projection into contiguous raw K/V plus fused norm/RoPE/V-norm paged-cache write.
 
 ## Remaining Unfused Inference Buildout
 
