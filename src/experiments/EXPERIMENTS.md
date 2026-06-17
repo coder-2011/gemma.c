@@ -11500,3 +11500,83 @@ Conclusion:
   because each cold sample replays a one-op CUDA graph after flushing L2. Use
   this row for fair custom-vs-PyTorch graph comparison, and the C++ benchmark
   for the cleanest custom kernel-only number.
+
+## 2026-06-17 - Decode prep-cache graph replay with torch.cuda._sleep
+
+Scope:
+
+- Replaced the warm-cache queue-saturation dummy matmul with
+  `torch.cuda._sleep(1_000_000)`.
+- Cold-cache timing now also does `flush_l2(); torch.cuda._sleep(1_000_000);`
+  before recording the start event.
+- The sleep is untimed: it is enqueued before `start.record()`.
+- A fallback dummy matmul remains in the script only for PyTorch builds without
+  the private `_sleep` API.
+
+Benchmark commands:
+
+```bash
+python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+  --cache warm --warmup 25 --iters 100 --samples 31 \
+  --sleep-cycles 1000000 \
+  --output src/experiments/results/2026-06-17_decode_prep_torch_graph_sleep_warm.json
+
+python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+  --cache cold --flush-mib 128 --warmup 25 --iters 100 --samples 31 \
+  --sleep-cycles 1000000 \
+  --output src/experiments/results/2026-06-17_decode_prep_torch_graph_sleep_cold.json
+```
+
+Clock controls:
+
+```bash
+nvidia-smi -ac 8001,2100
+sudo -n nvidia-smi -ac 8001,2100
+```
+
+Both clock-lock attempts failed with:
+
+```text
+The current user does not have permission to change clocks
+```
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence mode enabled.
+- PyTorch: `2.11.0+cu130`, CUDA runtime `13.0`.
+- Timing: CUDA events on the current PyTorch CUDA stream.
+- Execution: explicit CUDA graph replay for both custom CUDA and compiled
+  PyTorch work.
+- Queue saturation: untimed `torch.cuda._sleep(1_000_000)` before start event.
+- Cache: warm and cold runs are separate; cold uses a 128 MiB L2 flush before
+  the untimed sleep and start event.
+- Shape: `B=1`, `seq_len=1024`, `page_size=64`, `Q heads=32`, `KV heads=16`,
+  `head_dim=256`, BF16.
+- Correctness: custom and PyTorch outputs matched exactly for Q, cache K, and
+  cache V on this generated input (`max_abs=0` for all three).
+
+Warm-cache graph replay with `_sleep`:
+
+```text
+custom_cuda_graph_decode_norm_rope_paged_kv_write median=0.002949 ms p95=0.002999 ms p99=0.003113 ms
+torch_non_eager_decode_norm_rope_paged_kv_write   median=0.109596 ms p95=0.109913 ms p99=0.112374 ms
+median speedup = 37.16x
+```
+
+Cold-cache graph replay with `_sleep`:
+
+```text
+custom_cuda_graph_decode_norm_rope_paged_kv_write median=0.007511 ms p95=0.134406 ms p99=0.285987 ms
+torch_non_eager_decode_norm_rope_paged_kv_write   median=0.114130 ms p95=0.129568 ms p99=0.176282 ms
+median speedup = 15.20x
+```
+
+Conclusion:
+
+- `torch.cuda._sleep(1_000_000)` gives a cleaner warm-cache timing path than
+  the dummy matmul and avoids polluting cache state with matmul operands.
+- Warm-cache custom timing is now very stable at about `2.95 us`; the compiled
+  PyTorch graph replay is about `109.6 us`.
+- Cold-cache median improved, but custom cold tails had large outliers because
+  clocks are unlocked and each sample repeats flush/sleep/replay many times.
+  Use the median for the headline comparison and keep p95/p99 visible.
