@@ -11264,3 +11264,239 @@ Conclusion:
   batched tiny-write numbers because cold mode records per-iteration CUDA events
   after each flush. Use the attention/full-decode rows as the more meaningful
   comparison points.
+
+## 2026-06-17 - Sliding decode Q prep plus paged KV cache write
+
+Scope:
+
+- Added a decode-only fused prep-cache path in the flash-attn file:
+  raw one-token Q/K/V -> prepared Q plus Layout-A paged K/V cache write.
+- Q and K use the existing sliding learned RMSNorm + RoPE device helper.
+- V uses the existing sliding scale-free RMSNorm helper.
+- This does not make prefill FA consume paged K/V; it is the decode bridge
+  before `gemma4_paged_decode_attention_bf16`.
+
+Validation:
+
+```bash
+make test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+make flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Result:
+
+```text
+kv cache tests passed
+```
+
+Benchmark command:
+
+```bash
+./build/experiments/gemma4_flash_attention_bench 1024 20 20 30 1 64 cold 128
+```
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence mode enabled.
+- Compiler: `/usr/local/cuda/bin/nvcc`, CUDA `13.0`, target `sm_86`, flags
+  `--expt-relaxed-constexpr --expt-extended-lambda --use_fast_math`.
+- Timing: CUDA events on the same stream; launch overhead included.
+- Cache: cold-L2 mode, 128 MiB flush before each measured iteration; timed
+  event starts after the flush.
+- Shape: sliding attention `B=1`, `S=1024`, `Q heads=32`, `KV heads=16`,
+  `D=256`, BF16, decode cache page size `64`.
+- Counts: `warmup=20`, `iters_per_sample=20`, `samples=30`.
+- Correctness: benchmark precheck at `seq=64`; max attention abs diff
+  `0.015625`; prep Q/K/V max abs diffs `0.00195312`, `0.0078125`,
+  `0.000976562`.
+- Clock policy: attempted `nvidia-smi -ac 8001,2100` and
+  `sudo -n nvidia-smi -ac 8001,2100`; both were denied by driver permission.
+
+Cold-cache results:
+
+```text
+norm_rope_plus_fa              median=0.320997 ms p95=0.336466 ms p99=0.336648 ms
+decode_norm_rope_paged_kv_write median=0.006767 ms p95=0.011795 ms p99=0.032069 ms
+```
+
+Conclusion:
+
+- The new decode prep-cache kernel is a tiny operation relative to prefill FA:
+  about `6.77 us` median for `B=1`.
+- Tail samples had two visible outliers (`0.0155 ms`, `0.0389 ms`), so do not
+  treat p99 as stable until clocks can be locked or the run is repeated across
+  processes.
+
+## 2026-06-17 - Minimal PyTorch decode prep-cache comparator
+
+Scope:
+
+- Added a minimal eager PyTorch implementation for the same decode prep-cache
+  contract:
+  Q RMSNorm + RoPE, K RMSNorm + RoPE, V RMSNorm, then Layout-A paged K/V write.
+- The script also calls the real custom CUDA function through `ctypes`, so the
+  custom side is not reimplemented in Python.
+- This measures the prep-cache bridge only, not paged decode attention.
+
+Build:
+
+```bash
+make flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Clock controls:
+
+```bash
+nvidia-smi -ac 8001,2100
+sudo -n nvidia-smi -ac 8001,2100
+```
+
+Both clock-lock attempts failed with:
+
+```text
+The current user does not have permission to change clocks
+```
+
+Benchmark commands:
+
+```bash
+python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+  --cache warm --warmup 20 --iters 50 --samples 30 \
+  --output src/experiments/results/2026-06-17_decode_prep_torch_warm.json
+
+python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+  --cache cold --flush-mib 128 --warmup 20 --iters 50 --samples 30 \
+  --output src/experiments/results/2026-06-17_decode_prep_torch_cold.json
+```
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence mode enabled.
+- PyTorch: `2.11.0+cu130`, CUDA runtime `13.0`.
+- Timing: CUDA events on the current PyTorch CUDA stream.
+- Cache: warm and cold runs are separate; cold uses a 128 MiB device-buffer
+  add before each measured iteration, outside the timed event window.
+- Shape: `B=1`, `seq_len=1024`, `page_size=64`, `Q heads=32`, `KV heads=16`,
+  `head_dim=256`, BF16.
+- Counts: `warmup=20`, `iters_per_sample=50`, `samples=30`.
+- Correctness: custom and PyTorch outputs matched exactly for Q, cache K, and
+  cache V on this generated input (`max_abs=0` for all three).
+- Caveat: Python eager dispatch can create stream gaps for microsecond kernels,
+  so the C++ custom-only timing remains the cleaner number for the custom
+  kernel itself. This comparison is still useful because it times a minimal
+  PyTorch implementation of the same behavior.
+
+Warm-cache results:
+
+```text
+custom_decode_norm_rope_paged_kv_write      median=0.031335 ms p95=0.061114 ms p99=0.078949 ms
+torch_eager_decode_norm_rope_paged_kv_write median=3.060149 ms p95=3.817697 ms p99=3.874087 ms
+median speedup = 97.66x
+```
+
+Cold-cache results:
+
+```text
+custom_decode_norm_rope_paged_kv_write      median=0.011273 ms p95=0.030585 ms p99=0.036598 ms
+torch_eager_decode_norm_rope_paged_kv_write median=3.098637 ms p95=3.452670 ms p99=3.605872 ms
+median speedup = 274.87x
+```
+
+Conclusion:
+
+- Against a minimal eager PyTorch implementation of the same prep-cache work,
+  the fused CUDA path is roughly `98x` faster warm-cache and `275x` faster
+  cold-cache in this Python harness.
+- The cold-cache custom median aligns much better with the C++ custom benchmark
+  scale (`~11.3 us` here vs `~6.8 us` in C++), while the warm Python custom
+  timing appears inflated by dispatch/stream-gap noise.
+
+## 2026-06-17 - Non-eager PyTorch decode prep-cache graph replay
+
+Scope:
+
+- Reworked the PyTorch comparator so the timed path is no longer eager Python
+  dispatch.
+- The PyTorch prep-cache function is optionally compiled with
+  `torch.compile(mode="reduce-overhead")`.
+- Both the custom CUDA path and the PyTorch path are captured into explicit
+  `torch.cuda.CUDAGraph` objects before timing.
+- Warm-cache timing captures `iters_per_sample` prep-cache operations inside
+  one graph replay and divides by the number of operations.
+- Cold-cache timing captures one prep-cache operation per graph replay, flushes
+  L2 before each timed replay, and divides across repeated replays.
+
+Timing fixes:
+
+- CUDA events are recorded on the active PyTorch CUDA stream.
+- Host wall time and Python launch overhead are excluded from elapsed time.
+- Warm-cache timing queues an untimed `512x512` FP32 matmul before the start
+  event so the CPU cannot outrun the GPU before enqueuing the stop event.
+- Cold-cache timing uses the L2 flush before the start event as the queue
+  backlog.
+- L2 flush uses `zero_()` on a 128 MiB device buffer, larger than the RTX A6000
+  L2 cache.
+
+Clock controls:
+
+```bash
+nvidia-smi -ac 8001,2100
+sudo -n nvidia-smi -ac 8001,2100
+```
+
+Both clock-lock attempts failed with:
+
+```text
+The current user does not have permission to change clocks
+```
+
+Benchmark commands:
+
+```bash
+python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+  --cache warm --warmup 25 --iters 100 --samples 31 \
+  --output src/experiments/results/2026-06-17_decode_prep_torch_graph_warm.json
+
+python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+  --cache cold --flush-mib 128 --warmup 25 --iters 100 --samples 31 \
+  --output src/experiments/results/2026-06-17_decode_prep_torch_graph_cold.json
+```
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence mode enabled.
+- PyTorch: `2.11.0+cu130`, CUDA runtime `13.0`.
+- Shape: `B=1`, `seq_len=1024`, `page_size=64`, `Q heads=32`, `KV heads=16`,
+  `head_dim=256`, BF16.
+- Correctness: custom and PyTorch outputs matched exactly for Q, cache K, and
+  cache V on this generated input (`max_abs=0` for all three).
+- Inductor note: PyTorch printed a warning that its internal cudagraphs were
+  skipped because the compiled function mutates output buffers. The benchmark
+  still captures the resulting compiled work in an explicit outer CUDA graph.
+
+Warm-cache graph replay:
+
+```text
+custom_cuda_graph_decode_norm_rope_paged_kv_write median=0.003058 ms p95=0.003924 ms p99=0.005008 ms
+torch_non_eager_decode_norm_rope_paged_kv_write   median=0.109721 ms p95=0.110382 ms p99=0.110422 ms
+median speedup = 35.88x
+```
+
+Cold-cache graph replay:
+
+```text
+custom_cuda_graph_decode_norm_rope_paged_kv_write median=0.022212 ms p95=0.042371 ms p99=0.045316 ms
+torch_non_eager_decode_norm_rope_paged_kv_write   median=0.125388 ms p95=0.140934 ms p99=0.153021 ms
+median speedup = 5.65x
+```
+
+Conclusion:
+
+- The eager PyTorch comparator overstated the speedup because it included many
+  separate eager operations on the GPU timeline.
+- The corrected non-eager graph-replay comparison is still a clear win:
+  `35.9x` warm-cache and `5.65x` cold-cache at `B=1`.
+- The cold custom graph timing is higher than the C++ custom-only kernel timing
+  because each cold sample replays a one-op CUDA graph after flushing L2. Use
+  this row for fair custom-vs-PyTorch graph comparison, and the C++ benchmark
+  for the cleanest custom kernel-only number.
