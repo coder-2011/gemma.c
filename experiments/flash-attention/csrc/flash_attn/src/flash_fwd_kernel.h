@@ -70,8 +70,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
                            bidb, bidh, tidx, params.h);
 
-    // Save seed and offset for backward, before any early exiting. Otherwise the 0-th thread block might
-    // exit early and no one saves the rng states.
+    // Save seed and offset before any early exit so block 0 records the RNG state.
     if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
         params.rng_state[0] = std::get<0>(seed_offset);
         params.rng_state[1] = std::get<1>(seed_offset);
@@ -1080,9 +1079,7 @@ inline __device__ void compute_attn(const Params &params) {
     // The block index for the head.
     const int bidh = blockIdx.z;
 
-    // We want the fwd and bwd to generate the same dropout pattern (RNG), without restricting
-    // them to have the same number of threads or have to traverse the attention matrix
-    // in the same order.
+    // Keep dropout RNG independent of thread count and attention traversal order.
     // In the Philox RNG, we use the offset to store the batch, head, and the lane id
     // (within a warp). We use the subsequence to store the location of the 16 x 32 blocks within
     // the attention matrix. This way, as long as we have the batch, head, and the location of

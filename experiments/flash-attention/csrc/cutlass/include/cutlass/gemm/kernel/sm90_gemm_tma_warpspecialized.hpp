@@ -144,7 +144,7 @@ public:
 
   // Device side arguments
   struct Arguments {
-    cutlass::gemm::GemmUniversalMode mode{}; //maintained here for backward compatibility
+    cutlass::gemm::GemmUniversalMode mode{}; // maintained here for legacy compatibility
     ProblemShape problem_shape{};
     MainloopArguments mainloop{};
     EpilogueArguments epilogue{};
