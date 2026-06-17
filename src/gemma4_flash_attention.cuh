@@ -8,6 +8,7 @@
 
 extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     __nv_bfloat16 *__restrict__ d_out,
+    // Optional. Pass nullptr for inference paths that do not need LSE.
     float *__restrict__ d_softmax_lse,
     const __nv_bfloat16 *__restrict__ d_q,
     const __nv_bfloat16 *__restrict__ d_k,
@@ -21,6 +22,7 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
 
 extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     __nv_bfloat16 *__restrict__ d_out,
+    // Optional. Pass nullptr for inference paths that do not need LSE.
     float *__restrict__ d_softmax_lse,
     __nv_bfloat16 *__restrict__ d_q_prepared,
     __nv_bfloat16 *__restrict__ d_k_prepared,
@@ -47,6 +49,7 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_kernel_attributes(
 
 extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16(
     __nv_bfloat16 *__restrict__ d_out,
+    // Optional. Pass nullptr for inference paths that do not need LSE.
     float *__restrict__ d_softmax_lse,
     const __nv_bfloat16 *__restrict__ d_q,
     const __nv_bfloat16 *__restrict__ d_k,

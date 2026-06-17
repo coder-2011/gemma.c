@@ -118,7 +118,7 @@ template <typename KernelTraits,
           bool IsCausal,
           bool IsLocal>
 cudaError_t selected_direct_reference_kernel_attributes(long long *out, int len) {
-  if (out == nullptr || len < 16) return cudaErrorInvalidValue;
+  if (out == nullptr || len < 10) return cudaErrorInvalidValue;
   auto kernel = &flash::flash_fwd_kernel<
       KernelTraits,
       /*Is_dropout=*/false,
@@ -148,12 +148,6 @@ cudaError_t selected_direct_reference_kernel_attributes(long long *out, int len)
   out[7] = attr.cacheModeCA;
   out[8] = attr.maxDynamicSharedSizeBytes;
   out[9] = attr.preferredShmemCarveout;
-  out[10] = attr.clusterDimMustBeSet;
-  out[11] = attr.requiredClusterWidth;
-  out[12] = attr.requiredClusterHeight;
-  out[13] = attr.requiredClusterDepth;
-  out[14] = attr.clusterSchedulingPolicyPreference;
-  out[15] = attr.nonPortableClusterSizeAllowed;
   return cudaSuccess;
 }
 

@@ -7,93 +7,9 @@
 #define GEMMA4_ROPE_HEAD_FAST_GRID 0
 #endif
 
-#ifndef GEMMA4_ROPE_QK_LOAD_CS
-#define GEMMA4_ROPE_QK_LOAD_CS 1
-#endif
-
 namespace {
 
 constexpr int kRopeThreads = WARP_SIZE;
-using RopePack = Bf16Packed128;
-static constexpr int kRopePairsPerPack = kBf16Packed128Elements;
-
-__device__ inline float4 load_float4g(const float *__restrict__ address) {
-  return __ldg(reinterpret_cast<const float4 *>(address));
-}
-
-template <int Elem>
-__device__ inline void rotate_pack_element(RopePack &out_lo,
-                                           RopePack &out_hi,
-                                           const RopePack &lo,
-                                           const RopePack &hi,
-                                           float c,
-                                           float s) {
-  float x1 = __bfloat162float(lo[Elem]);
-  float x2 = __bfloat162float(hi[Elem]);
-  out_lo[Elem] = __float2bfloat16_rn(fmaf(-x2, s, x1 * c));
-  out_hi[Elem] = __float2bfloat16_rn(fmaf(x1, s, x2 * c));
-}
-
-__device__ inline void rotate_pair_bf16(floatX *__restrict__ head,
-                                        const float *__restrict__ cos_row,
-                                        const float *__restrict__ sin_row,
-                                        int rotary_half,
-                                        int i) {
-  float x1 = __bfloat162float(head[i]);
-  float x2 = __bfloat162float(head[rotary_half + i]);
-  float c = loadg(cos_row + i);
-  float s = loadg(sin_row + i);
-  head[i] = __float2bfloat16_rn(fmaf(-x2, s, x1 * c));
-  head[rotary_half + i] = __float2bfloat16_rn(fmaf(x1, s, x2 * c));
-}
-
-__device__ inline void rotate_pack_bf16(floatX *__restrict__ head,
-                                        const float *__restrict__ cos_row,
-                                        const float *__restrict__ sin_row,
-                                        int rotary_half,
-                                        int pack) {
-  int i = pack * kRopePairsPerPack;
-#if GEMMA4_ROPE_QK_LOAD_CS
-  RopePack lo = load128cs(head + i);
-  RopePack hi = load128cs(head + rotary_half + i);
-#else
-  RopePack lo = load128(head + i);
-  RopePack hi = load128(head + rotary_half + i);
-#endif
-  float4 c0 = load_float4g(cos_row + i);
-  float4 c1 = load_float4g(cos_row + i + 4);
-  float4 s0 = load_float4g(sin_row + i);
-  float4 s1 = load_float4g(sin_row + i + 4);
-  RopePack out_lo;
-  RopePack out_hi;
-
-  rotate_pack_element<0>(out_lo, out_hi, lo, hi, c0.x, s0.x);
-  rotate_pack_element<1>(out_lo, out_hi, lo, hi, c0.y, s0.y);
-  rotate_pack_element<2>(out_lo, out_hi, lo, hi, c0.z, s0.z);
-  rotate_pack_element<3>(out_lo, out_hi, lo, hi, c0.w, s0.w);
-  rotate_pack_element<4>(out_lo, out_hi, lo, hi, c1.x, s1.x);
-  rotate_pack_element<5>(out_lo, out_hi, lo, hi, c1.y, s1.y);
-  rotate_pack_element<6>(out_lo, out_hi, lo, hi, c1.z, s1.z);
-  rotate_pack_element<7>(out_lo, out_hi, lo, hi, c1.w, s1.w);
-
-  store128(head + i, out_lo);
-  store128(head + rotary_half + i, out_hi);
-}
-
-__device__ inline void rotate_head_bf16(floatX *__restrict__ head,
-                                        const float *__restrict__ cos_row,
-                                        const float *__restrict__ sin_row,
-                                        int rotary_half) {
-  int full_packs = rotary_half / kRopePairsPerPack;
-  for (int pack = threadIdx.x; pack < full_packs; pack += blockDim.x) {
-    rotate_pack_bf16(head, cos_row, sin_row, rotary_half, pack);
-  }
-
-  int tail_start = full_packs * kRopePairsPerPack;
-  for (int i = tail_start + threadIdx.x; i < rotary_half; i += blockDim.x) {
-    rotate_pair_bf16(head, cos_row, sin_row, rotary_half, i);
-  }
-}
 
 __global__ __launch_bounds__(kRopeThreads) void
 gemma4_rope_bf16_kernel(floatX *__restrict__ q,
@@ -128,12 +44,14 @@ gemma4_rope_bf16_kernel(floatX *__restrict__ q,
   if (head < q_heads) {
     int64_t q_offset = static_cast<int64_t>(row) * q_row_stride + head * head_dim;
     floatX *q_head = q + q_offset;
-    rotate_head_bf16(q_head, cos_row, sin_row, rotary_half);
+    gemma4_rope::rotate_head_bf16(q_head, cos_row, sin_row, rotary_half,
+                                  threadIdx.x, blockDim.x);
   }
   if (head < kv_heads) {
     int64_t k_offset = static_cast<int64_t>(row) * k_row_stride + head * head_dim;
     floatX *k_head = k + k_offset;
-    rotate_head_bf16(k_head, cos_row, sin_row, rotary_half);
+    gemma4_rope::rotate_head_bf16(k_head, cos_row, sin_row, rotary_half,
+                                  threadIdx.x, blockDim.x);
   }
 }
 
@@ -169,13 +87,15 @@ gemma4_rope_forward_bf16_kernel(floatX *__restrict__ q,
     int64_t batch_head = static_cast<int64_t>(batch) * q_heads + head;
     int64_t q_offset = (batch_head * seq_len + seq) * head_dim;
     floatX *q_head = q + q_offset;
-    rotate_head_bf16(q_head, cos_row, sin_row, rotary_half);
+    gemma4_rope::rotate_head_bf16(q_head, cos_row, sin_row, rotary_half,
+                                  threadIdx.x, blockDim.x);
   }
   if (head < kv_heads) {
     int64_t batch_head = static_cast<int64_t>(batch) * kv_heads + head;
     int64_t k_offset = (batch_head * seq_len + seq) * head_dim;
     floatX *k_head = k + k_offset;
-    rotate_head_bf16(k_head, cos_row, sin_row, rotary_half);
+    gemma4_rope::rotate_head_bf16(k_head, cos_row, sin_row, rotary_half,
+                                  threadIdx.x, blockDim.x);
   }
 }
 

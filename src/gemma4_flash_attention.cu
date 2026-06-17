@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 
+#include <cute/algorithm/tensor_reduce.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/array.h>
 #include <cutlass/cutlass.h>
@@ -25,7 +26,12 @@
 #include <cutlass/numeric_types.h>
 
 #include "gemma4_flash_attention.cuh"
+#include "gemma4_rope.cuh"
 #include "gemma4.h"
+
+#ifndef GEMMA4_FA_USE_SHARED_ROPE_HELPER
+#define GEMMA4_FA_USE_SHARED_ROPE_HELPER 1
+#endif
 
 namespace gemma4_flash_attention {
 
@@ -140,42 +146,19 @@ using Gemma4SlidingFa2KernelTraits =
 using Gemma4GlobalFa2KernelTraits =
     Gemma4FlashFwdKernelTraits<GEMMA4_GLOBAL_HEAD_DIM, 32, 32, 2>;
 
-// Small callable operators make the warp-reduction helper generic without
-// forcing lambdas through device template code.
-struct Gemma4MaxOp {
-  __device__ __forceinline__ float operator()(float const &x, float const &y) {
-    return max(x, y);
-  }
-};
+// Return the maximum value across the 4 lanes that jointly own one score row.
+__device__ __forceinline__ float gemma4_fa_quad_reduce_max(float x) {
+  x = max(x, __shfl_xor_sync(uint32_t(-1), x, 2));
+  x = max(x, __shfl_xor_sync(uint32_t(-1), x, 1));
+  return x;
+}
 
-struct Gemma4SumOp {
-  __device__ __forceinline__ float operator()(float const &x, float const &y) {
-    return x + y;
-  }
-};
-
-// Recursive warp allreduce over a power-of-two sub-group. FlashAttention's
-// accumulator layout needs reductions across 4 lanes for each logical row.
-template <int Threads>
-struct Gemma4Allreduce {
-  static_assert(Threads == 32 || Threads == 16 || Threads == 8 || Threads == 4,
-                "Unsupported warp reduction width");
-  template <typename T, typename Operator>
-  static __device__ __forceinline__ T run(T x, Operator &op) {
-    constexpr int kOffset = Threads / 2;
-    x = op(x, __shfl_xor_sync(uint32_t(-1), x, kOffset));
-    return Gemma4Allreduce<kOffset>::run(x, op);
-  }
-};
-
-template <>
-struct Gemma4Allreduce<2> {
-  template <typename T, typename Operator>
-  static __device__ __forceinline__ T run(T x, Operator &op) {
-    x = op(x, __shfl_xor_sync(uint32_t(-1), x, 1));
-    return x;
-  }
-};
+// Return the sum across the 4 lanes that jointly own one score row.
+__device__ __forceinline__ float gemma4_fa_quad_reduce_sum(float x) {
+  x += __shfl_xor_sync(uint32_t(-1), x, 2);
+  x += __shfl_xor_sync(uint32_t(-1), x, 1);
+  return x;
+}
 
 // Generic tiled tensor-core GEMM helper for operands staged in shared memory.
 // It overlaps the next LDSM copy into registers with the current MMA step.
@@ -196,19 +179,19 @@ __forceinline__ __device__ void gemma4_fa_gemm(
     ThrCopyB smem_thr_copy_B) {
   Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
   Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
-  if (!AInRegs) {
+  if constexpr (!AInRegs) {
     cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{}));
   }
-  if (!BInRegs) {
+  if constexpr (!BInRegs) {
     cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
   }
 #pragma unroll
   for (int i = 0; i < size<2>(tCrA); ++i) {
     if (i < size<2>(tCrA) - 1) {
-      if (!AInRegs) {
+      if constexpr (!AInRegs) {
         cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1));
       }
-      if (!BInRegs) {
+      if constexpr (!BInRegs) {
         cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
       }
     }
@@ -262,8 +245,7 @@ __forceinline__ __device__ auto gemma4_fa_acc_Aregs(Layout acc_layout) {
     return acc_layout;
   } else {
     auto l = logical_divide(acc_layout, Shape<X, X, _2>{});
-    return make_layout(make_layout(get<0>(l), get<2, 0>(l)),
-                       get<1>(l), get<2, 1>(l));
+    return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
   }
 }
 
@@ -275,8 +257,7 @@ __forceinline__ __device__ auto gemma4_fa_convert_type(
   using FromType = typename Engine::value_type;
   constexpr int numel = decltype(size(tensor))::value;
   cutlass::NumericArrayConverter<ToType, FromType, numel> convert_op;
-  auto frag = convert_op(
-      *reinterpret_cast<const cutlass::Array<FromType, numel> *>(tensor.data()));
+  auto frag = convert_op(*reinterpret_cast<const cutlass::Array<FromType, numel> *>(tensor.data()));
   return make_tensor(make_rmem_ptr<ToType>(&frag), tensor.layout());
 }
 
@@ -287,92 +268,106 @@ __device__ __forceinline__ void gemma4_fa_cp_async_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
-// Bounds-checked tiled copy. The template booleans let the compiler remove
-// unused predicate checks for full tiles while keeping edge tiles correct.
-template <bool IsEvenMN = true, bool IsEvenK = true,
-          bool ClearOobMN = false, bool ClearOobK = true,
-          typename TiledCopy, typename Engine0, typename Layout0,
-          typename Engine1, typename Layout1, typename Engine2,
-          typename Layout2, typename Engine3, typename Layout3>
+// Copy a full tile with no predicates; used when the caller has already proven
+// the whole tile is in-bounds.
+template <typename TiledCopy, typename Engine0, typename Layout0,
+          typename Engine1, typename Layout1>
 __forceinline__ __device__ void gemma4_fa_copy(
+    TiledCopy tiled_copy,
+    Tensor<Engine0, Layout0> const &src,
+    Tensor<Engine1, Layout1> &dst) {
+  cute::copy(tiled_copy, src, dst);
+}
+
+// Copy only rows/columns that are in-bounds, leaving out-of-bounds destination
+// entries untouched.
+template <typename TiledCopy, typename Engine0, typename Layout0,
+          typename Engine1, typename Layout1, typename Engine2,
+          typename Layout2>
+__forceinline__ __device__ void gemma4_fa_copy_mn_guarded(
     TiledCopy tiled_copy,
     Tensor<Engine0, Layout0> const &src,
     Tensor<Engine1, Layout1> &dst,
     Tensor<Engine2, Layout2> const &identity_mn,
-    Tensor<Engine3, Layout3> const &predicate_k,
-    const int max_mn = 0) {
-  static_assert(!(ClearOobMN && !ClearOobK),
-                "Cannot clear only MN without clearing K");
+    const int max_mn) {
 #pragma unroll
   for (int m = 0; m < size<1>(src); ++m) {
-    if (IsEvenMN || get<0>(identity_mn(0, m, 0)) < max_mn) {
+    // identity_mn carries the logical tile coordinate for this vector chunk.
+    if (get<0>(identity_mn(0, m, 0)) < max_mn) {
 #pragma unroll
       for (int k = 0; k < size<2>(src); ++k) {
-        if (IsEvenK || predicate_k(k)) {
-          cute::copy(tiled_copy, src(_, m, k), dst(_, m, k));
-        } else if (ClearOobK) {
-          cute::clear(dst(_, m, k));
-        }
+        cute::copy(tiled_copy, src(_, m, k), dst(_, m, k));
       }
-    } else if (ClearOobMN) {
+    }
+  }
+}
+
+// Copy only rows/columns that are in-bounds, and zero any out-of-bounds
+// destination rows so later math never consumes stale shared memory.
+template <typename TiledCopy, typename Engine0, typename Layout0,
+          typename Engine1, typename Layout1, typename Engine2,
+          typename Layout2>
+__forceinline__ __device__ void gemma4_fa_copy_mn_guarded_clear(
+    TiledCopy tiled_copy,
+    Tensor<Engine0, Layout0> const &src,
+    Tensor<Engine1, Layout1> &dst,
+    Tensor<Engine2, Layout2> const &identity_mn,
+    const int max_mn) {
+#pragma unroll
+  for (int m = 0; m < size<1>(src); ++m) {
+    // The first mode is the row/column coordinate; K is always even here.
+    if (get<0>(identity_mn(0, m, 0)) < max_mn) {
+#pragma unroll
+      for (int k = 0; k < size<2>(src); ++k) {
+        cute::copy(tiled_copy, src(_, m, k), dst(_, m, k));
+      }
+    } else {
       cute::clear(dst(_, m, _));
     }
   }
 }
 
-// Reduce each logical score row inside one thread's fragment.
-template <bool zero_init = true, typename Engine0, typename Layout0,
-          typename Engine1, typename Layout1, typename Operator>
-__device__ __forceinline__ void gemma4_fa_thread_reduce(
-    Tensor<Engine0, Layout0> const &tensor,
-    Tensor<Engine1, Layout1> &summary,
-    Operator &op) {
-#pragma unroll
-  for (int mi = 0; mi < size<0>(tensor); mi++) {
-    summary(mi) = zero_init ? tensor(mi, 0) : op(summary(mi), tensor(mi, 0));
-#pragma unroll
-    for (int ni = 1; ni < size<1>(tensor); ni++) {
-      summary(mi) = op(summary(mi), tensor(mi, ni));
-    }
-  }
-}
-
-// Finish row reductions across the 4-lane groups implied by the FA2 fragment
-// layout. This is narrower than a full-warp reduction.
+// Reduce each row-owned scalar fragment with a 4-lane maximum.
 template <typename Engine0, typename Layout0, typename Engine1,
-          typename Layout1, typename Operator>
-__device__ __forceinline__ void gemma4_fa_quad_allreduce(
+          typename Layout1>
+__device__ __forceinline__ void gemma4_fa_quad_reduce_max(
     Tensor<Engine0, Layout0> &dst,
-    Tensor<Engine1, Layout1> &src,
-    Operator &op) {
+    Tensor<Engine1, Layout1> const &src) {
 #pragma unroll
   for (int i = 0; i < size(dst); i++) {
-    dst(i) = Gemma4Allreduce<4>::run(src(i), op);
+    dst(i) = gemma4_fa_quad_reduce_max(src(i));
   }
 }
 
-// Row-wise max and sum helpers used by the online softmax.
-template <bool zero_init = true, typename Engine0, typename Layout0,
-          typename Engine1, typename Layout1>
-__device__ __forceinline__ void gemma4_fa_reduce_max(
-    Tensor<Engine0, Layout0> const &tensor,
-    Tensor<Engine1, Layout1> &max_values) {
-  Gemma4MaxOp max_op;
-  gemma4_fa_thread_reduce<zero_init>(tensor, max_values, max_op);
-  gemma4_fa_quad_allreduce(max_values, max_values, max_op);
-}
-
-template <bool zero_init = true, typename Engine0, typename Layout0,
-          typename Engine1, typename Layout1>
-__device__ __forceinline__ void gemma4_fa_reduce_sum(
-    Tensor<Engine0, Layout0> const &tensor,
-    Tensor<Engine1, Layout1> &sum_values) {
-  Gemma4SumOp sum_op;
-  gemma4_fa_thread_reduce<zero_init>(tensor, sum_values, sum_op);
+// Reduce each row-owned scalar fragment with a 4-lane sum.
+template <typename Engine0, typename Layout0, typename Engine1,
+          typename Layout1>
+__device__ __forceinline__ void gemma4_fa_quad_reduce_sum(
+    Tensor<Engine0, Layout0> &dst,
+    Tensor<Engine1, Layout1> const &src) {
+#pragma unroll
+  for (int i = 0; i < size(dst); i++) {
+    dst(i) = gemma4_fa_quad_reduce_sum(src(i));
+  }
 }
 
 // Apply exp2(score * scale - row_max * scale). Using exp2 lets the kernel keep
 // the softmax scale in log2 units, matching upstream FlashAttention.
+template <bool ScaleMax>
+__forceinline__ __device__ float gemma4_fa_scaled_max(
+    float max_value,
+    float scale) {
+  if (max_value == -INFINITY) return 0.0f;
+  if constexpr (ScaleMax) return max_value * scale;
+  return max_value * float(M_LOG2E);
+}
+
+template <bool CheckInf>
+__forceinline__ __device__ float gemma4_fa_checked_max(float max_value) {
+  if constexpr (CheckInf) return max_value == -INFINITY ? 0.0f : max_value;
+  return max_value;
+}
+
 template <bool ScaleMax = true, typename Engine0, typename Layout0,
           typename Engine1, typename Layout1>
 __forceinline__ __device__ void gemma4_fa_scale_apply_exp2(
@@ -382,7 +377,7 @@ __forceinline__ __device__ void gemma4_fa_scale_apply_exp2(
 #pragma unroll
   for (int mi = 0; mi < size<0>(tensor); ++mi) {
     const float max_scaled =
-        max_values(mi) == -INFINITY ? 0.0f : max_values(mi) * (ScaleMax ? scale : float(M_LOG2E));
+        gemma4_fa_scaled_max<ScaleMax>(max_values(mi), scale);
 #pragma unroll
     for (int ni = 0; ni < size<1>(tensor); ++ni) {
       tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
@@ -390,15 +385,43 @@ __forceinline__ __device__ void gemma4_fa_scale_apply_exp2(
   }
 }
 
+// Apply exp2 and accumulate the per-thread row sums in the same pass over the
+// score fragment. The cross-lane sum reduction still happens once at final
+// normalization, matching FA2's online-softmax state layout.
+template <bool ZeroInit, bool ScaleMax = true, typename Engine0,
+          typename Layout0, typename Engine1, typename Layout1,
+          typename Engine2, typename Layout2>
+__forceinline__ __device__ void gemma4_fa_scale_apply_exp2_sum(
+    Tensor<Engine0, Layout0> &tensor,
+    Tensor<Engine1, Layout1> const &max_values,
+    Tensor<Engine2, Layout2> &row_sum,
+    const float scale) {
+#pragma unroll
+  for (int mi = 0; mi < size<0>(tensor); ++mi) {
+    const float max_scaled =
+        gemma4_fa_scaled_max<ScaleMax>(max_values(mi), scale);
+    float sum = ZeroInit ? 0.0f : row_sum(mi);
+#pragma unroll
+    for (int ni = 0; ni < size<1>(tensor); ++ni) {
+      const float score = exp2f(tensor(mi, ni) * scale - max_scaled);
+      tensor(mi, ni) = score;
+      sum += score;
+    }
+    row_sum(mi) = sum;
+  }
+}
+
 // Online softmax state for one query tile. As K/V blocks stream right-to-left,
 // this tracks row maxima and row sums and rescales the accumulated output when
 // a later block changes the row maximum.
-template <int Rows>
+template <int Rows, bool UseFusedExpSum>
 struct Gemma4FlashSoftmax {
   using TensorT = decltype(make_tensor<float>(Shape<Int<Rows>>{}));
   TensorT row_max;
   TensorT row_sum;
 
+  // Update online-softmax state for one score tile and rescale O when the row
+  // maximum changes.
   template <bool IsFirst, bool CheckInf = false, typename Tensor0, typename Tensor1>
   __forceinline__ __device__ void softmax_rescale_o(
       Tensor0 &acc_s,
@@ -408,49 +431,97 @@ struct Gemma4FlashSoftmax {
     if (IsFirst) {
       // First K block: initialize max/sum and leave O unscaled because it is
       // still zero.
-      gemma4_fa_reduce_max</*zero_init=*/true>(scores, row_max);
-      gemma4_fa_scale_apply_exp2(scores, row_max, softmax_scale_log2);
-      gemma4_fa_reduce_sum</*zero_init=*/true>(scores, row_sum);
+      cute::fill(row_max, -INFINITY);
+#pragma unroll
+      for (int mi = 0; mi < size<0>(scores); ++mi) {
+        // Per-thread row max first; the quad reduction below joins row lanes.
+        row_max(mi) = cute::reduce(scores(mi, _), row_max(mi), cute::max_fn{});
+      }
+      gemma4_fa_quad_reduce_max(row_max, row_max);
+      if constexpr (UseFusedExpSum) {
+        // Sliding attention measured best when exp2 and local sum share a pass.
+        gemma4_fa_scale_apply_exp2_sum</*ZeroInit=*/true>(
+            scores, row_max, row_sum, softmax_scale_log2);
+      } else {
+        // Global attention keeps the older two-pass path to avoid extra spills.
+        gemma4_fa_scale_apply_exp2(scores, row_max, softmax_scale_log2);
+        cute::clear(row_sum);
+#pragma unroll
+        for (int mi = 0; mi < size<0>(scores); ++mi) {
+          row_sum(mi) = cute::reduce(scores(mi, _), row_sum(mi), cute::plus{});
+        }
+      }
     } else {
       // Later K blocks: if the max increases, previous probabilities and the
       // accumulated O must be scaled down to remain in the same softmax frame.
       Tensor scores_max_prev = make_fragment_like(row_max);
       cute::copy(row_max, scores_max_prev);
-      gemma4_fa_reduce_max</*zero_init=*/false>(scores, row_max);
-      Tensor acc_o_rowcol =
-          make_tensor(acc_o.data(), gemma4_fa_acc_rowcol(acc_o.layout()));
+#pragma unroll
+      for (int mi = 0; mi < size<0>(scores); ++mi) {
+        // Seed with the previous max so the result is max(old tiles, new tile).
+        row_max(mi) = cute::reduce(scores(mi, _), row_max(mi), cute::max_fn{});
+      }
+      gemma4_fa_quad_reduce_max(row_max, row_max);
+      Tensor acc_o_rowcol = make_tensor(acc_o.data(), gemma4_fa_acc_rowcol(acc_o.layout()));
 #pragma unroll
       for (int mi = 0; mi < size(row_max); ++mi) {
-        float scores_max_cur =
-            !CheckInf ? row_max(mi) : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
-        float scores_scale =
-            exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+        float scores_max_cur = gemma4_fa_checked_max<CheckInf>(row_max(mi));
+        float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+        // Bring the old denominator and O accumulator into the new max frame.
         row_sum(mi) *= scores_scale;
 #pragma unroll
         for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
           acc_o_rowcol(mi, ni) *= scores_scale;
         }
       }
-      gemma4_fa_scale_apply_exp2(scores, row_max, softmax_scale_log2);
-      gemma4_fa_reduce_sum</*zero_init=*/false>(scores, row_sum);
+      if constexpr (UseFusedExpSum) {
+        gemma4_fa_scale_apply_exp2_sum</*ZeroInit=*/false>(
+            scores, row_max, row_sum, softmax_scale_log2);
+      } else {
+        gemma4_fa_scale_apply_exp2(scores, row_max, softmax_scale_log2);
+#pragma unroll
+        for (int mi = 0; mi < size<0>(scores); ++mi) {
+          row_sum(mi) = cute::reduce(scores(mi, _), row_sum(mi), cute::plus{});
+        }
+      }
     }
   }
 
-  template <typename Tensor0>
+  template <bool IsFirst, typename Tensor0, typename Tensor1>
+  __forceinline__ __device__ void softmax_rescale_visible(
+      Tensor0 &acc_s,
+      Tensor1 &acc_o,
+      float softmax_scale_log2,
+      bool score_block_fully_visible) {
+    if (score_block_fully_visible) {
+      this->template softmax_rescale_o<IsFirst, /*CheckInf=*/false>(
+          acc_s, acc_o, softmax_scale_log2);
+    } else {
+      this->template softmax_rescale_o<IsFirst, /*CheckInf=*/true>(
+          acc_s, acc_o, softmax_scale_log2);
+    }
+  }
+
+  // Finish the softmax denominator, normalize O, and optionally return LSE.
+  template <bool ReturnLse, typename Tensor0>
   __forceinline__ __device__ TensorT normalize_softmax_lse(
       Tensor0 &acc_o,
       float softmax_scale) {
     // Complete the row-sum reduction, normalize O by the softmax denominator,
-    // and produce the log-sum-exp side output used by attention backward/tests.
-    Gemma4SumOp sum_op;
-    gemma4_fa_quad_allreduce(row_sum, row_sum, sum_op);
+    // and optionally produce the log-sum-exp side output for diagnostics/tests.
+    gemma4_fa_quad_reduce_sum(row_sum, row_sum);
     TensorT lse = make_fragment_like(row_sum);
     Tensor acc_o_rowcol = make_tensor(acc_o.data(), gemma4_fa_acc_rowcol(acc_o.layout()));
 #pragma unroll
     for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
       float sum = row_sum(mi);
-      float inv_sum = (sum == 0.0f || sum != sum) ? 1.0f : 1.0f / sum;
-      lse(mi) = (sum == 0.0f || sum != sum) ? INFINITY : row_max(mi) * softmax_scale + __logf(sum);
+      // Empty or fully masked rows produce a harmless scale and diagnostic LSE.
+      const bool invalid_sum = sum == 0.0f || sum != sum;
+      float inv_sum = invalid_sum ? 1.0f : 1.0f / sum;
+      if constexpr (ReturnLse) {
+        lse(mi) = invalid_sum ? INFINITY
+                              : row_max(mi) * softmax_scale + __logf(sum);
+      }
 #pragma unroll
       for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
         acc_o_rowcol(mi, ni) *= inv_sum;
@@ -473,6 +544,7 @@ __forceinline__ __device__ void gemma4_apply_local_sliding_mask(
     const int window_size_left) {
   Tensor tensor = make_tensor(tensor_.data(), gemma4_fa_acc_rowcol(tensor_.layout()));
   const int lane_id = threadIdx.x % kWarpSize;
+  // Each lane owns two adjacent logical columns in the FA2 accumulator view.
   const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
 #pragma unroll
   for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
@@ -489,6 +561,7 @@ __forceinline__ __device__ void gemma4_apply_local_sliding_mask(
 #pragma unroll
         for (int j = 0; j < size<1, 0>(tensor); ++j) {
           const int col_idx = col_idx_base + j;
+          // Keep only causal keys inside the local sliding window.
           if (col_idx >= right || col_idx < left) {
             tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
           }
@@ -510,6 +583,7 @@ __forceinline__ __device__ void gemma4_apply_causal_mask(
     const int max_seqlen_q) {
   Tensor tensor = make_tensor(tensor_.data(), gemma4_fa_acc_rowcol(tensor_.layout()));
   const int lane_id = threadIdx.x % kWarpSize;
+  // Each lane owns two adjacent logical columns in the FA2 accumulator view.
   const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
 #pragma unroll
   for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
@@ -525,6 +599,7 @@ __forceinline__ __device__ void gemma4_apply_causal_mask(
 #pragma unroll
         for (int j = 0; j < size<1, 0>(tensor); ++j) {
           const int col_idx = col_idx_base + j;
+          // Full attention only masks future keys.
           if (col_idx >= right) {
             tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
           }
@@ -532,6 +607,44 @@ __forceinline__ __device__ void gemma4_apply_causal_mask(
       }
     }
   }
+}
+
+// Return true when every score in a K tile is causally visible to every valid Q
+// row in the current query tile.
+__device__ __forceinline__ bool gemma4_causal_block_fully_visible(
+    int col_idx_offset,
+    int block_n,
+    int row_idx_offset,
+    int valid_rows,
+    int seqlen_delta,
+    int max_seqlen_k) {
+  if (valid_rows <= 0) return false;
+  // The last key column in this K tile must be no later than the earliest
+  // allowed causal key for the first valid query row.
+  const int block_end = std::min(max_seqlen_k, col_idx_offset + block_n) - 1;
+  const int earliest_right = row_idx_offset + seqlen_delta;
+  return block_end <= earliest_right;
+}
+
+// Return true when every score in a local K tile is both causal and inside the
+// sliding window for every valid Q row in the current query tile.
+__device__ __forceinline__ bool gemma4_local_block_fully_visible(
+    int col_idx_offset,
+    int block_n,
+    int row_idx_offset,
+    int valid_rows,
+    int seqlen_delta,
+    int max_seqlen_k,
+    int window_size_left) {
+  if (!gemma4_causal_block_fully_visible(
+          col_idx_offset, block_n, row_idx_offset, valid_rows, seqlen_delta,
+          max_seqlen_k)) {
+    return false;
+  }
+  // The latest valid query row has the strictest left-window boundary.
+  const int latest_key_row = row_idx_offset + valid_rows - 1 + seqlen_delta;
+  const int latest_left = std::max(0, latest_key_row - window_size_left);
+  return col_idx_offset >= latest_left;
 }
 
 // Build a [BlockM] tile view into the softmax log-sum-exp output for one
@@ -546,8 +659,7 @@ __forceinline__ __device__ auto gemma4_get_lse_tile(
   const index_t offset =
       (index_t(bidb) * GEMMA4_NUM_QUERY_HEADS + bidh) * params.seqlen_q +
       index_t(m_block) * BlockM;
-  return make_tensor(make_gmem_ptr(params.softmax_lse_ptr + offset),
-                     Shape<Int<BlockM>>{});
+  return make_tensor(make_gmem_ptr(params.softmax_lse_ptr + offset), Shape<Int<BlockM>>{});
 }
 
 // Compute one block of query rows for one batch and one query head. This is the
@@ -556,7 +668,7 @@ __forceinline__ __device__ auto gemma4_get_lse_tile(
 //   2. stream K/V blocks from right to left;
 //   3. compute QK^T, mask, online softmax, and P*V;
 //   4. normalize and write O plus LSE.
-template <typename KernelTraits, bool IsLocal>
+template <typename KernelTraits, bool IsLocal, bool ReturnLse>
 inline __device__ void gemma4_compute_attn_1rowblock(
     const Gemma4FlashFwdParams &params,
     const int bidb,
@@ -585,6 +697,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   const int q_tile_start = m_block * kBlockM;
   const int q_tile_remaining = params.seqlen_q - q_tile_start;
   if (q_tile_remaining <= 0) return;
+  const int valid_q_rows = std::min(kBlockM, q_tile_remaining);
 
   const int seqlen_delta = params.seqlen_k - params.seqlen_q;
   const int mask_row_offset =
@@ -592,17 +705,14 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   const index_t q_batch_offset = batch * index_t(params.seqlen_q) * kQRowStride;
   const index_t kv_batch_offset = batch * index_t(params.seqlen_k) * kKVRowStride;
 
-  const int n_block_min = IsLocal
-                              ? std::max(0,
-                                         (q_tile_start +
-                                          seqlen_delta -
-                                          params.window_size_left) /
-                                             kBlockN)
-                              : 0;
+  // Work backward over only the visible K blocks. Local layers clamp the left
+  // side to the sliding window; global layers start at block zero.
+  const int n_block_min =
+      IsLocal ? std::max(0, (q_tile_start + seqlen_delta - params.window_size_left) / kBlockN) : 0;
   int n_block_max = cute::ceil_div(params.seqlen_k, kBlockN);
-  n_block_max = std::min(
-      n_block_max,
-      cute::ceil_div(q_tile_start + kBlockM + seqlen_delta, kBlockN));
+  // The right edge is causal: queries in this tile never need blocks wholly in
+  // the future, even when seqlen_q != seqlen_k during decode.
+  n_block_max = std::min(n_block_max, cute::ceil_div(q_tile_start + kBlockM + seqlen_delta, kBlockN));
 
   // If a local tile has no visible keys, write zero output and +inf LSE. This
   // keeps edge cases defined instead of relying on stale output memory.
@@ -611,11 +721,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
         make_gmem_ptr(params.o_ptr + q_batch_offset),
         make_shape(params.seqlen_q, GEMMA4_NUM_QUERY_HEADS, kHeadDim),
         make_stride(kQRowStride, kHeadDim, _1{}));
-    Tensor gO = local_tile(mO(_, bidh, _),
-                           Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                           make_coord(m_block, 0));
-    Tensor gLSE = gemma4_get_lse_tile<kBlockM>(params, bidb, bidh, m_block);
-
+    Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
     typename KernelTraits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
     Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
@@ -623,15 +729,17 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     clear(tOrO);
     Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
     Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-    gemma4_fa_copy</*IsEvenMN=*/false, /*IsEvenK=*/true,
-                   /*ClearOobMN=*/false, /*ClearOobK=*/false>(
-        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, q_tile_remaining);
+    gemma4_fa_copy_mn_guarded(
+        gmem_tiled_copy_O, tOrO, tOgO, tOcO, q_tile_remaining);
+    if constexpr (ReturnLse) {
+      Tensor gLSE = gemma4_get_lse_tile<kBlockM>(params, bidb, bidh, m_block);
 #pragma unroll
-    for (int m = 0; m < size<1>(tOgO); ++m) {
-      const int row = get<0>(tOcO(0, m, 0));
-      if (row < q_tile_remaining && get<1>(tOcO(0, m, 0)) == 0) {
-        gLSE(row) = INFINITY;
+      for (int m = 0; m < size<1>(tOgO); ++m) {
+        const int row = get<0>(tOcO(0, m, 0));
+        // Only one vector lane owns the scalar LSE for each row.
+        if (row < q_tile_remaining && get<1>(tOcO(0, m, 0)) == 0) {
+          gLSE(row) = INFINITY;
+        }
       }
     }
     return;
@@ -643,38 +751,26 @@ inline __device__ void gemma4_compute_attn_1rowblock(
       make_gmem_ptr(params.q_ptr + q_batch_offset),
       make_shape(params.seqlen_q, GEMMA4_NUM_QUERY_HEADS, kHeadDim),
       make_stride(kQRowStride, kHeadDim, _1{}));
-  Tensor gQ = local_tile(mQ(_, bidh, _),
-                         Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                         make_coord(m_block, 0));
+  Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
   const int kv_head = bidh / kHeadRatio;
   Tensor mK = make_tensor(
       make_gmem_ptr(params.k_ptr + kv_batch_offset),
       make_shape(params.seqlen_k, kKVHeads, kHeadDim),
       make_stride(kKVRowStride, kHeadDim, _1{}));
-  Tensor gK = local_tile(mK(_, kv_head, _),
-                         Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                         make_coord(_, 0));
+  Tensor gK = local_tile(mK(_, kv_head, _), Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, 0));
   Tensor mV = make_tensor(
       make_gmem_ptr(params.v_ptr + kv_batch_offset),
       make_shape(params.seqlen_k, kKVHeads, kHeadDim),
       make_stride(kKVRowStride, kHeadDim, _1{}));
-  Tensor gV = local_tile(mV(_, kv_head, _),
-                         Shape<Int<kBlockN>, Int<kHeadDim>>{},
-                         make_coord(_, 0));
+  Tensor gV = local_tile(mV(_, kv_head, _), Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, 0));
 
   // Lay out dynamic shared memory as Q | K | V. V also receives a transposed
   // logical view over the same bytes for the P*V tensor-core operation.
-  Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
-                          typename KernelTraits::SmemLayoutQ{});
-  Tensor sK = make_tensor(sQ.data() + size(sQ),
-                          typename KernelTraits::SmemLayoutKV{});
-  Tensor sV = make_tensor(sK.data() + size(sK),
-                          typename KernelTraits::SmemLayoutKV{});
-  Tensor sVt = make_tensor(sV.data(),
-                           typename KernelTraits::SmemLayoutVtransposed{});
-  Tensor sVtNoSwizzle =
-      make_tensor(sV.data().get(),
-                  typename KernelTraits::SmemLayoutVtransposedNoSwizzle{});
+  Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename KernelTraits::SmemLayoutQ{});
+  Tensor sK = make_tensor(sQ.data() + size(sQ), typename KernelTraits::SmemLayoutKV{});
+  Tensor sV = make_tensor(sK.data() + size(sK), typename KernelTraits::SmemLayoutKV{});
+  Tensor sVt = make_tensor(sV.data(), typename KernelTraits::SmemLayoutVtransposed{});
+  Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename KernelTraits::SmemLayoutVtransposedNoSwizzle{});
 
   // Partition global/shared copies by thread. These objects encode which
   // vector lanes each thread owns for Q, K, and V movement.
@@ -696,16 +792,13 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   Tensor tSrQ = thr_mma_qk.partition_fragment_A(sQ);
   Tensor tSrK = thr_mma_qk.partition_fragment_B(sK);
   Tensor tOrVt = thr_mma_pv.partition_fragment_B(sVtNoSwizzle);
-  Tensor acc_o =
-      partition_fragment_C(tiled_mma_pv, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+  Tensor acc_o = partition_fragment_C(tiled_mma_pv, Shape<Int<kBlockM>, Int<kHeadDim>>{});
 
-  auto smem_tiled_copy_Q =
-      make_tiled_copy_A(typename KernelTraits::SmemCopyAtom{}, tiled_mma_qk);
+  auto smem_tiled_copy_Q = make_tiled_copy_A(typename KernelTraits::SmemCopyAtom{}, tiled_mma_qk);
   auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
   Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
 
-  auto smem_tiled_copy_K =
-      make_tiled_copy_B(typename KernelTraits::SmemCopyAtom{}, tiled_mma_qk);
+  auto smem_tiled_copy_K = make_tiled_copy_B(typename KernelTraits::SmemCopyAtom{}, tiled_mma_qk);
   auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
   Tensor tSsK = smem_thr_copy_K.partition_S(sK);
 
@@ -720,33 +813,28 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
   Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
   Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
-  Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
-  Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
 
   // Q is reused for every K/V block in this row tile, so it is loaded once.
-  gemma4_fa_copy</*IsEvenMN=*/false, /*IsEvenK=*/true>(
-      gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ, q_tile_remaining);
+  gemma4_fa_copy_mn_guarded(
+      gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, q_tile_remaining);
 
-  // Preload the rightmost K block. The loop walks K/V blocks backward so the
-  // causal edge is handled first, then the fully-visible prefix follows.
+  // Preload the rightmost K block. The loop then visits K/V blocks in
+  // descending order so the causal edge is handled before the visible prefix.
   int n_block = n_block_max - 1;
-  gemma4_fa_copy</*IsEvenMN=*/false, /*IsEvenK=*/true>(
-      gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+  gemma4_fa_copy_mn_guarded(
+      gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV,
       params.seqlen_k - n_block * kBlockN);
   cute::cp_async_fence();
 
   clear(acc_o);
-  Gemma4FlashSoftmax<2 * size<1>(acc_o)> softmax;
+  Gemma4FlashSoftmax<2 * size<1>(acc_o), IsLocal> softmax;
 
   // The first few blocks may touch the causal/window boundary and need masks.
   // After that, local/global fully-visible blocks can skip causal masking.
   constexpr int kMaskingSteps = cuda::ceil_div(kBlockM, kBlockN) + 1;
 #pragma unroll
-  for (int masking_step = 0;
-       masking_step < kMaskingSteps;
-       ++masking_step, --n_block) {
-    Tensor acc_s =
-        partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
+  for (int masking_step = 0; masking_step < kMaskingSteps; ++masking_step, --n_block) {
+    Tensor acc_s = partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_s);
     gemma4_fa_cp_async_wait<0>();
     __syncthreads();
@@ -754,12 +842,10 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     // Stage V for the current block while K for this block is already in SMEM.
     // The first V tile may be partial at seqlen_k's right edge.
     if (masking_step > 0) {
-      gemma4_fa_copy</*IsEvenMN=*/true, /*IsEvenK=*/true>(
-          gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+      gemma4_fa_copy(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV);
     } else {
-      gemma4_fa_copy</*IsEvenMN=*/false, /*IsEvenK=*/true,
-                     /*ClearOobMN=*/true>(
-          gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV,
+      gemma4_fa_copy_mn_guarded_clear(
+          gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV,
           params.seqlen_k - n_block * kBlockN);
     }
     cute::cp_async_fence();
@@ -770,38 +856,50 @@ inline __device__ void gemma4_compute_attn_1rowblock(
 
     // Boundary blocks need either sliding-window or full-causal masking before
     // their scores enter the online softmax.
+    const int score_col_offset = n_block * kBlockN;
+    bool score_block_fully_visible = false;
     if constexpr (IsLocal) {
-      gemma4_apply_local_sliding_mask(
-          acc_s, n_block * kBlockN, mask_row_offset, kWarpRowStride,
-          params.seqlen_k, params.seqlen_q, params.window_size_left);
+      score_block_fully_visible = gemma4_local_block_fully_visible(
+          score_col_offset, kBlockN, q_tile_start, valid_q_rows, seqlen_delta,
+          params.seqlen_k, params.window_size_left);
     } else {
-      gemma4_apply_causal_mask(
-          acc_s, n_block * kBlockN, mask_row_offset, kWarpRowStride,
-          params.seqlen_k, params.seqlen_q);
+      score_block_fully_visible = gemma4_causal_block_fully_visible(
+          score_col_offset, kBlockN, q_tile_start, valid_q_rows, seqlen_delta,
+          params.seqlen_k);
+    }
+
+    if (!score_block_fully_visible) {
+      if constexpr (IsLocal) {
+        gemma4_apply_local_sliding_mask(
+            acc_s, score_col_offset, mask_row_offset, kWarpRowStride,
+            params.seqlen_k, params.seqlen_q, params.window_size_left);
+      } else {
+        gemma4_apply_causal_mask(
+            acc_s, score_col_offset, mask_row_offset, kWarpRowStride,
+            params.seqlen_k, params.seqlen_q);
+      }
     }
 
     gemma4_fa_cp_async_wait<0>();
     __syncthreads();
     // K for the next iteration is prefetched while this iteration consumes V.
     if (n_block > n_block_min) {
-      gemma4_fa_copy</*IsEvenMN=*/true, /*IsEvenK=*/true>(
-          gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+      gemma4_fa_copy(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK);
       cute::cp_async_fence();
     }
 
-    masking_step == 0
-        ? softmax.template softmax_rescale_o</*IsFirst=*/true, /*CheckInf=*/true>(
-              acc_s, acc_o, params.scale_softmax_log2)
-        : softmax.template softmax_rescale_o</*IsFirst=*/false, /*CheckInf=*/true>(
-              acc_s, acc_o, params.scale_softmax_log2);
+    if (masking_step == 0) {
+      softmax.template softmax_rescale_visible</*IsFirst=*/true>(
+          acc_s, acc_o, params.scale_softmax_log2, score_block_fully_visible);
+    } else {
+      softmax.template softmax_rescale_visible</*IsFirst=*/false>(
+          acc_s, acc_o, params.scale_softmax_log2, score_block_fully_visible);
+    }
 
     // Convert probabilities to BF16 and multiply by V, accumulating O in FP32.
     Tensor rP = gemma4_fa_convert_type<Element>(acc_s);
-    Tensor tOrP = make_tensor(
-        rP.data(),
-        gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
-    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv,
-                      smem_tiled_copy_V, smem_thr_copy_V);
+    Tensor tOrP = make_tensor(rP.data(), gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
+    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V);
 
     if (kMaskingSteps > 1 && n_block <= n_block_min) {
       --n_block;
@@ -812,13 +910,11 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   // Remaining blocks are fully causal for global attention. Local attention
   // still checks the left side of the sliding window.
   for (; n_block >= n_block_min; --n_block) {
-    Tensor acc_s =
-        partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor acc_s = partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
     clear(acc_s);
     gemma4_fa_cp_async_wait<0>();
     __syncthreads();
-    gemma4_fa_copy</*IsEvenMN=*/true, /*IsEvenK=*/true>(
-        gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+    gemma4_fa_copy(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV);
     cute::cp_async_fence();
 
     gemma4_fa_gemm</*AInRegs=*/false>(
@@ -828,47 +924,69 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     gemma4_fa_cp_async_wait<0>();
     __syncthreads();
     if (n_block > n_block_min) {
-      gemma4_fa_copy</*IsEvenMN=*/true, /*IsEvenK=*/true>(
-          gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+      gemma4_fa_copy(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK);
       cute::cp_async_fence();
     }
 
     if constexpr (IsLocal) {
-      gemma4_apply_local_sliding_mask(
-          acc_s, n_block * kBlockN, mask_row_offset, kWarpRowStride,
-          params.seqlen_k, params.seqlen_q, params.window_size_left);
+      const int score_col_offset = n_block * kBlockN;
+      const bool score_block_fully_visible = gemma4_local_block_fully_visible(
+          score_col_offset, kBlockN, q_tile_start, valid_q_rows, seqlen_delta,
+          params.seqlen_k, params.window_size_left);
+      if (!score_block_fully_visible) {
+        gemma4_apply_local_sliding_mask(
+            acc_s, score_col_offset, mask_row_offset, kWarpRowStride,
+            params.seqlen_k, params.seqlen_q, params.window_size_left);
+      }
+      softmax.template softmax_rescale_visible</*IsFirst=*/false>(
+          acc_s, acc_o, params.scale_softmax_log2, score_block_fully_visible);
+    } else {
+      softmax.template softmax_rescale_o</*IsFirst=*/false, /*CheckInf=*/false>(
+          acc_s, acc_o, params.scale_softmax_log2);
     }
-    softmax.template softmax_rescale_o</*IsFirst=*/false, IsLocal>(
-        acc_s, acc_o, params.scale_softmax_log2);
 
+    // The score accumulator now holds probabilities, so it can serve as the A
+    // operand for the P*V tensor-core multiply.
     Tensor rP = gemma4_fa_convert_type<Element>(acc_s);
-    Tensor tOrP = make_tensor(
-        rP.data(),
-        gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
-    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv,
-                      smem_tiled_copy_V, smem_thr_copy_V);
+    Tensor tOrP = make_tensor(rP.data(), gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
+    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V);
   }
 
   // Finalize O = softmax(QK^T)V and store through shared memory so the MMA
   // accumulator fragment can be rearranged into coalesced global writes.
-  Tensor lse = softmax.normalize_softmax_lse(acc_o, params.scale_softmax);
+  Tensor lse = softmax.template normalize_softmax_lse<ReturnLse>(acc_o, params.scale_softmax);
   Tensor rO = gemma4_fa_convert_type<Element>(acc_o);
   Tensor sO = make_tensor(sQ.data(), typename KernelTraits::SmemLayoutO{});
-  auto smem_tiled_copy_O =
-      make_tiled_copy_C(typename KernelTraits::SmemCopyAtomO{}, tiled_mma_pv);
+  auto smem_tiled_copy_O = make_tiled_copy_C(typename KernelTraits::SmemCopyAtomO{}, tiled_mma_pv);
   auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
   Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
   Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
+  // Shared memory is used as a small layout-conversion buffer before global
+  // stores, matching the FA2 epilogue pattern.
   cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
   Tensor mO = make_tensor(
       make_gmem_ptr(params.o_ptr + q_batch_offset),
       make_shape(params.seqlen_q, GEMMA4_NUM_QUERY_HEADS, kHeadDim),
       make_stride(kQRowStride, kHeadDim, _1{}));
-  Tensor gO = local_tile(mO(_, bidh, _),
-                         Shape<Int<kBlockM>, Int<kHeadDim>>{},
-                         make_coord(m_block, 0));
-  Tensor gLSE = gemma4_get_lse_tile<kBlockM>(params, bidb, bidh, m_block);
+  Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
+  if constexpr (ReturnLse) {
+    Tensor gLSE = gemma4_get_lse_tile<kBlockM>(params, bidb, bidh, m_block);
+
+    Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
+    Tensor taccOcO = thr_mma_pv.partition_C(caccO);
+    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
+    // A single column-owner writes each row's scalar LSE.
+    if (get<1>(taccOcO_row(0)) == 0) {
+#pragma unroll
+      for (int mi = 0; mi < size(lse); ++mi) {
+        const int row = get<0>(taccOcO_row(mi));
+        if (row < q_tile_remaining) {
+          gLSE(row) = lse(mi);
+        }
+      }
+    }
+  }
 
   typename KernelTraits::GmemTiledCopyO gmem_tiled_copy_O;
   auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
@@ -877,39 +995,25 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   __syncthreads();
 
   Tensor tOrO = make_tensor<Element>(shape(tOgO));
+  // Bring O back out of shared memory in the same vector layout used for the
+  // final coalesced global store.
   cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
-
-  // One lane group writes the per-row LSE values. OOB rows in the final tile are
-  // skipped by comparing against the remaining sequence length.
-  Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
-  Tensor taccOcO = thr_mma_pv.partition_C(caccO);
-  Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
-  if (get<1>(taccOcO_row(0)) == 0) {
-#pragma unroll
-    for (int mi = 0; mi < size(lse); ++mi) {
-      const int row = get<0>(taccOcO_row(mi));
-      if (row < q_tile_remaining) {
-        gLSE(row) = lse(mi);
-      }
-    }
-  }
 
   Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
   Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
-  Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
-  gemma4_fa_copy</*IsEvenMN=*/false, /*IsEvenK=*/true,
-                 /*ClearOobMN=*/false, /*ClearOobK=*/false>(
-      gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO, q_tile_remaining);
+  gemma4_fa_copy_mn_guarded(
+      gmem_tiled_copy_O, tOrO, tOgO, tOcO, q_tile_remaining);
 }
 
 // One CTA computes one query row-block for one batch and one query head.
-template <typename KernelTraits, bool IsLocal>
+template <typename KernelTraits, bool IsLocal, bool ReturnLse>
 __global__ void gemma4_flash_fwd_bf16_kernel(
     __grid_constant__ const Gemma4FlashFwdParams params) {
   const int m_block = blockIdx.x;
   const int bidb = blockIdx.y;
   const int bidh = blockIdx.z;
-  gemma4_compute_attn_1rowblock<KernelTraits, IsLocal>(params, bidb, bidh, m_block);
+  gemma4_compute_attn_1rowblock<KernelTraits, IsLocal, ReturnLse>(
+      params, bidb, bidh, m_block);
 }
 
 // Fill the compact launch-parameter struct expected by the specialized kernel.
@@ -942,30 +1046,46 @@ Gemma4FlashFwdParams make_params(
 
 // Dynamic shared memory exceeds the default limit for these FA tiles, so the
 // selected kernel must opt in before launch or attribute introspection.
-template <typename KernelTraits, bool IsLocal>
+template <typename KernelTraits, bool IsLocal, bool ReturnLse>
 cudaError_t set_kernel_smem() {
-  auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal>;
-  return cudaFuncSetAttribute(kernel,
-                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                              KernelTraits::kSmemSize);
+  static bool initialized = false;
+  if (initialized) return cudaSuccess;
+  auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal, ReturnLse>;
+  cudaError_t status = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      KernelTraits::kSmemSize);
+  if (status == cudaSuccess) initialized = true;
+  return status;
 }
 
 // Common launcher for sliding and global variants. The grid dimensions map to:
 //   x = query row block, y = batch, z = query head.
-template <typename KernelTraits, bool IsLocal>
+template <typename KernelTraits, bool IsLocal, bool ReturnLse>
 cudaError_t launch_attention(
     Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
-  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal>();
+  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal, ReturnLse>();
   if (status != cudaSuccess) return status;
   const dim3 grid_dim(cuda::ceil_div(params.seqlen_q, KernelTraits::kBlockM),
                       batch_size,
                       GEMMA4_NUM_QUERY_HEADS);
   constexpr dim3 block_dim(KernelTraits::kNThreads);
-  gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal>
+  gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal, ReturnLse>
       <<<grid_dim, block_dim, KernelTraits::kSmemSize, stream>>>(params);
   return cudaGetLastError();
+}
+
+template <typename KernelTraits, bool IsLocal>
+cudaError_t launch_attention_maybe_lse(
+    Gemma4FlashFwdParams &params,
+    int batch_size,
+    cudaStream_t stream) {
+  return params.softmax_lse_ptr == nullptr
+             ? launch_attention<KernelTraits, IsLocal, false>(
+                   params, batch_size, stream)
+             : launch_attention<KernelTraits, IsLocal, true>(
+                   params, batch_size, stream);
 }
 
 // Gemma 4 sliding layers: head_dim=256, block 64x64, local causal window.
@@ -973,7 +1093,7 @@ cudaError_t launch_sliding(
     Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
-  return launch_attention<Gemma4SlidingFa2KernelTraits, true>(
+  return launch_attention_maybe_lse<Gemma4SlidingFa2KernelTraits, true>(
       params, batch_size, stream);
 }
 
@@ -982,7 +1102,7 @@ cudaError_t launch_global(
     Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
-  return launch_attention<Gemma4GlobalFa2KernelTraits, false>(
+  return launch_attention_maybe_lse<Gemma4GlobalFa2KernelTraits, false>(
       params, batch_size, stream);
 }
 
@@ -997,6 +1117,7 @@ constexpr int kSlidingNormRopePairsPerLane =
     kSlidingNormRopeValuesPerLane / 2;
 static_assert(GEMMA4_NUM_QUERY_HEADS % kSlidingNormRopeHeadsPerBlock == 0);
 
+// Sum a per-lane value across one warp for the per-head RMSNorm denominator.
 __device__ __forceinline__ float sliding_prep_warp_sum(float value) {
   for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
     value += __shfl_xor_sync(0xffffffffu, value, offset);
@@ -1004,6 +1125,8 @@ __device__ __forceinline__ float sliding_prep_warp_sum(float value) {
   return value;
 }
 
+// Load the values owned by this lane and return the RMS scale for the whole
+// head. Each warp owns exactly one head.
 __device__ __forceinline__ float sliding_prep_head_rms_scale(
     const __nv_bfloat16 *__restrict__ in,
     int lane,
@@ -1011,6 +1134,7 @@ __device__ __forceinline__ float sliding_prep_head_rms_scale(
   float sum = 0.0f;
 #pragma unroll
   for (int i = 0; i < kSlidingNormRopeValuesPerLane; ++i) {
+    // The lane-strided layout gives every lane 8 dimensions of a 256-wide head.
     values[i] = __bfloat162float(in[lane + i * kWarpSize]);
     sum = fmaf(values[i], values[i], sum);
   }
@@ -1018,6 +1142,8 @@ __device__ __forceinline__ float sliding_prep_head_rms_scale(
   return rsqrtf(sum / float(GEMMA4_SLIDING_HEAD_DIM) + GEMMA4_RMS_NORM_EPS);
 }
 
+// Apply learned RMSNorm to one Q/K head and then rotate the normalized values
+// with sliding-layer RoPE.
 __device__ __forceinline__ void sliding_prep_weighted_rope_head(
     __nv_bfloat16 *__restrict__ out,
     const __nv_bfloat16 *__restrict__ in,
@@ -1031,16 +1157,25 @@ __device__ __forceinline__ void sliding_prep_weighted_rope_head(
 #pragma unroll
   for (int i = 0; i < kSlidingNormRopePairsPerLane; ++i) {
     const int dim = lane + i * kWarpSize;
+    // RoPE pairs the low half and high half of the head at the same lane-owned
+    // offset, after applying the learned Q/K norm weight.
     const float lo = values[i] * scale * __bfloat162float(weight[dim]);
     const float hi = values[i + kSlidingNormRopePairsPerLane] * scale *
                      __bfloat162float(weight[kRotaryHalf + dim]);
+#if GEMMA4_FA_USE_SHARED_ROPE_HELPER
+    gemma4_rope::store_rotated_pair_bf16(out, cos_row, sin_row, kRotaryHalf,
+                                         dim, lo, hi);
+#else
     const float c = __ldg(cos_row + dim);
     const float s = __ldg(sin_row + dim);
     out[dim] = __float2bfloat16_rn(fmaf(-hi, s, lo * c));
     out[kRotaryHalf + dim] = __float2bfloat16_rn(fmaf(lo, s, hi * c));
+#endif
   }
 }
 
+// Apply scale-free RMSNorm to one V head. Gemma 4 sliding V has no learned norm
+// weight and no RoPE.
 __device__ __forceinline__ void sliding_prep_scale_head(
     __nv_bfloat16 *__restrict__ out,
     const __nv_bfloat16 *__restrict__ in,
@@ -1053,6 +1188,8 @@ __device__ __forceinline__ void sliding_prep_scale_head(
   }
 }
 
+// Prepare all sliding-layer Q/K/V heads for prefill attention. Each block owns
+// one sequence position, one batch, and a small group of heads.
 __global__ __launch_bounds__(kSlidingNormRopeThreads)
 void gemma4_sliding_qkv_norm_rope_kernel(
     __nv_bfloat16 *__restrict__ q_prepared,
@@ -1071,19 +1208,23 @@ void gemma4_sliding_qkv_norm_rope_kernel(
   constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
   constexpr int kRotaryHalf = kHeadDim / 2;
 
-  const int row = blockIdx.x;
+  const int seq = blockIdx.x;
+  const int batch = blockIdx.z;
   const int lane = threadIdx.x & (kWarpSize - 1);
   const int warp = threadIdx.x / kWarpSize;
   const int head = blockIdx.y * kSlidingNormRopeHeadsPerBlock + warp;
-  const int seq = row % seq_len;
+  // Cos/sin tables are row-major by position and rotary-pair index.
   const float *cos_row = cos + int64_t(seq) * kRotaryHalf;
   const float *sin_row = sin + int64_t(seq) * kRotaryHalf;
 
+  const int64_t row = int64_t(batch) * seq_len + seq;
   const int64_t q_offset = (int64_t(row) * kQHeads + head) * kHeadDim;
+  // All 32 query heads exist; every warp in the block prepares one Q head.
   sliding_prep_weighted_rope_head(q_prepared + q_offset, q + q_offset,
                                   q_norm_weight, cos_row, sin_row,
                                   lane);
 
+  // Only the first 16 heads are KV heads. Extra query-head warps skip K/V.
   if (head < kKvHeads) {
     const int64_t kv_offset = (int64_t(row) * kKvHeads + head) * kHeadDim;
     sliding_prep_weighted_rope_head(k_prepared + kv_offset, k + kv_offset,
@@ -1093,6 +1234,8 @@ void gemma4_sliding_qkv_norm_rope_kernel(
   }
 }
 
+// Launch the prefill Q/K/V preparation kernel after validating the raw and
+// prepared buffers.
 cudaError_t prepare_sliding_qkv_norm_rope(
     __nv_bfloat16 *__restrict__ d_q_prepared,
     __nv_bfloat16 *__restrict__ d_k_prepared,
@@ -1118,7 +1261,8 @@ cudaError_t prepare_sliding_qkv_norm_rope(
   constexpr int kHeadGroups =
       (GEMMA4_NUM_QUERY_HEADS + kSlidingNormRopeHeadsPerBlock - 1) /
       kSlidingNormRopeHeadsPerBlock;
-  const dim3 grid_dim(batch_size * seq_len, kHeadGroups);
+  // grid.x = sequence row, grid.y = group of 8 heads, grid.z = batch.
+  const dim3 grid_dim(seq_len, kHeadGroups, batch_size);
   constexpr dim3 block_dim(kSlidingNormRopeThreads);
   gemma4_sliding_qkv_norm_rope_kernel<<<grid_dim, block_dim, 0, stream>>>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
@@ -1130,10 +1274,10 @@ cudaError_t prepare_sliding_qkv_norm_rope(
 // dynamic shared memory, binary target, and related CUDA function attributes.
 template <typename KernelTraits, bool IsLocal>
 cudaError_t selected_kernel_attributes(long long *out, int len) {
-  if (out == nullptr || len < 16) return cudaErrorInvalidValue;
-  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal>();
+  if (out == nullptr || len < 10) return cudaErrorInvalidValue;
+  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal, true>();
   if (status != cudaSuccess) return status;
-  auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal>;
+  auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal, true>;
   cudaFuncAttributes attr{};
   status = cudaFuncGetAttributes(&attr, kernel);
   if (status != cudaSuccess) return status;
@@ -1147,12 +1291,6 @@ cudaError_t selected_kernel_attributes(long long *out, int len) {
   out[7] = attr.cacheModeCA;
   out[8] = attr.maxDynamicSharedSizeBytes;
   out[9] = attr.preferredShmemCarveout;
-  out[10] = attr.clusterDimMustBeSet;
-  out[11] = attr.requiredClusterWidth;
-  out[12] = attr.requiredClusterHeight;
-  out[13] = attr.requiredClusterDepth;
-  out[14] = attr.clusterSchedulingPolicyPreference;
-  out[15] = attr.nonPortableClusterSizeAllowed;
   return cudaSuccess;
 }
 
@@ -1172,8 +1310,9 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     int window_left,
     float softmax_scale,
     cudaStream_t stream) {
-  if (d_out == nullptr || d_softmax_lse == nullptr || d_q == nullptr ||
-      d_k == nullptr || d_v == nullptr) {
+  // Public C ABI boundary: reject invalid pointers and dimensions before the
+  // kernel can touch device memory.
+  if (d_out == nullptr || d_q == nullptr || d_k == nullptr || d_v == nullptr) {
     return cudaErrorInvalidValue;
   }
   if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0) {
@@ -1212,15 +1351,15 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     int window_left,
     float softmax_scale,
     cudaStream_t stream) {
-  if (d_out == nullptr || d_softmax_lse == nullptr ||
-      d_q_prepared == nullptr || d_k_prepared == nullptr ||
+  // Public C ABI boundary: all raw inputs, scratch outputs, norm weights, and
+  // RoPE tables are required for the fused prefill helper.
+  if (d_out == nullptr || d_q_prepared == nullptr || d_k_prepared == nullptr ||
       d_v_prepared == nullptr || d_q == nullptr || d_k == nullptr ||
       d_v == nullptr || d_q_norm_weight == nullptr ||
       d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr) {
     return cudaErrorInvalidValue;
   }
-  if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0 ||
-      window_left < 0) {
+  if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0 || window_left < 0) {
     return cudaErrorInvalidValue;
   }
   // ponytail: prefill-only until the paged decode cache lands; decode should
@@ -1244,14 +1383,17 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
 
 // Expose launch metadata so tests and benchmarks can sanity-check occupancy and
 // shared-memory requirements without duplicating template internals.
+// Return the dynamic shared-memory bytes required by sliding attention.
 extern "C" size_t gemma4_flash_attention_sliding_smem_bytes() {
   return gemma4_flash_attention::Gemma4SlidingFa2KernelTraits::kSmemSize;
 }
 
+// Return the CUDA threadblock size used by sliding attention.
 extern "C" int gemma4_flash_attention_sliding_threads_per_block() {
   return gemma4_flash_attention::Gemma4SlidingFa2KernelTraits::kNThreads;
 }
 
+// Fill a small attribute array for the compiled sliding attention kernel.
 extern "C" cudaError_t gemma4_flash_attention_sliding_kernel_attributes(
     long long *out,
     int len) {
@@ -1272,8 +1414,9 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16(
     int seqlen_k,
     float softmax_scale,
     cudaStream_t stream) {
-  if (d_out == nullptr || d_softmax_lse == nullptr || d_q == nullptr ||
-      d_k == nullptr || d_v == nullptr) {
+  // Public C ABI boundary: global attention expects already-prepared Q/K/V
+  // tensors in the fixed Gemma batch-major layout.
+  if (d_out == nullptr || d_q == nullptr || d_k == nullptr || d_v == nullptr) {
     return cudaErrorInvalidValue;
   }
   if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0) {
@@ -1287,14 +1430,17 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16(
   return gemma4_flash_attention::launch_global(params, batch_size, stream);
 }
 
+// Return the dynamic shared-memory bytes required by global attention.
 extern "C" size_t gemma4_flash_attention_global_smem_bytes() {
   return gemma4_flash_attention::Gemma4GlobalFa2KernelTraits::kSmemSize;
 }
 
+// Return the CUDA threadblock size used by global attention.
 extern "C" int gemma4_flash_attention_global_threads_per_block() {
   return gemma4_flash_attention::Gemma4GlobalFa2KernelTraits::kNThreads;
 }
 
+// Fill a small attribute array for the compiled global attention kernel.
 extern "C" cudaError_t gemma4_flash_attention_global_kernel_attributes(
     long long *out,
     int len) {
