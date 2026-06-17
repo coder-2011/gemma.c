@@ -1,0 +1,31 @@
+ptxas info    : 28 bytes gmem, 224 bytes cmem[4]
+ptxas info    : Compiling entry function '_ZN22gemma4_flash_attention28gemma4_flash_fwd_bf16_kernelINS_26Gemma4FlashFwdKernelTraitsILi512ELi32ELi32ELi2EEELb0ELb1EEEvNS_20Gemma4FlashFwdParamsE' for 'sm_86'
+ptxas info    : Function properties for _ZN22gemma4_flash_attention28gemma4_flash_fwd_bf16_kernelINS_26Gemma4FlashFwdKernelTraitsILi512ELi32ELi32ELi2EEELb0ELb1EEEvNS_20Gemma4FlashFwdParamsE
+    744 bytes stack frame, 1512 bytes spill stores, 1696 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 744 bytes cumulative stack size, 416 bytes cmem[0]
+ptxas info    : Compile time = 1210.598 ms
+ptxas info    : Compiling entry function '_ZN22gemma4_flash_attention28gemma4_flash_fwd_bf16_kernelINS_26Gemma4FlashFwdKernelTraitsILi512ELi32ELi32ELi2EEELb0ELb0EEEvNS_20Gemma4FlashFwdParamsE' for 'sm_86'
+ptxas info    : Function properties for _ZN22gemma4_flash_attention28gemma4_flash_fwd_bf16_kernelINS_26Gemma4FlashFwdKernelTraitsILi512ELi32ELi32ELi2EEELb0ELb0EEEvNS_20Gemma4FlashFwdParamsE
+    728 bytes stack frame, 1476 bytes spill stores, 1652 bytes spill loads
+ptxas info    : Used 255 registers, used 1 barriers, 728 bytes cumulative stack size, 416 bytes cmem[0]
+ptxas info    : Compile time = 1272.853 ms
+ptxas info    : Compiling entry function '_ZN22gemma4_flash_attention28gemma4_flash_fwd_bf16_kernelINS_26Gemma4FlashFwdKernelTraitsILi256ELi64ELi64ELi4EEELb1ELb1EEEvNS_20Gemma4FlashFwdParamsE' for 'sm_86'
+ptxas info    : Function properties for _ZN22gemma4_flash_attention28gemma4_flash_fwd_bf16_kernelINS_26Gemma4FlashFwdKernelTraitsILi256ELi64ELi64ELi4EEELb1ELb1EEEvNS_20Gemma4FlashFwdParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 245 registers, used 1 barriers, 416 bytes cmem[0]
+ptxas info    : Compile time = 956.379 ms
+ptxas info    : Compiling entry function '_ZN22gemma4_flash_attention28gemma4_flash_fwd_bf16_kernelINS_26Gemma4FlashFwdKernelTraitsILi256ELi64ELi64ELi4EEELb1ELb0EEEvNS_20Gemma4FlashFwdParamsE' for 'sm_86'
+ptxas info    : Function properties for _ZN22gemma4_flash_attention28gemma4_flash_fwd_bf16_kernelINS_26Gemma4FlashFwdKernelTraitsILi256ELi64ELi64ELi4EEELb1ELb0EEEvNS_20Gemma4FlashFwdParamsE
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 244 registers, used 1 barriers, 416 bytes cmem[0]
+ptxas info    : Compile time = 939.409 ms
+ptxas info    : Compiling entry function '_ZN22gemma4_flash_attention49gemma4_sliding_decode_q_paged_kv_norm_rope_kernelEP13__nv_bfloat16S1_S1_19Gemma4KvCacheConfigPKiS4_iPKS0_S6_S6_S6_S6_PKfS8_' for 'sm_86'
+ptxas info    : Function properties for _ZN22gemma4_flash_attention49gemma4_sliding_decode_q_paged_kv_norm_rope_kernelEP13__nv_bfloat16S1_S1_19Gemma4KvCacheConfigPKiS4_iPKS0_S6_S6_S6_S6_PKfS8_
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers, 488 bytes cmem[0]
+ptxas info    : Compile time = 46.397 ms
+ptxas info    : Compiling entry function '_ZN22gemma4_flash_attention35gemma4_sliding_qkv_norm_rope_kernelEP13__nv_bfloat16S1_S1_PKS0_S3_S3_S3_S3_PKfS5_i' for 'sm_86'
+ptxas info    : Function properties for _ZN22gemma4_flash_attention35gemma4_sliding_qkv_norm_rope_kernelEP13__nv_bfloat16S1_S1_PKS0_S3_S3_S3_S3_PKfS5_i
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 40 registers, used 0 barriers, 436 bytes cmem[0]
+ptxas info    : Compile time = 40.338 ms
