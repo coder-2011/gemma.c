@@ -1,4 +1,6 @@
 #include "gemma4_kv_cache.cuh"
+#include "gemma4_flash_attention.cuh"
+#include "gemma4.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -34,6 +36,18 @@ int64_t cache_elements(const Gemma4KvCacheConfig &config) {
          config.num_heads * config.head_dim;
 }
 
+int64_t sliding_q_offset(int batch, int head, int dim) {
+  return ((int64_t)batch * GEMMA4_NUM_QUERY_HEADS + head) *
+             GEMMA4_SLIDING_HEAD_DIM +
+         dim;
+}
+
+int64_t sliding_kv_offset(int batch, int head, int dim) {
+  return ((int64_t)batch * GEMMA4_SLIDING_KV_HEADS + head) *
+             GEMMA4_SLIDING_HEAD_DIM +
+         dim;
+}
+
 int64_t token_offset(int batch,
                      int position,
                      int head,
@@ -65,6 +79,69 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
                  label, max_abs, max_index, bf16_to_float(actual[max_index]),
                  bf16_to_float(expected[max_index]), tolerance);
     std::exit(1);
+  }
+}
+
+void fill_sliding_rope_tables(std::vector<float> &cos,
+                              std::vector<float> &sin,
+                              int seq_len) {
+  constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
+  constexpr int kRotaryHalf = kHeadDim / 2;
+  for (int row = 0; row < seq_len; ++row) {
+    for (int i = 0; i < kRotaryHalf; ++i) {
+      float freq = std::pow(GEMMA4_ROPE_THETA_SLIDING,
+                            -float(2 * i) / float(kHeadDim));
+      float angle = float(row) * freq;
+      cos[size_t(row) * kRotaryHalf + i] = std::cos(angle);
+      sin[size_t(row) * kRotaryHalf + i] = std::sin(angle);
+    }
+  }
+}
+
+float reference_sliding_rms_scale(const std::vector<__nv_bfloat16> &values,
+                                  int64_t base) {
+  float sum = 0.0f;
+  for (int d = 0; d < GEMMA4_SLIDING_HEAD_DIM; ++d) {
+    float value = bf16_to_float(values[base + d]);
+    sum = std::fma(value, value, sum);
+  }
+  return 1.0f / std::sqrt(sum / float(GEMMA4_SLIDING_HEAD_DIM) +
+                          GEMMA4_RMS_NORM_EPS);
+}
+
+void reference_sliding_weighted_rope_head(
+    std::vector<__nv_bfloat16> &out,
+    int64_t out_base,
+    const std::vector<__nv_bfloat16> &in,
+    int64_t in_base,
+    const std::vector<__nv_bfloat16> &weight,
+    const std::vector<float> &cos,
+    const std::vector<float> &sin,
+    int position) {
+  constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
+  constexpr int kRotaryHalf = kHeadDim / 2;
+  float scale = reference_sliding_rms_scale(in, in_base);
+  int64_t table_base = int64_t(position) * kRotaryHalf;
+  for (int d = 0; d < kRotaryHalf; ++d) {
+    float lo = bf16_to_float(in[in_base + d]) * scale * bf16_to_float(weight[d]);
+    float hi = bf16_to_float(in[in_base + kRotaryHalf + d]) * scale *
+               bf16_to_float(weight[kRotaryHalf + d]);
+    float c = cos[table_base + d];
+    float s = sin[table_base + d];
+    out[out_base + d] = __float2bfloat16_rn(std::fma(-hi, s, lo * c));
+    out[out_base + kRotaryHalf + d] =
+        __float2bfloat16_rn(std::fma(lo, s, hi * c));
+  }
+}
+
+void reference_sliding_scale_head(std::vector<__nv_bfloat16> &out,
+                                  int64_t out_base,
+                                  const std::vector<__nv_bfloat16> &in,
+                                  int64_t in_base) {
+  float scale = reference_sliding_rms_scale(in, in_base);
+  for (int d = 0; d < GEMMA4_SLIDING_HEAD_DIM; ++d) {
+    out[out_base + d] =
+        __float2bfloat16_rn(bf16_to_float(in[in_base + d]) * scale);
   }
 }
 
@@ -118,6 +195,159 @@ void reference_decode_attention(std::vector<__nv_bfloat16> &out,
       }
     }
   }
+}
+
+void run_sliding_decode_prep_cache_case() {
+  Gemma4KvCacheConfig config = {
+      2,
+      12,
+      4,
+      4,
+      GEMMA4_SLIDING_KV_HEADS,
+      GEMMA4_SLIDING_HEAD_DIM,
+      8,
+  };
+  int batch_size = 2;
+  int layer = 1;
+  std::vector<int32_t> token_position = {5, 11};
+  std::vector<int32_t> page_table(batch_size * config.max_pages_per_seq, -1);
+  page_table[gemma4_kv_cache_page_slot(config, token_position[0])] = 3;
+  page_table[config.max_pages_per_seq +
+             gemma4_kv_cache_page_slot(config, token_position[1])] = 7;
+
+  std::vector<__nv_bfloat16> q(batch_size * GEMMA4_NUM_QUERY_HEADS *
+                               GEMMA4_SLIDING_HEAD_DIM);
+  std::vector<__nv_bfloat16> k(batch_size * GEMMA4_SLIDING_KV_HEADS *
+                               GEMMA4_SLIDING_HEAD_DIM);
+  std::vector<__nv_bfloat16> v(k.size());
+  std::vector<__nv_bfloat16> q_weight(GEMMA4_SLIDING_HEAD_DIM);
+  std::vector<__nv_bfloat16> k_weight(GEMMA4_SLIDING_HEAD_DIM);
+  std::vector<float> cos((token_position[1] + 1) *
+                         (GEMMA4_SLIDING_HEAD_DIM / 2));
+  std::vector<float> sin(cos.size());
+
+  for (int i = 0; i < static_cast<int>(q.size()); ++i) q[i] = make_value(12000 + i);
+  for (int i = 0; i < static_cast<int>(k.size()); ++i) {
+    k[i] = make_value(22000 + i);
+    v[i] = make_value(32000 + i);
+  }
+  for (int d = 0; d < GEMMA4_SLIDING_HEAD_DIM; ++d) {
+    q_weight[d] = __float2bfloat16_rn(0.75f + 0.001f * float(d % 23));
+    k_weight[d] = __float2bfloat16_rn(0.95f - 0.001f * float(d % 19));
+  }
+  fill_sliding_rope_tables(cos, sin, token_position[1] + 1);
+
+  std::vector<__nv_bfloat16> expected_q(q.size());
+  std::vector<__nv_bfloat16> expected_cache_k(cache_elements(config));
+  std::vector<__nv_bfloat16> expected_cache_v(cache_elements(config));
+  for (int b = 0; b < batch_size; ++b) {
+    int pos = token_position[b];
+    int slot = gemma4_kv_cache_page_slot(config, pos);
+    int page = page_table[b * config.max_pages_per_seq + slot];
+    int page_offset = gemma4_kv_cache_page_offset(config, pos);
+    for (int h = 0; h < GEMMA4_NUM_QUERY_HEADS; ++h) {
+      reference_sliding_weighted_rope_head(
+          expected_q, sliding_q_offset(b, h, 0), q,
+          sliding_q_offset(b, h, 0), q_weight, cos, sin, pos);
+    }
+    for (int h = 0; h < GEMMA4_SLIDING_KV_HEADS; ++h) {
+      int64_t cache_base =
+          gemma4_kv_cache_offset(config, layer, page, page_offset, h, 0);
+      reference_sliding_weighted_rope_head(
+          expected_cache_k, cache_base, k, sliding_kv_offset(b, h, 0),
+          k_weight, cos, sin, pos);
+      reference_sliding_scale_head(expected_cache_v, cache_base, v,
+                                   sliding_kv_offset(b, h, 0));
+    }
+  }
+
+  __nv_bfloat16 *d_q = nullptr;
+  __nv_bfloat16 *d_k = nullptr;
+  __nv_bfloat16 *d_v = nullptr;
+  __nv_bfloat16 *d_q_prepared = nullptr;
+  __nv_bfloat16 *d_cache_k = nullptr;
+  __nv_bfloat16 *d_cache_v = nullptr;
+  __nv_bfloat16 *d_q_weight = nullptr;
+  __nv_bfloat16 *d_k_weight = nullptr;
+  int32_t *d_page_table = nullptr;
+  int32_t *d_token_position = nullptr;
+  float *d_cos = nullptr;
+  float *d_sin = nullptr;
+  CHECK_CUDA(cudaMalloc(&d_q, q.size() * sizeof(*d_q)));
+  CHECK_CUDA(cudaMalloc(&d_k, k.size() * sizeof(*d_k)));
+  CHECK_CUDA(cudaMalloc(&d_v, v.size() * sizeof(*d_v)));
+  CHECK_CUDA(cudaMalloc(&d_q_prepared, q.size() * sizeof(*d_q_prepared)));
+  CHECK_CUDA(cudaMalloc(&d_cache_k, cache_elements(config) * sizeof(*d_cache_k)));
+  CHECK_CUDA(cudaMalloc(&d_cache_v, cache_elements(config) * sizeof(*d_cache_v)));
+  CHECK_CUDA(cudaMalloc(&d_q_weight, q_weight.size() * sizeof(*d_q_weight)));
+  CHECK_CUDA(cudaMalloc(&d_k_weight, k_weight.size() * sizeof(*d_k_weight)));
+  CHECK_CUDA(cudaMalloc(&d_page_table, page_table.size() * sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc(&d_token_position,
+                        token_position.size() * sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc(&d_cos, cos.size() * sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_sin, sin.size() * sizeof(float)));
+  CHECK_CUDA(cudaMemset(d_q_prepared, 0, q.size() * sizeof(*d_q_prepared)));
+  CHECK_CUDA(cudaMemset(d_cache_k, 0, cache_elements(config) * sizeof(*d_cache_k)));
+  CHECK_CUDA(cudaMemset(d_cache_v, 0, cache_elements(config) * sizeof(*d_cache_v)));
+  CHECK_CUDA(cudaMemcpy(d_q, q.data(), q.size() * sizeof(q[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k, k.data(), k.size() * sizeof(k[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_v, v.data(), v.size() * sizeof(v[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_q_weight, q_weight.data(),
+                        q_weight.size() * sizeof(q_weight[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k_weight, k_weight.data(),
+                        k_weight.size() * sizeof(k_weight[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_page_table, page_table.data(),
+                        page_table.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_token_position, token_position.data(),
+                        token_position.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(), cos.size() * sizeof(float),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(), sin.size() * sizeof(float),
+                        cudaMemcpyHostToDevice));
+
+  CHECK_CUDA(gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_bf16(
+      d_q_prepared, d_cache_k, d_cache_v, config, d_page_table,
+      d_token_position, batch_size, layer, d_q, d_k, d_v, d_q_weight,
+      d_k_weight, d_cos, d_sin, 0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  std::vector<__nv_bfloat16> actual_q(q.size());
+  std::vector<__nv_bfloat16> actual_cache_k(cache_elements(config));
+  std::vector<__nv_bfloat16> actual_cache_v(cache_elements(config));
+  CHECK_CUDA(cudaMemcpy(actual_q.data(), d_q_prepared,
+                        actual_q.size() * sizeof(actual_q[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(actual_cache_k.data(), d_cache_k,
+                        actual_cache_k.size() * sizeof(actual_cache_k[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(actual_cache_v.data(), d_cache_v,
+                        actual_cache_v.size() * sizeof(actual_cache_v[0]),
+                        cudaMemcpyDeviceToHost));
+  compare_bf16(actual_q, expected_q, 0.03125f, "sliding decode prepared Q");
+  compare_bf16(actual_cache_k, expected_cache_k, 0.03125f,
+               "sliding decode cache K");
+  compare_bf16(actual_cache_v, expected_cache_v, 0.015625f,
+               "sliding decode cache V");
+
+  CHECK_CUDA(cudaFree(d_sin));
+  CHECK_CUDA(cudaFree(d_cos));
+  CHECK_CUDA(cudaFree(d_token_position));
+  CHECK_CUDA(cudaFree(d_page_table));
+  CHECK_CUDA(cudaFree(d_k_weight));
+  CHECK_CUDA(cudaFree(d_q_weight));
+  CHECK_CUDA(cudaFree(d_cache_v));
+  CHECK_CUDA(cudaFree(d_cache_k));
+  CHECK_CUDA(cudaFree(d_q_prepared));
+  CHECK_CUDA(cudaFree(d_v));
+  CHECK_CUDA(cudaFree(d_k));
+  CHECK_CUDA(cudaFree(d_q));
 }
 
 void run_address_case() {
@@ -437,6 +667,7 @@ void run_sliding_wrap_case() {
 
 int main() {
   run_address_case();
+  run_sliding_decode_prep_cache_case();
   run_global_write_and_attention_case();
   run_sliding_wrap_case();
   std::puts("kv cache tests passed");

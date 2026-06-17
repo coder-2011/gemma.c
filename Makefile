@@ -69,7 +69,7 @@ $(BUILD_DIR)/gemma4_rmsnorm.o: src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/
 $(BUILD_DIR)/gemma4_rope.o: src/gemma4_rope.cu src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -c src/gemma4_rope.cu -o $@
 
-$(BUILD_DIR)/gemma4_flash_attention.o: src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
+$(BUILD_DIR)/gemma4_flash_attention.o: src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) -c src/gemma4_flash_attention.cu -o $@
 
 $(BUILD_DIR)/gemma4_ffn_decode.o: src/gemma4_ffn_decode.cu src/gemma4_ffn_decode.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
@@ -78,7 +78,7 @@ $(BUILD_DIR)/gemma4_ffn_decode.o: src/gemma4_ffn_decode.cu src/gemma4_ffn_decode
 $(BUILD_DIR)/gemma4_kv_cache.o: src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -c src/gemma4_kv_cache.cu -o $@
 
-$(BUILD_DIR)/libgemma4_flash_attention.so: src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
+$(BUILD_DIR)/libgemma4_flash_attention.so: src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) -Xcompiler -fPIC -shared $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) src/gemma4_flash_attention.cu -o $@
 
 $(BUILD_DIR)/libgemma4_flash_attention_reference.so: src/experiments/gemma4_flash_attention_reference.cu src/gemma4.h $(FLASH_ATTN_SRC_DIR)/flash_fwd_hdim256_bf16_sm80.cu | $(BUILD_DIR)
@@ -114,7 +114,7 @@ $(BUILD_DIR)/experiments/gemma4_ffn_cudnn_bench: src/experiments/gemma4_ffn_cudn
 $(BUILD_DIR)/experiments/gemma4_ffn_decode_load_bench: src/experiments/gemma4_ffn_decode_load_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_ffn_decode.cu src/gemma4_ffn_decode.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/experiments/gemma4_ffn_decode_load_bench.cu src/gemma4_ffn_decode.cu -o $@
 
-$(BUILD_DIR)/experiments/gemma4_flash_attention_bench: src/experiments/gemma4_flash_attention_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
+$(BUILD_DIR)/experiments/gemma4_flash_attention_bench: src/experiments/gemma4_flash_attention_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
 	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) src/experiments/gemma4_flash_attention_bench.cu src/gemma4_flash_attention.cu -o $@
 
 $(BUILD_DIR)/experiments/gemma4_kv_cache_bench: src/experiments/gemma4_kv_cache_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/experiments
@@ -144,8 +144,8 @@ $(BUILD_DIR)/tests/test_rope: tests/test_rope.cu src/gemma4_rope.cu src/gemma4_r
 $(BUILD_DIR)/tests/test_ffn_decode: tests/test_ffn_decode.cu src/gemma4_ffn_decode.cu src/gemma4_ffn_decode.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_ffn_decode.cu src/gemma4_ffn_decode.cu -o $@
 
-$(BUILD_DIR)/tests/test_kv_cache: tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/tests
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4.cpp -o $@
+$(BUILD_DIR)/tests/test_kv_cache: tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/tests
+	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4.cpp -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)

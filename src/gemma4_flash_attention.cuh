@@ -6,6 +6,8 @@
 
 #include <stddef.h>
 
+#include "gemma4_kv_cache.cuh"
+
 extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     __nv_bfloat16 *__restrict__ d_out,
     // Optional. Pass nullptr for inference paths that do not need LSE.
@@ -39,6 +41,24 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     int seqlen_k,
     int window_left,
     float softmax_scale,
+    cudaStream_t stream);
+
+extern "C" cudaError_t gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_bf16(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_cache_k,
+    __nv_bfloat16 *__restrict__ d_cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_token_position,
+    int32_t batch_size,
+    int32_t cache_layer,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
     cudaStream_t stream);
 
 extern "C" size_t gemma4_flash_attention_sliding_smem_bytes();

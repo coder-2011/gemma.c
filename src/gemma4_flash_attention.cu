@@ -1051,6 +1051,16 @@ bool gemma4_fa_valid_sliding_args(
          window_left >= 0;
 }
 
+bool gemma4_fa_valid_sliding_cache_config(
+    const Gemma4KvCacheConfig &config,
+    int32_t cache_layer) {
+  return cache_layer >= 0 && cache_layer < config.num_layers &&
+         config.num_layers > 0 && config.num_pages > 0 &&
+         config.page_size > 0 && config.max_pages_per_seq > 0 &&
+         config.num_heads == GEMMA4_SLIDING_KV_HEADS &&
+         config.head_dim == GEMMA4_SLIDING_HEAD_DIM;
+}
+
 // Dynamic shared memory exceeds the default limit for these FA tiles, so the
 // selected kernel must opt in before launch or attribute introspection.
 template <typename KernelTraits, bool IsLocal, bool ReturnLse>
@@ -1241,6 +1251,76 @@ void gemma4_sliding_qkv_norm_rope_kernel(
   }
 }
 
+// Convert a decode token position into the Layout-A paged-cache row for one KV
+// head. Page allocation stays on the host/runtime side; this kernel only writes
+// if the page table already maps the requested position.
+__device__ __forceinline__ int64_t sliding_decode_cache_head_offset(
+    const Gemma4KvCacheConfig &config,
+    const int32_t *__restrict__ page_table,
+    int batch,
+    int position,
+    int cache_layer,
+    int head) {
+  const int slot = gemma4_kv_cache_page_slot(config, position);
+  const int physical_page =
+      __ldg(page_table + batch * config.max_pages_per_seq + slot);
+  if (physical_page < 0 || physical_page >= config.num_pages) return -1;
+  const int page_offset = gemma4_kv_cache_page_offset(config, position);
+  return gemma4_kv_cache_offset(
+      config, cache_layer, physical_page, page_offset, head, 0);
+}
+
+// Decode prep path: one token per batch. Q is prepared into a compact
+// [batch, 32, 256] buffer for paged decode attention, while K/V are normalized,
+// RoPE'd where needed, and written straight to the Layout-A paged cache.
+__global__ __launch_bounds__(kSlidingNormRopeThreads)
+void gemma4_sliding_decode_q_paged_kv_norm_rope_kernel(
+    __nv_bfloat16 *__restrict__ q_prepared,
+    __nv_bfloat16 *__restrict__ cache_k,
+    __nv_bfloat16 *__restrict__ cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ page_table,
+    const int32_t *__restrict__ token_position,
+    int cache_layer,
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
+    const __nv_bfloat16 *__restrict__ q_norm_weight,
+    const __nv_bfloat16 *__restrict__ k_norm_weight,
+    const float *__restrict__ cos,
+    const float *__restrict__ sin) {
+  constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
+  constexpr int kKvHeads = GEMMA4_SLIDING_KV_HEADS;
+  constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
+  constexpr int kRotaryHalf = kHeadDim / 2;
+
+  const int batch = blockIdx.x;
+  const int lane = threadIdx.x & (kWarpSize - 1);
+  const int warp = threadIdx.x / kWarpSize;
+  const int head = blockIdx.y * kSlidingNormRopeHeadsPerBlock + warp;
+  if (head >= kQHeads) return;
+
+  const int position = __ldg(token_position + batch);
+  if (position < 0) return;
+  const float *cos_row = cos + int64_t(position) * kRotaryHalf;
+  const float *sin_row = sin + int64_t(position) * kRotaryHalf;
+
+  const int64_t q_offset = (int64_t(batch) * kQHeads + head) * kHeadDim;
+  sliding_prep_weighted_rope_head(q_prepared + q_offset, q + q_offset,
+                                  q_norm_weight, cos_row, sin_row, lane);
+
+  // Only KV heads have cache rows; the remaining query-head warps are done.
+  if (head >= kKvHeads) return;
+  const int64_t cache_offset = sliding_decode_cache_head_offset(
+      cache_config, page_table, batch, position, cache_layer, head);
+  if (cache_offset < 0) return;
+
+  const int64_t kv_offset = (int64_t(batch) * kKvHeads + head) * kHeadDim;
+  sliding_prep_weighted_rope_head(cache_k + cache_offset, k + kv_offset,
+                                  k_norm_weight, cos_row, sin_row, lane);
+  sliding_prep_scale_head(cache_v + cache_offset, v + kv_offset, lane);
+}
+
 // Launch the prefill Q/K/V preparation kernel after validating the raw and
 // prepared buffers.
 cudaError_t prepare_sliding_qkv_norm_rope(
@@ -1274,6 +1354,49 @@ cudaError_t prepare_sliding_qkv_norm_rope(
   gemma4_sliding_qkv_norm_rope_kernel<<<grid_dim, block_dim, 0, stream>>>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, seq_len);
+  return cudaGetLastError();
+}
+
+// Launch the decode prep-cache kernel. This is intentionally only the current
+// token path: prefill still keeps contiguous K/V for FA, while decode consumes
+// the paged cache through split-KV attention.
+cudaError_t prepare_sliding_decode_q_paged_kv_norm_rope(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_cache_k,
+    __nv_bfloat16 *__restrict__ d_cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_token_position,
+    int32_t batch_size,
+    int32_t cache_layer,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    cudaStream_t stream) {
+  if (d_q_prepared == nullptr || d_cache_k == nullptr ||
+      d_cache_v == nullptr || d_page_table == nullptr ||
+      d_token_position == nullptr || d_q == nullptr || d_k == nullptr ||
+      d_v == nullptr || d_q_norm_weight == nullptr ||
+      d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr ||
+      batch_size <= 0 ||
+      !gemma4_fa_valid_sliding_cache_config(cache_config, cache_layer)) {
+    return cudaErrorInvalidValue;
+  }
+
+  constexpr int kHeadGroups =
+      (GEMMA4_NUM_QUERY_HEADS + kSlidingNormRopeHeadsPerBlock - 1) /
+      kSlidingNormRopeHeadsPerBlock;
+  // grid.x = batch, grid.y = group of 8 heads. Each warp owns one head.
+  const dim3 grid_dim(batch_size, kHeadGroups);
+  constexpr dim3 block_dim(kSlidingNormRopeThreads);
+  gemma4_sliding_decode_q_paged_kv_norm_rope_kernel<<<grid_dim, block_dim, 0, stream>>>(
+      d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
+      d_token_position, cache_layer, d_q, d_k, d_v, d_q_norm_weight,
+      d_k_norm_weight, d_cos, d_sin);
   return cudaGetLastError();
 }
 
@@ -1381,6 +1504,32 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
           d_out, d_softmax_lse, d_q_prepared, d_k_prepared, d_v_prepared,
           seqlen_q, seqlen_k, window_left, softmax_scale);
   return gemma4_flash_attention::launch_sliding(params, batch_size, stream);
+}
+
+// Gemma sliding decode prep-cache helper: Q gets learned RMSNorm+RoPE into the
+// current-token attention buffer; K gets learned RMSNorm+RoPE into the paged
+// cache; V gets scale-free RMSNorm into the same paged cache page.
+extern "C" cudaError_t gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_bf16(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_cache_k,
+    __nv_bfloat16 *__restrict__ d_cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_token_position,
+    int32_t batch_size,
+    int32_t cache_layer,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    cudaStream_t stream) {
+  return gemma4_flash_attention::prepare_sliding_decode_q_paged_kv_norm_rope(
+      d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
+      d_token_position, batch_size, cache_layer, d_q, d_k, d_v,
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
 }
 
 // Expose launch metadata so tests and benchmarks can sanity-check occupancy and
