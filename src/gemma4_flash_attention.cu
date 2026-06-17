@@ -531,10 +531,10 @@ struct Gemma4FlashSoftmax {
   }
 };
 
-// Sliding-window causal mask for local Gemma layers. Each logical score is set
-// to -inf unless its key column is both causal and within window_size_left.
-template <typename Engine, typename Layout>
-__forceinline__ __device__ void gemma4_apply_local_sliding_mask(
+// Score mask for Gemma's causal attention variants. Local layers additionally
+// clamp the visible keys to the sliding window.
+template <bool IsLocal, typename Engine, typename Layout>
+__forceinline__ __device__ void gemma4_apply_score_mask(
     Tensor<Engine, Layout> &tensor_,
     const int col_idx_offset_,
     const int row_idx_offset,
@@ -553,7 +553,6 @@ __forceinline__ __device__ void gemma4_apply_local_sliding_mask(
     for (int i = 0; i < size<0, 0>(tensor); ++i) {
       const int row_idx = row_idx_base + i * 8;
       const int key_row = row_idx + max_seqlen_k - max_seqlen_q;
-      const int left = std::max(0, key_row - window_size_left);
       const int right = std::min(max_seqlen_k, key_row + 1);
 #pragma unroll
       for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
@@ -561,46 +560,12 @@ __forceinline__ __device__ void gemma4_apply_local_sliding_mask(
 #pragma unroll
         for (int j = 0; j < size<1, 0>(tensor); ++j) {
           const int col_idx = col_idx_base + j;
-          // Keep only causal keys inside the local sliding window.
-          if (col_idx >= right || col_idx < left) {
-            tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+          bool masked = col_idx >= right;
+          if constexpr (IsLocal) {
+            const int left = std::max(0, key_row - window_size_left);
+            masked = masked || col_idx < left;
           }
-        }
-      }
-    }
-  }
-}
-
-// Full causal mask for global Gemma layers. This permits every previous key and
-// blocks future keys, with seqlen_q/seqlen_k offset handling for decode.
-template <typename Engine, typename Layout>
-__forceinline__ __device__ void gemma4_apply_causal_mask(
-    Tensor<Engine, Layout> &tensor_,
-    const int col_idx_offset_,
-    const int row_idx_offset,
-    const int warp_row_stride,
-    const int max_seqlen_k,
-    const int max_seqlen_q) {
-  Tensor tensor = make_tensor(tensor_.data(), gemma4_fa_acc_rowcol(tensor_.layout()));
-  const int lane_id = threadIdx.x % kWarpSize;
-  // Each lane owns two adjacent logical columns in the FA2 accumulator view.
-  const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
-#pragma unroll
-  for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
-    const int row_idx_base = row_idx_offset + mi * warp_row_stride;
-#pragma unroll
-    for (int i = 0; i < size<0, 0>(tensor); ++i) {
-      const int row_idx = row_idx_base + i * 8;
-      const int key_row = row_idx + max_seqlen_k - max_seqlen_q;
-      const int right = std::min(max_seqlen_k, key_row + 1);
-#pragma unroll
-      for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-        const int col_idx_base = col_idx_offset + nj * 8;
-#pragma unroll
-        for (int j = 0; j < size<1, 0>(tensor); ++j) {
-          const int col_idx = col_idx_base + j;
-          // Full attention only masks future keys.
-          if (col_idx >= right) {
+          if (masked) {
             tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
           }
         }
@@ -645,6 +610,26 @@ __device__ __forceinline__ bool gemma4_local_block_fully_visible(
   const int latest_key_row = row_idx_offset + valid_rows - 1 + seqlen_delta;
   const int latest_left = std::max(0, latest_key_row - window_size_left);
   return col_idx_offset >= latest_left;
+}
+
+template <bool IsLocal>
+__device__ __forceinline__ bool gemma4_score_block_fully_visible(
+    int col_idx_offset,
+    int block_n,
+    int row_idx_offset,
+    int valid_rows,
+    int seqlen_delta,
+    int max_seqlen_k,
+    int window_size_left) {
+  if constexpr (IsLocal) {
+    return gemma4_local_block_fully_visible(
+        col_idx_offset, block_n, row_idx_offset, valid_rows, seqlen_delta,
+        max_seqlen_k, window_size_left);
+  } else {
+    return gemma4_causal_block_fully_visible(
+        col_idx_offset, block_n, row_idx_offset, valid_rows, seqlen_delta,
+        max_seqlen_k);
+  }
 }
 
 // Build a [BlockM] tile view into the softmax log-sum-exp output for one
@@ -857,27 +842,14 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     // Boundary blocks need either sliding-window or full-causal masking before
     // their scores enter the online softmax.
     const int score_col_offset = n_block * kBlockN;
-    bool score_block_fully_visible = false;
-    if constexpr (IsLocal) {
-      score_block_fully_visible = gemma4_local_block_fully_visible(
-          score_col_offset, kBlockN, q_tile_start, valid_q_rows, seqlen_delta,
-          params.seqlen_k, params.window_size_left);
-    } else {
-      score_block_fully_visible = gemma4_causal_block_fully_visible(
-          score_col_offset, kBlockN, q_tile_start, valid_q_rows, seqlen_delta,
-          params.seqlen_k);
-    }
-
+    const bool score_block_fully_visible =
+        gemma4_score_block_fully_visible<IsLocal>(
+            score_col_offset, kBlockN, q_tile_start, valid_q_rows,
+            seqlen_delta, params.seqlen_k, params.window_size_left);
     if (!score_block_fully_visible) {
-      if constexpr (IsLocal) {
-        gemma4_apply_local_sliding_mask(
-            acc_s, score_col_offset, mask_row_offset, kWarpRowStride,
-            params.seqlen_k, params.seqlen_q, params.window_size_left);
-      } else {
-        gemma4_apply_causal_mask(
-            acc_s, score_col_offset, mask_row_offset, kWarpRowStride,
-            params.seqlen_k, params.seqlen_q);
-      }
+      gemma4_apply_score_mask<IsLocal>(
+          acc_s, score_col_offset, mask_row_offset, kWarpRowStride,
+          params.seqlen_k, params.seqlen_q, params.window_size_left);
     }
 
     gemma4_fa_cp_async_wait<0>();
@@ -898,8 +870,12 @@ inline __device__ void gemma4_compute_attn_1rowblock(
 
     // Convert probabilities to BF16 and multiply by V, accumulating O in FP32.
     Tensor rP = gemma4_fa_convert_type<Element>(acc_s);
-    Tensor tOrP = make_tensor(rP.data(), gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
-    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V);
+    Tensor tOrP = make_tensor(
+        rP.data(),
+        gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
+    gemma4_fa_gemm_rs(
+        acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V,
+        smem_thr_copy_V);
 
     if (kMaskingSteps > 1 && n_block <= n_block_min) {
       --n_block;
@@ -930,11 +906,12 @@ inline __device__ void gemma4_compute_attn_1rowblock(
 
     if constexpr (IsLocal) {
       const int score_col_offset = n_block * kBlockN;
-      const bool score_block_fully_visible = gemma4_local_block_fully_visible(
-          score_col_offset, kBlockN, q_tile_start, valid_q_rows, seqlen_delta,
-          params.seqlen_k, params.window_size_left);
+      const bool score_block_fully_visible =
+          gemma4_score_block_fully_visible<IsLocal>(
+              score_col_offset, kBlockN, q_tile_start, valid_q_rows,
+              seqlen_delta, params.seqlen_k, params.window_size_left);
       if (!score_block_fully_visible) {
-        gemma4_apply_local_sliding_mask(
+        gemma4_apply_score_mask<IsLocal>(
             acc_s, score_col_offset, mask_row_offset, kWarpRowStride,
             params.seqlen_k, params.seqlen_q, params.window_size_left);
       }
@@ -948,8 +925,12 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     // The score accumulator now holds probabilities, so it can serve as the A
     // operand for the P*V tensor-core multiply.
     Tensor rP = gemma4_fa_convert_type<Element>(acc_s);
-    Tensor tOrP = make_tensor(rP.data(), gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
-    gemma4_fa_gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V, smem_thr_copy_V);
+    Tensor tOrP = make_tensor(
+        rP.data(),
+        gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
+    gemma4_fa_gemm_rs(
+        acc_o, tOrP, tOrVt, tOsVt, tiled_mma_pv, smem_tiled_copy_V,
+        smem_thr_copy_V);
   }
 
   // Finalize O = softmax(QK^T)V and store through shared memory so the MMA
@@ -1042,6 +1023,32 @@ Gemma4FlashFwdParams make_params(
   params.scale_softmax_log2 = softmax_scale * float(M_LOG2E);
   params.window_size_left = window_left;
   return params;
+}
+
+bool gemma4_fa_valid_qkv_args(
+    const void *d_out,
+    const void *d_q,
+    const void *d_k,
+    const void *d_v,
+    int batch_size,
+    int seqlen_q,
+    int seqlen_k) {
+  return d_out != nullptr && d_q != nullptr && d_k != nullptr &&
+         d_v != nullptr && batch_size > 0 && seqlen_q > 0 && seqlen_k > 0;
+}
+
+bool gemma4_fa_valid_sliding_args(
+    const void *d_out,
+    const void *d_q,
+    const void *d_k,
+    const void *d_v,
+    int batch_size,
+    int seqlen_q,
+    int seqlen_k,
+    int window_left) {
+  return gemma4_fa_valid_qkv_args(
+             d_out, d_q, d_k, d_v, batch_size, seqlen_q, seqlen_k) &&
+         window_left >= 0;
 }
 
 // Dynamic shared memory exceeds the default limit for these FA tiles, so the
@@ -1312,13 +1319,9 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     cudaStream_t stream) {
   // Public C ABI boundary: reject invalid pointers and dimensions before the
   // kernel can touch device memory.
-  if (d_out == nullptr || d_q == nullptr || d_k == nullptr || d_v == nullptr) {
-    return cudaErrorInvalidValue;
-  }
-  if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0) {
-    return cudaErrorInvalidValue;
-  }
-  if (window_left < 0) {
+  if (!gemma4_flash_attention::gemma4_fa_valid_sliding_args(
+          d_out, d_q, d_k, d_v, batch_size, seqlen_q, seqlen_k,
+          window_left)) {
     return cudaErrorInvalidValue;
   }
 
@@ -1353,13 +1356,12 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     cudaStream_t stream) {
   // Public C ABI boundary: all raw inputs, scratch outputs, norm weights, and
   // RoPE tables are required for the fused prefill helper.
-  if (d_out == nullptr || d_q_prepared == nullptr || d_k_prepared == nullptr ||
-      d_v_prepared == nullptr || d_q == nullptr || d_k == nullptr ||
-      d_v == nullptr || d_q_norm_weight == nullptr ||
+  if (!gemma4_flash_attention::gemma4_fa_valid_sliding_args(
+          d_out, d_q, d_k, d_v, batch_size, seqlen_q, seqlen_k,
+          window_left) ||
+      d_q_prepared == nullptr || d_k_prepared == nullptr ||
+      d_v_prepared == nullptr || d_q_norm_weight == nullptr ||
       d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr) {
-    return cudaErrorInvalidValue;
-  }
-  if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0 || window_left < 0) {
     return cudaErrorInvalidValue;
   }
   // ponytail: prefill-only until the paged decode cache lands; decode should
@@ -1416,10 +1418,8 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16(
     cudaStream_t stream) {
   // Public C ABI boundary: global attention expects already-prepared Q/K/V
   // tensors in the fixed Gemma batch-major layout.
-  if (d_out == nullptr || d_q == nullptr || d_k == nullptr || d_v == nullptr) {
-    return cudaErrorInvalidValue;
-  }
-  if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0) {
+  if (!gemma4_flash_attention::gemma4_fa_valid_qkv_args(
+          d_out, d_q, d_k, d_v, batch_size, seqlen_q, seqlen_k)) {
     return cudaErrorInvalidValue;
   }
 
