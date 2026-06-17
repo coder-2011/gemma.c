@@ -266,6 +266,42 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_reduce_kernel(
   }
 }
 
+template <int BlockThreads>
+cudaError_t launch_paged_decode_attention(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_partial_m,
+    float *__restrict__ d_partial_l,
+    float *__restrict__ d_partial_acc,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_cache_k,
+    const __nv_bfloat16 *__restrict__ d_cache_v,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_seq_lengths,
+    Gemma4KvCacheConfig config,
+    int32_t layer,
+    int32_t batch_size,
+    int32_t q_heads,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits,
+    cudaStream_t stream) {
+  dim3 split_grid(batch_size, q_heads, num_splits);
+  paged_decode_split_kernel<BlockThreads>
+      <<<split_grid, BlockThreads, 0, stream>>>(
+          d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k, d_cache_v,
+          d_page_table, d_seq_lengths, config, layer, q_heads, softmax_scale,
+          split_size, num_splits);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+
+  dim3 reduce_grid(batch_size, q_heads);
+  paged_decode_reduce_kernel<BlockThreads>
+      <<<reduce_grid, BlockThreads, 0, stream>>>(
+          d_out, d_partial_m, d_partial_l, d_partial_acc, batch_size, q_heads,
+          config.head_dim, num_splits);
+  return cudaGetLastError();
+}
+
 }  // namespace
 
 int32_t Gemma4KvPageAllocator::allocate() {
@@ -465,31 +501,16 @@ cudaError_t gemma4_paged_decode_attention_bf16(
     return cudaErrorInvalidValue;
   }
 
-  int threads = attention_threads_for_head_dim(config.head_dim);
-  dim3 split_grid(batch_size, q_heads, num_splits);
-  if (threads == 256) {
-    paged_decode_split_kernel<256><<<split_grid, 256, 0, stream>>>(
-        d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k, d_cache_v,
-        d_page_table, d_seq_lengths, config, layer, q_heads, softmax_scale,
-        split_size, num_splits);
-  } else {
-    paged_decode_split_kernel<512><<<split_grid, 512, 0, stream>>>(
-        d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k, d_cache_v,
-        d_page_table, d_seq_lengths, config, layer, q_heads, softmax_scale,
-        split_size, num_splits);
-  }
-  cudaError_t status = cudaGetLastError();
-  if (status != cudaSuccess) return status;
-
-  dim3 reduce_grid(batch_size, q_heads);
-  if (threads == 256) {
-    paged_decode_reduce_kernel<256><<<reduce_grid, 256, 0, stream>>>(
-        d_out, d_partial_m, d_partial_l, d_partial_acc, batch_size, q_heads,
-        config.head_dim, num_splits);
-  } else {
-    paged_decode_reduce_kernel<512><<<reduce_grid, 512, 0, stream>>>(
-        d_out, d_partial_m, d_partial_l, d_partial_acc, batch_size, q_heads,
-        config.head_dim, num_splits);
-  }
-  return cudaGetLastError();
+  const int threads = attention_threads_for_head_dim(config.head_dim);
+  return threads == 256
+             ? launch_paged_decode_attention<256>(
+                   d_out, d_partial_m, d_partial_l, d_partial_acc, d_q,
+                   d_cache_k, d_cache_v, d_page_table, d_seq_lengths, config,
+                   layer, batch_size, q_heads, softmax_scale, split_size,
+                   num_splits, stream)
+             : launch_paged_decode_attention<512>(
+                   d_out, d_partial_m, d_partial_l, d_partial_acc, d_q,
+                   d_cache_k, d_cache_v, d_page_table, d_seq_lengths, config,
+                   layer, batch_size, q_heads, softmax_scale, split_size,
+                   num_splits, stream);
 }
