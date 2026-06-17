@@ -1,0 +1,140 @@
+#ifndef GEMMA4_KV_CACHE_CUH
+#define GEMMA4_KV_CACHE_CUH
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include <stddef.h>
+#include <stdint.h>
+#include <vector>
+
+struct Gemma4KvCacheConfig {
+  int32_t num_layers;
+  int32_t num_pages;
+  int32_t page_size;
+  int32_t max_pages_per_seq;
+  int32_t num_heads;
+  int32_t head_dim;
+  int32_t window_size;
+};
+
+struct Gemma4KvPageAllocator {
+  int32_t page_count = 0;
+  int32_t next_page = 0;
+  std::vector<int32_t> free_pages;
+
+  explicit Gemma4KvPageAllocator(int32_t page_count_ = 0)
+      : page_count(page_count_) {}
+
+  int32_t allocate();
+  void release(int32_t page);
+  void reset();
+};
+
+__host__ __device__ inline int64_t gemma4_kv_cache_offset(
+    const Gemma4KvCacheConfig &config,
+    int32_t layer,
+    int32_t physical_page,
+    int32_t page_offset,
+    int32_t head,
+    int32_t dim) {
+  return (((((int64_t)layer * config.num_pages + physical_page) * config.page_size + page_offset) *
+           config.num_heads + head) * config.head_dim + dim);
+}
+
+__host__ __device__ inline int32_t gemma4_kv_cache_logical_page(
+    const Gemma4KvCacheConfig &config,
+    int32_t position) {
+  return position / config.page_size;
+}
+
+__host__ __device__ inline int32_t gemma4_kv_cache_page_offset(
+    const Gemma4KvCacheConfig &config,
+    int32_t position) {
+  return position % config.page_size;
+}
+
+__host__ __device__ inline int32_t gemma4_kv_cache_page_slot(
+    const Gemma4KvCacheConfig &config,
+    int32_t position) {
+  int32_t logical_page = gemma4_kv_cache_logical_page(config, position);
+  return logical_page % config.max_pages_per_seq;
+}
+
+Gemma4KvCacheConfig gemma4_kv_cache_make_config(bool global,
+                                                int32_t num_pages,
+                                                int32_t page_size,
+                                                int32_t max_pages_per_seq);
+
+int32_t gemma4_kv_cache_layer_index(int32_t model_layer, bool global_cache);
+
+int32_t gemma4_kv_cache_ensure_page(
+    std::vector<int32_t> &page_table,
+    std::vector<int32_t> &slot_logical_pages,
+    Gemma4KvPageAllocator &allocator,
+    const Gemma4KvCacheConfig &config,
+    int32_t batch_size,
+    int32_t batch,
+    int32_t position);
+
+int32_t gemma4_kv_cache_ensure_range(
+    std::vector<int32_t> &page_table,
+    std::vector<int32_t> &slot_logical_pages,
+    Gemma4KvPageAllocator &allocator,
+    const Gemma4KvCacheConfig &config,
+    int32_t batch_size,
+    int32_t batch,
+    int32_t first_position,
+    int32_t token_count);
+
+int32_t gemma4_kv_cache_append_position(
+    std::vector<int32_t> &page_table,
+    std::vector<int32_t> &slot_logical_pages,
+    std::vector<int32_t> &seq_lengths,
+    Gemma4KvPageAllocator &allocator,
+    const Gemma4KvCacheConfig &config,
+    int32_t batch_size,
+    int32_t batch);
+
+size_t gemma4_paged_decode_partial_m_elements(int32_t batch_size,
+                                              int32_t q_heads,
+                                              int32_t num_splits);
+
+size_t gemma4_paged_decode_partial_acc_elements(int32_t batch_size,
+                                                int32_t q_heads,
+                                                int32_t num_splits,
+                                                int32_t head_dim);
+
+cudaError_t gemma4_kv_cache_write_bf16(
+    __nv_bfloat16 *__restrict__ d_cache_k,
+    __nv_bfloat16 *__restrict__ d_cache_v,
+    Gemma4KvCacheConfig config,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_token_batch,
+    const int32_t *__restrict__ d_token_position,
+    int32_t token_count,
+    int32_t layer,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    cudaStream_t stream);
+
+cudaError_t gemma4_paged_decode_attention_bf16(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_partial_m,
+    float *__restrict__ d_partial_l,
+    float *__restrict__ d_partial_acc,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_cache_k,
+    const __nv_bfloat16 *__restrict__ d_cache_v,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_seq_lengths,
+    Gemma4KvCacheConfig config,
+    int32_t layer,
+    int32_t batch_size,
+    int32_t q_heads,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits,
+    cudaStream_t stream);
+
+#endif
