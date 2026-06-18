@@ -121,6 +121,8 @@ def time_cuda_graph(
 def load_lib(path):
     lib = ctypes.CDLL(path)
 
+    # Keep ctypes signatures explicit so Python graph replay calls the same C ABI
+    # as the C++ benchmark: KV cache write, direct paged decode, and prefill FA.
     kv_write = lib.gemma4_kv_cache_write_bf16
     kv_write.argtypes = [
         ctypes.c_void_p,
@@ -355,6 +357,9 @@ def main():
     decode = make_decode_inputs(args, device)
     config = decode["config"]
     key_count = decode["key_count"]
+
+    # The PyTorch comparison uses only live decode splits. The C++ benchmark has
+    # a separate --extra-splits knob for overprovisioned graph-shape testing.
     num_splits = math.ceil(key_count / args.split_size)
     cache_k = torch.zeros(decode["cache_shape"], device=device, dtype=torch.bfloat16)
     cache_v = torch.zeros_like(cache_k)
@@ -389,6 +394,8 @@ def main():
         "gemma4_kv_cache_write_bf16",
     )
 
+    # Each closure enqueues one benchmarked path on PyTorch's current CUDA
+    # stream. CUDA graph capture below removes Python dispatch from timing.
     def custom_decode_direct():
         check_status(
             decode_direct(
@@ -460,6 +467,8 @@ def main():
 
         flush_buf = None
         if args.cache == "cold":
+            # Touching this buffer before each timed sample evicts the decode
+            # working set from L2 without putting the flush inside the event span.
             flush_buf = torch.empty(
                 (args.flush_mib * 1024 * 1024) // 4,
                 device=device,
@@ -467,6 +476,8 @@ def main():
             )
             flush_buf.zero_()
 
+        # Cold-cache samples replay one path invocation between L2 flushes. Warm
+        # samples capture repeated work per graph replay to improve event timing.
         graph_inner_iters = 1 if args.cache == "cold" else args.iters
         graphs = {
             "decode_custom_direct": make_cuda_graph(custom_decode_direct, graph_inner_iters),

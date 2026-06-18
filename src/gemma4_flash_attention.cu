@@ -1386,6 +1386,9 @@ static_assert(kSlidingDecodeThreads == 256);
 static_assert(kSlidingDecodeGqaRatio == 2);
 static_assert(GEMMA4_SLIDING_HEAD_DIM % kBf16Packed128Elements == 0);
 
+// Online softmax update for one output lane. `m` tracks the running max,
+// `l` tracks the running denominator in that max's scale, and `acc` tracks the
+// V-weighted numerator for the calling thread's head dimension.
 __device__ __forceinline__ void sliding_decode_online_update(
     float score,
     float v_value,
@@ -1418,33 +1421,51 @@ void sliding_decode_paged_grouped_split_kernel(
     float softmax_scale,
     int32_t split_size,
     int32_t num_splits) {
+  // CTA mapping: x=batch row, y=KV head, z=split. Within the CTA, one thread
+  // owns one head-dim lane, so the block-wide reductions cover the full dot.
   const int32_t batch = blockIdx.x;
   const int32_t kv_head = blockIdx.y;
   const int32_t split = blockIdx.z;
   const int32_t dim = threadIdx.x;
+
+  // Sliding layers use 2:1 GQA. This CTA computes both query heads for one KV
+  // head so each K/V cache vector is loaded once and reused for the pair.
   const int32_t q_head0 = kv_head * kSlidingDecodeGqaRatio;
   const int32_t q_head1 = q_head0 + 1;
+
+  // The launch keeps a fixed max `num_splits` for graph compatibility, but
+  // each row can have fewer live splits after applying the sliding window.
   const int32_t seq_len = __ldg(seq_lengths + batch);
   const int32_t first_key = config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
   const int32_t key_count = max(0, seq_len - first_key);
   const int32_t actual_splits = (key_count + split_size - 1) / split_size;
+  // Overprovisioned CTAs must not write neutral scratch; the reducer will also
+  // stop at the same live split count.
   if (split >= actual_splits) return;
 
+  // Keep the partial buffer stride as `num_splits` even though this row only
+  // writes `actual_splits`; that preserves the fixed graph/scratch layout.
   const int32_t split_begin = first_key + split * split_size;
   const int32_t split_end = min(seq_len, split_begin + split_size);
   const int32_t partial0 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head0) * num_splits + split;
   const int32_t partial1 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head1) * num_splits + split;
 
+  // Q is tiny for decode: each thread loads and keeps its two scalar Q lanes in
+  // registers for every key in this split.
   const int64_t q_base0 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head0) * GEMMA4_SLIDING_HEAD_DIM;
   const int64_t q_base1 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head1) * GEMMA4_SLIDING_HEAD_DIM;
   const float q0 = __bfloat162float(loadg(q + q_base0 + dim));
   const float q1 = __bfloat162float(loadg(q + q_base1 + dim));
-  float acc0 = 0.0f;
-  float acc1 = 0.0f;
-  float m0 = -INFINITY;
-  float m1 = -INFINITY;
-  float l0 = 0.0f;
-  float l1 = 0.0f;
+
+  // Each thread owns one output dimension for the two query heads. The online
+  // softmax state is per-query-head, per-dimension.
+  float acc0 = 0.0f, acc1 = 0.0f;
+  float m0 = -INFINITY, m1 = -INFINITY;
+  float l0 = 0.0f, l1 = 0.0f;
+
+  // Use separate CUB temp storage for the two dot-product reductions. Reusing
+  // one storage object for back-to-back reductions is easy to make unsafe
+  // without a clean synchronization boundary around all internal CUB state.
   using DecodeBlockReduce = cub::BlockReduce<float, kSlidingDecodeThreads>;
   __shared__ typename DecodeBlockReduce::TempStorage reduce_storage_q0;
   __shared__ typename DecodeBlockReduce::TempStorage reduce_storage_q1;
@@ -1452,15 +1473,23 @@ void sliding_decode_paged_grouped_split_kernel(
   __shared__ float s_score1;
 
   for (int32_t pos = split_begin; pos < split_end; ++pos) {
+    // Resolve logical token position -> physical cache page. Page lookups stay
+    // in the hot loop for now; page-span iteration is the next obvious cleanup.
     const int32_t page_slot = gemma4_kv_cache_page_slot(config, pos);
     const int32_t physical_page =
         __ldg(page_table + batch * config.max_pages_per_seq + page_slot);
     if (physical_page < 0 || physical_page >= config.num_pages) continue;
+
+    // Cache layout is [layer, page, page_offset, kv_head, dim]. All 256 threads
+    // read consecutive BF16 lanes, so K and V loads are coalesced direct global
+    // reads rather than shared-memory staged copies.
     const int32_t page_offset = gemma4_kv_cache_page_offset(config, pos);
     const int64_t kv_base = gemma4_kv_cache_offset(config, layer, physical_page, page_offset, kv_head, 0);
     const float k_value = __bfloat162float(loadg(cache_k + kv_base + dim));
     const float v_value = __bfloat162float(loadg(cache_v + kv_base + dim));
 
+    // Reduce the per-lane products into two scalar QK scores, then broadcast the
+    // scores through shared memory so every output-dimension thread can update.
     float score0 = DecodeBlockReduce(reduce_storage_q0).Sum(q0 * k_value);
     float score1 = DecodeBlockReduce(reduce_storage_q1).Sum(q1 * k_value);
     if (dim == 0) {
@@ -1472,10 +1501,14 @@ void sliding_decode_paged_grouped_split_kernel(
     score1 = s_score1 * softmax_scale;
     __syncthreads();
 
+    // Fold this token into the running online softmax state for both query
+    // heads. Each thread only accumulates its own V lane.
     sliding_decode_online_update(score0, v_value, m0, l0, acc0);
     sliding_decode_online_update(score1, v_value, m1, l1, acc1);
   }
 
+  // Live split CTAs write one max/denominator scalar per query head plus one
+  // FP32 accumulator row. Empty overprovisioned CTAs returned above.
   if (dim == 0) {
     partial_m[partial0] = m0;
     partial_l[partial0] = l0;
@@ -1496,27 +1529,41 @@ void sliding_decode_paged_reduce_kernel(
     Gemma4KvCacheConfig config,
     int32_t split_size,
     int32_t num_splits) {
+  // One CTA reduces all live split partials for one [batch, query head] output
+  // row; each thread writes one BF16 head-dim lane.
   const int32_t batch = blockIdx.x;
   const int32_t q_head = blockIdx.y;
   const int32_t dim = threadIdx.x;
   const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_head;
+
+  // Partial buffers are still laid out with the max `num_splits` stride even
+  // when this row has fewer live splits.
   const int32_t partial_row = row * num_splits;
   const int64_t partial_acc_row = int64_t(row) * num_splits * GEMMA4_SLIDING_HEAD_DIM;
+
+  // Recompute the live split count from device sequence lengths so fixed-shape
+  // graph launches can ignore stale scratch beyond `actual_splits`.
   const int32_t seq_len = __ldg(seq_lengths + batch);
   const int32_t first_key = config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
   const int32_t key_count = max(0, seq_len - first_key);
   const int32_t actual_splits = (key_count + split_size - 1) / split_size;
   const int32_t reduce_splits = min(actual_splits, num_splits);
 
+  // A zero-length row has no attention mass. This should be rare, but returning
+  // zeros keeps the kernel total for defensive tests and future graph captures.
   if (reduce_splits == 0) {
     out[(int64_t(row) * GEMMA4_SLIDING_HEAD_DIM) + dim] = __float2bfloat16_rn(0.0f);
     return;
   }
 
+  // First pass: find the global max across live splits for numerical stability.
   float local_m = -INFINITY;
   for (int32_t split = dim; split < reduce_splits; split += blockDim.x) {
     local_m = fmaxf(local_m, partial_m[partial_row + split]);
   }
+
+  // Separate CUB storage mirrors the split kernel: max-reduce and sum-reduce
+  // have distinct shared temp storage so CUB internals are not repurposed.
   using DecodeBlockReduce = cub::BlockReduce<float, kSlidingDecodeThreads>;
   __shared__ typename DecodeBlockReduce::TempStorage reduce_m_storage;
   __shared__ typename DecodeBlockReduce::TempStorage reduce_l_storage;
@@ -1527,6 +1574,8 @@ void sliding_decode_paged_reduce_kernel(
   if (dim == 0) s_m = block_m;
   __syncthreads();
 
+  // Second pass: rescale every split denominator into the global-max frame and
+  // sum them into the final softmax denominator.
   float local_l = 0.0f;
   for (int32_t split = dim; split < reduce_splits; split += blockDim.x) {
     const float split_l = partial_l[partial_row + split];
@@ -1538,6 +1587,8 @@ void sliding_decode_paged_reduce_kernel(
   if (dim == 0) s_l = block_l;
   __syncthreads();
 
+  // Final pass: every thread combines its own accumulator lane from all live
+  // splits using the same max-rescale factor, then normalizes by `s_l`.
   float value = 0.0f;
   for (int32_t split = 0; split < reduce_splits; ++split) {
     const float split_l = partial_l[partial_row + split];
@@ -1589,6 +1640,8 @@ cudaError_t launch_sliding_decode_paged(
     int32_t split_size,
     int32_t num_splits,
     cudaStream_t stream) {
+  // Phase 1 computes per-split online-softmax partials. The grid intentionally
+  // launches the max split count; each CTA cheaply exits if its row has no work.
   const dim3 split_grid(batch_size, GEMMA4_SLIDING_KV_HEADS, num_splits);
   constexpr dim3 block_dim(kSlidingDecodeThreads);
   sliding_decode_paged_grouped_split_kernel<<<split_grid, block_dim, 0, stream>>>(
@@ -1598,6 +1651,8 @@ cudaError_t launch_sliding_decode_paged(
   cudaError_t status = cudaGetLastError();
   if (status != cudaSuccess) return status;
 
+  // Phase 2 reduces live split partials into the final projection-ready BF16
+  // attention output.
   const dim3 reduce_grid(batch_size, GEMMA4_NUM_QUERY_HEADS);
   sliding_decode_paged_reduce_kernel<<<reduce_grid, block_dim, 0, stream>>>(
       d_out, d_partial_m, d_partial_l, d_partial_acc, d_seq_lengths, cache_config,
