@@ -1,0 +1,128 @@
+{
+  "contract": {
+    "benchmark": "global prefill BF16, warm cache custom/library path timing",
+    "timing": "CUDA events on PyTorch current stream for both custom and PyTorch paths",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "delay_s": 0.0,
+    "delay_location": "before each timed path invocation",
+    "samples": 15,
+    "warmup": 4,
+    "launch_overhead": "host enqueue overhead excluded; GPU timeline includes all kernels in the path",
+    "path_order": "alternates forward/reverse each sample to reduce drift bias",
+    "timed_paths": [
+      "direct_custom_global_prefill",
+      "fused_custom_norm_rope_global_prefill"
+    ]
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "nvidia_smi": "NVIDIA RTX A6000, 580.126.16, Enabled, Disabled, [N/A], 300.00, 1935, 7601, 35, 207.74, 93",
+    "time_utc": "2026-06-18T17:23:07Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "batch_size": 1,
+    "seq_len": 2048,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "rotary_dim": 128,
+    "dtype": "bf16"
+  },
+  "correctness": {
+    "fused_custom_vs_direct_custom_max_abs": 0.0,
+    "direct_custom_vs_pytorch_max_abs": 0.0078125,
+    "fused_custom_vs_pytorch_max_abs": 0.0078125
+  },
+  "kernel": {
+    "block_m": 64,
+    "block_n": 16,
+    "nwarps": 2,
+    "threads_per_block": 64,
+    "smem_bytes": 98304,
+    "attributes": {
+      "shared_size_bytes": 0,
+      "const_size_bytes": 0,
+      "local_size_bytes": 2672,
+      "max_threads_per_block": 256,
+      "num_regs": 255,
+      "ptx_version": 86,
+      "binary_version": 86,
+      "cache_mode_ca": 0,
+      "max_dynamic_shared_size_bytes": 98304,
+      "preferred_shmem_carveout": -1
+    }
+  },
+  "timings": {
+    "direct_custom_global_prefill": {
+      "median_ms": 31.843711853027344,
+      "mean_ms": 31.854898834228514,
+      "trimmed_mean_ms": 31.84829022334172,
+      "min_ms": 31.655935287475586,
+      "max_ms": 32.139774322509766,
+      "p95_ms": 32.03203086853027,
+      "p99_ms": 32.11822563171387,
+      "stddev_ms": 0.1265381027582064,
+      "iqr_ms": 0.18491077423095703,
+      "samples_ms": [
+        31.917695999145508,
+        31.9401912689209,
+        31.967519760131836,
+        31.985855102539062,
+        31.818239212036133,
+        31.711936950683594,
+        31.843711853027344,
+        31.913759231567383,
+        31.703903198242188,
+        31.7761287689209,
+        32.139774322509766,
+        31.89904022216797,
+        31.70684814453125,
+        31.655935287475586,
+        31.84294319152832
+      ]
+    },
+    "fused_custom_norm_rope_global_prefill": {
+      "median_ms": 32.08156967163086,
+      "mean_ms": 32.121038818359374,
+      "trimmed_mean_ms": 32.110473779531624,
+      "min_ms": 31.9553279876709,
+      "max_ms": 32.424095153808594,
+      "p95_ms": 32.402815628051755,
+      "p99_ms": 32.419839248657226,
+      "stddev_ms": 0.13918871335286365,
+      "iqr_ms": 0.1594066619873047,
+      "samples_ms": [
+        31.9553279876709,
+        32.39369583129883,
+        32.06265640258789,
+        32.241310119628906,
+        32.424095153808594,
+        32.011070251464844,
+        32.06403350830078,
+        32.101375579833984,
+        32.115936279296875,
+        32.239646911621094,
+        32.08156967163086,
+        31.964096069335938,
+        31.99385643005371,
+        32.12857437133789,
+        32.03833770751953
+      ]
+    }
+  },
+  "speedups": {},
+  "checksum": -50502.3525390625
+}
+
+global_tile=64x16x2 regs=255 local=2672 smem=98304
+| path | median ms | mean ms | min ms | p95 ms | max ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| direct custom | 31.843712 | 31.854899 | 31.655935 | 32.032031 | 32.139774 |
+| fused custom | 32.081570 | 32.121039 | 31.955328 | 32.402816 | 32.424095 |
+
+| comparison | PyTorch / custom median | custom result |
+| --- | ---: | --- |

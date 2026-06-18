@@ -1,0 +1,81 @@
+{
+  "contract": {
+    "timing": "CUDA-event timing on the current PyTorch CUDA stream",
+    "execution": "CUDA graph replay; PyTorch work captured after optional torch.compile",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "launch_overhead": "excluded from per-op timing by CUDA graph replay and batched warm replay",
+    "enqueue_delay": "untimed torch.cuda._sleep(1000000) before start event",
+    "host_wall_time": "excluded",
+    "dtype": "bfloat16",
+    "layout": "raw q=[B,32,D], raw k/v=[B,KV,D], cache=[1,pages,page,KV,D]",
+    "warmup": 8,
+    "iters_per_sample": 40,
+    "graph_inner_iters": 40,
+    "sleep_cycles": 1000000,
+    "samples": 15,
+    "timed_paths": "custom",
+    "min_effect_for_claim_pct": 5
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T19:07:03Z",
+    "custom_lib": "build/libgemma4_flash_attention.so",
+    "torch_compile": "disabled"
+  },
+  "kernel": {
+    "decode_norm_rope": {
+      "threads_per_block": 32,
+      "heads_per_block": 1
+    }
+  },
+  "shape": {
+    "layer_type": "global",
+    "batch_size": 8,
+    "seq_len": 1024,
+    "page_size": 64,
+    "pages_per_seq": 16,
+    "num_pages": 128,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "rotary_dim": 128,
+    "rope_theta": 1000000.0
+  },
+  "correctness": {
+    "q_max_abs": 0.0,
+    "cache_k_max_abs": 0.0,
+    "cache_v_max_abs": 0.0
+  },
+  "checksum": 473.6989288330078,
+  "custom_cuda_graph_decode_norm_rope_paged_kv_write": {
+    "median_ms": 0.0031272001564502717,
+    "mean_ms": 0.0031264533350865045,
+    "trimmed_mean_ms": 0.003126030773497545,
+    "min_ms": 0.0031191999092698096,
+    "max_ms": 0.003139200061559677,
+    "p95_ms": 0.003134720027446747,
+    "p99_ms": 0.003138304054737091,
+    "stddev_ms": 5.437442473424949e-06,
+    "iqr_ms": 7.600244134664709e-06,
+    "samples_ms": [
+      0.003139200061559677,
+      0.0031304001808166505,
+      0.0031328000128269195,
+      0.0031279999762773513,
+      0.0031199999153614043,
+      0.003120799921452999,
+      0.0031191999092698096,
+      0.00313120000064373,
+      0.0031247999519109725,
+      0.003123199939727783,
+      0.0031279999762773513,
+      0.003128800168633461,
+      0.003123199939727783,
+      0.0031272001564502717,
+      0.0031199999153614043
+    ]
+  }
+}

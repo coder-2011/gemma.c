@@ -1,0 +1,129 @@
+{
+  "contract": {
+    "benchmark": "global prefill BF16, warm cache custom/library path timing",
+    "timing": "CUDA events on PyTorch current stream for both custom and PyTorch paths",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "delay_s": 0.0,
+    "delay_location": "before each timed path invocation",
+    "samples": 20,
+    "warmup": 5,
+    "launch_overhead": "host enqueue overhead excluded; GPU timeline includes all kernels in the path",
+    "path_order": "alternates forward/reverse each sample to reduce drift bias",
+    "timed_paths": [
+      "direct_custom_global_prefill",
+      "fused_custom_norm_rope_global_prefill"
+    ]
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "nvidia_smi": "NVIDIA RTX A6000, 580.126.16, Enabled, Disabled, [N/A], 300.00, 1800, 7601, 30, 87.27, 9",
+    "time_utc": "2026-06-18T17:06:46Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "batch_size": 1,
+    "seq_len": 1024,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "rotary_dim": 128,
+    "dtype": "bf16"
+  },
+  "correctness": {
+    "fused_custom_vs_direct_custom_max_abs": 3.75439453125,
+    "direct_custom_vs_pytorch_max_abs": 3.6103515625,
+    "fused_custom_vs_pytorch_max_abs": 3.75439453125
+  },
+  "kernel": {
+    "block_m": 16,
+    "block_n": 32,
+    "nwarps": 2,
+    "threads_per_block": 64,
+    "smem_bytes": 81920,
+    "attributes": {
+      "shared_size_bytes": 0,
+      "const_size_bytes": 0,
+      "local_size_bytes": 704,
+      "max_threads_per_block": 256,
+      "num_regs": 255,
+      "ptx_version": 86,
+      "binary_version": 86,
+      "cache_mode_ca": 0,
+      "max_dynamic_shared_size_bytes": 81920,
+      "preferred_shmem_carveout": -1
+    }
+  },
+  "timings": {
+    "direct_custom_global_prefill": {
+      "median_ms": 3.581584095954895,
+      "mean_ms": 3.5818943977355957,
+      "trimmed_mean_ms": 3.5787279903888702,
+      "min_ms": 3.4229440689086914,
+      "max_ms": 3.757375955581665,
+      "p95_ms": 3.700801599025726,
+      "p99_ms": 3.7460610842704773,
+      "stddev_ms": 0.06754537260980589,
+      "iqr_ms": 0.04681605100631714,
+      "samples_ms": [
+        3.757375955581665,
+        3.607680082321167,
+        3.697824001312256,
+        3.5872321128845215,
+        3.533247947692871,
+        3.5551679134368896,
+        3.5885438919067383,
+        3.56825590133667,
+        3.589184045791626,
+        3.535583972930908,
+        3.500096082687378,
+        3.5306880474090576,
+        3.594655990600586,
+        3.5759360790252686,
+        3.590847969055176,
+        3.568864107131958,
+        3.604383945465088,
+        3.5751359462738037,
+        3.6542398929595947,
+        3.4229440689086914
+      ]
+    },
+    "fused_custom_norm_rope_global_prefill": {
+      "median_ms": 3.7175040245056152,
+      "mean_ms": 3.722503995895386,
+      "trimmed_mean_ms": 3.7165659964084625,
+      "min_ms": 3.631711959838867,
+      "max_ms": 3.8810880184173584,
+      "p95_ms": 3.8358831644058227,
+      "p99_ms": 3.8720470476150513,
+      "stddev_ms": 0.0710154400567573,
+      "iqr_ms": 0.10435998439788818,
+      "samples_ms": [
+        3.813568115234375,
+        3.754271984100342,
+        3.7609920501708984,
+        3.6958720684051514,
+        3.8335039615631104,
+        3.647552013397217,
+        3.631711959838867,
+        3.6636478900909424,
+        3.650815963745117,
+        3.6387200355529785,
+        3.682176113128662,
+        3.793247938156128,
+        3.7565760612487793,
+        3.675391912460327,
+        3.6586880683898926,
+        3.7616639137268066,
+        3.739135980606079,
+        3.760319948196411,
+        3.8810880184173584,
+        3.6511359214782715
+      ]
+    }
+  },
+  "speedups": {},
+  "checksum": -63667.2353515625
+}

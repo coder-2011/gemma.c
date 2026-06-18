@@ -1,0 +1,16 @@
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+prepared_fa_correctness max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+standalone_norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+benchmark batch=1 seq=64 window_left=1024 warmup=15 iters=80 samples=5 cache=warm flush_bytes=0 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_prep_only median_ms=0.0169652 mean_ms=0.0167384 trimmed_mean_ms=0.0167384 min_ms=0.014758 max_ms=0.0182144 p95_ms=0.0180358 p99_ms=0.0181787 stddev_ms=0.00114765 iqr_ms=0.0008888 samples_ms=[0.014758,0.0182144,0.0164328,0.0173216,0.0169652]
+norm_rope_plus_fa median_ms=0.0224328 mean_ms=0.0226285 trimmed_mean_ms=0.0226285 min_ms=0.0213688 max_ms=0.0248348 p95_ms=0.0243666 p99_ms=0.0247412 stddev_ms=0.00117397 iqr_ms=0.000482 samples_ms=[0.022494,0.0224328,0.0248348,0.022012,0.0213688]
+flash_attn_prepared_no_lse median_ms=0.0080776 mean_ms=0.00812424 trimmed_mean_ms=0.00812424 min_ms=0.0078912 max_ms=0.0084316 p95_ms=0.0084076 p99_ms=0.0084268 stddev_ms=0.000215546 iqr_ms=0.0004024 samples_ms=[0.0084316,0.0079092,0.0083116,0.0078912,0.0080776]
+flash_attn_prepared_lse median_ms=0.0083268 mean_ms=0.00823744 trimmed_mean_ms=0.00823744 min_ms=0.0075972 max_ms=0.0089104 p95_ms=0.008842 p99_ms=0.00889672 stddev_ms=0.000486939 iqr_ms=0.000784 samples_ms=[0.0075972,0.0089104,0.0077844,0.0085684,0.0083268]
+decode_norm_rope_paged_kv_write median_ms=0.0190604 mean_ms=0.0189298 trimmed_mean_ms=0.0189298 min_ms=0.016676 max_ms=0.0203196 p95_ms=0.0202281 p99_ms=0.0203013 stddev_ms=0.00125991 iqr_ms=0.0011312 samples_ms=[0.016676,0.0190604,0.019862,0.0187308,0.0203196]
+approx_attention_tflops_in_total_path_median=3.03829
+approx_attention_tflops_prepared_no_lse_median=8.43783
+kernel threads_per_block=128 block_m=64 block_n=64 nwarps=4 dynamic_smem_bytes=98304
+prefill_norm_rope threads_per_block=256 heads_per_block=8
+kernel_attrs static_smem=0 const_bytes=0 local_bytes=0 max_threads_per_block=256 num_regs=249 ptx_version=86 binary_version=86 cache_mode_ca=0 max_dynamic_smem=98304 preferred_smem_carveout=-1

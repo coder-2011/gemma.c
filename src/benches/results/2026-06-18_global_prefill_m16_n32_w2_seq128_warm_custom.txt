@@ -1,0 +1,138 @@
+{
+  "contract": {
+    "benchmark": "global prefill BF16, warm cache custom/library path timing",
+    "timing": "CUDA events on PyTorch current stream for both custom and PyTorch paths",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "delay_s": 0.0,
+    "delay_location": "before each timed path invocation",
+    "samples": 20,
+    "warmup": 5,
+    "launch_overhead": "host enqueue overhead excluded; GPU timeline includes all kernels in the path",
+    "path_order": "alternates forward/reverse each sample to reduce drift bias",
+    "timed_paths": [
+      "direct_custom_global_prefill",
+      "fused_custom_norm_rope_global_prefill"
+    ]
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "nvidia_smi": "NVIDIA RTX A6000, 580.126.16, Enabled, Disabled, [N/A], 300.00, 1800, 7601, 33, 84.28, 4",
+    "time_utc": "2026-06-18T17:06:24Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "batch_size": 1,
+    "seq_len": 128,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "rotary_dim": 128,
+    "dtype": "bf16"
+  },
+  "correctness": {
+    "fused_custom_vs_direct_custom_max_abs": 3.93359375,
+    "direct_custom_vs_pytorch_max_abs": 3.93359375,
+    "fused_custom_vs_pytorch_max_abs": 3.7724609375
+  },
+  "kernel": {
+    "block_m": 16,
+    "block_n": 32,
+    "nwarps": 2,
+    "threads_per_block": 64,
+    "smem_bytes": 81920,
+    "attributes": {
+      "shared_size_bytes": 0,
+      "const_size_bytes": 0,
+      "local_size_bytes": 704,
+      "max_threads_per_block": 256,
+      "num_regs": 255,
+      "ptx_version": 86,
+      "binary_version": 86,
+      "cache_mode_ca": 0,
+      "max_dynamic_shared_size_bytes": 81920,
+      "preferred_shmem_carveout": -1
+    }
+  },
+  "timings": {
+    "direct_custom_global_prefill": {
+      "median_ms": 0.0976799987256527,
+      "mean_ms": 0.11153440028429032,
+      "trimmed_mean_ms": 0.10603799996897578,
+      "min_ms": 0.0894400030374527,
+      "max_ms": 0.20281599462032318,
+      "p95_ms": 0.15399360507726673,
+      "p99_ms": 0.1930515167117118,
+      "stddev_ms": 0.02833158996242274,
+      "iqr_ms": 0.02210400253534317,
+      "samples_ms": [
+        0.10982400178909302,
+        0.09232000261545181,
+        0.10835199803113937,
+        0.10076799988746643,
+        0.09372799843549728,
+        0.11446399986743927,
+        0.09040000289678574,
+        0.15142400562763214,
+        0.0894400030374527,
+        0.09731200337409973,
+        0.09497600048780441,
+        0.14959999918937683,
+        0.09177599847316742,
+        0.09756799787282944,
+        0.20281599462032318,
+        0.1425279974937439,
+        0.11878400295972824,
+        0.09424000233411789,
+        0.09257599711418152,
+        0.09779199957847595
+      ]
+    },
+    "fused_custom_norm_rope_global_prefill": {
+      "median_ms": 0.1807520017027855,
+      "mean_ms": 0.19663039967417717,
+      "trimmed_mean_ms": 0.17828800017014146,
+      "min_ms": 0.10790400207042694,
+      "max_ms": 0.6071040034294128,
+      "p95_ms": 0.2714575886726382,
+      "p99_ms": 0.5399747204780574,
+      "stddev_ms": 0.10567395329715612,
+      "iqr_ms": 0.10538399592041969,
+      "samples_ms": [
+        0.2128639966249466,
+        0.19046400487422943,
+        0.1111999973654747,
+        0.2537919878959656,
+        0.10790400207042694,
+        0.16227200627326965,
+        0.1674879938364029,
+        0.16816000640392303,
+        0.17366400361061096,
+        0.11452800035476685,
+        0.20201599597930908,
+        0.11657600104808807,
+        0.22015999257564545,
+        0.22592000663280487,
+        0.6071040034294128,
+        0.23296000063419342,
+        0.11513599753379822,
+        0.18783999979496002,
+        0.11184000223875046,
+        0.25071999430656433
+      ]
+    }
+  },
+  "speedups": {},
+  "checksum": -3766.1458129882812
+}
+
+global_tile=16x32x2 regs=255 local=704 smem=81920
+| path | median ms | mean ms | min ms | p95 ms | max ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| direct custom | 0.097680 | 0.111534 | 0.089440 | 0.153994 | 0.202816 |
+| fused custom | 0.180752 | 0.196630 | 0.107904 | 0.271458 | 0.607104 |
+
+| comparison | PyTorch / custom median | custom result |
+| --- | ---: | --- |

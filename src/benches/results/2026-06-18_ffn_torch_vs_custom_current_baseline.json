@@ -1,0 +1,2251 @@
+{
+  "contract": {
+    "benchmark": "Gemma 4 dense FFN BF16, PyTorch eager CUDA graph vs gemma4_ffn_bf16 C ABI wrapper",
+    "timing": "CUDA events around CUDA graph replay on PyTorch's current stream",
+    "cache_modes": [
+      "warm",
+      "cold"
+    ],
+    "l2_flush_bytes": 268435456,
+    "cold_cache_policy": "flush buffer touched before each timed graph replay; flush excluded from event span",
+    "warm_cache_policy": "same path replayed once immediately before timing each warm sample",
+    "launch_overhead": "excluded by CUDA graph replay for both paths",
+    "host_wall_time": "excluded from elapsed timings",
+    "sample_delay_s": 0.1,
+    "order": "custom/PyTorch path order alternates each sample",
+    "warmup": 5,
+    "iters_per_sample": 10,
+    "samples": 8,
+    "dtype": "bfloat16",
+    "torch_baseline": "mm -> tanh GeGLU -> mm -> residual add -> RMSNorm using preallocated out tensors"
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T13:14:28Z",
+    "nvidia_smi": {
+      "name": "NVIDIA RTX A6000",
+      "driver_version": "580.126.16",
+      "persistence_mode": "Enabled",
+      "ecc_mode": "Disabled",
+      "mig_mode": "[N/A]",
+      "power_limit_w": 300.0,
+      "sm_clock_mhz": 1800.0,
+      "mem_clock_mhz": 7601.0,
+      "temperature_c": 35.0,
+      "power_draw_w": 81.88,
+      "utilization_gpu_pct": 0.0
+    },
+    "custom_lib": "build/libgemma4_ffn_bench.so"
+  },
+  "shape": {
+    "rows": [
+      1,
+      16
+    ],
+    "hidden": 5376,
+    "intermediate": 21504,
+    "packed_ffn": 43008
+  },
+  "cases": [
+    {
+      "rows": 1,
+      "cache_mode": "warm",
+      "correctness": {
+        "residual_max_abs": 0.0009765625,
+        "normed_max_abs": 0.015625
+      },
+      "timings": {
+        "custom_cuda": {
+          "median_ms": 0.9762304306030274,
+          "mean_ms": 0.9761836171150208,
+          "trimmed_mean_ms": 0.9761836171150208,
+          "min_ms": 0.9757344245910644,
+          "max_ms": 0.9763327598571777,
+          "p95_ms": 0.976317105293274,
+          "p99_ms": 0.9763296289443969,
+          "stddev_ms": 0.0001772698520637244,
+          "iqr_ms": 8.003711700454996e-05,
+          "samples_ms": [
+            0.9757344245910644,
+            0.9762304306030274,
+            0.9762816429138184,
+            0.9761504173278809,
+            0.9763327598571777,
+            0.9762304306030274,
+            0.9762880325317382,
+            0.9762207984924316
+          ],
+          "clock_summary": {
+            "sm_clock_mhz": {
+              "min": 1800.0,
+              "max": 1935.0,
+              "mean": 1808.4375
+            },
+            "mem_clock_mhz": {
+              "min": 7601.0,
+              "max": 7601.0,
+              "mean": 7601.0
+            },
+            "temperature_c": {
+              "min": 32.0,
+              "max": 33.0,
+              "mean": 32.375
+            },
+            "power_draw_w": {
+              "min": 78.43,
+              "max": 97.54,
+              "mean": 82.02
+            },
+            "utilization_gpu_pct": {
+              "min": 0.0,
+              "max": 3.0,
+              "mean": 0.375
+            }
+          },
+          "clock_samples": [
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 78.43,
+              "utilization_gpu_pct": 3.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1935.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 97.54,
+              "utilization_gpu_pct": 3.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 82.6,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 81.21,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 80.78,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 80.73,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 81.17,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 81.3,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 80.89,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 80.85,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 81.19,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 81.25,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.79,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.86,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 81.31,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 81.42,
+              "utilization_gpu_pct": 0.0
+            }
+          ]
+        },
+        "pytorch": {
+          "median_ms": 1.0539072036743165,
+          "mean_ms": 1.053567600250244,
+          "trimmed_mean_ms": 1.053567600250244,
+          "min_ms": 1.0499584197998046,
+          "max_ms": 1.0547103881835938,
+          "p95_ms": 1.0546969366073609,
+          "p99_ms": 1.0547076978683472,
+          "stddev_ms": 0.0014164959422016,
+          "iqr_ms": 0.000521612167358354,
+          "samples_ms": [
+            1.0499584197998046,
+            1.053603172302246,
+            1.0547103881835938,
+            1.0540608406066894,
+            1.053929615020752,
+            1.0546719551086425,
+            1.0537216186523437,
+            1.053884792327881
+          ],
+          "clock_summary": {
+            "sm_clock_mhz": {
+              "min": 1800.0,
+              "max": 1935.0,
+              "mean": 1825.3125
+            },
+            "mem_clock_mhz": {
+              "min": 7601.0,
+              "max": 7601.0,
+              "mean": 7601.0
+            },
+            "temperature_c": {
+              "min": 32.0,
+              "max": 33.0,
+              "mean": 32.5
+            },
+            "power_draw_w": {
+              "min": 80.69,
+              "max": 105.96,
+              "mean": 84.749375
+            },
+            "utilization_gpu_pct": {
+              "min": 0.0,
+              "max": 0.0,
+              "mean": 0.0
+            }
+          },
+          "clock_samples": [
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1935.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 105.96,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1935.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 93.96,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1935.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 94.5,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 88.9,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 80.75,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 80.84,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 81.4,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 32.0,
+              "power_draw_w": 81.23,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.73,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.69,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 81.27,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 81.28,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.94,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.98,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 81.33,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 81.23,
+              "utilization_gpu_pct": 0.0
+            }
+          ]
+        }
+      },
+      "checksum": 104.93892025947571,
+      "table_row": {
+        "rows": 1,
+        "cache": "warm",
+        "custom_median_ms": 0.9762304306030274,
+        "torch_median_ms": 1.0539072036743165,
+        "speedup_torch_over_custom": 1.0795680718775662,
+        "custom_p99_ms": 0.9763296289443969,
+        "torch_p99_ms": 1.0547076978683472,
+        "residual_max_abs": 0.0009765625,
+        "normed_max_abs": 0.015625
+      }
+    },
+    {
+      "rows": 1,
+      "cache_mode": "cold",
+      "correctness": {
+        "residual_max_abs": 0.0009765625,
+        "normed_max_abs": 0.015625
+      },
+      "timings": {
+        "custom_cuda": {
+          "median_ms": 0.9875055998563766,
+          "mean_ms": 0.9877435997128486,
+          "trimmed_mean_ms": 0.9877435997128486,
+          "min_ms": 0.9872896075248718,
+          "max_ms": 0.9885631918907165,
+          "p95_ms": 0.9884567955136299,
+          "p99_ms": 0.9885419126152992,
+          "stddev_ms": 0.0004696016707757672,
+          "iqr_ms": 0.0008384004235267861,
+          "samples_ms": [
+            0.9873536050319671,
+            0.9874848008155823,
+            0.9882592022418976,
+            0.9881568014621734,
+            0.9872896075248718,
+            0.987526398897171,
+            0.9873151898384094,
+            0.9885631918907165
+          ],
+          "clock_summary": {
+            "sm_clock_mhz": {
+              "min": 1800.0,
+              "max": 1800.0,
+              "mean": 1800.0
+            },
+            "mem_clock_mhz": {
+              "min": 7601.0,
+              "max": 7601.0,
+              "mean": 7601.0
+            },
+            "temperature_c": {
+              "min": 33.0,
+              "max": 34.0,
+              "mean": 33.3125
+            },
+            "power_draw_w": {
+              "min": 80.23,
+              "max": 84.85,
+              "mean": 80.79125
+            },
+            "utilization_gpu_pct": {
+              "min": 0.0,
+              "max": 0.0,
+              "mean": 0.0
+            }
+          },
+          "clock_samples": [
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.89,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 84.85,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.47,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.44,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.25,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.32,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.67,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.61,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.25,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.23,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 80.75,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.82,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 80.48,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 80.5,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 80.58,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 80.55,
+              "utilization_gpu_pct": 0.0
+            }
+          ]
+        },
+        "pytorch": {
+          "median_ms": 1.062368005514145,
+          "mean_ms": 1.0625852018594741,
+          "trimmed_mean_ms": 1.0625852018594741,
+          "min_ms": 1.0620256066322327,
+          "max_ms": 1.0639871954917908,
+          "p95_ms": 1.0636119991540909,
+          "p99_ms": 1.0639121562242508,
+          "stddev_ms": 0.00060921912007824,
+          "iqr_ms": 0.0006288200616837436,
+          "samples_ms": [
+            1.0627552151679993,
+            1.0625024080276488,
+            1.0620256066322327,
+            1.0622015953063966,
+            1.0639871954917908,
+            1.062233603000641,
+            1.062060785293579,
+            1.0629152059555054
+          ],
+          "clock_summary": {
+            "sm_clock_mhz": {
+              "min": 1800.0,
+              "max": 1800.0,
+              "mean": 1800.0
+            },
+            "mem_clock_mhz": {
+              "min": 7601.0,
+              "max": 7601.0,
+              "mean": 7601.0
+            },
+            "temperature_c": {
+              "min": 33.0,
+              "max": 34.0,
+              "mean": 33.25
+            },
+            "power_draw_w": {
+              "min": 80.18,
+              "max": 84.11,
+              "mean": 80.73625
+            },
+            "utilization_gpu_pct": {
+              "min": 0.0,
+              "max": 0.0,
+              "mean": 0.0
+            }
+          },
+          "clock_samples": [
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 84.11,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.18,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.6,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.64,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.3,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.26,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.64,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.67,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.38,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.52,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.77,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 33.0,
+              "power_draw_w": 80.7,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 80.46,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 80.38,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 80.58,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 80.59,
+              "utilization_gpu_pct": 0.0
+            }
+          ]
+        }
+      },
+      "checksum": 104.93892025947571,
+      "table_row": {
+        "rows": 1,
+        "cache": "cold",
+        "custom_median_ms": 0.9875055998563766,
+        "torch_median_ms": 1.062368005514145,
+        "speedup_torch_over_custom": 1.0758096011492555,
+        "custom_p99_ms": 0.9885419126152992,
+        "torch_p99_ms": 1.0639121562242508,
+        "residual_max_abs": 0.0009765625,
+        "normed_max_abs": 0.015625
+      }
+    },
+    {
+      "rows": 16,
+      "cache_mode": "warm",
+      "correctness": {
+        "residual_max_abs": 0.0009765625,
+        "normed_max_abs": 0.03125
+      },
+      "timings": {
+        "custom_cuda": {
+          "median_ms": 1.0156288146972656,
+          "mean_ms": 1.0153687953948975,
+          "trimmed_mean_ms": 1.0153687953948975,
+          "min_ms": 1.0126655578613282,
+          "max_ms": 1.0166239738464355,
+          "p95_ms": 1.0164963006973267,
+          "p99_ms": 1.0165984392166139,
+          "stddev_ms": 0.0011276393351512828,
+          "iqr_ms": 0.0006183862686157671,
+          "samples_ms": [
+            1.0126655578613282,
+            1.0166239738464355,
+            1.0162591934204102,
+            1.015670394897461,
+            1.0154047966003419,
+            1.0157919883728028,
+            1.0155872344970702,
+            1.0149472236633301
+          ],
+          "clock_summary": {
+            "sm_clock_mhz": {
+              "min": 1800.0,
+              "max": 1920.0,
+              "mean": 1807.5
+            },
+            "mem_clock_mhz": {
+              "min": 7601.0,
+              "max": 7601.0,
+              "mean": 7601.0
+            },
+            "temperature_c": {
+              "min": 34.0,
+              "max": 34.0,
+              "mean": 34.0
+            },
+            "power_draw_w": {
+              "min": 81.1,
+              "max": 103.24,
+              "mean": 84.2625
+            },
+            "utilization_gpu_pct": {
+              "min": 0.0,
+              "max": 6.0,
+              "mean": 0.75
+            }
+          },
+          "clock_samples": [
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 81.1,
+              "utilization_gpu_pct": 6.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1920.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 103.24,
+              "utilization_gpu_pct": 6.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.64,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.43,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.24,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.29,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.54,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.58,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.28,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.15,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.36,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 86.42,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.16,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.16,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.24,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.37,
+              "utilization_gpu_pct": 0.0
+            }
+          ]
+        },
+        "pytorch": {
+          "median_ms": 1.0354479789733886,
+          "mean_ms": 1.034936797618866,
+          "trimmed_mean_ms": 1.034936797618866,
+          "min_ms": 1.0318016052246093,
+          "max_ms": 1.035910415649414,
+          "p95_ms": 1.0359003353118896,
+          "p99_ms": 1.0359083995819092,
+          "stddev_ms": 0.001281776127367852,
+          "iqr_ms": 0.0011239767074582296,
+          "samples_ms": [
+            1.0318016052246093,
+            1.0352607727050782,
+            1.0345439910888672,
+            1.0356351852416992,
+            1.0347040176391602,
+            1.035910415649414,
+            1.0358816146850587,
+            1.035756778717041
+          ],
+          "clock_summary": {
+            "sm_clock_mhz": {
+              "min": 1800.0,
+              "max": 1920.0,
+              "mean": 1822.5
+            },
+            "mem_clock_mhz": {
+              "min": 7601.0,
+              "max": 7601.0,
+              "mean": 7601.0
+            },
+            "temperature_c": {
+              "min": 34.0,
+              "max": 35.0,
+              "mean": 34.0625
+            },
+            "power_draw_w": {
+              "min": 82.21,
+              "max": 111.23,
+              "mean": 86.61
+            },
+            "utilization_gpu_pct": {
+              "min": 0.0,
+              "max": 0.0,
+              "mean": 0.0
+            }
+          },
+          "clock_samples": [
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1920.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 111.23,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1920.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 95.28,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1920.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 94.53,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 89.39,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.17,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.06,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.37,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.43,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.1,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.05,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.21,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 85.48,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.06,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.95,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.24,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 82.21,
+              "utilization_gpu_pct": 0.0
+            }
+          ]
+        }
+      },
+      "checksum": 543.8782196044922,
+      "table_row": {
+        "rows": 16,
+        "cache": "warm",
+        "custom_median_ms": 1.0156288146972656,
+        "torch_median_ms": 1.0354479789733886,
+        "speedup_torch_over_custom": 1.0195141807610397,
+        "custom_p99_ms": 1.0165984392166139,
+        "torch_p99_ms": 1.0359083995819092,
+        "residual_max_abs": 0.0009765625,
+        "normed_max_abs": 0.03125
+      }
+    },
+    {
+      "rows": 16,
+      "cache_mode": "cold",
+      "correctness": {
+        "residual_max_abs": 0.0009765625,
+        "normed_max_abs": 0.03125
+      },
+      "timings": {
+        "custom_cuda": {
+          "median_ms": 1.023769599199295,
+          "mean_ms": 1.0237619951367378,
+          "trimmed_mean_ms": 1.0237619951367378,
+          "min_ms": 1.022156798839569,
+          "max_ms": 1.0251872062683105,
+          "p95_ms": 1.0248579180240631,
+          "p99_ms": 1.025121348619461,
+          "stddev_ms": 0.0007982785073695331,
+          "iqr_ms": 0.000536009669303672,
+          "samples_ms": [
+            1.0251872062683105,
+            1.023359978199005,
+            1.022156798839569,
+            1.0237344026565551,
+            1.024246382713318,
+            1.024012804031372,
+            1.0238047957420349,
+            1.0235935926437378
+          ],
+          "clock_summary": {
+            "sm_clock_mhz": {
+              "min": 1800.0,
+              "max": 1800.0,
+              "mean": 1800.0
+            },
+            "mem_clock_mhz": {
+              "min": 7601.0,
+              "max": 7601.0,
+              "mean": 7601.0
+            },
+            "temperature_c": {
+              "min": 34.0,
+              "max": 35.0,
+              "mean": 34.9375
+            },
+            "power_draw_w": {
+              "min": 81.46,
+              "max": 87.4,
+              "mean": 82.16625
+            },
+            "utilization_gpu_pct": {
+              "min": 0.0,
+              "max": 0.0,
+              "mean": 0.0
+            }
+          },
+          "clock_samples": [
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 34.0,
+              "power_draw_w": 83.09,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 87.4,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.46,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.51,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.86,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.77,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.5,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.5,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.79,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.81,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.58,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.66,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.99,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.94,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.98,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.82,
+              "utilization_gpu_pct": 0.0
+            }
+          ]
+        },
+        "pytorch": {
+          "median_ms": 1.0398415982723237,
+          "mean_ms": 1.0402964070439338,
+          "trimmed_mean_ms": 1.0402964070439338,
+          "min_ms": 1.039580798149109,
+          "max_ms": 1.0435968160629272,
+          "p95_ms": 1.042390580177307,
+          "p99_ms": 1.0433555688858032,
+          "stddev_ms": 0.0012691272390848347,
+          "iqr_ms": 0.000544816255569458,
+          "samples_ms": [
+            1.0396576046943664,
+            1.0396064043045044,
+            1.0400255918502808,
+            1.0401504278182983,
+            1.0396031975746154,
+            1.0401504158973693,
+            1.0435968160629272,
+            1.039580798149109
+          ],
+          "clock_summary": {
+            "sm_clock_mhz": {
+              "min": 1800.0,
+              "max": 1800.0,
+              "mean": 1800.0
+            },
+            "mem_clock_mhz": {
+              "min": 7601.0,
+              "max": 7601.0,
+              "mean": 7601.0
+            },
+            "temperature_c": {
+              "min": 35.0,
+              "max": 35.0,
+              "mean": 35.0
+            },
+            "power_draw_w": {
+              "min": 81.45,
+              "max": 85.99,
+              "mean": 81.945625
+            },
+            "utilization_gpu_pct": {
+              "min": 0.0,
+              "max": 0.0,
+              "mean": 0.0
+            }
+          },
+          "clock_samples": [
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 85.99,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.67,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.47,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.54,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.7,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.66,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.45,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.5,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.82,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.85,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.61,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.56,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.94,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.92,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.64,
+              "utilization_gpu_pct": 0.0
+            },
+            {
+              "name": "NVIDIA RTX A6000",
+              "driver_version": "580.126.16",
+              "persistence_mode": "Enabled",
+              "ecc_mode": "Disabled",
+              "mig_mode": "[N/A]",
+              "power_limit_w": 300.0,
+              "sm_clock_mhz": 1800.0,
+              "mem_clock_mhz": 7601.0,
+              "temperature_c": 35.0,
+              "power_draw_w": 81.81,
+              "utilization_gpu_pct": 0.0
+            }
+          ]
+        }
+      },
+      "checksum": 543.8782196044922,
+      "table_row": {
+        "rows": 16,
+        "cache": "cold",
+        "custom_median_ms": 1.023769599199295,
+        "torch_median_ms": 1.0398415982723237,
+        "speedup_torch_over_custom": 1.0156988438468957,
+        "custom_p99_ms": 1.025121348619461,
+        "torch_p99_ms": 1.0433555688858032,
+        "residual_max_abs": 0.0009765625,
+        "normed_max_abs": 0.03125
+      }
+    }
+  ],
+  "table": [
+    {
+      "rows": 1,
+      "cache": "warm",
+      "custom_median_ms": 0.9762304306030274,
+      "torch_median_ms": 1.0539072036743165,
+      "speedup_torch_over_custom": 1.0795680718775662,
+      "custom_p99_ms": 0.9763296289443969,
+      "torch_p99_ms": 1.0547076978683472,
+      "residual_max_abs": 0.0009765625,
+      "normed_max_abs": 0.015625
+    },
+    {
+      "rows": 1,
+      "cache": "cold",
+      "custom_median_ms": 0.9875055998563766,
+      "torch_median_ms": 1.062368005514145,
+      "speedup_torch_over_custom": 1.0758096011492555,
+      "custom_p99_ms": 0.9885419126152992,
+      "torch_p99_ms": 1.0639121562242508,
+      "residual_max_abs": 0.0009765625,
+      "normed_max_abs": 0.015625
+    },
+    {
+      "rows": 16,
+      "cache": "warm",
+      "custom_median_ms": 1.0156288146972656,
+      "torch_median_ms": 1.0354479789733886,
+      "speedup_torch_over_custom": 1.0195141807610397,
+      "custom_p99_ms": 1.0165984392166139,
+      "torch_p99_ms": 1.0359083995819092,
+      "residual_max_abs": 0.0009765625,
+      "normed_max_abs": 0.03125
+    },
+    {
+      "rows": 16,
+      "cache": "cold",
+      "custom_median_ms": 1.023769599199295,
+      "torch_median_ms": 1.0398415982723237,
+      "speedup_torch_over_custom": 1.0156988438468957,
+      "custom_p99_ms": 1.025121348619461,
+      "torch_p99_ms": 1.0433555688858032,
+      "residual_max_abs": 0.0009765625,
+      "normed_max_abs": 0.03125
+    }
+  ]
+}

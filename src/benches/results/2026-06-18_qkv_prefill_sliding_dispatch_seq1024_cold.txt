@@ -1,0 +1,17 @@
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+prepared_fa_correctness max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+standalone_norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+benchmark batch=1 seq=1024 window_left=1024 warmup=5 iters=20 samples=5 cache=cold flush_bytes=67108864 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_prep_only median_ms=0.105822 mean_ms=0.1058 trimmed_mean_ms=0.1058 min_ms=0.105646 max_ms=0.10588 p95_ms=0.105877 p99_ms=0.105879 stddev_ms=8.36238e-05 iqr_ms=7.84099e-05 samples_ms=[0.105866,0.10588,0.105646,0.105787,0.105822]
+norm_rope_plus_fa median_ms=0.328094 mean_ms=0.327913 trimmed_mean_ms=0.327913 min_ms=0.326976 max_ms=0.328434 p95_ms=0.328412 p99_ms=0.328429 stddev_ms=0.000526252 iqr_ms=0.000591993 samples_ms=[0.326976,0.328094,0.328326,0.327734,0.328434]
+flash_attn_prepared_no_lse median_ms=0.216283 mean_ms=0.217032 trimmed_mean_ms=0.217032 min_ms=0.21585 max_ms=0.220648 p95_ms=0.219779 p99_ms=0.220474 stddev_ms=0.00181543 iqr_ms=0.000225589 samples_ms=[0.220648,0.216077,0.216283,0.21585,0.216302]
+flash_attn_prepared_lse median_ms=0.216582 mean_ms=0.216579 trimmed_mean_ms=0.216579 min_ms=0.216234 max_ms=0.216973 p95_ms=0.216935 p99_ms=0.216965 stddev_ms=0.00027688 iqr_ms=0.000464007 samples_ms=[0.216582,0.216973,0.216322,0.216234,0.216786]
+decode_norm_rope_paged_kv_write median_ms=0.0069824 mean_ms=0.0069952 trimmed_mean_ms=0.0069952 min_ms=0.0069536 max_ms=0.007048 p95_ms=0.00704448 p99_ms=0.0070473 stddev_ms=3.75508e-05 iqr_ms=6.88001e-05 samples_ms=[0.007048,0.0069616,0.0069536,0.0069824,0.0070304]
+approx_attention_tflops_in_total_path_median=52.4137
+approx_attention_tflops_prepared_no_lse_median=79.5098
+kernel threads_per_block=128 block_m=64 block_n=64 nwarps=4 dynamic_smem_bytes=98304
+prefill_norm_rope threads_per_block=256 heads_per_block=8
+prefill_norm_rope_large min_seqlen=512 threads_per_block=1024 heads_per_block=32
+kernel_attrs static_smem=0 const_bytes=0 local_bytes=0 max_threads_per_block=256 num_regs=249 ptx_version=86 binary_version=86 cache_mode_ca=0 max_dynamic_smem=98304 preferred_smem_carveout=-1

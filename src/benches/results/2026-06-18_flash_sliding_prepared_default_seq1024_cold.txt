@@ -1,0 +1,9 @@
+benchmark batch=1 seq=1024 window_left=1024 warmup=5 iters=20 samples=5 cache=cold flush_bytes=67108864 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_plus_fa median_ms=0.334536 mean_ms=0.334522 trimmed_mean_ms=0.334522 min_ms=0.333995 max_ms=0.335266 p95_ms=0.33513 p99_ms=0.335238 stddev_ms=0.000429549 iqr_ms=0.000360012 samples_ms=[0.334226,0.334586,0.333995,0.335266,0.334536]
+flash_attn_prepared_no_lse median_ms=0.226282 mean_ms=0.2263 trimmed_mean_ms=0.2263 min_ms=0.226066 max_ms=0.226512 p95_ms=0.226501 p99_ms=0.22651 stddev_ms=0.000165922 iqr_ms=0.000270411 samples_ms=[0.226456,0.226282,0.226512,0.226066,0.226186]
+flash_attn_prepared_lse median_ms=0.227685 mean_ms=0.226922 trimmed_mean_ms=0.226922 min_ms=0.223186 max_ms=0.228187 p95_ms=0.228124 p99_ms=0.228175 stddev_ms=0.00187708 iqr_ms=0.000190377 samples_ms=[0.22768,0.22787,0.228187,0.227685,0.223186]
+decode_norm_rope_paged_kv_write median_ms=0.006896 mean_ms=0.00690208 trimmed_mean_ms=0.00690208 min_ms=0.0067952 max_ms=0.0069776 p95_ms=0.00697344 p99_ms=0.00697677 stddev_ms=6.39633e-05 iqr_ms=7.20001e-05 samples_ms=[0.0069776,0.0068848,0.0069568,0.0067952,0.006896]
+approx_attention_tflops_in_total_path_median=51.4045
+approx_attention_tflops_prepared_no_lse_median=75.9967
+kernel threads_per_block=128 block_m=64 block_n=64 nwarps=4 dynamic_smem_bytes=98304
+kernel_attrs static_smem=0 const_bytes=0 local_bytes=0 max_threads_per_block=256 num_regs=244 ptx_version=86 binary_version=86 cache_mode_ca=0 max_dynamic_smem=98304 preferred_smem_carveout=-1

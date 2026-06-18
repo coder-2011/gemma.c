@@ -1,0 +1,5 @@
+gpu=NVIDIA RTX A6000 sm=86 memory_gb=50.90 driver=13000 runtime=13000 l2_cache_bytes=6291456 sms=84 clock_rate_khz=1800000 memory_clock_rate_khz=8001000
+contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline cache_mode=warm l2_flush_bytes=0 launch_overhead=queued_launches_only host_wall_time=excluded stability_scope=single_process min_effect_for_claim_pct=5 mode=sliding seq_len=4096 page_size=64 split_size=64 key_count=1024 splits=16 warmup=5 iters_per_sample=30 samples=5 write_only=1
+build=nvcc flags="-std=c++17 -O3 -arch=sm_86 -Isrc" dtype=bf16 layout="cache=[layers,pages,page_size,kv_heads,head_dim]" batch_size=1 q_heads=32 kv_heads=16 head_dim=260
+prefill_cache_write median_ms=0.229205 mean_ms=0.228980 trimmed_mean_ms=0.228980 min_ms=0.228130 max_ms=0.229482 p95_ms=0.229453 p99_ms=0.229476 stddev_ms=0.000492 iqr_ms=0.000593 samples_ms=[0.228130,0.228745,0.229338,0.229205,0.229482]
+decode_cache_write median_ms=0.016127 mean_ms=0.016417 trimmed_mean_ms=0.016417 min_ms=0.015612 max_ms=0.017127 p95_ms=0.017124 p99_ms=0.017127 stddev_ms=0.000602 iqr_ms=0.000998 samples_ms=[0.015612,0.016111,0.017127,0.016127,0.017109]

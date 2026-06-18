@@ -1,0 +1,142 @@
+{
+  "contract": {
+    "benchmark": "global prefill BF16, warm cache custom/library path timing",
+    "timing": "CUDA events on PyTorch current stream for both custom and PyTorch paths",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "delay_s": 0.0,
+    "delay_location": "before each timed path invocation",
+    "samples": 20,
+    "warmup": 5,
+    "launch_overhead": "host enqueue overhead excluded; GPU timeline includes all kernels in the path",
+    "path_order": "alternates forward/reverse each sample to reduce drift bias",
+    "timed_paths": [
+      "custom_global_prefill_norm_rope_prep"
+    ]
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "nvidia_smi": "NVIDIA RTX A6000, 580.126.16, Enabled, Disabled, [N/A], 300.00, 1800, 7601, 30, 82.58, 1",
+    "time_utc": "2026-06-18T17:55:26Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "batch_size": 1,
+    "seq_len": 512,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "rotary_dim": 128,
+    "dtype": "bf16"
+  },
+  "correctness": {
+    "fused_custom_vs_direct_custom_max_abs": 0.0,
+    "direct_custom_vs_pytorch_max_abs": 0.0078125,
+    "fused_custom_vs_pytorch_max_abs": 0.0078125
+  },
+  "kernel": {
+    "label": "large",
+    "block_m": 32,
+    "block_n": 16,
+    "nwarps": 2,
+    "threads_per_block": 64,
+    "smem_bytes": 65536,
+    "attributes": {
+      "shared_size_bytes": 0,
+      "const_size_bytes": 0,
+      "local_size_bytes": 360,
+      "max_threads_per_block": 256,
+      "num_regs": 255,
+      "ptx_version": 86,
+      "binary_version": 86,
+      "cache_mode_ca": 0,
+      "max_dynamic_shared_size_bytes": 65536,
+      "preferred_shmem_carveout": -1
+    },
+    "selected_label": "large",
+    "large_min_seqlen": 256,
+    "small_tile": {
+      "label": "small",
+      "block_m": 32,
+      "block_n": 32,
+      "nwarps": 2,
+      "threads_per_block": 64,
+      "smem_bytes": 98304,
+      "attributes": {
+        "shared_size_bytes": 0,
+        "const_size_bytes": 0,
+        "local_size_bytes": 704,
+        "max_threads_per_block": 256,
+        "num_regs": 255,
+        "ptx_version": 86,
+        "binary_version": 86,
+        "cache_mode_ca": 0,
+        "max_dynamic_shared_size_bytes": 98304,
+        "preferred_shmem_carveout": -1
+      }
+    },
+    "large_tile": {
+      "label": "large",
+      "block_m": 32,
+      "block_n": 16,
+      "nwarps": 2,
+      "threads_per_block": 64,
+      "smem_bytes": 65536,
+      "attributes": {
+        "shared_size_bytes": 0,
+        "const_size_bytes": 0,
+        "local_size_bytes": 360,
+        "max_threads_per_block": 256,
+        "num_regs": 255,
+        "ptx_version": 86,
+        "binary_version": 86,
+        "cache_mode_ca": 0,
+        "max_dynamic_shared_size_bytes": 65536,
+        "preferred_shmem_carveout": -1
+      }
+    },
+    "prefill_norm_rope": {
+      "threads_per_block": 256,
+      "heads_per_block": 8
+    }
+  },
+  "timings": {
+    "custom_global_prefill_norm_rope_prep": {
+      "median_ms": 0.14611200243234634,
+      "mean_ms": 0.14951200112700463,
+      "trimmed_mean_ms": 0.1466360013000667,
+      "min_ms": 0.08048000186681747,
+      "max_ms": 0.2504960000514984,
+      "p95_ms": 0.23119200170040133,
+      "p99_ms": 0.24663520038127895,
+      "stddev_ms": 0.04752260803956173,
+      "iqr_ms": 0.04676799662411213,
+      "samples_ms": [
+        0.14406399428844452,
+        0.15647999942302704,
+        0.08048000186681747,
+        0.1462080031633377,
+        0.11715199798345566,
+        0.1438080072402954,
+        0.12054400146007538,
+        0.15158399939537048,
+        0.1258240044116974,
+        0.16476799547672272,
+        0.08832000195980072,
+        0.08291199803352356,
+        0.23017600178718567,
+        0.2189760059118271,
+        0.14601600170135498,
+        0.17155200242996216,
+        0.2091200053691864,
+        0.2504960000514984,
+        0.15401600301265717,
+        0.08774399757385254
+      ]
+    }
+  },
+  "speedups": {},
+  "checksum": 42364.673828125
+}

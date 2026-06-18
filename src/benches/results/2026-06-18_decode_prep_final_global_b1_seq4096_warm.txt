@@ -1,0 +1,92 @@
+{
+  "contract": {
+    "timing": "CUDA-event timing on the current PyTorch CUDA stream",
+    "execution": "CUDA graph replay; PyTorch work captured after optional torch.compile",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "launch_overhead": "excluded from per-op timing by CUDA graph replay and batched warm replay",
+    "enqueue_delay": "untimed torch.cuda._sleep(1000000) before start event",
+    "host_wall_time": "excluded",
+    "dtype": "bfloat16",
+    "layout": "raw q=[B,32,D], raw k/v=[B,KV,D], cache=[1,pages,page,KV,D]",
+    "warmup": 8,
+    "iters_per_sample": 40,
+    "graph_inner_iters": 40,
+    "sleep_cycles": 1000000,
+    "samples": 15,
+    "timed_paths": "custom",
+    "min_effect_for_claim_pct": 5
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T19:20:10Z",
+    "custom_lib": "build/libgemma4_flash_attention.so",
+    "torch_compile": "disabled"
+  },
+  "kernel": {
+    "decode_norm_rope": {
+      "selected": {
+        "threads_per_block": 64,
+        "heads_per_block": 2
+      },
+      "default": {
+        "threads_per_block": 64,
+        "heads_per_block": 2
+      },
+      "large_batch": {
+        "min_batch": 8,
+        "threads_per_block": 32,
+        "heads_per_block": 1
+      }
+    }
+  },
+  "shape": {
+    "layer_type": "global",
+    "batch_size": 1,
+    "seq_len": 4096,
+    "page_size": 64,
+    "pages_per_seq": 64,
+    "num_pages": 64,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "rotary_dim": 128,
+    "rope_theta": 1000000.0
+  },
+  "correctness": {
+    "q_max_abs": 0.0,
+    "cache_k_max_abs": 0.0,
+    "cache_v_max_abs": 0.0
+  },
+  "checksum": 207.58228302001953,
+  "custom_cuda_graph_decode_norm_rope_paged_kv_write": {
+    "median_ms": 0.002584799937903881,
+    "mean_ms": 0.002585279941558838,
+    "trimmed_mean_ms": 0.0025846768600436354,
+    "min_ms": 0.0025831999257206915,
+    "max_ms": 0.002595200017094612,
+    "p95_ms": 0.002589039970189333,
+    "p99_ms": 0.0025939680077135562,
+    "stddev_ms": 2.783592043631078e-06,
+    "iqr_ms": 1.200009137392044e-06,
+    "samples_ms": [
+      0.002595200017094612,
+      0.0025863999500870703,
+      0.002584799937903881,
+      0.002583999931812286,
+      0.002584799937903881,
+      0.002584799937903881,
+      0.002583999931812286,
+      0.0025855999439954756,
+      0.002583999931812286,
+      0.0025831999257206915,
+      0.0025855999439954756,
+      0.0025831999257206915,
+      0.002584799937903881,
+      0.002583999931812286,
+      0.002584799937903881
+    ]
+  }
+}

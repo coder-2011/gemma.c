@@ -1,0 +1,11 @@
+device=NVIDIA RTX A6000
+seed=0x20260618,iters=50,warmup=10,trials=4
+flush_bytes=268435456
+metric,best_ms,avg_ms
+custom_graph,0.977364,0.977413
+scratch_clear_graph,0.001164,0.001205
+warm_minus_clear,0.976200,0.976208
+cold_custom,1.378704,1.378943
+cold_clear,0.400087,0.400449
+flush_only,0.398196,0.398769
+cold_minus_flush_clear,0.978617,0.978495

@@ -1,0 +1,75 @@
+{
+  "contract": {
+    "timing": "CUDA-event timing on the current PyTorch CUDA stream",
+    "execution": "CUDA graph replay; PyTorch work captured after optional torch.compile",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "launch_overhead": "excluded from per-op timing by CUDA graph replay and batched warm replay",
+    "enqueue_delay": "untimed torch.cuda._sleep(1000000) before start event",
+    "host_wall_time": "excluded",
+    "dtype": "bfloat16",
+    "layout": "raw q=[B,32,D], raw k/v=[B,KV,D], cache=[1,pages,page,KV,D]",
+    "warmup": 5,
+    "iters_per_sample": 30,
+    "graph_inner_iters": 30,
+    "sleep_cycles": 1000000,
+    "samples": 9,
+    "timed_paths": "custom",
+    "min_effect_for_claim_pct": 5
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T18:45:34Z",
+    "custom_lib": "build/libgemma4_flash_attention.so",
+    "torch_compile": "disabled"
+  },
+  "kernel": {
+    "decode_norm_rope": {
+      "threads_per_block": 32,
+      "heads_per_block": 1
+    }
+  },
+  "shape": {
+    "layer_type": "sliding",
+    "batch_size": 1,
+    "seq_len": 128,
+    "page_size": 64,
+    "pages_per_seq": 2,
+    "num_pages": 2,
+    "q_heads": 32,
+    "kv_heads": 16,
+    "head_dim": 256,
+    "rotary_dim": 256,
+    "rope_theta": 10000.0
+  },
+  "correctness": {
+    "q_max_abs": 5.960464477539063e-08,
+    "cache_k_max_abs": 0.0,
+    "cache_v_max_abs": 0.0
+  },
+  "checksum": 157.75650787353516,
+  "custom_cuda_graph_decode_norm_rope_paged_kv_write": {
+    "median_ms": 0.00240639994541804,
+    "mean_ms": 0.002407229581364879,
+    "trimmed_mean_ms": 0.002407229581364879,
+    "min_ms": 0.002404266595840454,
+    "max_ms": 0.0024160000185171763,
+    "p95_ms": 0.0024121599892775215,
+    "p99_ms": 0.0024152320126692457,
+    "stddev_ms": 3.1713635639081916e-06,
+    "iqr_ms": 0.0,
+    "samples_ms": [
+      0.0024160000185171763,
+      0.002404266595840454,
+      0.00240639994541804,
+      0.00240639994541804,
+      0.00240639994541804,
+      0.00240639994541804,
+      0.00240639994541804,
+      0.00240639994541804,
+      0.00240639994541804
+    ]
+  }
+}

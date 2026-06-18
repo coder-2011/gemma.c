@@ -1,0 +1,81 @@
+{
+  "contract": {
+    "timing": "CUDA-event timing on the current PyTorch CUDA stream",
+    "execution": "CUDA graph replay; PyTorch work captured after optional torch.compile",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "launch_overhead": "excluded from per-op timing by CUDA graph replay and batched warm replay",
+    "enqueue_delay": "untimed torch.cuda._sleep(1000000) before start event",
+    "host_wall_time": "excluded",
+    "dtype": "bfloat16",
+    "layout": "raw q=[B,32,D], raw k/v=[B,KV,D], cache=[1,pages,page,KV,D]",
+    "warmup": 8,
+    "iters_per_sample": 40,
+    "graph_inner_iters": 40,
+    "sleep_cycles": 1000000,
+    "samples": 15,
+    "timed_paths": "custom",
+    "min_effect_for_claim_pct": 5
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T19:19:17Z",
+    "custom_lib": "build/libgemma4_flash_attention.so",
+    "torch_compile": "disabled"
+  },
+  "kernel": {
+    "decode_norm_rope": {
+      "threads_per_block": 64,
+      "heads_per_block": 2
+    }
+  },
+  "shape": {
+    "layer_type": "sliding",
+    "batch_size": 16,
+    "seq_len": 128,
+    "page_size": 64,
+    "pages_per_seq": 2,
+    "num_pages": 32,
+    "q_heads": 32,
+    "kv_heads": 16,
+    "head_dim": 256,
+    "rotary_dim": 256,
+    "rope_theta": 10000.0
+  },
+  "correctness": {
+    "q_max_abs": 1.52587890625e-05,
+    "cache_k_max_abs": 0.001953125,
+    "cache_v_max_abs": 0.0
+  },
+  "checksum": 309.11119842529297,
+  "custom_cuda_graph_decode_norm_rope_paged_kv_write": {
+    "median_ms": 0.0029255999252200127,
+    "mean_ms": 0.002927093269924323,
+    "trimmed_mean_ms": 0.0029265845481019756,
+    "min_ms": 0.0029239999130368233,
+    "max_ms": 0.0029368000105023384,
+    "p95_ms": 0.002933999989181757,
+    "p99_ms": 0.002936240006238222,
+    "stddev_ms": 3.5880568018915813e-06,
+    "iqr_ms": 4.00003045797348e-06,
+    "samples_ms": [
+      0.0029368000105023384,
+      0.0029279999434947968,
+      0.0029239999130368233,
+      0.0029263999313116074,
+      0.0029239999130368233,
+      0.002924799919128418,
+      0.0029263999313116074,
+      0.002924799919128418,
+      0.0029255999252200127,
+      0.002929599955677986,
+      0.002929599955677986,
+      0.002932799980044365,
+      0.0029239999130368233,
+      0.002924799919128418,
+      0.002924799919128418
+    ]
+  }
+}

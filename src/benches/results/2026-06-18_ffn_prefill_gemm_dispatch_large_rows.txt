@@ -1,0 +1,15 @@
+device=NVIDIA RTX A6000
+iters=30,warmup=10,trials=5,min_rows=128,max_rows=1024
+gate_up_small_max_rows=64,gate_up_small_tb=64x128x64,gate_up_small_warp=32x64,gate_up_small_stages=3
+gate_up_large_tb=128x128x64,gate_up_large_warp=64x64,gate_up_large_stages=3
+down_small_max_rows=128,down_small_tb=64x128x64,down_small_warp=32x64,down_small_stages=3
+down_large_tb=128x128x64,down_large_warp=64x64,down_large_stages=3
+op,rows,best_ms,avg_ms,tflops
+gate_up,128,0.701217,0.703962,84.41
+down,128,0.364692,0.372099,81.15
+gate_up,256,0.984630,1.052506,120.23
+down,256,0.530984,0.541814,111.47
+gate_up,512,2.053467,2.097563,115.30
+down,512,1.022006,1.025041,115.83
+gate_up,1024,4.118157,4.140891,114.98
+down,1024,1.997628,2.009519,118.52

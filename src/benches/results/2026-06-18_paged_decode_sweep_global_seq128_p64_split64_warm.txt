@@ -1,0 +1,10 @@
+gpu=NVIDIA RTX A6000 sm=86 memory_gb=50.90 driver=13000 runtime=13000 l2_cache_bytes=6291456 sms=84 clock_rate_khz=1800000 memory_clock_rate_khz=8001000
+contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline cache_mode=warm l2_flush_bytes=0 launch_overhead=queued_launches_only host_wall_time=excluded stability_scope=single_process min_effect_for_claim_pct=5 mode=global seq_len=128 page_size=64 split_size=64 key_count=128 splits=2 warmup=5 iters_per_sample=40 samples=5 write_only=0
+build=nvcc flags="-std=c++17 -O3 -arch=sm_86 -Isrc" dtype=bf16 layout="cache=[layers,pages,page_size,kv_heads,head_dim]" batch_size=1 q_heads=32 kv_heads=4 head_dim=512
+correctness max_abs=0.000000 mean_abs=0.000000
+correctness max_abs=0.000000 mean_abs=0.000000
+prefill_cache_write median_ms=0.021998 mean_ms=0.024219 trimmed_mean_ms=0.024219 min_ms=0.020950 max_ms=0.034288 p95_ms=0.031836 p99_ms=0.033798 stddev_ms=0.005050 iqr_ms=0.000201 samples_ms=[0.034288,0.022029,0.021998,0.021828,0.020950]
+decode_cache_write median_ms=0.014745 mean_ms=0.017720 trimmed_mean_ms=0.017720 min_ms=0.014226 max_ms=0.023150 p95_ms=0.022950 p99_ms=0.023110 stddev_ms=0.004040 iqr_ms=0.007815 samples_ms=[0.022146,0.023150,0.014226,0.014745,0.014331]
+generic_decode_paged_attention median_ms=0.055790 mean_ms=0.056249 trimmed_mean_ms=0.056249 min_ms=0.055601 max_ms=0.058095 p95_ms=0.057702 p99_ms=0.058016 stddev_ms=0.000942 iqr_ms=0.000495 samples_ms=[0.055601,0.055790,0.055632,0.056127,0.058095]
+flash_decode_paged_attention_direct median_ms=0.148398 mean_ms=0.148378 trimmed_mean_ms=0.148378 min_ms=0.147897 max_ms=0.148716 p95_ms=0.148672 p99_ms=0.148707 stddev_ms=0.000268 iqr_ms=0.000114 samples_ms=[0.147897,0.148716,0.148497,0.148398,0.148382]
+flash_full_decode_write_plus_attention median_ms=0.150743 mean_ms=0.150756 trimmed_mean_ms=0.150756 min_ms=0.150219 max_ms=0.151479 p95_ms=0.151367 p99_ms=0.151457 stddev_ms=0.000436 iqr_ms=0.000501 samples_ms=[0.150219,0.150743,0.151479,0.150418,0.150919]

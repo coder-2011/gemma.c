@@ -1,0 +1,39 @@
+correctness seq=64 max_abs=0.015625 mean_abs=0.000254934 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000254934 max_rel=0.00775194
+prepared_fa_correctness max_abs=0.015625 mean_abs=0.000254934 max_rel=0.00775194
+norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+benchmark batch=1 seq=64 window_left=1024 warmup=15 iters=80 samples=5 cache=warm flush_bytes=0 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_plus_fa median_ms=0.0309084 mean_ms=0.0316431 trimmed_mean_ms=0.0316431 min_ms=0.0271808 max_ms=0.0391312 p95_ms=0.0377753 p99_ms=0.03886 stddev_ms=0.00414783 iqr_ms=0.003708 samples_ms=[0.0271808,0.0286436,0.0323516,0.0391312,0.0309084]
+flash_attn_prepared_no_lse median_ms=0.0170944 mean_ms=0.0169322 trimmed_mean_ms=0.0169322 min_ms=0.0164788 max_ms=0.0172336 p95_ms=0.0172209 p99_ms=0.0172311 stddev_ms=0.000296876 iqr_ms=0.000485601 samples_ms=[0.0164788,0.0172336,0.01717,0.0170944,0.0166844]
+flash_attn_prepared_lse median_ms=0.0183856 mean_ms=0.0190631 trimmed_mean_ms=0.0190631 min_ms=0.0181752 max_ms=0.0220204 p95_ms=0.0213017 p99_ms=0.0218767 stddev_ms=0.00148112 iqr_ms=0.0001192 samples_ms=[0.0181752,0.0184268,0.0183076,0.0183856,0.0220204]
+decode_norm_rope_paged_kv_write median_ms=0.0193012 mean_ms=0.0189822 trimmed_mean_ms=0.0189822 min_ms=0.0173988 max_ms=0.0195856 p95_ms=0.0195584 p99_ms=0.0195802 stddev_ms=0.000803601 iqr_ms=0.000274001 samples_ms=[0.0173988,0.0193012,0.0195856,0.0191756,0.0194496]
+approx_attention_tflops_in_total_path_median=2.20514
+approx_attention_tflops_prepared_no_lse_median=3.98712
+kernel threads_per_block=128 block_m=128 block_n=32 nwarps=4 dynamic_smem_bytes=98304
+kernel_attrs static_smem=0 const_bytes=0 local_bytes=816 max_threads_per_block=256 num_regs=255 ptx_version=86 binary_version=86 cache_mode_ca=0 max_dynamic_smem=98304 preferred_smem_carveout=-1
+correctness seq=64 max_abs=0.015625 mean_abs=0.000254934 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000254934 max_rel=0.00775194
+prepared_fa_correctness max_abs=0.015625 mean_abs=0.000254934 max_rel=0.00775194
+norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+benchmark batch=1 seq=256 window_left=1024 warmup=15 iters=80 samples=5 cache=warm flush_bytes=0 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_plus_fa median_ms=0.120333 mean_ms=0.120594 trimmed_mean_ms=0.120594 min_ms=0.120061 max_ms=0.121758 p95_ms=0.121518 p99_ms=0.12171 stddev_ms=0.000603672 iqr_ms=0.000300407 samples_ms=[0.120061,0.120333,0.120558,0.120258,0.121758]
+flash_attn_prepared_no_lse median_ms=0.0937588 mean_ms=0.093729 trimmed_mean_ms=0.093729 min_ms=0.0934992 max_ms=0.0939592 p95_ms=0.0939193 p99_ms=0.0939512 stddev_ms=0.000149195 iqr_ms=9.12026e-05 samples_ms=[0.0934992,0.0937596,0.0936684,0.0937588,0.0939592]
+flash_attn_prepared_lse median_ms=0.0959428 mean_ms=0.0958883 trimmed_mean_ms=0.0958883 min_ms=0.0956636 max_ms=0.0960112 p95_ms=0.0960066 p99_ms=0.0960103 stddev_ms=0.000127563 iqr_ms=0.000152797 samples_ms=[0.0956636,0.0959428,0.0960112,0.0959884,0.0958356]
+decode_norm_rope_paged_kv_write median_ms=0.019856 mean_ms=0.020158 trimmed_mean_ms=0.020158 min_ms=0.019666 max_ms=0.0207956 p95_ms=0.0207606 p99_ms=0.0207886 stddev_ms=0.000457658 iqr_ms=0.000768399 samples_ms=[0.019852,0.019856,0.0207956,0.019666,0.0206204]
+approx_attention_tflops_in_total_path_median=8.95796
+approx_attention_tflops_prepared_no_lse_median=11.4969
+kernel threads_per_block=128 block_m=128 block_n=32 nwarps=4 dynamic_smem_bytes=98304
+kernel_attrs static_smem=0 const_bytes=0 local_bytes=816 max_threads_per_block=256 num_regs=255 ptx_version=86 binary_version=86 cache_mode_ca=0 max_dynamic_smem=98304 preferred_smem_carveout=-1
+correctness seq=64 max_abs=0.015625 mean_abs=0.000254934 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000254934 max_rel=0.00775194
+prepared_fa_correctness max_abs=0.015625 mean_abs=0.000254934 max_rel=0.00775194
+norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+benchmark batch=1 seq=1024 window_left=1024 warmup=15 iters=80 samples=5 cache=warm flush_bytes=0 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_plus_fa median_ms=1.1291 mean_ms=1.13153 trimmed_mean_ms=1.13153 min_ms=1.12535 max_ms=1.13844 p95_ms=1.13827 p99_ms=1.13841 stddev_ms=0.00543116 iqr_ms=0.0104125 samples_ms=[1.13844,1.13758,1.12535,1.12717,1.1291]
+flash_attn_prepared_no_lse median_ms=1.0217 mean_ms=1.02168 trimmed_mean_ms=1.02168 min_ms=1.02096 max_ms=1.02266 p95_ms=1.02247 p99_ms=1.02262 stddev_ms=0.000561104 iqr_ms=0.000359178 samples_ms=[1.02266,1.02173,1.02096,1.02137,1.0217]
+flash_attn_prepared_lse median_ms=1.01528 mean_ms=1.01539 trimmed_mean_ms=1.01539 min_ms=1.0141 max_ms=1.01625 p95_ms=1.01621 p99_ms=1.01624 stddev_ms=0.00075924 iqr_ms=0.0008111 samples_ms=[1.0141,1.01528,1.01605,1.01524,1.01625]
+decode_norm_rope_paged_kv_write median_ms=0.0187548 mean_ms=0.0186213 trimmed_mean_ms=0.0186213 min_ms=0.0174596 max_ms=0.0194492 p95_ms=0.0193793 p99_ms=0.0194352 stddev_ms=0.000686863 iqr_ms=0.000756402 samples_ms=[0.0194492,0.0190996,0.0183432,0.0174596,0.0187548]
+approx_attention_tflops_in_total_path_median=15.2304
+approx_attention_tflops_prepared_no_lse_median=16.8314
+kernel threads_per_block=128 block_m=128 block_n=32 nwarps=4 dynamic_smem_bytes=98304
+kernel_attrs static_smem=0 const_bytes=0 local_bytes=816 max_threads_per_block=256 num_regs=255 ptx_version=86 binary_version=86 cache_mode_ca=0 max_dynamic_smem=98304 preferred_smem_carveout=-1

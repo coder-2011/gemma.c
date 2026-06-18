@@ -1,0 +1,77 @@
+{
+  "contract": {
+    "timing": "custom CUDA uses CUDA events; PyTorch uses torch.utils.benchmark.Timer",
+    "execution": "CUDA graph replay for custom CUDA paths; Timer measurements for PyTorch paths",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "sample_delay_s": 0.0,
+    "delay_location": "host sleep between initial path checks and before each measured sample",
+    "launch_overhead": "custom CUDA excludes launch overhead by graph replay; PyTorch Timer includes the timed Python statement",
+    "host_wall_time": "excluded from elapsed timings",
+    "warmup": 5,
+    "iters_per_sample": 10,
+    "custom_graph_inner_iters": 10,
+    "samples": 5,
+    "timed_paths": "custom",
+    "min_effect_for_claim_pct": 5
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T20:53:56Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "mode": "global",
+    "batch_size": 1,
+    "decode_q_len": 1,
+    "decode_seq_len": 4096,
+    "decode_key_count": 4096,
+    "page_size": 64,
+    "max_pages_per_seq": 64,
+    "num_pages": 64,
+    "split_size": 32,
+    "num_splits": 128,
+    "prefill_seq_len": null,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "window_size": 0
+  },
+  "kernel": {
+    "decode": {
+      "split_threads_per_block": 512,
+      "reduce_threads_per_block": 512,
+      "query_heads_per_cta": 2,
+      "short_query_heads_per_cta": 2,
+      "long_query_heads_per_cta": 4,
+      "long_min_keys": 4096
+    }
+  },
+  "correctness": {
+    "decode_direct_vs_torch_max_abs": 7.62939453125e-06
+  },
+  "checksum": -2.9011001586914062,
+  "timings": {
+    "decode_custom_direct": {
+      "median_ms": 0.34717440605163574,
+      "mean_ms": 0.3469478464126587,
+      "trimmed_mean_ms": 0.3469478464126587,
+      "min_ms": 0.34617600440979,
+      "max_ms": 0.34742400646209715,
+      "p95_ms": 0.3474208068847656,
+      "p99_ms": 0.3474233665466308,
+      "stddev_ms": 0.0004976864714098892,
+      "iqr_ms": 0.0008512020111083873,
+      "samples_ms": [
+        0.34617600440979,
+        0.34740800857543946,
+        0.34742400646209715,
+        0.34717440605163574,
+        0.3465568065643311
+      ]
+    }
+  },
+  "speedups": {}
+}

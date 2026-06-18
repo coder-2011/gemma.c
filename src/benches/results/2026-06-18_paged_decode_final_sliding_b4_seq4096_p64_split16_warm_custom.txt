@@ -1,0 +1,74 @@
+{
+  "contract": {
+    "timing": "custom CUDA uses CUDA events; PyTorch uses torch.utils.benchmark.Timer",
+    "execution": "CUDA graph replay for custom CUDA paths; Timer measurements for PyTorch paths",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "sample_delay_s": 0.0,
+    "delay_location": "host sleep between initial path checks and before each measured sample",
+    "launch_overhead": "custom CUDA excludes launch overhead by graph replay; PyTorch Timer includes the timed Python statement",
+    "host_wall_time": "excluded from elapsed timings",
+    "warmup": 5,
+    "iters_per_sample": 10,
+    "custom_graph_inner_iters": 10,
+    "samples": 5,
+    "timed_paths": "custom",
+    "min_effect_for_claim_pct": 5
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T20:53:31Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "mode": "sliding",
+    "batch_size": 4,
+    "decode_q_len": 1,
+    "decode_seq_len": 4096,
+    "decode_key_count": 1024,
+    "page_size": 64,
+    "max_pages_per_seq": 17,
+    "num_pages": 68,
+    "split_size": 16,
+    "num_splits": 64,
+    "prefill_seq_len": 64,
+    "q_heads": 32,
+    "kv_heads": 16,
+    "head_dim": 256,
+    "window_size": 1024
+  },
+  "kernel": {
+    "decode": {
+      "split_threads_per_block": 256,
+      "reduce_threads_per_block": 256,
+      "query_heads_per_cta": 2
+    }
+  },
+  "correctness": {
+    "decode_direct_vs_torch_max_abs": 0.000244140625
+  },
+  "checksum": -23.909857749938965,
+  "timings": {
+    "decode_custom_direct": {
+      "median_ms": 0.1801759958267212,
+      "mean_ms": 0.18027391910552978,
+      "trimmed_mean_ms": 0.18027391910552978,
+      "min_ms": 0.17991679906845093,
+      "max_ms": 0.18069759607315064,
+      "p95_ms": 0.18067583799362183,
+      "p99_ms": 0.18069324445724486,
+      "stddev_ms": 0.00031501210464951885,
+      "iqr_ms": 0.0005984067916870173,
+      "samples_ms": [
+        0.1801759958267212,
+        0.1805888056755066,
+        0.17999039888381957,
+        0.17991679906845093,
+        0.18069759607315064
+      ]
+    }
+  },
+  "speedups": {}
+}

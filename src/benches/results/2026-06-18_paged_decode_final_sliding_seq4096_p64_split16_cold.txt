@@ -1,0 +1,11 @@
+gpu=NVIDIA RTX A6000 sm=86 memory_gb=50.90 driver=13000 runtime=13000 l2_cache_bytes=6291456 sms=84 clock_rate_khz=1800000 memory_clock_rate_khz=8001000
+contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline cache_mode=cold l2_flush_bytes=67108864 launch_overhead=queued_launches_only host_wall_time=excluded stability_scope=single_process min_effect_for_claim_pct=5 mode=sliding seq_len=4096 page_size=64 split_size=16 key_count=1024 splits=64 warmup=10 iters_per_sample=30 samples=10 write_only=0
+build=nvcc flags="-std=c++17 -O3 -arch=sm_86 -Isrc" dtype=bf16 layout="cache=[layers,pages,page_size,kv_heads,head_dim]" batch_size=1 q_heads=32 kv_heads=16 head_dim=256
+flash_decode_kernel split_threads=256 reduce_threads=256 query_heads_per_cta=2
+correctness max_abs=0.023438 mean_abs=0.000202
+correctness max_abs=0.023438 mean_abs=0.000202
+prefill_cache_write median_ms=0.204253 mean_ms=0.204279 trimmed_mean_ms=0.204263 min_ms=0.204029 max_ms=0.204659 p95_ms=0.204565 p99_ms=0.204640 stddev_ms=0.000175 iqr_ms=0.000180 samples_ms=[0.204253,0.204251,0.204029,0.204079,0.204254,0.204395,0.204659,0.204450,0.204262,0.204159]
+decode_cache_write median_ms=0.005308 mean_ms=0.005272 trimmed_mean_ms=0.005259 min_ms=0.005078 max_ms=0.005574 p95_ms=0.005498 p99_ms=0.005559 stddev_ms=0.000165 iqr_ms=0.000301 samples_ms=[0.005091,0.005574,0.005291,0.005100,0.005078,0.005371,0.005086,0.005326,0.005404,0.005402]
+generic_decode_paged_attention median_ms=0.111162 mean_ms=0.111124 trimmed_mean_ms=0.111132 min_ms=0.110662 max_ms=0.111525 p95_ms=0.111480 p99_ms=0.111516 stddev_ms=0.000257 iqr_ms=0.000388 samples_ms=[0.110885,0.111220,0.111237,0.111323,0.110895,0.110967,0.111525,0.111104,0.111424,0.110662]
+flash_decode_paged_attention_direct median_ms=0.064954 mean_ms=0.066413 trimmed_mean_ms=0.065024 min_ms=0.064666 max_ms=0.079270 p95_ms=0.073040 p99_ms=0.078024 stddev_ms=0.004291 iqr_ms=0.000390 samples_ms=[0.064811,0.065270,0.064990,0.065426,0.079270,0.064810,0.064917,0.064666,0.064893,0.065073]
+flash_full_decode_write_plus_attention median_ms=0.067438 mean_ms=0.067526 trimmed_mean_ms=0.067516 min_ms=0.067210 max_ms=0.067920 p95_ms=0.067920 p99_ms=0.067920 stddev_ms=0.000268 iqr_ms=0.000486 samples_ms=[0.067526,0.067287,0.067325,0.067351,0.067525,0.067920,0.067920,0.067306,0.067887,0.067210]

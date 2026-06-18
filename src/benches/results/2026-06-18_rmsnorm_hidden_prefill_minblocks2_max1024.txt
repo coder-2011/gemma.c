@@ -1,0 +1,9 @@
+device=NVIDIA RTX A6000
+shape=width5376,max_rows=1024,seed=0x20260618
+iters=200,warmup_graph_launches=30,trials=7
+rows,fused_graph_best_ms,fused_graph_avg_ms,fused_graph_gib_s
+4,0.002040,0.002098,98.165
+16,0.002132,0.002192,375.660
+64,0.002820,0.002877,1136.164
+256,0.017320,0.017367,740.047
+1024,0.065768,0.065797,779.555

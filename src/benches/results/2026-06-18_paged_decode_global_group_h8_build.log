@@ -1,0 +1,2 @@
+mkdir -p build/benches
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_GLOBAL_DECODE_QUERY_HEADS_PER_CTA=8 --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -D_GLIBCXX_USE_CXX11_ABI=1 -Isrc -Iexperiments/flash-attention/csrc/cutlass/include src/benches/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4.cpp -o build/benches/gemma4_kv_cache_bench

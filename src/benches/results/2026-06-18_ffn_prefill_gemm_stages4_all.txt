@@ -1,0 +1,7 @@
+device=NVIDIA RTX A6000
+iters=8,warmup=3,trials=3,min_rows=1,max_rows=1024
+gate_up_small_max_rows=0,gate_up_small_tb=64x128x64,gate_up_small_warp=32x64,gate_up_small_stages=3
+gate_up_large_tb=128x128x64,gate_up_large_warp=64x64,gate_up_large_stages=4
+down_small_max_rows=128,down_small_tb=64x128x64,down_small_warp=32x64,down_small_stages=4
+down_large_tb=128x128x64,down_large_warp=64x64,down_large_stages=4
+op,rows,best_ms,avg_ms,tflops

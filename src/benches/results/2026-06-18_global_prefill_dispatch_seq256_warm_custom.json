@@ -1,0 +1,172 @@
+{
+  "contract": {
+    "benchmark": "global prefill BF16, warm cache custom/library path timing",
+    "timing": "CUDA events on PyTorch current stream for both custom and PyTorch paths",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "delay_s": 0.0,
+    "delay_location": "before each timed path invocation",
+    "samples": 20,
+    "warmup": 5,
+    "launch_overhead": "host enqueue overhead excluded; GPU timeline includes all kernels in the path",
+    "path_order": "alternates forward/reverse each sample to reduce drift bias",
+    "timed_paths": [
+      "direct_custom_global_prefill",
+      "fused_custom_norm_rope_global_prefill"
+    ]
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "nvidia_smi": "NVIDIA RTX A6000, 580.126.16, Enabled, Disabled, [N/A], 300.00, 1800, 7601, 39, 87.71, 3",
+    "time_utc": "2026-06-18T17:38:25Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "batch_size": 1,
+    "seq_len": 256,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "rotary_dim": 128,
+    "dtype": "bf16"
+  },
+  "correctness": {
+    "fused_custom_vs_direct_custom_max_abs": 0.0,
+    "direct_custom_vs_pytorch_max_abs": 0.0078125,
+    "fused_custom_vs_pytorch_max_abs": 0.0078125
+  },
+  "kernel": {
+    "label": "large",
+    "block_m": 32,
+    "block_n": 16,
+    "nwarps": 2,
+    "threads_per_block": 64,
+    "smem_bytes": 65536,
+    "attributes": {
+      "shared_size_bytes": 0,
+      "const_size_bytes": 0,
+      "local_size_bytes": 360,
+      "max_threads_per_block": 256,
+      "num_regs": 255,
+      "ptx_version": 86,
+      "binary_version": 86,
+      "cache_mode_ca": 0,
+      "max_dynamic_shared_size_bytes": 65536,
+      "preferred_shmem_carveout": -1
+    },
+    "selected_label": "large",
+    "large_min_seqlen": 256,
+    "small_tile": {
+      "label": "small",
+      "block_m": 32,
+      "block_n": 32,
+      "nwarps": 2,
+      "threads_per_block": 64,
+      "smem_bytes": 98304,
+      "attributes": {
+        "shared_size_bytes": 0,
+        "const_size_bytes": 0,
+        "local_size_bytes": 704,
+        "max_threads_per_block": 256,
+        "num_regs": 255,
+        "ptx_version": 86,
+        "binary_version": 86,
+        "cache_mode_ca": 0,
+        "max_dynamic_shared_size_bytes": 98304,
+        "preferred_shmem_carveout": -1
+      }
+    },
+    "large_tile": {
+      "label": "large",
+      "block_m": 32,
+      "block_n": 16,
+      "nwarps": 2,
+      "threads_per_block": 64,
+      "smem_bytes": 65536,
+      "attributes": {
+        "shared_size_bytes": 0,
+        "const_size_bytes": 0,
+        "local_size_bytes": 360,
+        "max_threads_per_block": 256,
+        "num_regs": 255,
+        "ptx_version": 86,
+        "binary_version": 86,
+        "cache_mode_ca": 0,
+        "max_dynamic_shared_size_bytes": 65536,
+        "preferred_shmem_carveout": -1
+      }
+    }
+  },
+  "timings": {
+    "direct_custom_global_prefill": {
+      "median_ms": 0.1671840026974678,
+      "mean_ms": 0.16939520016312598,
+      "trimmed_mean_ms": 0.16737200040370226,
+      "min_ms": 0.15331199765205383,
+      "max_ms": 0.2205439954996109,
+      "p95_ms": 0.1816624037921429,
+      "p99_ms": 0.21276767715811723,
+      "stddev_ms": 0.013142623593696716,
+      "iqr_ms": 0.004415992647409439,
+      "samples_ms": [
+        0.2205439954996109,
+        0.16300800442695618,
+        0.15887999534606934,
+        0.16617600619792938,
+        0.16380800306797028,
+        0.16864000260829926,
+        0.16732800006866455,
+        0.15331199765205383,
+        0.15647999942302704,
+        0.16704000532627106,
+        0.16966399550437927,
+        0.17961600422859192,
+        0.16569599509239197,
+        0.16566400229930878,
+        0.16569599509239197,
+        0.17689600586891174,
+        0.17203199863433838,
+        0.16899199783802032,
+        0.16883200407028198,
+        0.1695999950170517
+      ]
+    },
+    "fused_custom_norm_rope_global_prefill": {
+      "median_ms": 0.20287999510765076,
+      "mean_ms": 0.21122720018029212,
+      "trimmed_mean_ms": 0.2027740003541112,
+      "min_ms": 0.18854400515556335,
+      "max_ms": 0.3738879859447479,
+      "p95_ms": 0.23131200447678577,
+      "p99_ms": 0.3453727896511553,
+      "stddev_ms": 0.03793105660737939,
+      "iqr_ms": 0.0036880038678646088,
+      "samples_ms": [
+        0.22380800545215607,
+        0.2011519968509674,
+        0.21024000644683838,
+        0.18854400515556335,
+        0.2035840004682541,
+        0.19392000138759613,
+        0.20259200036525726,
+        0.20988799631595612,
+        0.19948799908161163,
+        0.1998399943113327,
+        0.20051200687885284,
+        0.20342400670051575,
+        0.3738879859447479,
+        0.2035199999809265,
+        0.20508800446987152,
+        0.20348800718784332,
+        0.20041599869728088,
+        0.19539199769496918,
+        0.20294399559497833,
+        0.20281599462032318
+      ]
+    }
+  },
+  "speedups": {},
+  "checksum": 10491.0146484375
+}

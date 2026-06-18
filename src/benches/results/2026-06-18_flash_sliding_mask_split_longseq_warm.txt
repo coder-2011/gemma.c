@@ -1,0 +1,27 @@
+benchmark batch=1 seq=1024 window_left=1024 warmup=10 iters=40 samples=5 cache=warm flush_bytes=0 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_plus_fa median_ms=0.328865 mean_ms=0.328894 trimmed_mean_ms=0.328894 min_ms=0.328617 max_ms=0.329319 p95_ms=0.329247 p99_ms=0.329305 stddev_ms=0.000243238 iqr_ms=0.000245571 samples_ms=[0.328957,0.329319,0.328865,0.328617,0.328711]
+flash_attn_prepared_no_lse median_ms=0.222863 mean_ms=0.222976 trimmed_mean_ms=0.222976 min_ms=0.222022 max_ms=0.224243 p95_ms=0.224108 p99_ms=0.224216 stddev_ms=0.00083673 iqr_ms=0.00137998 samples_ms=[0.222022,0.222185,0.222863,0.223565,0.224243]
+flash_attn_prepared_lse median_ms=0.223054 mean_ms=0.223291 trimmed_mean_ms=0.223291 min_ms=0.222604 max_ms=0.224318 p95_ms=0.224211 p99_ms=0.224296 stddev_ms=0.000661514 iqr_ms=0.00109601 samples_ms=[0.223786,0.222604,0.22269,0.223054,0.224318]
+decode_norm_rope_paged_kv_write median_ms=0.0143312 mean_ms=0.0144645 trimmed_mean_ms=0.0144645 min_ms=0.012724 max_ms=0.0163056 p95_ms=0.0161379 p99_ms=0.0162721 stddev_ms=0.00129486 iqr_ms=0.0019728 samples_ms=[0.0134944,0.0154672,0.0163056,0.0143312,0.012724]
+approx_attention_tflops_in_total_path_median=52.2909
+approx_attention_tflops_prepared_no_lse_median=77.1623
+kernel threads_per_block=128 block_m=64 block_n=64 nwarps=4 dynamic_smem_bytes=98304
+kernel_attrs static_smem=0 const_bytes=0 local_bytes=0 max_threads_per_block=256 num_regs=249 ptx_version=86 binary_version=86 cache_mode_ca=0 max_dynamic_smem=98304 preferred_smem_carveout=-1
+benchmark batch=1 seq=2048 window_left=1024 warmup=10 iters=40 samples=5 cache=warm flush_bytes=0 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_plus_fa median_ms=0.776998 mean_ms=0.774547 trimmed_mean_ms=0.774547 min_ms=0.759566 max_ms=0.780315 p95_ms=0.780135 p99_ms=0.780279 stddev_ms=0.00762908 iqr_ms=0.00297594 samples_ms=[0.759566,0.780315,0.77644,0.776998,0.779416]
+flash_attn_prepared_no_lse median_ms=0.585129 mean_ms=0.583562 trimmed_mean_ms=0.583562 min_ms=0.563172 max_ms=0.593982 p95_ms=0.593964 p99_ms=0.593979 stddev_ms=0.011289 iqr_ms=0.0122552 samples_ms=[0.563172,0.593982,0.593892,0.585129,0.581637]
+flash_attn_prepared_lse median_ms=0.582802 mean_ms=0.581654 trimmed_mean_ms=0.581654 min_ms=0.574616 max_ms=0.586726 p95_ms=0.586246 p99_ms=0.58663 stddev_ms=0.00417516 iqr_ms=0.00452638 samples_ms=[0.584326,0.574616,0.5798,0.586726,0.582802]
+decode_norm_rope_paged_kv_write median_ms=0.0231248 mean_ms=0.0226654 trimmed_mean_ms=0.0226654 min_ms=0.0144128 max_ms=0.032236 p95_ms=0.030736 p99_ms=0.031936 stddev_ms=0.00598341 iqr_ms=0.0059184 samples_ms=[0.032236,0.0144128,0.0188176,0.024736,0.0231248]
+approx_attention_tflops_in_total_path_median=66.3965
+approx_attention_tflops_prepared_no_lse_median=88.1685
+kernel threads_per_block=128 block_m=64 block_n=64 nwarps=4 dynamic_smem_bytes=98304
+kernel_attrs static_smem=0 const_bytes=0 local_bytes=0 max_threads_per_block=256 num_regs=249 ptx_version=86 binary_version=86 cache_mode_ca=0 max_dynamic_smem=98304 preferred_smem_carveout=-1
+benchmark batch=1 seq=4096 window_left=1024 warmup=10 iters=40 samples=5 cache=warm flush_bytes=0 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_plus_fa median_ms=1.79477 mean_ms=1.79251 trimmed_mean_ms=1.79251 min_ms=1.78208 max_ms=1.79656 p95_ms=1.7965 p99_ms=1.79655 stddev_ms=0.00537819 iqr_ms=0.00336719 samples_ms=[1.78208,1.79656,1.79477,1.79289,1.79626]
+flash_attn_prepared_no_lse median_ms=1.40629 mean_ms=1.40486 trimmed_mean_ms=1.40486 min_ms=1.39851 max_ms=1.4096 p95_ms=1.40899 p99_ms=1.40948 stddev_ms=0.00374293 iqr_ms=0.00320876 samples_ms=[1.39851,1.40656,1.4096,1.40629,1.40335]
+flash_attn_prepared_lse median_ms=1.41536 mean_ms=1.42329 trimmed_mean_ms=1.42329 min_ms=1.39265 max_ms=1.46563 p95_ms=1.46024 p99_ms=1.46455 stddev_ms=0.0260709 iqr_ms=0.034564 samples_ms=[1.39265,1.40414,1.41536,1.46563,1.4387]
+decode_norm_rope_paged_kv_write median_ms=0.0166184 mean_ms=0.0174573 trimmed_mean_ms=0.0174573 min_ms=0.0164728 max_ms=0.018828 p95_ms=0.018815 p99_ms=0.0188254 stddev_ms=0.0010941 iqr_ms=0.0021592 samples_ms=[0.018828,0.016604,0.0187632,0.0164728,0.0166184]
+approx_attention_tflops_in_total_path_median=67.0706
+approx_attention_tflops_prepared_no_lse_median=85.5985
+kernel threads_per_block=128 block_m=64 block_n=64 nwarps=4 dynamic_smem_bytes=98304
+kernel_attrs static_smem=0 const_bytes=0 local_bytes=0 max_threads_per_block=256 num_regs=249 ptx_version=86 binary_version=86 cache_mode_ca=0 max_dynamic_smem=98304 preferred_smem_carveout=-1

@@ -1,0 +1,70 @@
+{
+  "contract": {
+    "timing": "custom CUDA uses CUDA events; PyTorch uses torch.utils.benchmark.Timer",
+    "execution": "CUDA graph replay for custom CUDA paths; Timer measurements for PyTorch paths",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "sample_delay_s": 0.0,
+    "delay_location": "host sleep between initial path checks and before each measured sample",
+    "launch_overhead": "custom CUDA excludes launch overhead by graph replay; PyTorch Timer includes the timed Python statement",
+    "host_wall_time": "excluded from elapsed timings",
+    "warmup": 1,
+    "iters_per_sample": 5,
+    "custom_graph_inner_iters": 5,
+    "samples": 2,
+    "timed_paths": "custom",
+    "min_effect_for_claim_pct": 5
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T19:41:55Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "mode": "global",
+    "batch_size": 1,
+    "decode_q_len": 1,
+    "decode_seq_len": 1024,
+    "decode_key_count": 1024,
+    "page_size": 64,
+    "max_pages_per_seq": 16,
+    "num_pages": 16,
+    "split_size": 64,
+    "num_splits": 16,
+    "prefill_seq_len": null,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "window_size": 0
+  },
+  "kernel": {
+    "decode": {
+      "split_threads_per_block": 512,
+      "reduce_threads_per_block": 512
+    }
+  },
+  "correctness": {
+    "decode_direct_vs_torch_max_abs": 0.000244140625
+  },
+  "checksum": -59.05447959899902,
+  "timings": {
+    "decode_custom_direct": {
+      "median_ms": 0.16383360028266908,
+      "mean_ms": 0.16383360028266908,
+      "trimmed_mean_ms": 0.16383360028266908,
+      "min_ms": 0.16379519701004028,
+      "max_ms": 0.16387200355529785,
+      "p95_ms": 0.16386816322803496,
+      "p99_ms": 0.16387123548984528,
+      "stddev_ms": 3.8403272628786955e-05,
+      "iqr_ms": 3.840327262880083e-05,
+      "samples_ms": [
+        0.16379519701004028,
+        0.16387200355529785
+      ]
+    }
+  },
+  "speedups": {}
+}

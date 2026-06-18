@@ -1,0 +1,7 @@
+device=NVIDIA RTX A6000
+iters=20,warmup=5,trials=7
+threads=256,blocks_per_row=0,load_policy=1,store_policy=0
+metric,best_ms,avg_ms,effective_gb_s
+gate_up,1.353803,1.354463,683.1
+down,0.679123,0.679436,680.9
+combined,2.032691,2.033196,682.5

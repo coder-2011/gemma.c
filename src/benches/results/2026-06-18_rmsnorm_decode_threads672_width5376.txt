@@ -1,0 +1,6 @@
+device=NVIDIA RTX A6000
+shape=width5376,max_rows=1,seed=0x20260618
+iters=1000,warmup_iters=100,trials=9
+cudnn_frontend=not_compiled
+rows,rms_ms,rms_gib_s,rms_graph_kernel_ms,rms_graph_kernel_gib_s,cudnn_ms,cudnn_gib_s,cudnn_graph_kernel_ms,cudnn_graph_kernel_gib_s,cudnn_max_abs,scale_free_ms,scale_free_gib_s,scale_free_graph_kernel_ms,scale_free_graph_kernel_gib_s,cudnn_one_scale_ms,cudnn_one_scale_gib_s,cudnn_one_scale_graph_kernel_ms,cudnn_one_scale_graph_kernel_gib_s,cudnn_one_scale_max_abs,scale_free_vs_cudnn_one_scale,residual_ms,fused_ms,split_ms,fused_vs_split,fused_graph_kernel_ms,split_graph_kernel_ms,fused_graph_vs_split_graph,cudnn_split_ms,cudnn_split_graph_ms,fused_vs_cudnn_split,cudnn_split_max_abs
+1,0.007641,3.931,0.001969,15.257,-1.000000,0.000,-1.000000,0.000,-1,0.008089,2.476,0.004842,4.136,-1.000000,0.000,-1.000000,0.000,-1,-1.000,0.006647,0.008183,0.011728,1.433,0.002154,0.003058,1.419,-1.000000,-1.000000,-1.000,-1
