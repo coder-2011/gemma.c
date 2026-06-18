@@ -1,0 +1,2 @@
+mkdir -p build/benches
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 --expt-relaxed-constexpr -Isrc  -I/tmp/cutlass/include -Iexperiments/flash-attention/csrc/cutlass/include src/benches/gemma4_ffn_decode_load_bench.cu src/gemma4_ffn_decode.cu src/gemma4_rmsnorm.cu -o build/benches/gemma4_ffn_decode_load_bench
