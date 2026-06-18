@@ -4,3 +4,5 @@
 skills-lock.json
 models/
 build/experiments/
+__pycache__/
+*.py[cod]

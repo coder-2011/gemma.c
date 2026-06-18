@@ -1,0 +1,13 @@
+gpu=NVIDIA RTX A6000 sm=86 memory_gb=50.90 driver=13000 runtime=13000 l2_cache_bytes=6291456 sms=84 clock_rate_khz=1800000 memory_clock_rate_khz=8001000
+contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline cache_mode=cold l2_flush_bytes=67108864 launch_overhead=queued_launches_only host_wall_time=excluded stability_scope=single_process min_effect_for_claim_pct=5 seq_len=4096 page_size=64 split_size=64 key_count=1024 splits=16 warmup=10 iters_per_sample=20 samples=8
+build=nvcc flags="-std=c++17 -O3 -arch=sm_86 -Isrc" dtype=bf16 layout="cache=[layers,pages,page_size,kv_heads,head_dim]" batch_size=1 q_heads=32 kv_heads=16 head_dim=256
+correctness max_abs=0.023438 mean_abs=0.000202
+correctness max_abs=0.023438 mean_abs=0.000202
+correctness max_abs=0.023438 mean_abs=0.000202
+prefill_cache_write median_ms=0.203959 mean_ms=0.204519 trimmed_mean_ms=0.204519 min_ms=0.203787 max_ms=0.207363 p95_ms=0.206601 p99_ms=0.207211 stddev_ms=0.001156 iqr_ms=0.000528 samples_ms=[0.203981,0.203930,0.203787,0.205186,0.207363,0.204171,0.203798,0.203938]
+decode_cache_write median_ms=0.005046 mean_ms=0.005206 trimmed_mean_ms=0.005206 min_ms=0.005000 max_ms=0.006360 p95_ms=0.005923 p99_ms=0.006273 stddev_ms=0.000437 iqr_ms=0.000044 samples_ms=[0.005021,0.005112,0.005019,0.005000,0.005046,0.005048,0.005045,0.006360]
+paged_decode_attention median_ms=0.138623 mean_ms=0.141254 trimmed_mean_ms=0.141254 min_ms=0.138381 max_ms=0.157563 p95_ms=0.151598 p99_ms=0.156370 stddev_ms=0.006202 iqr_ms=0.001229 samples_ms=[0.157563,0.138381,0.138734,0.138490,0.139424,0.138512,0.138406,0.140520]
+flash_decode_paged_attention_direct median_ms=0.096505 mean_ms=0.099949 trimmed_mean_ms=0.099949 min_ms=0.096438 max_ms=0.120909 p95_ms=0.113114 p99_ms=0.119350 stddev_ms=0.007957 iqr_ms=0.001395 samples_ms=[0.096502,0.096507,0.096474,0.120909,0.097632,0.098637,0.096438,0.096493]
+flash_decode_paged_attention_cp_async median_ms=0.099613 mean_ms=0.100147 trimmed_mean_ms=0.100147 min_ms=0.099146 max_ms=0.102909 p95_ms=0.102277 p99_ms=0.102782 stddev_ms=0.001175 iqr_ms=0.000504 samples_ms=[0.099603,0.099622,0.099533,0.102909,0.099146,0.099704,0.099555,0.101104]
+paged_full_decode_write_plus_attention median_ms=0.140937 mean_ms=0.140890 trimmed_mean_ms=0.140890 min_ms=0.140586 max_ms=0.141026 p95_ms=0.141016 p99_ms=0.141024 stddev_ms=0.000132 iqr_ms=0.000126 samples_ms=[0.140586,0.140813,0.140861,0.140997,0.140968,0.140928,0.141026,0.140946]
+flash_full_decode_write_plus_attention median_ms=0.098925 mean_ms=0.100485 trimmed_mean_ms=0.100485 min_ms=0.098773 max_ms=0.111245 p95_ms=0.107027 p99_ms=0.110401 stddev_ms=0.004070 iqr_ms=0.000364 samples_ms=[0.098898,0.111245,0.099192,0.098787,0.098842,0.098773,0.098952,0.099194]

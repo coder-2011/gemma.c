@@ -1,0 +1,1390 @@
+.visible .entry _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii(
+	.param .u64 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_0,
+	.param .u64 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_1,
+	.param .u64 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_2,
+	.param .u64 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_3,
+	.param .u64 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_4,
+	.param .u64 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_5,
+	.param .u64 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_6,
+	.param .u64 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_7,
+	.param .align 4 .b8 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_8[28],
+	.param .u32 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_9,
+	.param .f32 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_10,
+	.param .u32 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_11,
+	.param .u32 _ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_12
+)
+.maxntid 256, 1, 1
+{
+	.reg .pred 	%p<18>;
+	.reg .b16 	%rs<7>;
+	.reg .f32 	%f<128>;
+	.reg .b32 	%r<127>;
+	.reg .b64 	%rd<90>;
+
+//src/gemma4_flash_attention.cu:1424 template <bool UseCpAsync>
+//src/gemma4_flash_attention.cu:1425 __global__ __launch_bounds__(kSlidingDecodeThreads)
+//src/gemma4_flash_attention.cu:1426 void sliding_decode_paged_grouped_split_kernel(
+	.loc	1 1426 0
+	// demoted variable
+	.shared .align 16 .b8 _ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE16cp_async_storage[1024];
+	// demoted variable
+	.shared .align 4 .b8 _ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage[44];
+	// demoted variable
+	.shared .align 4 .f32 _ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE7s_score;
+
+	ld.param.u64 	%rd9, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_0];
+	ld.param.u64 	%rd10, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_1];
+	ld.param.u64 	%rd11, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_2];
+	ld.param.u64 	%rd12, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_3];
+	ld.param.u64 	%rd13, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_4];
+	ld.param.u64 	%rd14, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_5];
+	ld.param.u64 	%rd15, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_6];
+	ld.param.u64 	%rd17, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_7];
+	ld.param.u32 	%r25, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_9];
+	ld.param.f32 	%f30, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_10];
+	ld.param.u32 	%r28, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_11];
+	ld.param.u32 	%r26, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_12];
+	ld.param.u32 	%r24, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_8+24];
+	ld.param.u32 	%r23, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_8+20];
+	ld.param.u32 	%r22, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_8+16];
+	ld.param.u32 	%r21, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_8+12];
+	ld.param.u32 	%r20, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_8+8];
+	ld.param.u32 	%r19, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_8+4];
+
+//src/gemma4_flash_attention.cu:1443   const int32_t kv_head = blockIdx.y;
+//src/gemma4_flash_attention.cu:1444   const int32_t split = blockIdx.z;
+//src/gemma4_flash_attention.cu:1445   const int32_t dim = threadIdx.x;
+	.loc	1 1445 3
+	mov.u32 	%r1, %tid.x;
+
+//src/gemma4_flash_attention.cu:1441
+//src/gemma4_flash_attention.cu:1442   const int32_t batch = blockIdx.x;
+//src/gemma4_flash_attention.cu:1443   const int32_t kv_head = blockIdx.y;
+	.loc	1 1443 3
+	mov.u32 	%r29, %ctaid.y;
+
+//src/gemma4_flash_attention.cu:1446   const int32_t q_head0 = kv_head * kSlidingDecodeGqaRatio;
+	.loc	1 1446 3
+	shl.b32 	%r2, %r29, 1;
+
+//src/gemma4_flash_attention.cu:1442   const int32_t batch = blockIdx.x;
+	.loc	1 1442 3
+	mov.u32 	%r30, %ctaid.x;
+
+//src/gemma4_flash_attention.cu:1447   const int32_t q_head1 = q_head0 + 1;
+//src/gemma4_flash_attention.cu:1448   const int32_t seq_len = __ldg(seq_lengths + batch);
+	.loc	1 1448 3
+	cvt.s64.s32 	%rd1, %r30;
+	mul.wide.s32 	%rd18, %r30, 4;
+	add.s64 	%rd16, %rd17, %rd18;
+
+//src/gemma4_flash_attention.cu:1448   const int32_t seq_len = __ldg(seq_lengths + batch);
+	.loc	1 1448 3
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp:110 __SM_32_INTRINSICS_DECL__ signed char __ldg(const signed char *ptr) { unsigned int ret; asm volatile ("ld.global.nc.s8 %0, [%1];"  : "=r"(ret) : __LDG_PTR (ptr)); return (signed char)ret; }
+///usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp:111 __SM_32_INTRINSICS_DECL__ short __ldg(const short *ptr) { unsigned short ret; asm volatile ("ld.global.nc.s16 %0, [%1];"  : "=h"(ret) : __LDG_PTR (ptr)); return (short)ret; }
+///usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp:112 __SM_32_INTRINSICS_DECL__ int __ldg(const int *ptr) { unsigned int ret; asm volatile ("ld.global.nc.s32 %0, [%1];"  : "=r"(ret) : __LDG_PTR (ptr)); return (int)ret; }
+	.loc	6 112 47, function_name $L__info_string13, inlined_at 1 1448 3
+	// begin inline asm
+	ld.global.nc.s32 %r27, [%rd16];
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1447   const int32_t q_head1 = q_head0 + 1;
+//src/gemma4_flash_attention.cu:1448   const int32_t seq_len = __ldg(seq_lengths + batch);
+//src/gemma4_flash_attention.cu:1449   const int32_t first_key = config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
+	.loc	1 1449 3
+	setp.gt.s32 	%p1, %r24, 0;
+	sub.s32 	%r31, %r27, %r24;
+	setp.gt.s32 	%p2, %r31, 0;
+	and.pred  	%p3, %p1, %p2;
+	selp.b32 	%r32, %r31, 0, %p3;
+
+//src/gemma4_flash_attention.cu:1442   const int32_t batch = blockIdx.x;
+//src/gemma4_flash_attention.cu:1443   const int32_t kv_head = blockIdx.y;
+//src/gemma4_flash_attention.cu:1444   const int32_t split = blockIdx.z;
+	.loc	1 1444 3
+	mov.u32 	%r3, %ctaid.z;
+
+//src/gemma4_flash_attention.cu:1450   const int32_t key_count = seq_len - first_key;
+//src/gemma4_flash_attention.cu:1451   const int32_t split_begin = first_key + split * split_size;
+	.loc	1 1451 3
+	mad.lo.s32 	%r126, %r3, %r28, %r32;
+
+//src/gemma4_flash_attention.cu:1452   const int32_t split_end = min(first_key + key_count, split_begin + split_size);
+	.loc	1 1452 3
+	add.s32 	%r33, %r126, %r28;
+	min.s32 	%r5, %r27, %r33;
+
+//src/gemma4_flash_attention.cu:1453   const int32_t partial0 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head0) * num_splits + split;
+	.loc	1 1453 3
+	shl.b32 	%r6, %r30, 5;
+
+//src/gemma4_flash_attention.cu:1445   const int32_t dim = threadIdx.x;
+//src/gemma4_flash_attention.cu:1446   const int32_t q_head0 = kv_head * kSlidingDecodeGqaRatio;
+//src/gemma4_flash_attention.cu:1447   const int32_t q_head1 = q_head0 + 1;
+	.loc	1 1447 3
+	add.s32 	%r34, %r2, %r6;
+
+//src/gemma4_flash_attention.cu:1454   const int32_t partial1 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head1) * num_splits + split;
+	.loc	1 1454 3
+	or.b32  	%r35, %r34, 1;
+	mad.lo.s32 	%r7, %r35, %r26, %r3;
+
+//src/gemma4_flash_attention.cu:1455
+//src/gemma4_flash_attention.cu:1456   if (split_begin >= split_end) {
+	.loc	1 1456 3
+	setp.lt.s32 	%p4, %r126, %r5;
+	@%p4 bra 	$L__BB7_4;
+	bra.uni 	$L__BB7_1;
+
+$L__BB7_4:
+	.loc	1 0 3
+	cvt.u32.u64 	%r41, %rd1;
+
+//src/gemma4_flash_attention.cu:1466   }
+//src/gemma4_flash_attention.cu:1467
+//src/gemma4_flash_attention.cu:1468   const int64_t q_base0 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head0) * GEMMA4_SLIDING_HEAD_DIM;
+	.loc	1 1468 3
+	cvt.s64.s32 	%rd39, %r2;
+	shl.b64 	%rd40, %rd1, 5;
+	add.s64 	%rd41, %rd40, %rd39;
+	shl.b64 	%rd42, %rd41, 8;
+
+//src/gemma4_flash_attention.cu:1447   const int32_t q_head1 = q_head0 + 1;
+	.loc	1 1447 3
+	add.s32 	%r42, %r2, 1;
+
+//src/gemma4_flash_attention.cu:1469   const int64_t q_base1 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head1) * GEMMA4_SLIDING_HEAD_DIM;
+	.loc	1 1469 3
+	cvt.s64.s32 	%rd43, %r42;
+	add.s64 	%rd44, %rd40, %rd43;
+	shl.b64 	%rd45, %rd44, 8;
+
+//src/gemma4_flash_attention.cu:1470   const float q0 = __bfloat162float(loadg(q + q_base0 + dim));
+	.loc	1 1470 3
+	cvt.s64.s32 	%rd46, %r1;
+	add.s64 	%rd47, %rd42, %rd46;
+	shl.b64 	%rd48, %rd47, 1;
+	add.s64 	%rd37, %rd12, %rd48;
+
+//src/gemma4_flash_attention.cu:1470   const float q0 = __bfloat162float(loadg(q + q_base0 + dim));
+	.loc	1 1470 3
+
+//src/gemma4_cuda_utils.cuh:98 template <typename ElementType>
+//src/gemma4_cuda_utils.cuh:99 __device__ inline ElementType loadg(const ElementType *address) {
+//src/gemma4_cuda_utils.cuh:100   return __ldg(address);
+	.loc	5 100 3, function_name $L__info_string796, inlined_at 1 1470 3
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:1826 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:1827     __nv_bfloat16 ret;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:1828     asm ("ld.global.nc.b16 %0, [%1];"  : "=h"(__BFLOAT16_TO_US(ret)) : __LDG_PTR(ptr));
+	.loc	2 1828 5, function_name $L__info_string797, inlined_at 5 100 3
+	// begin inline asm
+	ld.global.nc.b16 %rs1, [%rd37];
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1468   const int64_t q_base0 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head0) * GEMMA4_SLIDING_HEAD_DIM;
+//src/gemma4_flash_attention.cu:1469   const int64_t q_base1 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head1) * GEMMA4_SLIDING_HEAD_DIM;
+//src/gemma4_flash_attention.cu:1470   const float q0 = __bfloat162float(loadg(q + q_base0 + dim));
+	.loc	1 1470 3
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:606 __CUDA_HOSTDEVICE_BF16_DECL__ float __bfloat162float(const __nv_bfloat16 a)
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:607 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:608     return __internal_bfloat162float(static_cast<__nv_bfloat16_raw>(a).x);
+	.loc	2 608 5, function_name $L__info_string2, inlined_at 1 1470 3
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:595 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:596     float f;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:597 NV_IF_ELSE_TARGET(NV_IS_DEVICE,
+	.loc	2 597 1, function_name $L__info_string3, inlined_at 2 608 5
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:583 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:584     float f;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:585 NV_IF_ELSE_TARGET(NV_PROVIDES_SM_90,
+	.loc	2 585 1, function_name $L__info_string4, inlined_at 2 597 1
+	// begin inline asm
+	{ mov.b32 %f31, {0,%rs1};}
+
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1469   const int64_t q_base1 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head1) * GEMMA4_SLIDING_HEAD_DIM;
+//src/gemma4_flash_attention.cu:1470   const float q0 = __bfloat162float(loadg(q + q_base0 + dim));
+//src/gemma4_flash_attention.cu:1471   const float q1 = __bfloat162float(loadg(q + q_base1 + dim));
+	.loc	1 1471 3
+	add.s64 	%rd49, %rd45, %rd46;
+	shl.b64 	%rd50, %rd49, 1;
+	add.s64 	%rd38, %rd12, %rd50;
+
+//src/gemma4_flash_attention.cu:1471   const float q1 = __bfloat162float(loadg(q + q_base1 + dim));
+	.loc	1 1471 3
+
+//src/gemma4_cuda_utils.cuh:98 template <typename ElementType>
+//src/gemma4_cuda_utils.cuh:99 __device__ inline ElementType loadg(const ElementType *address) {
+//src/gemma4_cuda_utils.cuh:100   return __ldg(address);
+	.loc	5 100 3, function_name $L__info_string796, inlined_at 1 1471 3
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:1826 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:1827     __nv_bfloat16 ret;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:1828     asm ("ld.global.nc.b16 %0, [%1];"  : "=h"(__BFLOAT16_TO_US(ret)) : __LDG_PTR(ptr));
+	.loc	2 1828 5, function_name $L__info_string797, inlined_at 5 100 3
+	// begin inline asm
+	ld.global.nc.b16 %rs3, [%rd38];
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1469   const int64_t q_base1 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head1) * GEMMA4_SLIDING_HEAD_DIM;
+//src/gemma4_flash_attention.cu:1470   const float q0 = __bfloat162float(loadg(q + q_base0 + dim));
+//src/gemma4_flash_attention.cu:1471   const float q1 = __bfloat162float(loadg(q + q_base1 + dim));
+	.loc	1 1471 3
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:606 __CUDA_HOSTDEVICE_BF16_DECL__ float __bfloat162float(const __nv_bfloat16 a)
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:607 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:608     return __internal_bfloat162float(static_cast<__nv_bfloat16_raw>(a).x);
+	.loc	2 608 5, function_name $L__info_string2, inlined_at 1 1471 3
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:595 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:596     float f;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:597 NV_IF_ELSE_TARGET(NV_IS_DEVICE,
+	.loc	2 597 1, function_name $L__info_string3, inlined_at 2 608 5
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:583 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:584     float f;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:585 NV_IF_ELSE_TARGET(NV_PROVIDES_SM_90,
+	.loc	2 585 1, function_name $L__info_string4, inlined_at 2 597 1
+	// begin inline asm
+	{ mov.b32 %f32, {0,%rs3};}
+
+	// end inline asm
+	mul.lo.s32 	%r43, %r21, %r41;
+	cvt.s64.s32 	%rd3, %r43;
+	mul.wide.s32 	%rd4, %r25, %r19;
+	cvt.s64.s32 	%rd5, %r22;
+	cvt.s64.s32 	%rd6, %r23;
+	shl.b32 	%r44, %r1, 3;
+	cvt.s64.s32 	%rd7, %r44;
+	shl.b32 	%r45, %r1, 4;
+	mov.u32 	%r46, _ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE16cp_async_storage;
+	add.s32 	%r11, %r46, %r45;
+	add.s32 	%r12, %r11, 512;
+	shl.b32 	%r47, %r1, 1;
+	add.s32 	%r13, %r46, %r47;
+	shr.s32 	%r48, %r1, 31;
+	shr.u32 	%r49, %r48, 27;
+	add.s32 	%r50, %r1, %r49;
+	shr.s32 	%r51, %r50, 5;
+	shl.b32 	%r52, %r51, 2;
+	mov.u32 	%r53, _ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage;
+	add.s32 	%r54, %r53, %r52;
+	mov.f32 	%f127, 0f00000000;
+	mov.f32 	%f125, 0fFF800000;
+	// begin inline asm
+	mov.u32 %r62, %laneid;
+	// end inline asm
+	mov.f32 	%f126, %f127;
+	mov.f32 	%f124, %f125;
+	mov.f32 	%f123, %f127;
+	mov.f32 	%f122, %f127;
+
+$L__BB7_5:
+
+//src/gemma4_flash_attention.cu:1481
+//src/gemma4_flash_attention.cu:1482   for (int32_t pos = split_begin; pos < split_end; ++pos) {
+//src/gemma4_flash_attention.cu:1483     const int32_t page_slot = gemma4_kv_cache_page_slot(config, pos);
+	.loc	1 1483 5
+
+//src/gemma4_kv_cache.cuh:58     const Gemma4KvCacheConfig &config,
+//src/gemma4_kv_cache.cuh:59     int32_t position) {
+//src/gemma4_kv_cache.cuh:60   int32_t logical_page = gemma4_kv_cache_logical_page(config, position);
+	.loc	7 60 3, function_name $L__info_string15, inlined_at 1 1483 5
+
+//src/gemma4_kv_cache.cuh:46     const Gemma4KvCacheConfig &config,
+//src/gemma4_kv_cache.cuh:47     int32_t position) {
+//src/gemma4_kv_cache.cuh:48   return position / config.page_size;
+	.loc	7 48 3, function_name $L__info_string16, inlined_at 7 60 3
+	div.s32 	%r56, %r126, %r20;
+
+//src/gemma4_kv_cache.cuh:61   return logical_page % config.max_pages_per_seq;
+	.loc	7 61 3, function_name $L__info_string15, inlined_at 1 1483 5
+	rem.s32 	%r57, %r56, %r21;
+
+//src/gemma4_flash_attention.cu:1483     const int32_t page_slot = gemma4_kv_cache_page_slot(config, pos);
+//src/gemma4_flash_attention.cu:1484     const int32_t physical_page =
+//src/gemma4_flash_attention.cu:1485         __ldg(page_table + batch * config.max_pages_per_seq + page_slot);
+	.loc	1 1485 9
+	cvt.s64.s32 	%rd52, %r57;
+	add.s64 	%rd53, %rd52, %rd3;
+	shl.b64 	%rd54, %rd53, 2;
+	add.s64 	%rd51, %rd15, %rd54;
+
+//src/gemma4_flash_attention.cu:1485         __ldg(page_table + batch * config.max_pages_per_seq + page_slot);
+	.loc	1 1485 9
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp:110 __SM_32_INTRINSICS_DECL__ signed char __ldg(const signed char *ptr) { unsigned int ret; asm volatile ("ld.global.nc.s8 %0, [%1];"  : "=r"(ret) : __LDG_PTR (ptr)); return (signed char)ret; }
+///usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp:111 __SM_32_INTRINSICS_DECL__ short __ldg(const short *ptr) { unsigned short ret; asm volatile ("ld.global.nc.s16 %0, [%1];"  : "=h"(ret) : __LDG_PTR (ptr)); return (short)ret; }
+///usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp:112 __SM_32_INTRINSICS_DECL__ int __ldg(const int *ptr) { unsigned int ret; asm volatile ("ld.global.nc.s32 %0, [%1];"  : "=r"(ret) : __LDG_PTR (ptr)); return (int)ret; }
+	.loc	6 112 47, function_name $L__info_string13, inlined_at 1 1485 9
+	// begin inline asm
+	ld.global.nc.s32 %r55, [%rd51];
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1484     const int32_t physical_page =
+//src/gemma4_flash_attention.cu:1485         __ldg(page_table + batch * config.max_pages_per_seq + page_slot);
+//src/gemma4_flash_attention.cu:1486     if (physical_page < 0 || physical_page >= config.num_pages) continue;
+	.loc	1 1486 5
+	setp.lt.s32 	%p6, %r55, 0;
+	setp.ge.s32 	%p7, %r55, %r19;
+	or.pred  	%p8, %p6, %p7;
+	@%p8 bra 	$L__BB7_21;
+
+	.loc	1 0 5
+	setp.gt.u32 	%p9, %r1, 31;
+
+//src/gemma4_flash_attention.cu:1491     float v_value;
+//src/gemma4_flash_attention.cu:1492     if constexpr (UseCpAsync) {
+//src/gemma4_flash_attention.cu:1493       if (threadIdx.x < GEMMA4_SLIDING_HEAD_DIM / kBf16Packed128Elements) {
+	.loc	1 1493 7
+	@%p9 bra 	$L__BB7_8;
+
+
+//src/gemma4_flash_attention.cu:1487     const int32_t page_offset = gemma4_kv_cache_page_offset(config, pos);
+//src/gemma4_flash_attention.cu:1488     const int64_t kv_base = gemma4_kv_cache_offset(config, layer, physical_page, page_offset, kv_head, 0);
+	.loc	1 1488 5
+
+//src/gemma4_kv_cache.cuh:40     int32_t dim) {
+//src/gemma4_kv_cache.cuh:41   return (((((int64_t)layer * config.num_pages + physical_page) * config.page_size + page_offset) *
+//src/gemma4_kv_cache.cuh:42            config.num_heads + head) * config.head_dim + dim);
+	.loc	7 42 12, function_name $L__info_string18, inlined_at 1 1488 5
+	cvt.s64.s32 	%rd57, %r29;
+
+//src/gemma4_flash_attention.cu:1485         __ldg(page_table + batch * config.max_pages_per_seq + page_slot);
+//src/gemma4_flash_attention.cu:1486     if (physical_page < 0 || physical_page >= config.num_pages) continue;
+//src/gemma4_flash_attention.cu:1487     const int32_t page_offset = gemma4_kv_cache_page_offset(config, pos);
+	.loc	1 1487 5
+
+//src/gemma4_kv_cache.cuh:52     const Gemma4KvCacheConfig &config,
+//src/gemma4_kv_cache.cuh:53     int32_t position) {
+//src/gemma4_kv_cache.cuh:54   return position % config.page_size;
+	.loc	7 54 3, function_name $L__info_string17, inlined_at 1 1487 5
+	rem.s32 	%r61, %r126, %r20;
+
+//src/gemma4_kv_cache.cuh:39     int32_t head,
+//src/gemma4_kv_cache.cuh:40     int32_t dim) {
+//src/gemma4_kv_cache.cuh:41   return (((((int64_t)layer * config.num_pages + physical_page) * config.page_size + page_offset) *
+	.loc	7 41 3, function_name $L__info_string18, inlined_at 1 1488 5
+	cvt.s64.s32 	%rd58, %r61;
+	cvt.s64.s32 	%rd59, %r20;
+	cvt.s64.s32 	%rd60, %r55;
+	add.s64 	%rd61, %rd4, %rd60;
+	mul.lo.s64 	%rd62, %rd61, %rd59;
+	add.s64 	%rd63, %rd62, %rd58;
+
+//src/gemma4_kv_cache.cuh:42            config.num_heads + head) * config.head_dim + dim);
+	.loc	7 42 12, function_name $L__info_string18, inlined_at 1 1488 5
+	mul.lo.s64 	%rd64, %rd63, %rd5;
+	add.s64 	%rd65, %rd64, %rd57;
+	mul.lo.s64 	%rd66, %rd65, %rd6;
+
+//src/gemma4_flash_attention.cu:1493       if (threadIdx.x < GEMMA4_SLIDING_HEAD_DIM / kBf16Packed128Elements) {
+//src/gemma4_flash_attention.cu:1494         const int32_t vec_dim = threadIdx.x * kBf16Packed128Elements;
+//src/gemma4_flash_attention.cu:1495         sliding_decode_cp_async_16(cp_async_storage.s_k + vec_dim, cache_k + kv_base + vec_dim);
+	.loc	1 1495 9
+	add.s64 	%rd67, %rd66, %rd7;
+	shl.b64 	%rd68, %rd67, 1;
+	add.s64 	%rd55, %rd13, %rd68;
+
+//src/gemma4_flash_attention.cu:1495         sliding_decode_cp_async_16(cp_async_storage.s_k + vec_dim, cache_k + kv_base + vec_dim);
+	.loc	1 1495 9
+
+//src/gemma4_flash_attention.cu:1416   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+//src/gemma4_flash_attention.cu:1417                :
+//src/gemma4_flash_attention.cu:1418                : "r"(smem_addr), "l"(gmem_ptr));
+	.loc	1 1418 22, function_name $L__info_string798, inlined_at 1 1495 9
+	// begin inline asm
+	cp.async.cg.shared.global [%r11], [%rd55], 16;
+
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1496         sliding_decode_cp_async_16(cp_async_storage.s_v + vec_dim, cache_v + kv_base + vec_dim);
+	.loc	1 1496 9
+	add.s64 	%rd56, %rd14, %rd68;
+
+//src/gemma4_flash_attention.cu:1496         sliding_decode_cp_async_16(cp_async_storage.s_v + vec_dim, cache_v + kv_base + vec_dim);
+	.loc	1 1496 9
+
+//src/gemma4_flash_attention.cu:1418                : "r"(smem_addr), "l"(gmem_ptr));
+	.loc	1 1418 22, function_name $L__info_string798, inlined_at 1 1496 9
+	// begin inline asm
+	cp.async.cg.shared.global [%r12], [%rd56], 16;
+
+	// end inline asm
+
+$L__BB7_8:
+
+//src/gemma4_flash_attention.cu:1497       }
+//src/gemma4_flash_attention.cu:1498       asm volatile("cp.async.commit_group;\n" ::);
+	.loc	1 1498 7
+	// begin inline asm
+	cp.async.commit_group;
+
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1499       asm volatile("cp.async.wait_group 0;\n" ::);
+	.loc	1 1499 7
+	// begin inline asm
+	cp.async.wait_group 0;
+
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1500       __syncthreads();
+	.loc	1 1500 7
+	bar.sync 	0;
+
+//src/gemma4_flash_attention.cu:1501       k_value = __bfloat162float(cp_async_storage.s_k[dim]);
+	.loc	1 1501 7
+	ld.shared.u16 	%rs5, [%r13];
+
+//src/gemma4_flash_attention.cu:1501       k_value = __bfloat162float(cp_async_storage.s_k[dim]);
+	.loc	1 1501 7
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:606 __CUDA_HOSTDEVICE_BF16_DECL__ float __bfloat162float(const __nv_bfloat16 a)
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:607 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:608     return __internal_bfloat162float(static_cast<__nv_bfloat16_raw>(a).x);
+	.loc	2 608 5, function_name $L__info_string2, inlined_at 1 1501 7
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:595 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:596     float f;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:597 NV_IF_ELSE_TARGET(NV_IS_DEVICE,
+	.loc	2 597 1, function_name $L__info_string3, inlined_at 2 608 5
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:583 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:584     float f;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:585 NV_IF_ELSE_TARGET(NV_PROVIDES_SM_90,
+	.loc	2 585 1, function_name $L__info_string4, inlined_at 2 597 1
+	// begin inline asm
+	{ mov.b32 %f39, {0,%rs5};}
+
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1500       __syncthreads();
+//src/gemma4_flash_attention.cu:1501       k_value = __bfloat162float(cp_async_storage.s_k[dim]);
+//src/gemma4_flash_attention.cu:1502       v_value = __bfloat162float(cp_async_storage.s_v[dim]);
+	.loc	1 1502 7
+	ld.shared.u16 	%rs6, [%r13+512];
+
+//src/gemma4_flash_attention.cu:1502       v_value = __bfloat162float(cp_async_storage.s_v[dim]);
+	.loc	1 1502 7
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:606 __CUDA_HOSTDEVICE_BF16_DECL__ float __bfloat162float(const __nv_bfloat16 a)
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:607 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:608     return __internal_bfloat162float(static_cast<__nv_bfloat16_raw>(a).x);
+	.loc	2 608 5, function_name $L__info_string2, inlined_at 1 1502 7
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:595 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:596     float f;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:597 NV_IF_ELSE_TARGET(NV_IS_DEVICE,
+	.loc	2 597 1, function_name $L__info_string3, inlined_at 2 608 5
+
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:583 {
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:584     float f;
+///usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp:585 NV_IF_ELSE_TARGET(NV_PROVIDES_SM_90,
+	.loc	2 585 1, function_name $L__info_string4, inlined_at 2 597 1
+	// begin inline asm
+	{ mov.b32 %f40, {0,%rs6};}
+
+	// end inline asm
+
+//src/gemma4_flash_attention.cu:1506     }
+//src/gemma4_flash_attention.cu:1507
+//src/gemma4_flash_attention.cu:1508     float score0 = DecodeBlockReduce(reduce_storage).Sum(q0 * k_value);
+	.loc	1 1508 5
+	mul.ftz.f32 	%f43, %f31, %f39;
+
+//src/gemma4_flash_attention.cu:1508     float score0 = DecodeBlockReduce(reduce_storage).Sum(q0 * k_value);
+	.loc	1 1508 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/block_reduce.cuh:516   _CCCL_DEVICE _CCCL_FORCEINLINE T Sum(T input)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/block_reduce.cuh:517   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/block_reduce.cuh:518     return InternalBlockReduce(temp_storage).template Sum<true>(input, BLOCK_THREADS);
+	.loc	8 518 5, function_name $L__info_string36, inlined_at 1 1508 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:218     // Warp reduction in every warp
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:219     T warp_aggregate =
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:220       WarpReduce(temp_storage.warp_reduce[warp_id])
+	.loc	9 220 7, function_name $L__info_string37, inlined_at 8 518 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:673   _CCCL_DEVICE _CCCL_FORCEINLINE T Reduce(T input, int valid_items, ReductionOp reduction_op)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:674   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:675     return ReduceImpl(bool_constant_v<ALL_LANES_VALID>, input, valid_items, reduction_op);
+	.loc	11 675 5, function_name $L__info_string48, inlined_at 9 220 7
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:597
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:598     // Template-iterate reduction steps
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:599     ReduceStep(output, reduction_op, last_lane, constant_v<0>);
+	.loc	11 599 5, function_name $L__info_string49, inlined_at 11 675 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:530   ReduceStep(T& input, ReductionOp reduction_op, int last_lane, constant_t<STEP> /*step*/)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:531   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string50, inlined_at 11 599 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:509     _T input, ReductionOp reduction_op, int last_lane, int offset, ::cuda::std::false_type /*is_small_unsigned*/)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:510   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:230       "}"
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:231       : "=f"(output)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r63, 1;
+	mov.u32 	%r76, 31;
+	mov.u32 	%r77, -1;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f43, %r63, %r76, %r77;  @p add.f32 r0, r0, %f43;  mov.f32 %f41, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:533
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:534     ReduceStep(input, reduction_op, last_lane, constant_v<STEP + 1>);
+	.loc	11 534 5, function_name $L__info_string50, inlined_at 11 599 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string53, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r66, 2;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f41, %r66, %r76, %r77;  @p add.f32 r0, r0, %f41;  mov.f32 %f44, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:534     ReduceStep(input, reduction_op, last_lane, constant_v<STEP + 1>);
+	.loc	11 534 5, function_name $L__info_string53, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string54, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r69, 4;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f44, %r69, %r76, %r77;  @p add.f32 r0, r0, %f44;  mov.f32 %f47, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:534     ReduceStep(input, reduction_op, last_lane, constant_v<STEP + 1>);
+	.loc	11 534 5, function_name $L__info_string54, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string55, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r72, 8;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f47, %r72, %r76, %r77;  @p add.f32 r0, r0, %f47;  mov.f32 %f50, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:534     ReduceStep(input, reduction_op, last_lane, constant_v<STEP + 1>);
+	.loc	11 534 5, function_name $L__info_string55, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string56, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r75, 16;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f50, %r75, %r76, %r77;  @p add.f32 r0, r0, %f50;  mov.f32 %f120, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:222
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:223     // Update outputs and block_aggregate with warp-wide aggregates from lane-0s
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:224     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid);
+	.loc	9 224 5, function_name $L__info_string37, inlined_at 8 518 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:180   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:181     // Share lane aggregates
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:182     if (lane_id == 0)
+	.loc	9 182 5, function_name $L__info_string38, inlined_at 9 224 5
+	setp.ne.s32 	%p10, %r62, 0;
+	@%p10 bra 	$L__BB7_10;
+
+	.loc	9 0 5
+	add.s32 	%r118, %r54, 8;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:183     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:184       detail::uninitialized_copy_single(temp_storage.warp_aggregates + warp_id, warp_aggregate);
+	.loc	9 184 7, function_name $L__info_string38, inlined_at 9 224 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/detail/uninitialized_copy.cuh:58 {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/detail/uninitialized_copy.cuh:59   // gevtushenko: placement new should work here as well, but the code generated for copy assignment is sometimes better
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/detail/uninitialized_copy.cuh:60   *ptr = ::cuda::std::forward<U>(val);
+	.loc	13 60 3, function_name $L__info_string40, inlined_at 9 184 7
+	st.shared.f32 	[%r118], %f120;
+
+$L__BB7_10:
+	.loc	13 0 3
+	setp.ne.s32 	%p11, %r1, 0;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:185     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:186
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:187     __syncthreads();
+	.loc	9 187 5, function_name $L__info_string38, inlined_at 9 224 5
+	bar.sync 	0;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:188
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:189     // Update total aggregate in warp 0, lane 0
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:190     if (linear_tid == 0)
+	.loc	9 190 5, function_name $L__info_string38, inlined_at 9 224 5
+	@%p11 bra 	$L__BB7_12;
+
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:191     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:192       warp_aggregate = ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<1>);
+	.loc	9 192 7, function_name $L__info_string38, inlined_at 9 224 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string57, inlined_at 9 192 7
+	ld.shared.f32 	%f56, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+12];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string57, inlined_at 9 192 7
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f57, %f120, %f56;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string57, inlined_at 9 192 7
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string59, inlined_at 9 146 5
+	ld.shared.f32 	%f58, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+16];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string59, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f59, %f57, %f58;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string59, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string60, inlined_at 9 146 5
+	ld.shared.f32 	%f60, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+20];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string60, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f61, %f59, %f60;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string60, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string61, inlined_at 9 146 5
+	ld.shared.f32 	%f62, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+24];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string61, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f63, %f61, %f62;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string61, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string62, inlined_at 9 146 5
+	ld.shared.f32 	%f64, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+28];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string62, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f65, %f63, %f64;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string62, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string63, inlined_at 9 146 5
+	ld.shared.f32 	%f66, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+32];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string63, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f67, %f65, %f66;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string63, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string64, inlined_at 9 146 5
+	ld.shared.f32 	%f68, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+36];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string64, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f120, %f67, %f68;
+
+$L__BB7_12:
+
+//src/gemma4_flash_attention.cu:1507
+//src/gemma4_flash_attention.cu:1508     float score0 = DecodeBlockReduce(reduce_storage).Sum(q0 * k_value);
+//src/gemma4_flash_attention.cu:1509     if (dim == 0) s_score = score0;
+	.loc	1 1509 5
+	@%p11 bra 	$L__BB7_14;
+
+	st.shared.f32 	[_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE7s_score], %f120;
+
+$L__BB7_14:
+
+//src/gemma4_flash_attention.cu:1510     __syncthreads();
+	.loc	1 1510 5
+	bar.sync 	0;
+
+//src/gemma4_flash_attention.cu:1511     score0 = s_score * softmax_scale;
+	.loc	1 1511 5
+	ld.shared.f32 	%f14, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE7s_score];
+
+//src/gemma4_flash_attention.cu:1512     __syncthreads();
+	.loc	1 1512 5
+	bar.sync 	0;
+
+//src/gemma4_flash_attention.cu:1513
+//src/gemma4_flash_attention.cu:1514     float score1 = DecodeBlockReduce(reduce_storage).Sum(q1 * k_value);
+	.loc	1 1514 5
+	mul.ftz.f32 	%f71, %f32, %f39;
+
+//src/gemma4_flash_attention.cu:1514     float score1 = DecodeBlockReduce(reduce_storage).Sum(q1 * k_value);
+	.loc	1 1514 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/block_reduce.cuh:516   _CCCL_DEVICE _CCCL_FORCEINLINE T Sum(T input)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/block_reduce.cuh:517   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/block_reduce.cuh:518     return InternalBlockReduce(temp_storage).template Sum<true>(input, BLOCK_THREADS);
+	.loc	8 518 5, function_name $L__info_string36, inlined_at 1 1514 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:218     // Warp reduction in every warp
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:219     T warp_aggregate =
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:220       WarpReduce(temp_storage.warp_reduce[warp_id])
+	.loc	9 220 7, function_name $L__info_string37, inlined_at 8 518 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:673   _CCCL_DEVICE _CCCL_FORCEINLINE T Reduce(T input, int valid_items, ReductionOp reduction_op)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:674   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:675     return ReduceImpl(bool_constant_v<ALL_LANES_VALID>, input, valid_items, reduction_op);
+	.loc	11 675 5, function_name $L__info_string48, inlined_at 9 220 7
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:597
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:598     // Template-iterate reduction steps
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:599     ReduceStep(output, reduction_op, last_lane, constant_v<0>);
+	.loc	11 599 5, function_name $L__info_string49, inlined_at 11 675 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:530   ReduceStep(T& input, ReductionOp reduction_op, int last_lane, constant_t<STEP> /*step*/)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:531   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string50, inlined_at 11 599 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:509     _T input, ReductionOp reduction_op, int last_lane, int offset, ::cuda::std::false_type /*is_small_unsigned*/)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:510   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:230       "}"
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:231       : "=f"(output)
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r79, 1;
+	mov.u32 	%r92, 31;
+	mov.u32 	%r93, -1;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f71, %r79, %r92, %r93;  @p add.f32 r0, r0, %f71;  mov.f32 %f69, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:533
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:534     ReduceStep(input, reduction_op, last_lane, constant_v<STEP + 1>);
+	.loc	11 534 5, function_name $L__info_string50, inlined_at 11 599 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string53, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r82, 2;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f69, %r82, %r92, %r93;  @p add.f32 r0, r0, %f69;  mov.f32 %f72, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:534     ReduceStep(input, reduction_op, last_lane, constant_v<STEP + 1>);
+	.loc	11 534 5, function_name $L__info_string53, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string54, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r85, 4;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f72, %r85, %r92, %r93;  @p add.f32 r0, r0, %f72;  mov.f32 %f75, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:534     ReduceStep(input, reduction_op, last_lane, constant_v<STEP + 1>);
+	.loc	11 534 5, function_name $L__info_string54, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string55, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r88, 8;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f75, %r88, %r92, %r93;  @p add.f32 r0, r0, %f75;  mov.f32 %f78, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:534     ReduceStep(input, reduction_op, last_lane, constant_v<STEP + 1>);
+	.loc	11 534 5, function_name $L__info_string55, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:532     input = ReduceStep(input, reduction_op, last_lane, 1 << STEP, bool_constant_v<IsInteger<T>::IS_SMALL_UNSIGNED>);
+	.loc	11 532 5, function_name $L__info_string56, inlined_at 11 534 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:511     return ReduceStep(input, reduction_op, last_lane, offset);
+	.loc	11 511 5, function_name $L__info_string51, inlined_at 11 532 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/warp/specializations/warp_reduce_shfl.cuh:232       : "f"(input), "r"(offset), "r"(shfl_c), "f"(input), "r"(member_mask));
+	.loc	11 232 13, function_name $L__info_string52, inlined_at 11 511 5
+	mov.u32 	%r91, 16;
+	// begin inline asm
+	{  .reg .f32 r0;  .reg .pred p;  shfl.sync.down.b32 r0|p, %f78, %r91, %r92, %r93;  @p add.f32 r0, r0, %f78;  mov.f32 %f121, r0;}
+	// end inline asm
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:222
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:223     // Update outputs and block_aggregate with warp-wide aggregates from lane-0s
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:224     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid);
+	.loc	9 224 5, function_name $L__info_string37, inlined_at 8 518 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:180   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:181     // Share lane aggregates
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:182     if (lane_id == 0)
+	.loc	9 182 5, function_name $L__info_string38, inlined_at 9 224 5
+	@%p10 bra 	$L__BB7_16;
+
+	.loc	9 0 5
+	add.s32 	%r119, %r54, 8;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:183     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:184       detail::uninitialized_copy_single(temp_storage.warp_aggregates + warp_id, warp_aggregate);
+	.loc	9 184 7, function_name $L__info_string38, inlined_at 9 224 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/detail/uninitialized_copy.cuh:58 {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/detail/uninitialized_copy.cuh:59   // gevtushenko: placement new should work here as well, but the code generated for copy assignment is sometimes better
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/detail/uninitialized_copy.cuh:60   *ptr = ::cuda::std::forward<U>(val);
+	.loc	13 60 3, function_name $L__info_string40, inlined_at 9 184 7
+	st.shared.f32 	[%r119], %f121;
+
+$L__BB7_16:
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:185     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:186
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:187     __syncthreads();
+	.loc	9 187 5, function_name $L__info_string38, inlined_at 9 224 5
+	bar.sync 	0;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:188
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:189     // Update total aggregate in warp 0, lane 0
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:190     if (linear_tid == 0)
+	.loc	9 190 5, function_name $L__info_string38, inlined_at 9 224 5
+	@%p11 bra 	$L__BB7_18;
+
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:191     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:192       warp_aggregate = ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<1>);
+	.loc	9 192 7, function_name $L__info_string38, inlined_at 9 224 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string57, inlined_at 9 192 7
+	ld.shared.f32 	%f84, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+12];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string57, inlined_at 9 192 7
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f85, %f121, %f84;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string57, inlined_at 9 192 7
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string59, inlined_at 9 146 5
+	ld.shared.f32 	%f86, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+16];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string59, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f87, %f85, %f86;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string59, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string60, inlined_at 9 146 5
+	ld.shared.f32 	%f88, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+20];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string60, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f89, %f87, %f88;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string60, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string61, inlined_at 9 146 5
+	ld.shared.f32 	%f90, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+24];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string61, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f91, %f89, %f90;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string61, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string62, inlined_at 9 146 5
+	ld.shared.f32 	%f92, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+28];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string62, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f93, %f91, %f92;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string62, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string63, inlined_at 9 146 5
+	ld.shared.f32 	%f94, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+32];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string63, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f95, %f93, %f94;
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:145     }
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:146     return ApplyWarpAggregates<FULL_TILE>(reduction_op, warp_aggregate, num_valid, constant_v<SUCCESSOR_WARP + 1>);
+	.loc	9 146 5, function_name $L__info_string63, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:141     if (FULL_TILE || (SUCCESSOR_WARP * LOGICAL_WARP_SIZE < num_valid))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:142     {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:143       T addend       = temp_storage.warp_aggregates[SUCCESSOR_WARP];
+	.loc	9 143 7, function_name $L__info_string64, inlined_at 9 146 5
+	ld.shared.f32 	%f96, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE14reduce_storage+36];
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cub/block/specializations/block_reduce_warp_reductions.cuh:144       warp_aggregate = reduction_op(warp_aggregate, addend);
+	.loc	9 144 7, function_name $L__info_string64, inlined_at 9 146 5
+
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:51       -> decltype(_CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u))
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:52   {
+///usr/local/cuda/targets/x86_64-linux/include/cccl/cuda/std/__functional/operations.h:53     return _CUDA_VSTD::forward<_T1>(__t) + _CUDA_VSTD::forward<_T2>(__u);
+	.loc	14 53 5, function_name $L__info_string58, inlined_at 9 144 7
+	add.ftz.f32 	%f121, %f95, %f96;
+
+$L__BB7_18:
+
+//src/gemma4_flash_attention.cu:1513
+//src/gemma4_flash_attention.cu:1514     float score1 = DecodeBlockReduce(reduce_storage).Sum(q1 * k_value);
+//src/gemma4_flash_attention.cu:1515     if (dim == 0) s_score = score1;
+	.loc	1 1515 5
+	@%p11 bra 	$L__BB7_20;
+
+	st.shared.f32 	[_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE7s_score], %f121;
+
+$L__BB7_20:
+
+//src/gemma4_flash_attention.cu:1509     if (dim == 0) s_score = score0;
+//src/gemma4_flash_attention.cu:1510     __syncthreads();
+//src/gemma4_flash_attention.cu:1511     score0 = s_score * softmax_scale;
+	.loc	1 1511 5
+	mul.ftz.f32 	%f97, %f14, %f30;
+
+//src/gemma4_flash_attention.cu:1516     __syncthreads();
+	.loc	1 1516 5
+	bar.sync 	0;
+
+//src/gemma4_flash_attention.cu:1517     score1 = s_score * softmax_scale;
+	.loc	1 1517 5
+	ld.shared.f32 	%f98, [_ZZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifiiE7s_score];
+	mul.ftz.f32 	%f99, %f98, %f30;
+
+//src/gemma4_flash_attention.cu:1518     __syncthreads();
+	.loc	1 1518 5
+	bar.sync 	0;
+
+//src/gemma4_flash_attention.cu:1519
+//src/gemma4_flash_attention.cu:1520     sliding_decode_online_update(score0, v_value, m0, l0, acc0);
+	.loc	1 1520 5
+
+//src/gemma4_flash_attention.cu:1402     float &l,
+//src/gemma4_flash_attention.cu:1403     float &acc) {
+//src/gemma4_flash_attention.cu:1404   const float new_m = fmaxf(m, score);
+	.loc	1 1404 3, function_name $L__info_string799, inlined_at 1 1520 5
+	max.ftz.f32 	%f18, %f125, %f97;
+
+//src/gemma4_flash_attention.cu:1405   const float old_scale = __expf(m - new_m);
+	.loc	1 1405 3, function_name $L__info_string799, inlined_at 1 1520 5
+	sub.ftz.f32 	%f100, %f125, %f18;
+	mul.ftz.f32 	%f101, %f100, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 	%f102, %f101;
+
+//src/gemma4_flash_attention.cu:1406   const float new_scale = __expf(score - new_m);
+	.loc	1 1406 3, function_name $L__info_string799, inlined_at 1 1520 5
+	sub.ftz.f32 	%f103, %f97, %f18;
+	mul.ftz.f32 	%f104, %f103, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 	%f105, %f104;
+
+//src/gemma4_flash_attention.cu:1407   acc = acc * old_scale + v_value * new_scale;
+	.loc	1 1407 3, function_name $L__info_string799, inlined_at 1 1520 5
+	mul.ftz.f32 	%f106, %f40, %f105;
+	fma.rn.ftz.f32 	%f127, %f127, %f102, %f106;
+
+//src/gemma4_flash_attention.cu:1408   l = l * old_scale + new_scale;
+	.loc	1 1408 3, function_name $L__info_string799, inlined_at 1 1520 5
+	fma.rn.ftz.f32 	%f122, %f122, %f102, %f105;
+
+//src/gemma4_flash_attention.cu:1521     sliding_decode_online_update(score1, v_value, m1, l1, acc1);
+	.loc	1 1521 5
+
+//src/gemma4_flash_attention.cu:1404   const float new_m = fmaxf(m, score);
+	.loc	1 1404 3, function_name $L__info_string799, inlined_at 1 1521 5
+	max.ftz.f32 	%f21, %f124, %f99;
+
+//src/gemma4_flash_attention.cu:1405   const float old_scale = __expf(m - new_m);
+	.loc	1 1405 3, function_name $L__info_string799, inlined_at 1 1521 5
+	sub.ftz.f32 	%f107, %f124, %f21;
+	mul.ftz.f32 	%f108, %f107, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 	%f109, %f108;
+
+//src/gemma4_flash_attention.cu:1406   const float new_scale = __expf(score - new_m);
+	.loc	1 1406 3, function_name $L__info_string799, inlined_at 1 1521 5
+	sub.ftz.f32 	%f110, %f99, %f21;
+	mul.ftz.f32 	%f111, %f110, 0f3FB8AA3B;
+	ex2.approx.ftz.f32 	%f112, %f111;
+
+//src/gemma4_flash_attention.cu:1407   acc = acc * old_scale + v_value * new_scale;
+	.loc	1 1407 3, function_name $L__info_string799, inlined_at 1 1521 5
+	mul.ftz.f32 	%f113, %f40, %f112;
+	fma.rn.ftz.f32 	%f126, %f126, %f109, %f113;
+
+//src/gemma4_flash_attention.cu:1408   l = l * old_scale + new_scale;
+	.loc	1 1408 3, function_name $L__info_string799, inlined_at 1 1521 5
+	fma.rn.ftz.f32 	%f123, %f123, %f109, %f112;
+
+//src/gemma4_flash_attention.cu:1522     if constexpr (UseCpAsync) __syncthreads();
+	.loc	1 1522 5
+	bar.sync 	0;
+	mov.f32 	%f124, %f21;
+	mov.f32 	%f125, %f18;
+
+$L__BB7_21:
+
+//src/gemma4_flash_attention.cu:1480   __shared__ float s_score;
+//src/gemma4_flash_attention.cu:1481
+//src/gemma4_flash_attention.cu:1482   for (int32_t pos = split_begin; pos < split_end; ++pos) {
+	.loc	1 1482 52
+	add.s32 	%r126, %r126, 1;
+
+//src/gemma4_flash_attention.cu:1482   for (int32_t pos = split_begin; pos < split_end; ++pos) {
+	.loc	1 1482 3
+	setp.lt.s32 	%p16, %r126, %r5;
+	@%p16 bra 	$L__BB7_5;
+
+
+//src/gemma4_flash_attention.cu:1442   const int32_t batch = blockIdx.x;
+//src/gemma4_flash_attention.cu:1443   const int32_t kv_head = blockIdx.y;
+//src/gemma4_flash_attention.cu:1444   const int32_t split = blockIdx.z;
+	.loc	1 1444 3
+	mov.u32 	%r125, %ctaid.z;
+	ld.param.u32 	%r124, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_12];
+
+//src/gemma4_flash_attention.cu:1443   const int32_t kv_head = blockIdx.y;
+	.loc	1 1443 3
+	mov.u32 	%r123, %ctaid.y;
+
+//src/gemma4_flash_attention.cu:1445   const int32_t dim = threadIdx.x;
+//src/gemma4_flash_attention.cu:1446   const int32_t q_head0 = kv_head * kSlidingDecodeGqaRatio;
+	.loc	1 1446 3
+	shl.b32 	%r122, %r123, 1;
+
+//src/gemma4_flash_attention.cu:1440   __shared__ SlidingDecodeCpAsyncStorage<UseCpAsync> cp_async_storage;
+//src/gemma4_flash_attention.cu:1441
+//src/gemma4_flash_attention.cu:1442   const int32_t batch = blockIdx.x;
+	.loc	1 1442 3
+	mov.u32 	%r121, %ctaid.x;
+
+//src/gemma4_flash_attention.cu:1451   const int32_t split_begin = first_key + split * split_size;
+//src/gemma4_flash_attention.cu:1452   const int32_t split_end = min(first_key + key_count, split_begin + split_size);
+//src/gemma4_flash_attention.cu:1453   const int32_t partial0 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head0) * num_splits + split;
+	.loc	1 1453 3
+	shl.b32 	%r120, %r121, 5;
+	setp.eq.s32 	%p17, %r1, 0;
+	add.s32 	%r98, %r120, %r122;
+	mad.lo.s32 	%r100, %r98, %r124, %r125;
+	.loc	1 0 0
+	cvt.s64.s32 	%rd8, %r100;
+
+//src/gemma4_flash_attention.cu:1523   }
+//src/gemma4_flash_attention.cu:1524
+//src/gemma4_flash_attention.cu:1525   if (dim == 0) {
+	.loc	1 1525 3
+	@%p17 bra 	$L__BB7_23;
+	bra.uni 	$L__BB7_24;
+
+$L__BB7_23:
+	.loc	1 0 3
+	ld.param.u64 	%rd88, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_0];
+	ld.param.u64 	%rd87, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_1];
+	cvta.to.global.u64 	%rd69, %rd88;
+
+//src/gemma4_flash_attention.cu:1526     partial_m[partial0] = m0;
+	.loc	1 1526 5
+	shl.b64 	%rd70, %rd8, 2;
+	add.s64 	%rd71, %rd69, %rd70;
+	st.global.f32 	[%rd71], %f125;
+	cvta.to.global.u64 	%rd72, %rd87;
+
+//src/gemma4_flash_attention.cu:1527     partial_l[partial0] = l0;
+	.loc	1 1527 5
+	add.s64 	%rd73, %rd72, %rd70;
+	st.global.f32 	[%rd73], %f122;
+
+//src/gemma4_flash_attention.cu:1528     partial_m[partial1] = m1;
+	.loc	1 1528 5
+	mul.wide.s32 	%rd74, %r7, 4;
+	add.s64 	%rd75, %rd69, %rd74;
+	st.global.f32 	[%rd75], %f124;
+
+//src/gemma4_flash_attention.cu:1529     partial_l[partial1] = l1;
+	.loc	1 1529 5
+	add.s64 	%rd76, %rd72, %rd74;
+	st.global.f32 	[%rd76], %f123;
+
+$L__BB7_24:
+	.loc	1 0 5
+	ld.param.u64 	%rd89, [_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb1EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii_param_2];
+
+//src/gemma4_flash_attention.cu:1530   }
+//src/gemma4_flash_attention.cu:1531   partial_acc[int64_t(partial0) * GEMMA4_SLIDING_HEAD_DIM + dim] = acc0;
+	.loc	1 1531 3
+	shl.b64 	%rd78, %rd8, 8;
+	add.s64 	%rd79, %rd78, %rd46;
+	cvta.to.global.u64 	%rd80, %rd89;
+	shl.b64 	%rd81, %rd79, 2;
+	add.s64 	%rd82, %rd80, %rd81;
+	st.global.f32 	[%rd82], %f127;
+
+//src/gemma4_flash_attention.cu:1532   partial_acc[int64_t(partial1) * GEMMA4_SLIDING_HEAD_DIM + dim] = acc1;
+	.loc	1 1532 3
+	mul.wide.s32 	%rd83, %r7, 256;
+	add.s64 	%rd84, %rd83, %rd46;
+	shl.b64 	%rd85, %rd84, 2;
+	add.s64 	%rd86, %rd80, %rd85;
+	st.global.f32 	[%rd86], %f126;
+	bra.uni 	$L__BB7_25;
+
+$L__BB7_1:
+
+//src/gemma4_flash_attention.cu:1455
+//src/gemma4_flash_attention.cu:1456   if (split_begin >= split_end) {
+//src/gemma4_flash_attention.cu:1457     if (dim == 0) {
+	.loc	1 1457 5
+	setp.eq.s32 	%p5, %r1, 0;
+
+//src/gemma4_flash_attention.cu:1453   const int32_t partial0 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head0) * num_splits + split;
+	.loc	1 1453 3
+	add.s32 	%r36, %r6, %r2;
+	mad.lo.s32 	%r37, %r36, %r26, %r3;
+	.loc	1 0 0
+	cvt.s64.s32 	%rd2, %r37;
+
+//src/gemma4_flash_attention.cu:1457     if (dim == 0) {
+	.loc	1 1457 5
+	@%p5 bra 	$L__BB7_2;
+	bra.uni 	$L__BB7_3;
+
+$L__BB7_2:
+	.loc	1 0 5
+	cvta.to.global.u64 	%rd19, %rd10;
+	cvta.to.global.u64 	%rd20, %rd9;
+
+//src/gemma4_flash_attention.cu:1458       partial_m[partial0] = -INFINITY;
+	.loc	1 1458 7
+	shl.b64 	%rd21, %rd2, 2;
+	add.s64 	%rd22, %rd20, %rd21;
+	mov.u32 	%r38, -8388608;
+	st.global.u32 	[%rd22], %r38;
+
+//src/gemma4_flash_attention.cu:1459       partial_l[partial0] = 0.0f;
+	.loc	1 1459 7
+	add.s64 	%rd23, %rd19, %rd21;
+	mov.u32 	%r39, 0;
+	st.global.u32 	[%rd23], %r39;
+
+//src/gemma4_flash_attention.cu:1460       partial_m[partial1] = -INFINITY;
+	.loc	1 1460 7
+	mul.wide.s32 	%rd24, %r7, 4;
+	add.s64 	%rd25, %rd20, %rd24;
+	st.global.u32 	[%rd25], %r38;
+
+//src/gemma4_flash_attention.cu:1461       partial_l[partial1] = 0.0f;
+	.loc	1 1461 7
+	add.s64 	%rd26, %rd19, %rd24;
+	st.global.u32 	[%rd26], %r39;
+
+$L__BB7_3:
+	.loc	1 0 7
+	cvta.to.global.u64 	%rd27, %rd11;
+
+//src/gemma4_flash_attention.cu:1462     }
+//src/gemma4_flash_attention.cu:1463     partial_acc[int64_t(partial0) * GEMMA4_SLIDING_HEAD_DIM + dim] = 0.0f;
+	.loc	1 1463 5
+	cvt.s64.s32 	%rd28, %r1;
+	shl.b64 	%rd29, %rd2, 8;
+	add.s64 	%rd30, %rd29, %rd28;
+	shl.b64 	%rd31, %rd30, 2;
+	add.s64 	%rd32, %rd27, %rd31;
+	mov.u32 	%r40, 0;
+	st.global.u32 	[%rd32], %r40;
+
+//src/gemma4_flash_attention.cu:1464     partial_acc[int64_t(partial1) * GEMMA4_SLIDING_HEAD_DIM + dim] = 0.0f;
+	.loc	1 1464 5
+	mul.wide.s32 	%rd33, %r7, 256;
+	add.s64 	%rd34, %rd33, %rd28;
+	shl.b64 	%rd35, %rd34, 2;
+	add.s64 	%rd36, %rd27, %rd35;
+	st.global.u32 	[%rd36], %r40;
+
+$L__BB7_25:
+
+//src/gemma4_flash_attention.cu:1533 }
+	.loc	1 1533 1
+	ret;
+
+}
+	// .globl	_ZN22gemma4_flash_attention41sliding_decode_paged_grouped_split_kernelILb0EEEvPfS1_S1_PK13__nv_bfloat16S4_S4_PKiS6_19Gemma4KvCacheConfigifii
+
+//src/gemma4_flash_attention.cu:1426 void sliding_decode_paged_grouped_split_kernel(

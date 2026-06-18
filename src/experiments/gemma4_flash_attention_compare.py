@@ -31,12 +31,6 @@ ATTR_NAMES = [
     "cacheModeCA",
     "maxDynamicSharedSizeBytes",
     "preferredShmemCarveout",
-    "clusterDimMustBeSet",
-    "requiredClusterWidth",
-    "requiredClusterHeight",
-    "requiredClusterDepth",
-    "clusterSchedulingPolicyPreference",
-    "nonPortableClusterSizeAllowed",
 ]
 
 
