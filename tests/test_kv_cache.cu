@@ -669,7 +669,9 @@ void run_sliding_flash_decode_attention_case(const char *label,
                                              int page_size,
                                              int max_pages_per_seq,
                                              int window_size,
-                                             int split_size) {
+                                             int split_size,
+                                             int extra_num_splits = 0,
+                                             bool stagger_seq_lengths = false) {
   Gemma4KvCacheConfig config = {
       1,
       batch_size * max_pages_per_seq,
@@ -681,8 +683,20 @@ void run_sliding_flash_decode_attention_case(const char *label,
   };
   int layer = 0;
   int q_heads = GEMMA4_NUM_QUERY_HEADS;
-  int key_count = seq_len - (window_size > 0 ? std::max(0, seq_len - window_size) : 0);
-  int num_splits = (key_count + split_size - 1) / split_size;
+  std::vector<int32_t> target_seq_lengths(batch_size, seq_len);
+  if (stagger_seq_lengths) {
+    const int step = std::max(1, split_size + 1);
+    for (int b = 0; b < batch_size; ++b) {
+      target_seq_lengths[b] = std::max(1, seq_len - b * step);
+    }
+  }
+  int num_splits = 0;
+  for (int batch_seq_len : target_seq_lengths) {
+    const int first_key = window_size > 0 ? std::max(0, batch_seq_len - window_size) : 0;
+    const int key_count = std::max(0, batch_seq_len - first_key);
+    num_splits = std::max(num_splits, (key_count + split_size - 1) / split_size);
+  }
+  num_splits = std::max(1, num_splits + extra_num_splits);
   float scale = 1.0f / std::sqrt(float(config.head_dim));
 
   std::vector<int32_t> page_table(batch_size * config.max_pages_per_seq, -1);
@@ -697,7 +711,6 @@ void run_sliding_flash_decode_attention_case(const char *label,
   __nv_bfloat16 *d_q = nullptr;
   __nv_bfloat16 *d_baseline_out = nullptr;
   __nv_bfloat16 *d_direct_out = nullptr;
-  __nv_bfloat16 *d_cp_async_out = nullptr;
   int32_t *d_page_table = nullptr;
   int32_t *d_token_batch = nullptr;
   int32_t *d_token_position = nullptr;
@@ -705,6 +718,11 @@ void run_sliding_flash_decode_attention_case(const char *label,
   float *d_partial_m = nullptr;
   float *d_partial_l = nullptr;
   float *d_partial_acc = nullptr;
+  const size_t partial_m_bytes =
+      gemma4_paged_decode_partial_m_elements(batch_size, q_heads, num_splits) * sizeof(float);
+  const size_t partial_acc_bytes =
+      gemma4_paged_decode_partial_acc_elements(batch_size, q_heads, num_splits,
+                                               config.head_dim) * sizeof(float);
 
   CHECK_CUDA(cudaMalloc(&d_cache_k, cache_elements(config) * sizeof(*d_cache_k)));
   CHECK_CUDA(cudaMalloc(&d_cache_v, cache_elements(config) * sizeof(*d_cache_v)));
@@ -715,24 +733,13 @@ void run_sliding_flash_decode_attention_case(const char *label,
                         batch_size * q_heads * config.head_dim * sizeof(*d_baseline_out)));
   CHECK_CUDA(cudaMalloc(&d_direct_out,
                         batch_size * q_heads * config.head_dim * sizeof(*d_direct_out)));
-  CHECK_CUDA(cudaMalloc(&d_cp_async_out,
-                        batch_size * q_heads * config.head_dim * sizeof(*d_cp_async_out)));
   CHECK_CUDA(cudaMalloc(&d_page_table, page_table.size() * sizeof(int32_t)));
   CHECK_CUDA(cudaMalloc(&d_token_batch, sizeof(int32_t)));
   CHECK_CUDA(cudaMalloc(&d_token_position, sizeof(int32_t)));
   CHECK_CUDA(cudaMalloc(&d_seq_lengths, seq_lengths.size() * sizeof(int32_t)));
-  CHECK_CUDA(cudaMalloc(&d_partial_m,
-                        gemma4_paged_decode_partial_m_elements(
-                            batch_size, q_heads, num_splits) *
-                            sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&d_partial_l,
-                        gemma4_paged_decode_partial_m_elements(
-                            batch_size, q_heads, num_splits) *
-                            sizeof(float)));
-  CHECK_CUDA(cudaMalloc(&d_partial_acc,
-                        gemma4_paged_decode_partial_acc_elements(
-                            batch_size, q_heads, num_splits, config.head_dim) *
-                            sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_partial_m, partial_m_bytes));
+  CHECK_CUDA(cudaMalloc(&d_partial_l, partial_m_bytes));
+  CHECK_CUDA(cudaMalloc(&d_partial_acc, partial_acc_bytes));
   CHECK_CUDA(cudaMemset(d_cache_k, 0, cache_elements(config) * sizeof(*d_cache_k)));
   CHECK_CUDA(cudaMemset(d_cache_v, 0, cache_elements(config) * sizeof(*d_cache_v)));
 
@@ -742,7 +749,7 @@ void run_sliding_flash_decode_attention_case(const char *label,
   std::vector<__nv_bfloat16> one_k(config.num_heads * config.head_dim);
   std::vector<__nv_bfloat16> one_v(one_k.size());
   for (int b = 0; b < batch_size; ++b) {
-    for (int pos = 0; pos < seq_len; ++pos) {
+    for (int pos = 0; pos < target_seq_lengths[b]; ++pos) {
       int ensured_page = gemma4_kv_cache_ensure_page(
           page_table, slot_logical_pages, allocator, config, batch_size, b, pos);
       if (ensured_page < 0) {
@@ -805,35 +812,30 @@ void run_sliding_flash_decode_attention_case(const char *label,
       d_baseline_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
       d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
       q_heads, scale, split_size, num_splits, 0));
+  auto poison_partials = [&]() {
+    CHECK_CUDA(cudaMemset(d_partial_m, 0x7f, partial_m_bytes));
+    CHECK_CUDA(cudaMemset(d_partial_l, 0x7f, partial_m_bytes));
+    CHECK_CUDA(cudaMemset(d_partial_acc, 0x7f, partial_acc_bytes));
+  };
+  poison_partials();
   CHECK_CUDA(gemma4_flash_attention_sliding_decode_paged_bf16(
       d_direct_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
-      d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
-      scale, split_size, num_splits, 0));
-  CHECK_CUDA(gemma4_flash_attention_sliding_decode_paged_cp_async_bf16(
-      d_cp_async_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
       d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
       scale, split_size, num_splits, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
   std::vector<__nv_bfloat16> baseline(q.size());
   std::vector<__nv_bfloat16> direct(q.size());
-  std::vector<__nv_bfloat16> cp_async(q.size());
   CHECK_CUDA(cudaMemcpy(baseline.data(), d_baseline_out,
                         baseline.size() * sizeof(baseline[0]),
                         cudaMemcpyDeviceToHost));
   CHECK_CUDA(cudaMemcpy(direct.data(), d_direct_out,
                         direct.size() * sizeof(direct[0]),
                         cudaMemcpyDeviceToHost));
-  CHECK_CUDA(cudaMemcpy(cp_async.data(), d_cp_async_out,
-                        cp_async.size() * sizeof(cp_async[0]),
-                        cudaMemcpyDeviceToHost));
 
   compare_bf16(baseline, expected, 0.015625f, label);
   compare_bf16(direct, baseline, 0.015625f, "sliding flash decode direct");
   compare_bf16(direct, expected, 0.015625f, "sliding flash decode direct cpu");
-  compare_bf16(cp_async, baseline, 0.015625f, "sliding flash decode cp.async");
-  compare_bf16(cp_async, expected, 0.015625f,
-               "sliding flash decode cp.async cpu");
 
   CHECK_CUDA(cudaFree(d_cache_k));
   CHECK_CUDA(cudaFree(d_cache_v));
@@ -842,7 +844,6 @@ void run_sliding_flash_decode_attention_case(const char *label,
   CHECK_CUDA(cudaFree(d_q));
   CHECK_CUDA(cudaFree(d_baseline_out));
   CHECK_CUDA(cudaFree(d_direct_out));
-  CHECK_CUDA(cudaFree(d_cp_async_out));
   CHECK_CUDA(cudaFree(d_page_table));
   CHECK_CUDA(cudaFree(d_token_batch));
   CHECK_CUDA(cudaFree(d_token_position));
@@ -862,7 +863,15 @@ int main() {
   run_sliding_flash_decode_attention_case(
       "sliding flash decode short", 1, 5, 8, 2, 8, 3);
   run_sliding_flash_decode_attention_case(
+      "sliding flash decode shorter than split", 1, 5, 8, 2, 8, 8, 2);
+  run_sliding_flash_decode_attention_case(
+      "sliding flash decode exact splits", 1, 8, 4, 3, 8, 4);
+  run_sliding_flash_decode_attention_case(
+      "sliding flash decode overprovisioned", 1, 5, 8, 2, 8, 3, 3);
+  run_sliding_flash_decode_attention_case(
       "sliding flash decode boundary", 2, 10, 4, 3, 8, 3);
+  run_sliding_flash_decode_attention_case(
+      "sliding flash decode varlen overprovisioned", 2, 10, 4, 3, 8, 3, 3, true);
   run_sliding_flash_decode_attention_case(
       "sliding flash decode wrap", 1, 13, 4, 3, 8, 5);
   std::puts("kv cache tests passed");

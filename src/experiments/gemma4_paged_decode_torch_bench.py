@@ -138,27 +138,25 @@ def load_lib(path):
     kv_write.restype = ctypes.c_int
 
     decode_direct = lib.gemma4_flash_attention_sliding_decode_paged_bf16
-    decode_cp_async = lib.gemma4_flash_attention_sliding_decode_paged_cp_async_bf16
-    for fn in (decode_direct, decode_cp_async):
-        fn.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            Gemma4KvCacheConfig,
-            ctypes.c_int32,
-            ctypes.c_int32,
-            ctypes.c_float,
-            ctypes.c_int32,
-            ctypes.c_int32,
-            ctypes.c_void_p,
-        ]
-        fn.restype = ctypes.c_int
+    decode_direct.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        Gemma4KvCacheConfig,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_float,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_void_p,
+    ]
+    decode_direct.restype = ctypes.c_int
 
     prefill = lib.gemma4_flash_attention_sliding_fwd_bf16
     prefill.argtypes = [
@@ -175,7 +173,7 @@ def load_lib(path):
         ctypes.c_void_p,
     ]
     prefill.restype = ctypes.c_int
-    return kv_write, decode_direct, decode_cp_async, prefill
+    return kv_write, decode_direct, prefill
 
 
 def check_status(status, label):
@@ -350,7 +348,7 @@ def main():
         raise RuntimeError(f"missing custom library: {args.lib}")
 
     device = torch.device("cuda")
-    kv_write, decode_direct, decode_cp_async, prefill = load_lib(args.lib)
+    kv_write, decode_direct, prefill = load_lib(args.lib)
     stream = lambda: ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
     scale = 1.0 / math.sqrt(GEMMA4_SLIDING_HEAD_DIM)
 
@@ -361,7 +359,6 @@ def main():
     cache_k = torch.zeros(decode["cache_shape"], device=device, dtype=torch.bfloat16)
     cache_v = torch.zeros_like(cache_k)
     decode_out_direct = torch.empty_like(decode["q"])
-    decode_out_cp_async = torch.empty_like(decode["q"])
     decode_out_torch = torch.empty_like(decode["q"])
     partial_m = torch.empty(
         args.batch_size * GEMMA4_NUM_QUERY_HEADS * num_splits,
@@ -415,29 +412,6 @@ def main():
             "gemma4_flash_attention_sliding_decode_paged_bf16",
         )
 
-    def custom_decode_cp_async():
-        check_status(
-            decode_cp_async(
-                ptr(decode_out_cp_async),
-                ptr(partial_m),
-                ptr(partial_l),
-                ptr(partial_acc),
-                ptr(decode["q"]),
-                ptr(cache_k),
-                ptr(cache_v),
-                ptr(decode["page_table"]),
-                ptr(decode["seq_lengths"]),
-                config,
-                0,
-                args.batch_size,
-                ctypes.c_float(scale),
-                args.split_size,
-                num_splits,
-                stream(),
-            ),
-            "gemma4_flash_attention_sliding_decode_paged_cp_async_bf16",
-        )
-
     def torch_decode():
         torch_decode_attention(
             decode["q"],
@@ -475,19 +449,12 @@ def main():
     with torch.no_grad():
         torch_decode()
         custom_decode_direct()
-        custom_decode_cp_async()
         torch_prefill()
         custom_prefill()
         torch.cuda.synchronize()
 
         correctness = {
             "decode_direct_vs_torch_max_abs": max_abs(decode_out_direct, decode_out_torch),
-            "decode_cp_async_vs_torch_max_abs": max_abs(
-                decode_out_cp_async, decode_out_torch
-            ),
-            "decode_direct_vs_cp_async_max_abs": max_abs(
-                decode_out_direct, decode_out_cp_async
-            ),
             "prefill_custom_vs_torch_max_abs": max_abs(custom_prefill_out, torch_prefill_out),
         }
 
@@ -503,7 +470,6 @@ def main():
         graph_inner_iters = 1 if args.cache == "cold" else args.iters
         graphs = {
             "decode_custom_direct": make_cuda_graph(custom_decode_direct, graph_inner_iters),
-            "decode_custom_cp_async": make_cuda_graph(custom_decode_cp_async, graph_inner_iters),
             "decode_torch_graph": make_cuda_graph(torch_decode, graph_inner_iters),
             "prefill_custom_tensor_core": make_cuda_graph(custom_prefill, graph_inner_iters),
             "prefill_torch_sdpa_graph": make_cuda_graph(torch_prefill, graph_inner_iters),
@@ -525,7 +491,6 @@ def main():
         torch.cuda.synchronize()
         checksum = float(
             decode_out_direct.float().sum().item()
-            + decode_out_cp_async.float().sum().item()
             + decode_out_torch.float().sum().item()
             + custom_prefill_out.float().sum().item()
             + torch_prefill_out.float().sum().item()
@@ -574,10 +539,6 @@ def main():
         "timings": timings,
         "speedups": {
             "decode_direct_vs_torch_median": timings["decode_torch_graph"]["median_ms"]
-            / timings["decode_custom_direct"]["median_ms"],
-            "decode_cp_async_vs_torch_median": timings["decode_torch_graph"]["median_ms"]
-            / timings["decode_custom_cp_async"]["median_ms"],
-            "decode_direct_vs_cp_async_median": timings["decode_custom_cp_async"]["median_ms"]
             / timings["decode_custom_direct"]["median_ms"],
             "prefill_custom_vs_torch_median": timings["prefill_torch_sdpa_graph"]["median_ms"]
             / timings["prefill_custom_tensor_core"]["median_ms"],
