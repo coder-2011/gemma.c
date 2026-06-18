@@ -6,7 +6,14 @@
 
 namespace {
 
-constexpr int kEmbeddingGatherThreads = WARP_SIZE;
+#ifndef GEMMA4_EMBEDDING_GATHER_THREADS
+#define GEMMA4_EMBEDDING_GATHER_THREADS 128
+#endif
+
+constexpr int kEmbeddingGatherThreads = GEMMA4_EMBEDDING_GATHER_THREADS;
+static_assert(kEmbeddingGatherThreads > 0 &&
+                  (kEmbeddingGatherThreads % WARP_SIZE) == 0,
+              "embedding gather thread count must be a positive warp multiple");
 constexpr int kPacksPerEmbeddingRow = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
               "embedding width must be divisible by Packed128 bf16 width");

@@ -269,6 +269,7 @@ void run_fused_case(int rows, int width) {
 
 int main() {
   run_rmsnorm_case(1, 256, RmsnormMode::LearnedWeight);
+  run_rmsnorm_case(1, GEMMA4_HIDDEN_SIZE, RmsnormMode::LearnedWeight);
   run_rmsnorm_case(17, GEMMA4_HIDDEN_SIZE, RmsnormMode::LearnedWeight);
   run_rmsnorm_case(7, 512, RmsnormMode::ScaleFreeWrapper);
   run_residual_add_case(9, GEMMA4_HIDDEN_SIZE);

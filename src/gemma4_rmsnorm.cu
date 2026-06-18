@@ -12,17 +12,43 @@ namespace {
 
 using RmsnormPack = Bf16Packed128;
 constexpr int kFloatXPerPack = RmsnormPack::size;
-constexpr int kDecodeRmsnormThreads = 704;
-constexpr int kDecodeFusedThreads = 672;
+
+constexpr int kDecodeRmsnormThreads = 512;
+constexpr int kDecodeFusedThreads = 704;
 constexpr int kDecodePacks = GEMMA4_HIDDEN_SIZE / kFloatXPerPack;
 constexpr int kHiddenPrefillFusedThreads = kDecodePacks;
-constexpr int kRmsnormRowsPerBlock = 2;
-constexpr int kRmsnormThreads = WARP_SIZE * kRmsnormRowsPerBlock;
+constexpr int kSlidingRmsnormRowsPerBlock = 8;
+constexpr int kGlobalRmsnormRowsPerBlock = 2;
+constexpr int kHiddenRmsnormRowsPerBlock = 3;
 constexpr int kResidualAddThreads = 256;
-
-#ifndef GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM
-#define GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM 2
-#endif
+constexpr int kHiddenPrefillMinBlocksPerSm = 2;
+static_assert(kDecodeRmsnormThreads > 0 &&
+                  (kDecodeRmsnormThreads % WARP_SIZE) == 0 &&
+                  kDecodeRmsnormThreads <= 1024,
+              "decode RMSNorm threads must be a valid warp-multiple block size");
+static_assert(kDecodeFusedThreads > 0 &&
+                  (kDecodeFusedThreads % WARP_SIZE) == 0 &&
+                  kDecodeFusedThreads <= 1024,
+              "fused decode RMSNorm threads must be a valid warp-multiple block size");
+static_assert(kDecodeFusedThreads >= kDecodePacks,
+              "fused decode RMSNorm needs at least one thread per hidden pack");
+static_assert(kSlidingRmsnormRowsPerBlock > 0 &&
+                  WARP_SIZE * kSlidingRmsnormRowsPerBlock <= 1024,
+              "sliding RMSNorm rows per block must keep the block size valid");
+static_assert(kGlobalRmsnormRowsPerBlock > 0 &&
+                  WARP_SIZE * kGlobalRmsnormRowsPerBlock <= 1024,
+              "global RMSNorm rows per block must keep the block size valid");
+static_assert(kHiddenRmsnormRowsPerBlock > 0 &&
+                  WARP_SIZE * kHiddenRmsnormRowsPerBlock <= 1024,
+              "hidden RMSNorm rows per block must keep the block size valid");
+static_assert(static_cast<size_t>(1 + kHiddenRmsnormRowsPerBlock) *
+                      kDecodePacks * sizeof(RmsnormPack) <=
+                  48 * 1024,
+              "hidden RMSNorm rows per block exceed default dynamic shared memory");
+static_assert(kResidualAddThreads > 0 &&
+                  (kResidualAddThreads % WARP_SIZE) == 0 &&
+                  kResidualAddThreads <= 1024,
+              "residual add threads must be a valid warp-multiple block size");
 
 template <int Threads>
 __device__ float gemma4_block_reduce_sum(float value,
@@ -141,7 +167,7 @@ gemma4_residual_add_rmsnorm_bf16_decode_kernel(floatX *residual,
 
 template <int Threads>
 __global__ __launch_bounds__(
-    Threads, GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM) void
+    Threads, kHiddenPrefillMinBlocksPerSm) void
 gemma4_residual_add_rmsnorm_bf16_hidden_prefill_kernel(
     floatX *residual,
     floatX *normed,
@@ -185,7 +211,8 @@ gemma4_residual_add_rmsnorm_bf16_hidden_prefill_kernel(
   store128(normed + pack * kFloatXPerPack, result);
 }
 
-__global__ __launch_bounds__(kRmsnormThreads) void
+template <int RowsPerBlock>
+__global__ __launch_bounds__(WARP_SIZE * RowsPerBlock) void
 gemma4_rmsnorm_bf16_shared_kernel(
     floatX *out,
     const floatX *inp,
@@ -194,20 +221,21 @@ gemma4_rmsnorm_bf16_shared_kernel(
     int width,
     int packs_per_row,
     float eps) {
+  static_assert(RowsPerBlock > 0, "rows per block must be positive");
   extern __shared__ int4 shared_packs[];
   auto *shared = reinterpret_cast<RmsnormPack *>(shared_packs);
   RmsnormPack *s_weight = shared;
   RmsnormPack *s_in = shared + packs_per_row + threadIdx.y * packs_per_row;
 
   const int packed_thread = threadIdx.x + WARP_SIZE * threadIdx.y;
-  const int packed_stride = WARP_SIZE * blockDim.y;
+  constexpr int packed_stride = WARP_SIZE * RowsPerBlock;
   for (int pack = packed_thread; pack < packs_per_row;
        pack += packed_stride) {
     s_weight[pack] = load128g(weight + pack * kFloatXPerPack);
   }
   __syncthreads();
 
-  const int row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int row = blockIdx.x * RowsPerBlock + threadIdx.y;
   if (row >= rows) {
     return;
   }
@@ -245,7 +273,8 @@ gemma4_rmsnorm_bf16_shared_kernel(
   }
 }
 
-__global__ __launch_bounds__(kRmsnormThreads) void
+template <int RowsPerBlock>
+__global__ __launch_bounds__(WARP_SIZE * RowsPerBlock) void
 gemma4_rmsnorm_bf16_direct_weight_kernel(
     floatX *out,
     const floatX *inp,
@@ -254,11 +283,12 @@ gemma4_rmsnorm_bf16_direct_weight_kernel(
     int width,
     int packs_per_row,
     float eps) {
+  static_assert(RowsPerBlock > 0, "rows per block must be positive");
   extern __shared__ int4 shared_packs[];
   auto *s_in = reinterpret_cast<RmsnormPack *>(shared_packs) +
                threadIdx.y * packs_per_row;
 
-  const int row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int row = blockIdx.x * RowsPerBlock + threadIdx.y;
   if (row >= rows) {
     return;
   }
@@ -296,7 +326,8 @@ gemma4_rmsnorm_bf16_direct_weight_kernel(
   }
 }
 
-__global__ __launch_bounds__(kRmsnormThreads) void
+template <int RowsPerBlock>
+__global__ __launch_bounds__(WARP_SIZE * RowsPerBlock) void
 gemma4_rmsnorm_scale_free_bf16_shared_kernel(
     floatX *out,
     const floatX *inp,
@@ -304,11 +335,12 @@ gemma4_rmsnorm_scale_free_bf16_shared_kernel(
     int width,
     int packs_per_row,
     float eps) {
+  static_assert(RowsPerBlock > 0, "rows per block must be positive");
   extern __shared__ int4 shared_packs[];
   auto *s_in = reinterpret_cast<RmsnormPack *>(shared_packs) +
                threadIdx.y * packs_per_row;
 
-  const int row = blockIdx.x * blockDim.y + threadIdx.y;
+  const int row = blockIdx.x * RowsPerBlock + threadIdx.y;
   if (row >= rows) {
     return;
   }
@@ -408,6 +440,59 @@ bool gemma4_residual_add_rmsnorm_args_valid(floatX *residual,
          is_aligned_16(residual) && is_aligned_16(inp2);
 }
 
+template <int RowsPerBlock>
+cudaError_t gemma4_launch_rmsnorm_direct_weight(floatX *out,
+                                                const floatX *inp,
+                                                const floatX *__restrict__ weight,
+                                                int rows,
+                                                int width,
+                                                int packs_per_row,
+                                                float eps,
+                                                cudaStream_t stream) {
+  const int grid = div_up(rows, RowsPerBlock);
+  const size_t smem = static_cast<size_t>(RowsPerBlock) *
+                      packs_per_row * sizeof(RmsnormPack);
+  gemma4_rmsnorm_bf16_direct_weight_kernel<RowsPerBlock><<<
+      grid, dim3(WARP_SIZE, RowsPerBlock), smem, stream>>>(
+      out, inp, weight, rows, width, packs_per_row, eps);
+  return cudaGetLastError();
+}
+
+template <int RowsPerBlock>
+cudaError_t gemma4_launch_rmsnorm_shared_weight(floatX *out,
+                                                const floatX *inp,
+                                                const floatX *__restrict__ weight,
+                                                int rows,
+                                                int width,
+                                                int packs_per_row,
+                                                float eps,
+                                                cudaStream_t stream) {
+  const int grid = div_up(rows, RowsPerBlock);
+  const size_t smem = static_cast<size_t>(1 + RowsPerBlock) *
+                      packs_per_row * sizeof(RmsnormPack);
+  gemma4_rmsnorm_bf16_shared_kernel<RowsPerBlock><<<
+      grid, dim3(WARP_SIZE, RowsPerBlock), smem, stream>>>(
+      out, inp, weight, rows, width, packs_per_row, eps);
+  return cudaGetLastError();
+}
+
+template <int RowsPerBlock>
+cudaError_t gemma4_launch_rmsnorm_scale_free(floatX *out,
+                                             const floatX *inp,
+                                             int rows,
+                                             int width,
+                                             int packs_per_row,
+                                             float eps,
+                                             cudaStream_t stream) {
+  const int grid = div_up(rows, RowsPerBlock);
+  const size_t smem = static_cast<size_t>(RowsPerBlock) *
+                      packs_per_row * sizeof(RmsnormPack);
+  gemma4_rmsnorm_scale_free_bf16_shared_kernel<RowsPerBlock><<<
+      grid, dim3(WARP_SIZE, RowsPerBlock), smem, stream>>>(
+      out, inp, rows, width, packs_per_row, eps);
+  return cudaGetLastError();
+}
+
 cudaError_t gemma4_rmsnorm_bf16_impl(floatX *out,
                                      const floatX *inp,
                                      const floatX *__restrict__ weight,
@@ -428,22 +513,19 @@ cudaError_t gemma4_rmsnorm_bf16_impl(floatX *out,
   }
 
   const int packs_per_row = width / kFloatXPerPack;
-  const int grid = div_up(rows, kRmsnormRowsPerBlock);
+  if (width == GEMMA4_SLIDING_HEAD_DIM) {
+    return gemma4_launch_rmsnorm_direct_weight<
+        kSlidingRmsnormRowsPerBlock>(
+        out, inp, weight, rows, width, packs_per_row, eps, stream);
+  }
   if (width <= GEMMA4_GLOBAL_HEAD_DIM) {
-    const size_t smem = static_cast<size_t>(kRmsnormRowsPerBlock) *
-                        packs_per_row * sizeof(RmsnormPack);
-    gemma4_rmsnorm_bf16_direct_weight_kernel<<<
-        grid, dim3(WARP_SIZE, kRmsnormRowsPerBlock), smem, stream>>>(
-        out, inp, weight, rows, width, packs_per_row, eps);
-    return cudaGetLastError();
+    return gemma4_launch_rmsnorm_direct_weight<
+        kGlobalRmsnormRowsPerBlock>(
+        out, inp, weight, rows, width, packs_per_row, eps, stream);
   }
 
-  const size_t smem = static_cast<size_t>(1 + kRmsnormRowsPerBlock) *
-                      packs_per_row * sizeof(RmsnormPack);
-  gemma4_rmsnorm_bf16_shared_kernel<<<
-      grid, dim3(WARP_SIZE, kRmsnormRowsPerBlock), smem, stream>>>(
-      out, inp, weight, rows, width, packs_per_row, eps);
-  return cudaGetLastError();
+  return gemma4_launch_rmsnorm_shared_weight<kHiddenRmsnormRowsPerBlock>(
+      out, inp, weight, rows, width, packs_per_row, eps, stream);
 }
 
 cudaError_t gemma4_rmsnorm_scale_free_bf16_impl(floatX *out,
@@ -459,14 +541,16 @@ cudaError_t gemma4_rmsnorm_scale_free_bf16_impl(floatX *out,
     return cudaSuccess;
   }
   const int packs_per_row = width / kFloatXPerPack;
-  const int grid = div_up(rows, kRmsnormRowsPerBlock);
-  const size_t smem = static_cast<size_t>(kRmsnormRowsPerBlock) *
-                      packs_per_row * sizeof(RmsnormPack);
-
-  gemma4_rmsnorm_scale_free_bf16_shared_kernel<<<
-      grid, dim3(WARP_SIZE, kRmsnormRowsPerBlock), smem, stream>>>(
-      out, inp, rows, width, packs_per_row, eps);
-  return cudaGetLastError();
+  if (width == GEMMA4_SLIDING_HEAD_DIM) {
+    return gemma4_launch_rmsnorm_scale_free<kSlidingRmsnormRowsPerBlock>(
+        out, inp, rows, width, packs_per_row, eps, stream);
+  }
+  if (width <= GEMMA4_GLOBAL_HEAD_DIM) {
+    return gemma4_launch_rmsnorm_scale_free<kGlobalRmsnormRowsPerBlock>(
+        out, inp, rows, width, packs_per_row, eps, stream);
+  }
+  return gemma4_launch_rmsnorm_scale_free<kHiddenRmsnormRowsPerBlock>(
+      out, inp, rows, width, packs_per_row, eps, stream);
 }
 
 cudaError_t gemma4_residual_add_rmsnorm_bf16_impl(

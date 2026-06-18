@@ -12,21 +12,31 @@
 namespace {
 
 constexpr int kDefaultThreads = 512;
-constexpr int kDefaultColsPerBlock = 8;
+constexpr int kDefaultColsPerBlock = 4;
 constexpr int kDefaultMinBlocksPerSm = 2;
 constexpr int kInterleaveSwizzleBlocks = 16;
 constexpr int kFfnDownThreads = 1024;
-constexpr int kFfnDownColsPerBlock = 8;
+constexpr int kFfnDownColsPerBlock = 4;
 constexpr int kFfnDownMinBlocksPerSm = 1;
 constexpr int kGlobalOThreads = 512;
-constexpr int kGlobalOColsPerBlock = 8;
+constexpr int kGlobalOColsPerBlock = 4;
 constexpr int kGlobalOMinBlocksPerSm = 1;
 constexpr int kFinalLogitsThreads = 1024;
-constexpr int kFinalLogitsColsPerBlock = 8;
+constexpr int kFinalLogitsColsPerBlock = 4;
 constexpr int kFinalLogitsMinBlocksPerSm = 1;
 
-static_assert((kDefaultThreads % WARP_SIZE) == 0,
-              "decode thread count must be a whole number of warps");
+static_assert(kDefaultThreads > 0 && kDefaultThreads <= 1024 &&
+                  (kDefaultThreads % WARP_SIZE) == 0,
+              "decode thread count must be a valid warp-multiple block size");
+static_assert(kFfnDownThreads > 0 && kFfnDownThreads <= 1024 &&
+                  (kFfnDownThreads % WARP_SIZE) == 0,
+              "FFN-down thread count must be a valid warp-multiple block size");
+static_assert(kGlobalOThreads > 0 && kGlobalOThreads <= 1024 &&
+                  (kGlobalOThreads % WARP_SIZE) == 0,
+              "global-O thread count must be a valid warp-multiple block size");
+static_assert(kFinalLogitsThreads > 0 && kFinalLogitsThreads <= 1024 &&
+                  (kFinalLogitsThreads % WARP_SIZE) == 0,
+              "final-logits thread count must be a valid warp-multiple block size");
 
 struct Gemma4ProjectionShape {
   int k;

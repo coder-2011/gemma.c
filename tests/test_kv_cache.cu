@@ -182,6 +182,93 @@ void run_global_write_and_generic_decode_case() {
   CHECK_CUDA(cudaFree(d_partial_acc));
 }
 
+void run_scalar_write_case() {
+  Gemma4KvCacheConfig config = {1, 4, 4, 4, 2, 10, 0};
+  int layer = 0;
+  int token_count = 3;
+  std::vector<int32_t> page_table = {0, 1, 2, 3};
+  std::vector<int32_t> token_batch(token_count, 0);
+  std::vector<int32_t> token_position = {0, 1, 2};
+  std::vector<__nv_bfloat16> flat_k(token_count * config.num_heads *
+                                    config.head_dim);
+  std::vector<__nv_bfloat16> flat_v(flat_k.size());
+  for (int i = 0; i < static_cast<int>(flat_k.size()); ++i) {
+    flat_k[i] = make_value(13000 + i);
+    flat_v[i] = make_value(17000 + i);
+  }
+
+  __nv_bfloat16 *d_cache_k = nullptr;
+  __nv_bfloat16 *d_cache_v = nullptr;
+  __nv_bfloat16 *d_k = nullptr;
+  __nv_bfloat16 *d_v = nullptr;
+  int32_t *d_page_table = nullptr;
+  int32_t *d_token_batch = nullptr;
+  int32_t *d_token_position = nullptr;
+  CHECK_CUDA(cudaMalloc(&d_cache_k, cache_elements(config) * sizeof(*d_cache_k)));
+  CHECK_CUDA(cudaMalloc(&d_cache_v, cache_elements(config) * sizeof(*d_cache_v)));
+  CHECK_CUDA(cudaMalloc(&d_k, flat_k.size() * sizeof(*d_k)));
+  CHECK_CUDA(cudaMalloc(&d_v, flat_v.size() * sizeof(*d_v)));
+  CHECK_CUDA(cudaMalloc(&d_page_table, page_table.size() * sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc(&d_token_batch, token_batch.size() * sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc(&d_token_position,
+                        token_position.size() * sizeof(int32_t)));
+  CHECK_CUDA(cudaMemset(d_cache_k, 0, cache_elements(config) * sizeof(*d_cache_k)));
+  CHECK_CUDA(cudaMemset(d_cache_v, 0, cache_elements(config) * sizeof(*d_cache_v)));
+  CHECK_CUDA(cudaMemcpy(d_k, flat_k.data(), flat_k.size() * sizeof(*d_k),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_v, flat_v.data(), flat_v.size() * sizeof(*d_v),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_page_table, page_table.data(),
+                        page_table.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_token_batch, token_batch.data(),
+                        token_batch.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_token_position, token_position.data(),
+                        token_position.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
+
+  CHECK_CUDA(gemma4_kv_cache_write_bf16(
+      d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
+      d_token_position, token_count, layer, d_k, d_v, 0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  std::vector<__nv_bfloat16> cache_k(cache_elements(config));
+  std::vector<__nv_bfloat16> cache_v(cache_elements(config));
+  CHECK_CUDA(cudaMemcpy(cache_k.data(), d_cache_k,
+                        cache_k.size() * sizeof(cache_k[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(cache_v.data(), d_cache_v,
+                        cache_v.size() * sizeof(cache_v[0]),
+                        cudaMemcpyDeviceToHost));
+  for (int token = 0; token < token_count; ++token) {
+    int pos = token_position[token];
+    int page = page_table[gemma4_kv_cache_page_slot(config, pos)];
+    int page_offset = gemma4_kv_cache_page_offset(config, pos);
+    for (int h = 0; h < config.num_heads; ++h) {
+      for (int d = 0; d < config.head_dim; ++d) {
+        int64_t got_offset =
+            gemma4_kv_cache_offset(config, layer, page, page_offset, h, d);
+        int64_t src = (int64_t(token) * config.num_heads + h) *
+                      config.head_dim + d;
+        if (bf16_to_float(cache_k[got_offset]) != bf16_to_float(flat_k[src]) ||
+            bf16_to_float(cache_v[got_offset]) != bf16_to_float(flat_v[src])) {
+          std::fprintf(stderr, "scalar cache write mismatch\n");
+          std::exit(1);
+        }
+      }
+    }
+  }
+
+  CHECK_CUDA(cudaFree(d_cache_k));
+  CHECK_CUDA(cudaFree(d_cache_v));
+  CHECK_CUDA(cudaFree(d_k));
+  CHECK_CUDA(cudaFree(d_v));
+  CHECK_CUDA(cudaFree(d_page_table));
+  CHECK_CUDA(cudaFree(d_token_batch));
+  CHECK_CUDA(cudaFree(d_token_position));
+}
+
 void run_sliding_wrap_case() {
   Gemma4KvCacheConfig config = {1, 6, 4, 3, 2, 16, 8};
   int batch_size = 1;
@@ -322,6 +409,7 @@ void run_sliding_wrap_case() {
 int main() {
   run_address_case();
   run_global_write_and_generic_decode_case();
+  run_scalar_write_case();
   run_sliding_wrap_case();
   std::puts("kv cache tests passed");
   return 0;

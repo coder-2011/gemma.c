@@ -13,8 +13,15 @@
 
 namespace {
 
-constexpr int kKvWriteThreads = 256;
+constexpr int kKvWriteThreads = 128;
 constexpr int kKvWriteVecThreads = 128;
+static_assert(kKvWriteThreads > 0 && (kKvWriteThreads % WARP_SIZE) == 0 &&
+                  kKvWriteThreads <= 1024,
+              "scalar KV write threads must be a valid warp-multiple block size");
+static_assert(kKvWriteVecThreads > 0 &&
+                  (kKvWriteVecThreads % WARP_SIZE) == 0 &&
+                  kKvWriteVecThreads <= 1024,
+              "vector KV write threads must be a valid warp-multiple block size");
 
 struct SumOp {
   // Addition functor for CUB reductions; using an explicit type keeps the sum
@@ -313,7 +320,8 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_reduce_kernel(
       float split_l = partial_l[partial_row + split];
       if (split_l > 0.0f) {
         float split_m = partial_m[partial_row + split];
-        value += partial_acc[partial_acc_row + int64_t(split) * head_dim + d] * __expf(split_m - s_m);
+        value += partial_acc[partial_acc_row + int64_t(split) * head_dim + d] *
+                 __expf(split_m - s_m);
       }
     }
     out[(int64_t)row * head_dim + d] =
@@ -462,8 +470,6 @@ int32_t gemma4_kv_cache_ensure_page(
   }
   if (page_table[index] < 0) return -1;
 
-  // ponytail: sliding cache reuses the slot page; add physical-page recycling
-  // only if the runtime wants to shrink cache memory below one full window.
   slot_logical_pages[index] = logical_page;
   return page_table[index];
 }

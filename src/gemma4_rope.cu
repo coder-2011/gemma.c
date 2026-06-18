@@ -7,9 +7,16 @@
 #define GEMMA4_ROPE_HEAD_FAST_GRID 0
 #endif
 
+#ifndef GEMMA4_ROPE_THREADS
+#define GEMMA4_ROPE_THREADS WARP_SIZE
+#endif
+
 namespace {
 
-constexpr int kRopeThreads = WARP_SIZE;
+constexpr int kRopeThreads = GEMMA4_ROPE_THREADS;
+static_assert(kRopeThreads > 0 && (kRopeThreads % WARP_SIZE) == 0 &&
+                  kRopeThreads <= 1024,
+              "RoPE threads must be a valid warp-multiple block size");
 
 __global__ __launch_bounds__(kRopeThreads) void
 gemma4_rope_bf16_kernel(floatX *__restrict__ q,
