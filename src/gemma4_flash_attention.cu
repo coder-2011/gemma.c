@@ -1,8 +1,8 @@
 // BSD-3-Clause FlashAttention-derived Gemma 4 attention path.
 //
 // This file is a Gemma-specific inline specialization of the FlashAttention-2
-// SM80 forward path. It keeps only the BF16 forward kernels used by Gemma 4
-// 31B text attention: local sliding layers and full-causal global layers. The
+// SM80 forward path. It keeps only the active BF16 forward kernels used by
+// Gemma 4 31B text attention: local sliding layers. The
 // implementation is limited to fixed-shape model paths and omits the upstream
 // generic feature matrix.
 //
@@ -33,10 +33,6 @@
 #include "gemma4_rope.cuh"
 #include "gemma4.h"
 
-#ifndef GEMMA4_FA_USE_SHARED_ROPE_HELPER
-#define GEMMA4_FA_USE_SHARED_ROPE_HELPER 1
-#endif
-
 namespace gemma4_flash_attention {
 
 using namespace cute;
@@ -44,7 +40,6 @@ using namespace cute;
 // FlashAttention code is extremely shape-specialized. These constants and
 // aliases pin this file to Gemma 4's BF16 attention path on SM80+ GPUs.
 constexpr int kWarpSize = 32;
-constexpr int kNoWindow = 0;
 
 // Runtime parameters copied into constant-kernel-parameter space at launch.
 // The tensor layouts are batch-major and row-major inside each head:
@@ -149,8 +144,6 @@ struct Gemma4FlashFwdKernelTraits {
 
 using Gemma4SlidingFa2KernelTraits =
     Gemma4FlashFwdKernelTraits<GEMMA4_SLIDING_HEAD_DIM, 64, 64, 4>;
-using Gemma4GlobalFa2KernelTraits =
-    Gemma4FlashFwdKernelTraits<GEMMA4_GLOBAL_HEAD_DIM, 32, 32, 2>;
 
 // Return the maximum value across the 4 lanes that jointly own one score row.
 __device__ __forceinline__ float gemma4_fa_quad_reduce_max(float x) {
@@ -264,6 +257,14 @@ __forceinline__ __device__ auto gemma4_fa_convert_type(
 template <int N>
 __device__ __forceinline__ void gemma4_fa_cp_async_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+
+__device__ __forceinline__ int32_t gemma4_warp_uniform_ldg_i32(
+    const int32_t *__restrict__ ptr,
+    int lane) {
+  int32_t value = 0;
+  if (lane == 0) value = __ldg(ptr);
+  return __shfl_sync(0xffffffffu, value, 0);
 }
 
 // Copy only rows/columns that are in-bounds, leaving out-of-bounds destination
@@ -1096,15 +1097,6 @@ cudaError_t launch_sliding(
       params, batch_size, stream);
 }
 
-// Gemma 4 global layers: head_dim=512, block 32x32, full causal context.
-cudaError_t launch_global(
-    Gemma4FlashFwdParams &params,
-    int batch_size,
-    cudaStream_t stream) {
-  return launch_attention_maybe_lse<Gemma4GlobalFa2KernelTraits, false>(
-      params, batch_size, stream);
-}
-
 constexpr int kSlidingNormRopeThreads = GEMMA4_SLIDING_HEAD_DIM;
 static_assert(kSlidingNormRopeThreads % kWarpSize == 0);
 static_assert(GEMMA4_SLIDING_HEAD_DIM == 256);
@@ -1158,18 +1150,12 @@ __device__ __forceinline__ void sliding_prep_weighted_rope_head(
     const int dim = lane + i * kWarpSize;
     // RoPE pairs the low half and high half of the head at the same lane-owned
     // offset, after applying the learned Q/K norm weight.
-    const float lo = values[i] * scale * __bfloat162float(weight[dim]);
+    const float lo =
+        values[i] * scale * __bfloat162float(loadg(weight + dim));
     const float hi = values[i + kSlidingNormRopePairsPerLane] * scale *
-                     __bfloat162float(weight[kRotaryHalf + dim]);
-#if GEMMA4_FA_USE_SHARED_ROPE_HELPER
+                     __bfloat162float(loadg(weight + kRotaryHalf + dim));
     gemma4_rope::store_rotated_pair_bf16(out, cos_row, sin_row, kRotaryHalf,
                                          dim, lo, hi);
-#else
-    const float c = __ldg(cos_row + dim);
-    const float s = __ldg(sin_row + dim);
-    out[dim] = __float2bfloat16_rn(fmaf(-hi, s, lo * c));
-    out[kRotaryHalf + dim] = __float2bfloat16_rn(fmaf(lo, s, hi * c));
-#endif
   }
 }
 
@@ -1242,10 +1228,11 @@ __device__ __forceinline__ int64_t sliding_decode_cache_head_offset(
     int batch,
     int position,
     int cache_layer,
-    int head) {
+    int head,
+    int lane) {
   const int slot = gemma4_kv_cache_page_slot(config, position);
-  const int physical_page =
-      __ldg(page_table + batch * config.max_pages_per_seq + slot);
+  const int physical_page = gemma4_warp_uniform_ldg_i32(
+      page_table + batch * config.max_pages_per_seq + slot, lane);
   if (physical_page < 0 || physical_page >= config.num_pages) return -1;
   const int page_offset = gemma4_kv_cache_page_offset(config, position);
   return gemma4_kv_cache_offset(
@@ -1282,7 +1269,8 @@ void gemma4_sliding_decode_q_paged_kv_norm_rope_kernel(
   const int head = blockIdx.y * kSlidingNormRopeHeadsPerBlock + warp;
   if (head >= kQHeads) return;
 
-  const int position = __ldg(token_position + batch);
+  const int position =
+      gemma4_warp_uniform_ldg_i32(token_position + batch, lane);
   if (position < 0) return;
   const float *cos_row = cos + int64_t(position) * kRotaryHalf;
   const float *sin_row = sin + int64_t(position) * kRotaryHalf;
@@ -1294,7 +1282,7 @@ void gemma4_sliding_decode_q_paged_kv_norm_rope_kernel(
   // Only KV heads have cache rows; the remaining query-head warps are done.
   if (head >= kKvHeads) return;
   const int64_t cache_offset = sliding_decode_cache_head_offset(
-      cache_config, page_table, batch, position, cache_layer, head);
+      cache_config, page_table, batch, position, cache_layer, head, lane);
   if (cache_offset < 0) return;
 
   const int64_t kv_offset = (int64_t(batch) * kKvHeads + head) * kHeadDim;
@@ -1429,6 +1417,7 @@ void sliding_decode_paged_grouped_split_kernel(
   const int32_t kv_head = blockIdx.y;
   const int32_t split = blockIdx.z;
   const int32_t dim = threadIdx.x;
+  const int32_t lane = dim & (kWarpSize - 1);
 
   // Sliding layers use 2:1 GQA. This CTA computes both query heads for one KV
   // head so each K/V cache vector is loaded once and reused for the pair.
@@ -1437,8 +1426,10 @@ void sliding_decode_paged_grouped_split_kernel(
 
   // The launch keeps a fixed max `num_splits` for graph compatibility, but
   // each row can have fewer live splits after applying the sliding window.
-  const int32_t seq_len = __ldg(seq_lengths + batch);
-  const int32_t first_key = config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
+  const int32_t seq_len =
+      gemma4_warp_uniform_ldg_i32(seq_lengths + batch, lane);
+  const int32_t first_key =
+      config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
   const int32_t key_count = max(0, seq_len - first_key);
   const int32_t actual_splits = (key_count + split_size - 1) / split_size;
   // Overprovisioned CTAs must not write neutral scratch; the reducer will also
@@ -1474,39 +1465,49 @@ void sliding_decode_paged_grouped_split_kernel(
   __shared__ float s_score0;
   __shared__ float s_score1;
 
-  for (int32_t pos = split_begin; pos < split_end; ++pos) {
-    // Resolve logical token position -> physical cache page. Page lookups stay
-    // in the hot loop for now; page-span iteration is the next obvious cleanup.
-    const int32_t page_slot = gemma4_kv_cache_page_slot(config, pos);
-    const int32_t physical_page =
-        __ldg(page_table + batch * config.max_pages_per_seq + page_slot);
-    if (physical_page < 0 || physical_page >= config.num_pages) continue;
+  for (int32_t page_pos = split_begin; page_pos < split_end;) {
+    // Resolve one logical page span at a time. This keeps page-table loads
+    // read-only, but removes repeated page table, division/modulo, and full
+    // cache-offset work for every token inside the same cache page.
+    const int32_t page_offset0 = gemma4_kv_cache_page_offset(config, page_pos);
+    const int32_t span_end =
+        min(split_end, page_pos + config.page_size - page_offset0);
+    const int32_t page_slot = gemma4_kv_cache_page_slot(config, page_pos);
+    const int32_t physical_page = gemma4_warp_uniform_ldg_i32(
+        page_table + batch * config.max_pages_per_seq + page_slot, lane);
+    if (physical_page < 0 || physical_page >= config.num_pages) {
+      page_pos = span_end;
+      continue;
+    }
 
     // Cache layout is [layer, page, page_offset, kv_head, dim]. All 256 threads
-    // read consecutive BF16 lanes, so K and V loads are coalesced direct global
-    // reads rather than shared-memory staged copies.
-    const int32_t page_offset = gemma4_kv_cache_page_offset(config, pos);
-    const int64_t kv_base = gemma4_kv_cache_offset(config, layer, physical_page, page_offset, kv_head, 0);
-    const float k_value = __bfloat162float(loadg(cache_k + kv_base + dim));
-    const float v_value = __bfloat162float(loadg(cache_v + kv_base + dim));
+    // read consecutive BF16 lanes, so K and V stay direct read-only global loads.
+    // Advancing one token inside a page is a fixed stride over all KV heads.
+    int64_t kv_base = gemma4_kv_cache_offset(
+        config, layer, physical_page, page_offset0, kv_head, 0);
+    const int64_t kv_token_stride = int64_t(config.num_heads) * config.head_dim;
+    for (; page_pos < span_end; ++page_pos, kv_base += kv_token_stride) {
+      const float k_value = __bfloat162float(loadg(cache_k + kv_base + dim));
+      const float v_value = __bfloat162float(loadg(cache_v + kv_base + dim));
 
-    // Reduce the per-lane products into two scalar QK scores, then broadcast the
-    // scores through shared memory so every output-dimension thread can update.
-    float score0 = DecodeBlockReduce(reduce_storage_q0).Sum(q0 * k_value);
-    float score1 = DecodeBlockReduce(reduce_storage_q1).Sum(q1 * k_value);
-    if (dim == 0) {
-      s_score0 = score0;
-      s_score1 = score1;
+      // Reduce the per-lane products into two scalar QK scores, then broadcast
+      // the scores through shared memory so every output lane can update.
+      float score0 = DecodeBlockReduce(reduce_storage_q0).Sum(q0 * k_value);
+      float score1 = DecodeBlockReduce(reduce_storage_q1).Sum(q1 * k_value);
+      if (dim == 0) {
+        s_score0 = score0;
+        s_score1 = score1;
+      }
+      __syncthreads();
+      score0 = s_score0 * softmax_scale;
+      score1 = s_score1 * softmax_scale;
+      __syncthreads();
+
+      // Fold this token into the running online softmax state for both query
+      // heads. Each thread only accumulates its own V lane.
+      sliding_decode_online_update(score0, v_value, m0, l0, acc0);
+      sliding_decode_online_update(score1, v_value, m1, l1, acc1);
     }
-    __syncthreads();
-    score0 = s_score0 * softmax_scale;
-    score1 = s_score1 * softmax_scale;
-    __syncthreads();
-
-    // Fold this token into the running online softmax state for both query
-    // heads. Each thread only accumulates its own V lane.
-    sliding_decode_online_update(score0, v_value, m0, l0, acc0);
-    sliding_decode_online_update(score1, v_value, m1, l1, acc1);
   }
 
   // Live split CTAs write one max/denominator scalar per query head plus one
@@ -1536,17 +1537,21 @@ void sliding_decode_paged_reduce_kernel(
   const int32_t batch = blockIdx.x;
   const int32_t q_head = blockIdx.y;
   const int32_t dim = threadIdx.x;
+  const int32_t lane = dim & (kWarpSize - 1);
   const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_head;
 
   // Partial buffers are still laid out with the max `num_splits` stride even
   // when this row has fewer live splits.
   const int32_t partial_row = row * num_splits;
-  const int64_t partial_acc_row = int64_t(row) * num_splits * GEMMA4_SLIDING_HEAD_DIM;
+  const int64_t partial_acc_row =
+      int64_t(row) * num_splits * GEMMA4_SLIDING_HEAD_DIM;
 
   // Recompute the live split count from device sequence lengths so fixed-shape
   // graph launches can ignore stale scratch beyond `actual_splits`.
-  const int32_t seq_len = __ldg(seq_lengths + batch);
-  const int32_t first_key = config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
+  const int32_t seq_len =
+      gemma4_warp_uniform_ldg_i32(seq_lengths + batch, lane);
+  const int32_t first_key =
+      config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
   const int32_t key_count = max(0, seq_len - first_key);
   const int32_t actual_splits = (key_count + split_size - 1) / split_size;
   const int32_t reduce_splits = min(actual_splits, num_splits);
@@ -1622,6 +1627,8 @@ bool valid_sliding_decode_paged_args(
          d_q != nullptr && d_cache_k != nullptr && d_cache_v != nullptr &&
          d_page_table != nullptr && d_seq_lengths != nullptr &&
          batch_size > 0 && split_size > 0 && num_splits > 0 &&
+         cache_config.window_size > 0 &&
+         int64_t(split_size) * num_splits >= cache_config.window_size &&
          gemma4_fa_valid_sliding_cache_config(cache_config, cache_layer);
 }
 
@@ -1844,50 +1851,4 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_kernel_attributes(
     int len) {
   return gemma4_flash_attention::selected_kernel_attributes<
       gemma4_flash_attention::Gemma4SlidingFa2KernelTraits, true>(out, len);
-}
-
-// C ABI wrapper for Gemma 4 global attention. It shares the same implementation
-// but selects the global compile-time traits and disables the local window mask.
-extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16(
-    __nv_bfloat16 *__restrict__ d_out,
-    float *__restrict__ d_softmax_lse,
-    const __nv_bfloat16 *__restrict__ d_q,
-    const __nv_bfloat16 *__restrict__ d_k,
-    const __nv_bfloat16 *__restrict__ d_v,
-    int batch_size,
-    int seqlen_q,
-    int seqlen_k,
-    float softmax_scale,
-    cudaStream_t stream) {
-  // Public C ABI boundary: global attention expects already-prepared Q/K/V
-  // tensors in the fixed Gemma batch-major layout.
-  if (!gemma4_flash_attention::gemma4_fa_valid_qkv_args(
-          d_out, d_q, d_k, d_v, batch_size, seqlen_q, seqlen_k)) {
-    return cudaErrorInvalidValue;
-  }
-
-  gemma4_flash_attention::Gemma4FlashFwdParams params =
-      gemma4_flash_attention::make_params(d_out, d_softmax_lse, d_q, d_k, d_v,
-                                          seqlen_q, seqlen_k,
-                                          gemma4_flash_attention::kNoWindow,
-                                          softmax_scale);
-  return gemma4_flash_attention::launch_global(params, batch_size, stream);
-}
-
-// Return the dynamic shared-memory bytes required by global attention.
-extern "C" size_t gemma4_flash_attention_global_smem_bytes() {
-  return gemma4_flash_attention::Gemma4GlobalFa2KernelTraits::kSmemSize;
-}
-
-// Return the CUDA threadblock size used by global attention.
-extern "C" int gemma4_flash_attention_global_threads_per_block() {
-  return gemma4_flash_attention::Gemma4GlobalFa2KernelTraits::kNThreads;
-}
-
-// Fill a small attribute array for the compiled global attention kernel.
-extern "C" cudaError_t gemma4_flash_attention_global_kernel_attributes(
-    long long *out,
-    int len) {
-  return gemma4_flash_attention::selected_kernel_attributes<
-      gemma4_flash_attention::Gemma4GlobalFa2KernelTraits, false>(out, len);
 }

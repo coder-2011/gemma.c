@@ -702,10 +702,15 @@ void run_sliding_flash_decode_attention_case(const char *label,
   // empty CTAs to prove they do not write or get reduced.
   int num_splits = 0;
   for (int batch_seq_len : target_seq_lengths) {
-    const int first_key = window_size > 0 ? std::max(0, batch_seq_len - window_size) : 0;
+    const int first_key =
+        window_size > 0 ? std::max(0, batch_seq_len - window_size) : 0;
     const int key_count = std::max(0, batch_seq_len - first_key);
-    num_splits = std::max(num_splits, (key_count + split_size - 1) / split_size);
+    num_splits =
+        std::max(num_splits, (key_count + split_size - 1) / split_size);
   }
+  const int max_key_count = window_size > 0 ? window_size : seq_len;
+  num_splits =
+      std::max(num_splits, (max_key_count + split_size - 1) / split_size);
   num_splits = std::max(1, num_splits + extra_num_splits);
   float scale = 1.0f / std::sqrt(float(config.head_dim));
 
@@ -858,6 +863,45 @@ void run_sliding_flash_decode_attention_case(const char *label,
   CHECK_CUDA(cudaFree(d_partial_acc));
 }
 
+void run_sliding_flash_decode_invalid_args_case() {
+  __nv_bfloat16 *d_bf16 = nullptr;
+  float *d_float = nullptr;
+  int32_t *d_i32 = nullptr;
+  CHECK_CUDA(cudaMalloc(&d_bf16, sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMalloc(&d_float, sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_i32, sizeof(int32_t)));
+
+  Gemma4KvCacheConfig config = {
+      1,
+      1,
+      64,
+      16,
+      GEMMA4_SLIDING_KV_HEADS,
+      GEMMA4_SLIDING_HEAD_DIM,
+      0,
+  };
+  cudaError_t status = gemma4_flash_attention_sliding_decode_paged_bf16(
+      d_bf16, d_float, d_float, d_float, d_bf16, d_bf16, d_bf16, d_i32,
+      d_i32, config, 0, 1, 0.25f, 64, 16, 0);
+  if (status != cudaErrorInvalidValue) {
+    std::fprintf(stderr, "expected invalid sliding window config\n");
+    std::exit(1);
+  }
+
+  config.window_size = 1024;
+  status = gemma4_flash_attention_sliding_decode_paged_bf16(
+      d_bf16, d_float, d_float, d_float, d_bf16, d_bf16, d_bf16, d_i32,
+      d_i32, config, 0, 1, 0.25f, 64, 15, 0);
+  if (status != cudaErrorInvalidValue) {
+    std::fprintf(stderr, "expected invalid underprovisioned decode splits\n");
+    std::exit(1);
+  }
+
+  CHECK_CUDA(cudaFree(d_i32));
+  CHECK_CUDA(cudaFree(d_float));
+  CHECK_CUDA(cudaFree(d_bf16));
+}
+
 }  // namespace
 
 int main() {
@@ -882,6 +926,7 @@ int main() {
       "sliding flash decode varlen overprovisioned", 2, 10, 4, 3, 8, 3, 3, true);
   run_sliding_flash_decode_attention_case(
       "sliding flash decode wrap", 1, 13, 4, 3, 8, 5);
+  run_sliding_flash_decode_invalid_args_case();
   std::puts("kv cache tests passed");
   return 0;
 }
