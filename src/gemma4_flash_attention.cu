@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include <cute/algorithm/tensor_reduce.hpp>
 #include <cute/tensor.hpp>
@@ -91,10 +92,11 @@ struct Gemma4FlashFwdKernelTraits {
 
   // Global memory is loaded as 128-bit vectors. kBlockKSmem controls the
   // shared-memory row width used by the swizzled Q/K/V tiles.
-  static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
+  using BlockKSmemInt = std::conditional_t<(kHeadDim % 64 == 0), Int<64>, Int<32>>;
+  static constexpr int kBlockKSmem = BlockKSmemInt::value;
   static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
   static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
-  static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+  using SmemSwizzle = std::conditional_t<(kBlockKSmem == 32), Swizzle<2, 3, 3>, Swizzle<3, 3, 3>>;
   static_assert(kHeadDim % kGmemElemsPerLoad == 0,
                 "FA head dim must be a multiple of vector load width");
   static_assert(kNThreads % kGmemThreadsPerRow == 0, "FA thread count must divide row load layout");
@@ -113,14 +115,14 @@ struct Gemma4FlashFwdKernelTraits {
   // Shared-memory layouts use a CUTE swizzle to make tensor-core LDSM loads
   // bank-conflict-friendly. Q, K, and V share the same logical tile shape, but
   // V also gets a transposed view for the P*V multiply.
-  using SmemLayoutAtomQ = decltype(composition(Swizzle<kSwizzle, 3, 3>{}, Layout<Shape<_8, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{})); // 3, 3 changes, if we adjust layout
+  using SmemLayoutAtomQ = decltype(composition(SmemSwizzle{}, Layout<Shape<_8, BlockKSmemInt>, Stride<BlockKSmemInt, _1>>{})); // 3, 3 changes, if we adjust layout
   using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
   using SmemLayoutKV = decltype(tile_to_shape(SmemLayoutAtomQ{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
   using SmemLayoutVtransposed = decltype(composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
   using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
-  using SmemLayoutAtomO = decltype(composition(Swizzle<kSwizzle, 3, 3>{}, Layout<Shape<Int<8>, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
+  using SmemLayoutAtomO = decltype(composition(SmemSwizzle{}, Layout<Shape<_8, BlockKSmemInt>, Stride<BlockKSmemInt, _1>>{}));
   using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
 
