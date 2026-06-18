@@ -22,7 +22,7 @@ TORCH_API_INCLUDE ?= .venv/lib/python3.11/site-packages/torch/include/torch/csrc
 TORCH_LIB ?= .venv/lib/python3.11/site-packages/torch/lib
 PYTHON_INCLUDE ?= /usr/include/python3.11
 
-.PHONY: all cuda-kernels decode-bench embedding-gather-bench rmsnorm-bench rmsnorm-hidden-fused-bench rope-bench ffn-cudnn-bench ffn-decode-load-bench flash-attn-bench kv-cache-bench flash-attn-lib flash-attn-reference-lib tuna-prefill-bench sgemm-prefill-bench sgemm-bf16-prefill-bench test-cuda-utils test-embedding-gather test-rmsnorm test-rope test-ffn-decode test-kv-cache clean
+.PHONY: all cuda-kernels decode-bench embedding-gather-bench rmsnorm-bench rmsnorm-hidden-fused-bench rope-bench ffn-cudnn-bench ffn-decode-load-bench flash-attn-bench kv-cache-bench flash-attn-lib flash-attn-reference-lib tuna-prefill-bench sgemm-prefill-bench sgemm-bf16-prefill-bench test-cuda-utils test-embedding-gather test-rmsnorm test-rope test-ffn-decode test-kv-cache test-flash-decode clean
 
 all: $(BUILD_DIR)/gemma4.o
 
@@ -52,6 +52,8 @@ test-rope: $(BUILD_DIR)/tests/test_rope
 test-ffn-decode: $(BUILD_DIR)/tests/test_ffn_decode
 	./$<
 test-kv-cache: $(BUILD_DIR)/tests/test_kv_cache
+	./$<
+test-flash-decode: $(BUILD_DIR)/tests/test_flash_decode
 	./$<
 
 $(BUILD_DIR):
@@ -144,8 +146,11 @@ $(BUILD_DIR)/tests/test_rope: tests/test_rope.cu src/gemma4_rope.cu src/gemma4_r
 $(BUILD_DIR)/tests/test_ffn_decode: tests/test_ffn_decode.cu src/gemma4_ffn_decode.cu src/gemma4_ffn_decode.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_ffn_decode.cu src/gemma4_ffn_decode.cu -o $@
 
-$(BUILD_DIR)/tests/test_kv_cache: tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/tests
-	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4.cpp -o $@
+$(BUILD_DIR)/tests/test_kv_cache: tests/test_kv_cache.cu tests/test_decode_common.cuh src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/tests
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4.cpp -o $@
+
+$(BUILD_DIR)/tests/test_flash_decode: tests/test_flash_decode.cu tests/test_decode_common.cuh src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/tests
+	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) tests/test_flash_decode.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4.cpp -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)

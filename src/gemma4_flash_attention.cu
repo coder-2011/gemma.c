@@ -1034,14 +1034,33 @@ bool gemma4_fa_valid_sliding_args(
          window_left >= 0;
 }
 
-bool gemma4_fa_valid_sliding_cache_config(
+bool gemma4_fa_valid_cache_config(
     const Gemma4KvCacheConfig &config,
-    int32_t cache_layer) {
+    int32_t cache_layer,
+    int32_t expected_kv_heads,
+    int32_t expected_head_dim) {
   return cache_layer >= 0 && cache_layer < config.num_layers &&
          config.num_layers > 0 && config.num_pages > 0 &&
          config.page_size > 0 && config.max_pages_per_seq > 0 &&
-         config.num_heads == GEMMA4_SLIDING_KV_HEADS &&
-         config.head_dim == GEMMA4_SLIDING_HEAD_DIM;
+         config.num_heads == expected_kv_heads &&
+         config.head_dim == expected_head_dim;
+}
+
+bool gemma4_fa_valid_sliding_cache_config(
+    const Gemma4KvCacheConfig &config,
+    int32_t cache_layer) {
+  return gemma4_fa_valid_cache_config(
+      config, cache_layer, GEMMA4_SLIDING_KV_HEADS,
+      GEMMA4_SLIDING_HEAD_DIM) &&
+         config.window_size > 0;
+}
+
+bool gemma4_fa_valid_global_cache_config(
+    const Gemma4KvCacheConfig &config,
+    int32_t cache_layer) {
+  return gemma4_fa_valid_cache_config(
+      config, cache_layer, GEMMA4_GLOBAL_KV_HEADS, GEMMA4_GLOBAL_HEAD_DIM) &&
+         config.window_size == 0;
 }
 
 // Dynamic shared memory exceeds the default limit for these FA tiles, so the
@@ -1102,14 +1121,10 @@ static_assert(kSlidingNormRopeThreads % kWarpSize == 0);
 static_assert(GEMMA4_SLIDING_HEAD_DIM == 256);
 constexpr int kSlidingNormRopeHeadsPerBlock =
     kSlidingNormRopeThreads / kWarpSize;
-constexpr int kSlidingNormRopeValuesPerLane =
-    GEMMA4_SLIDING_HEAD_DIM / kWarpSize;
-constexpr int kSlidingNormRopePairsPerLane =
-    kSlidingNormRopeValuesPerLane / 2;
 static_assert(GEMMA4_NUM_QUERY_HEADS % kSlidingNormRopeHeadsPerBlock == 0);
 
 // Sum a per-lane value across one warp for the per-head RMSNorm denominator.
-__device__ __forceinline__ float sliding_prep_warp_sum(float value) {
+__device__ __forceinline__ float prep_warp_sum(float value) {
   for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
     value += __shfl_xor_sync(0xffffffffu, value, offset);
   }
@@ -1118,57 +1133,72 @@ __device__ __forceinline__ float sliding_prep_warp_sum(float value) {
 
 // Load the values owned by this lane and return the RMS scale for the whole
 // head. Each warp owns exactly one head.
-__device__ __forceinline__ float sliding_prep_head_rms_scale(
+template <int HeadDim>
+__device__ __forceinline__ float prep_head_rms_scale(
     const __nv_bfloat16 *__restrict__ in,
     int lane,
-    float (&values)[kSlidingNormRopeValuesPerLane]) {
+    float (&values)[HeadDim / kWarpSize]) {
+  static_assert(HeadDim % kWarpSize == 0);
   float sum = 0.0f;
 #pragma unroll
-  for (int i = 0; i < kSlidingNormRopeValuesPerLane; ++i) {
-    // The lane-strided layout gives every lane 8 dimensions of a 256-wide head.
+  for (int i = 0; i < HeadDim / kWarpSize; ++i) {
+    // The lane-strided layout gives every lane HeadDim/32 dimensions.
     values[i] = __bfloat162float(in[lane + i * kWarpSize]);
     sum = fmaf(values[i], values[i], sum);
   }
-  sum = sliding_prep_warp_sum(sum);
-  return rsqrtf(sum / float(GEMMA4_SLIDING_HEAD_DIM) + GEMMA4_RMS_NORM_EPS);
+  sum = prep_warp_sum(sum);
+  return rsqrtf(sum / float(HeadDim) + GEMMA4_RMS_NORM_EPS);
 }
 
 // Apply learned RMSNorm to one Q/K head and then rotate the normalized values
-// with sliding-layer RoPE.
-__device__ __forceinline__ void sliding_prep_weighted_rope_head(
+// with RoPE. Partial/p-RoPE leaves dimensions [RotaryDim, HeadDim) unrotated.
+template <int HeadDim, int RotaryDim>
+__device__ __forceinline__ void prep_weighted_rope_head(
     __nv_bfloat16 *__restrict__ out,
     const __nv_bfloat16 *__restrict__ in,
     const __nv_bfloat16 *__restrict__ weight,
     const float *__restrict__ cos_row,
     const float *__restrict__ sin_row,
     int lane) {
-  constexpr int kRotaryHalf = GEMMA4_SLIDING_HEAD_DIM / 2;
-  float values[kSlidingNormRopeValuesPerLane];
-  const float scale = sliding_prep_head_rms_scale(in, lane, values);
+  static_assert(HeadDim % kWarpSize == 0);
+  static_assert(RotaryDim > 0 && RotaryDim <= HeadDim && RotaryDim % 2 == 0);
+  constexpr int kValuesPerLane = HeadDim / kWarpSize;
+  constexpr int kRotaryHalf = RotaryDim / 2;
+  float values[kValuesPerLane];
+  const float scale = prep_head_rms_scale<HeadDim>(in, lane, values);
 #pragma unroll
-  for (int i = 0; i < kSlidingNormRopePairsPerLane; ++i) {
-    const int dim = lane + i * kWarpSize;
+  for (int dim = lane; dim < kRotaryHalf; dim += kWarpSize) {
     // RoPE pairs the low half and high half of the head at the same lane-owned
     // offset, after applying the learned Q/K norm weight.
+    const int lo_idx = dim / kWarpSize;
+    const int hi_dim = kRotaryHalf + dim;
+    const int hi_idx = hi_dim / kWarpSize;
     const float lo =
-        values[i] * scale * __bfloat162float(loadg(weight + dim));
-    const float hi = values[i + kSlidingNormRopePairsPerLane] * scale *
-                     __bfloat162float(loadg(weight + kRotaryHalf + dim));
+        values[lo_idx] * scale * __bfloat162float(loadg(weight + dim));
+    const float hi = values[hi_idx] * scale *
+                     __bfloat162float(loadg(weight + hi_dim));
     gemma4_rope::store_rotated_pair_bf16(out, cos_row, sin_row, kRotaryHalf,
                                          dim, lo, hi);
   }
+  for (int dim = RotaryDim + lane; dim < HeadDim; dim += kWarpSize) {
+    out[dim] = __float2bfloat16_rn(
+        values[dim / kWarpSize] * scale * __bfloat162float(loadg(weight + dim)));
+  }
 }
 
-// Apply scale-free RMSNorm to one V head. Gemma 4 sliding V has no learned norm
+// Apply scale-free RMSNorm to one V head. Gemma 4 V norms have no learned norm
 // weight and no RoPE.
-__device__ __forceinline__ void sliding_prep_scale_head(
+template <int HeadDim>
+__device__ __forceinline__ void prep_scale_head(
     __nv_bfloat16 *__restrict__ out,
     const __nv_bfloat16 *__restrict__ in,
     int lane) {
-  float values[kSlidingNormRopeValuesPerLane];
-  const float scale = sliding_prep_head_rms_scale(in, lane, values);
+  static_assert(HeadDim % kWarpSize == 0);
+  constexpr int kValuesPerLane = HeadDim / kWarpSize;
+  float values[kValuesPerLane];
+  const float scale = prep_head_rms_scale<HeadDim>(in, lane, values);
 #pragma unroll
-  for (int i = 0; i < kSlidingNormRopeValuesPerLane; ++i) {
+  for (int i = 0; i < kValuesPerLane; ++i) {
     out[lane + i * kWarpSize] = __float2bfloat16_rn(values[i] * scale);
   }
 }
@@ -1205,17 +1235,18 @@ void gemma4_sliding_qkv_norm_rope_kernel(
   const int64_t row = int64_t(batch) * seq_len + seq;
   const int64_t q_offset = (int64_t(row) * kQHeads + head) * kHeadDim;
   // All 32 query heads exist; every warp in the block prepares one Q head.
-  sliding_prep_weighted_rope_head(q_prepared + q_offset, q + q_offset,
-                                  q_norm_weight, cos_row, sin_row,
-                                  lane);
+  prep_weighted_rope_head<GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_HEAD_DIM>(
+      q_prepared + q_offset, q + q_offset, q_norm_weight, cos_row, sin_row,
+      lane);
 
   // Only the first 16 heads are KV heads. Extra query-head warps skip K/V.
   if (head < kKvHeads) {
     const int64_t kv_offset = (int64_t(row) * kKvHeads + head) * kHeadDim;
-    sliding_prep_weighted_rope_head(k_prepared + kv_offset, k + kv_offset,
-                                    k_norm_weight, cos_row, sin_row,
-                                    lane);
-    sliding_prep_scale_head(v_prepared + kv_offset, v + kv_offset, lane);
+    prep_weighted_rope_head<GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_HEAD_DIM>(
+        k_prepared + kv_offset, k + kv_offset, k_norm_weight, cos_row,
+        sin_row, lane);
+    prep_scale_head<GEMMA4_SLIDING_HEAD_DIM>(
+        v_prepared + kv_offset, v + kv_offset, lane);
   }
 }
 
@@ -1276,8 +1307,9 @@ void gemma4_sliding_decode_q_paged_kv_norm_rope_kernel(
   const float *sin_row = sin + int64_t(position) * kRotaryHalf;
 
   const int64_t q_offset = (int64_t(batch) * kQHeads + head) * kHeadDim;
-  sliding_prep_weighted_rope_head(q_prepared + q_offset, q + q_offset,
-                                  q_norm_weight, cos_row, sin_row, lane);
+  prep_weighted_rope_head<GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_HEAD_DIM>(
+      q_prepared + q_offset, q + q_offset, q_norm_weight, cos_row, sin_row,
+      lane);
 
   // Only KV heads have cache rows; the remaining query-head warps are done.
   if (head >= kKvHeads) return;
@@ -1286,9 +1318,65 @@ void gemma4_sliding_decode_q_paged_kv_norm_rope_kernel(
   if (cache_offset < 0) return;
 
   const int64_t kv_offset = (int64_t(batch) * kKvHeads + head) * kHeadDim;
-  sliding_prep_weighted_rope_head(cache_k + cache_offset, k + kv_offset,
-                                  k_norm_weight, cos_row, sin_row, lane);
-  sliding_prep_scale_head(cache_v + cache_offset, v + kv_offset, lane);
+  prep_weighted_rope_head<GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_HEAD_DIM>(
+      cache_k + cache_offset, k + kv_offset, k_norm_weight, cos_row, sin_row,
+      lane);
+  prep_scale_head<GEMMA4_SLIDING_HEAD_DIM>(
+      cache_v + cache_offset, v + kv_offset, lane);
+}
+
+constexpr int kGlobalRotaryDim = GEMMA4_GLOBAL_HEAD_DIM / 4;
+static_assert(kGlobalRotaryDim == 128);
+
+// Global decode prep path. Global layers have no V projection; V is derived
+// from the raw K source, then scale-free normalized before writing the cache.
+__global__ __launch_bounds__(kSlidingNormRopeThreads)
+void gemma4_global_decode_q_paged_kv_norm_rope_kernel(
+    __nv_bfloat16 *__restrict__ q_prepared,
+    __nv_bfloat16 *__restrict__ cache_k,
+    __nv_bfloat16 *__restrict__ cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ page_table,
+    const int32_t *__restrict__ token_position,
+    int cache_layer,
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ q_norm_weight,
+    const __nv_bfloat16 *__restrict__ k_norm_weight,
+    const float *__restrict__ cos,
+    const float *__restrict__ sin) {
+  constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
+  constexpr int kKvHeads = GEMMA4_GLOBAL_KV_HEADS;
+  constexpr int kHeadDim = GEMMA4_GLOBAL_HEAD_DIM;
+  constexpr int kRotaryHalf = kGlobalRotaryDim / 2;
+
+  const int batch = blockIdx.x;
+  const int lane = threadIdx.x & (kWarpSize - 1);
+  const int warp = threadIdx.x / kWarpSize;
+  const int head = blockIdx.y * kSlidingNormRopeHeadsPerBlock + warp;
+  if (head >= kQHeads) return;
+
+  const int position =
+      gemma4_warp_uniform_ldg_i32(token_position + batch, lane);
+  if (position < 0) return;
+  const float *cos_row = cos + int64_t(position) * kRotaryHalf;
+  const float *sin_row = sin + int64_t(position) * kRotaryHalf;
+
+  const int64_t q_offset = (int64_t(batch) * kQHeads + head) * kHeadDim;
+  prep_weighted_rope_head<kHeadDim, kGlobalRotaryDim>(
+      q_prepared + q_offset, q + q_offset, q_norm_weight, cos_row, sin_row,
+      lane);
+
+  if (head >= kKvHeads) return;
+  const int64_t cache_offset = sliding_decode_cache_head_offset(
+      cache_config, page_table, batch, position, cache_layer, head, lane);
+  if (cache_offset < 0) return;
+
+  const int64_t kv_offset = (int64_t(batch) * kKvHeads + head) * kHeadDim;
+  prep_weighted_rope_head<kHeadDim, kGlobalRotaryDim>(
+      cache_k + cache_offset, k + kv_offset, k_norm_weight, cos_row, sin_row,
+      lane);
+  prep_scale_head<kHeadDim>(cache_v + cache_offset, k + kv_offset, lane);
 }
 
 // Launch the prefill Q/K/V preparation kernel after validating the raw and
@@ -1370,16 +1458,70 @@ cudaError_t prepare_sliding_decode_q_paged_kv_norm_rope(
   return cudaGetLastError();
 }
 
-constexpr int kSlidingDecodeThreads = GEMMA4_SLIDING_HEAD_DIM;
-constexpr int kSlidingDecodeGqaRatio = GEMMA4_NUM_QUERY_HEADS / GEMMA4_SLIDING_KV_HEADS;
-static_assert(kSlidingDecodeThreads == 256);
-static_assert(kSlidingDecodeGqaRatio == 2);
+cudaError_t prepare_global_decode_q_paged_kv_norm_rope(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_cache_k,
+    __nv_bfloat16 *__restrict__ d_cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_token_position,
+    int32_t batch_size,
+    int32_t cache_layer,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    cudaStream_t stream) {
+  if (d_q_prepared == nullptr || d_cache_k == nullptr ||
+      d_cache_v == nullptr || d_page_table == nullptr ||
+      d_token_position == nullptr || d_q == nullptr || d_k == nullptr ||
+      d_q_norm_weight == nullptr || d_k_norm_weight == nullptr ||
+      d_cos == nullptr || d_sin == nullptr || batch_size <= 0 ||
+      !gemma4_fa_valid_global_cache_config(cache_config, cache_layer)) {
+    return cudaErrorInvalidValue;
+  }
+
+  constexpr int kHeadGroups =
+      (GEMMA4_NUM_QUERY_HEADS + kSlidingNormRopeHeadsPerBlock - 1) /
+      kSlidingNormRopeHeadsPerBlock;
+  const dim3 grid_dim(batch_size, kHeadGroups);
+  constexpr dim3 block_dim(kSlidingNormRopeThreads);
+  gemma4_global_decode_q_paged_kv_norm_rope_kernel<<<grid_dim, block_dim, 0, stream>>>(
+      d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
+      d_token_position, cache_layer, d_q, d_k, d_q_norm_weight,
+      d_k_norm_weight, d_cos, d_sin);
+  return cudaGetLastError();
+}
+
+struct SlidingDecodeSpec {
+  static constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
+  static constexpr int kKvHeads = GEMMA4_SLIDING_KV_HEADS;
+  static constexpr int kGqaRatio = GEMMA4_NUM_QUERY_HEADS / kKvHeads;
+  static constexpr int kThreads = kHeadDim;
+  static constexpr bool kWindowed = true;
+};
+
+struct GlobalDecodeSpec {
+  static constexpr int kHeadDim = GEMMA4_GLOBAL_HEAD_DIM;
+  static constexpr int kKvHeads = GEMMA4_GLOBAL_KV_HEADS;
+  static constexpr int kGqaRatio = GEMMA4_NUM_QUERY_HEADS / kKvHeads;
+  static constexpr int kThreads = kHeadDim;
+  static constexpr bool kWindowed = false;
+};
+
+static_assert(SlidingDecodeSpec::kThreads == 256);
+static_assert(SlidingDecodeSpec::kGqaRatio == 2);
+static_assert(GlobalDecodeSpec::kThreads == 512);
+static_assert(GlobalDecodeSpec::kGqaRatio == 8);
 static_assert(GEMMA4_SLIDING_HEAD_DIM % kBf16Packed128Elements == 0);
+static_assert(GEMMA4_GLOBAL_HEAD_DIM % kBf16Packed128Elements == 0);
 
 // Online softmax update for one output lane. `m` tracks the running max,
 // `l` tracks the running denominator in that max's scale, and `acc` tracks the
 // V-weighted numerator for the calling thread's head dimension.
-__device__ __forceinline__ void sliding_decode_online_update(
+__device__ __forceinline__ void decode_online_update(
     float score,
     float v_value,
     float &m,
@@ -1393,11 +1535,12 @@ __device__ __forceinline__ void sliding_decode_online_update(
   m = new_m;
 }
 
-// CUDA-core decode path for q_len=1. One CTA owns a KV head and the two
-// sliding-layer query heads mapped to it, so each K/V cache vector is loaded
-// once for the GQA pair instead of once per query head.
-__global__ __launch_bounds__(kSlidingDecodeThreads)
-void sliding_decode_paged_grouped_split_kernel(
+// CUDA-core decode path for q_len=1. One CTA owns one KV head and all query
+// heads mapped to that KV head, so each K/V cache vector is loaded once and
+// reused across the fixed GQA group.
+template <typename Spec>
+__global__ __launch_bounds__(Spec::kThreads)
+void decode_paged_grouped_split_kernel(
     float *__restrict__ partial_m,
     float *__restrict__ partial_l,
     float *__restrict__ partial_acc,
@@ -1419,17 +1562,13 @@ void sliding_decode_paged_grouped_split_kernel(
   const int32_t dim = threadIdx.x;
   const int32_t lane = dim & (kWarpSize - 1);
 
-  // Sliding layers use 2:1 GQA. This CTA computes both query heads for one KV
-  // head so each K/V cache vector is loaded once and reused for the pair.
-  const int32_t q_head0 = kv_head * kSlidingDecodeGqaRatio;
-  const int32_t q_head1 = q_head0 + 1;
-
   // The launch keeps a fixed max `num_splits` for graph compatibility, but
-  // each row can have fewer live splits after applying the sliding window.
+  // each row can have fewer live splits after applying its context policy.
   const int32_t seq_len =
       gemma4_warp_uniform_ldg_i32(seq_lengths + batch, lane);
-  const int32_t first_key =
-      config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
+  const int32_t first_key = Spec::kWindowed
+                                ? max(0, seq_len - config.window_size)
+                                : 0;
   const int32_t key_count = max(0, seq_len - first_key);
   const int32_t actual_splits = (key_count + split_size - 1) / split_size;
   // Overprovisioned CTAs must not write neutral scratch; the reducer will also
@@ -1440,30 +1579,33 @@ void sliding_decode_paged_grouped_split_kernel(
   // writes `actual_splits`; that preserves the fixed graph/scratch layout.
   const int32_t split_begin = first_key + split * split_size;
   const int32_t split_end = min(seq_len, split_begin + split_size);
-  const int32_t partial0 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head0) * num_splits + split;
-  const int32_t partial1 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head1) * num_splits + split;
+  const int32_t q_head0 = kv_head * Spec::kGqaRatio;
 
-  // Q is tiny for decode: each thread loads and keeps its two scalar Q lanes in
-  // registers for every key in this split.
-  const int64_t q_base0 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head0) * GEMMA4_SLIDING_HEAD_DIM;
-  const int64_t q_base1 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head1) * GEMMA4_SLIDING_HEAD_DIM;
-  const float q0 = __bfloat162float(loadg(q + q_base0 + dim));
-  const float q1 = __bfloat162float(loadg(q + q_base1 + dim));
+  // Q is tiny for decode: each thread keeps its lane for every query head in
+  // this GQA group resident in registers for every key in this split.
+  float q_value[Spec::kGqaRatio];
+  float acc[Spec::kGqaRatio];
+  float m[Spec::kGqaRatio];
+  float l[Spec::kGqaRatio];
+  int32_t partial[Spec::kGqaRatio];
+  #pragma unroll
+  for (int i = 0; i < Spec::kGqaRatio; ++i) {
+    const int32_t q_head = q_head0 + i;
+    const int64_t q_base =
+        (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head) * Spec::kHeadDim;
+    q_value[i] = __bfloat162float(loadg(q + q_base + dim));
+    acc[i] = 0.0f;
+    m[i] = -INFINITY;
+    l[i] = 0.0f;
+    partial[i] = (batch * GEMMA4_NUM_QUERY_HEADS + q_head) * num_splits + split;
+  }
 
-  // Each thread owns one output dimension for the two query heads. The online
-  // softmax state is per-query-head, per-dimension.
-  float acc0 = 0.0f, acc1 = 0.0f;
-  float m0 = -INFINITY, m1 = -INFINITY;
-  float l0 = 0.0f, l1 = 0.0f;
-
-  // Use separate CUB temp storage for the two dot-product reductions. Reusing
+  // Use separate CUB temp storage for the dot-product reductions. Reusing
   // one storage object for back-to-back reductions is easy to make unsafe
   // without a clean synchronization boundary around all internal CUB state.
-  using DecodeBlockReduce = cub::BlockReduce<float, kSlidingDecodeThreads>;
-  __shared__ typename DecodeBlockReduce::TempStorage reduce_storage_q0;
-  __shared__ typename DecodeBlockReduce::TempStorage reduce_storage_q1;
-  __shared__ float s_score0;
-  __shared__ float s_score1;
+  using DecodeBlockReduce = cub::BlockReduce<float, Spec::kThreads>;
+  __shared__ typename DecodeBlockReduce::TempStorage reduce_storage[Spec::kGqaRatio];
+  __shared__ float s_score[Spec::kGqaRatio];
 
   for (int32_t page_pos = split_begin; page_pos < split_end;) {
     // Resolve one logical page span at a time. This keeps page-table loads
@@ -1480,7 +1622,7 @@ void sliding_decode_paged_grouped_split_kernel(
       continue;
     }
 
-    // Cache layout is [layer, page, page_offset, kv_head, dim]. All 256 threads
+    // Cache layout is [layer, page, page_offset, kv_head, dim]. All threads
     // read consecutive BF16 lanes, so K and V stay direct read-only global loads.
     // Advancing one token inside a page is a fixed stride over all KV heads.
     int64_t kv_base = gemma4_kv_cache_offset(
@@ -1490,40 +1632,45 @@ void sliding_decode_paged_grouped_split_kernel(
       const float k_value = __bfloat162float(loadg(cache_k + kv_base + dim));
       const float v_value = __bfloat162float(loadg(cache_v + kv_base + dim));
 
-      // Reduce the per-lane products into two scalar QK scores, then broadcast
+      // Reduce the per-lane products into scalar QK scores, then broadcast
       // the scores through shared memory so every output lane can update.
-      float score0 = DecodeBlockReduce(reduce_storage_q0).Sum(q0 * k_value);
-      float score1 = DecodeBlockReduce(reduce_storage_q1).Sum(q1 * k_value);
-      if (dim == 0) {
-        s_score0 = score0;
-        s_score1 = score1;
+      float score[Spec::kGqaRatio];
+      #pragma unroll
+      for (int i = 0; i < Spec::kGqaRatio; ++i) {
+        score[i] = DecodeBlockReduce(reduce_storage[i]).Sum(q_value[i] * k_value);
+        if (dim == 0) s_score[i] = score[i];
       }
       __syncthreads();
-      score0 = s_score0 * softmax_scale;
-      score1 = s_score1 * softmax_scale;
+      #pragma unroll
+      for (int i = 0; i < Spec::kGqaRatio; ++i) {
+        score[i] = s_score[i] * softmax_scale;
+      }
       __syncthreads();
 
-      // Fold this token into the running online softmax state for both query
+      // Fold this token into the running online softmax state for each query
       // heads. Each thread only accumulates its own V lane.
-      sliding_decode_online_update(score0, v_value, m0, l0, acc0);
-      sliding_decode_online_update(score1, v_value, m1, l1, acc1);
+      #pragma unroll
+      for (int i = 0; i < Spec::kGqaRatio; ++i) {
+        decode_online_update(score[i], v_value, m[i], l[i], acc[i]);
+      }
     }
   }
 
   // Live split CTAs write one max/denominator scalar per query head plus one
   // FP32 accumulator row. Empty overprovisioned CTAs returned above.
-  if (dim == 0) {
-    partial_m[partial0] = m0;
-    partial_l[partial0] = l0;
-    partial_m[partial1] = m1;
-    partial_l[partial1] = l1;
+  #pragma unroll
+  for (int i = 0; i < Spec::kGqaRatio; ++i) {
+    if (dim == 0) {
+      partial_m[partial[i]] = m[i];
+      partial_l[partial[i]] = l[i];
+    }
+    partial_acc[int64_t(partial[i]) * Spec::kHeadDim + dim] = acc[i];
   }
-  partial_acc[int64_t(partial0) * GEMMA4_SLIDING_HEAD_DIM + dim] = acc0;
-  partial_acc[int64_t(partial1) * GEMMA4_SLIDING_HEAD_DIM + dim] = acc1;
 }
 
-__global__ __launch_bounds__(kSlidingDecodeThreads)
-void sliding_decode_paged_reduce_kernel(
+template <typename Spec>
+__global__ __launch_bounds__(Spec::kThreads)
+void decode_paged_reduce_kernel(
     __nv_bfloat16 *__restrict__ out,
     const float *__restrict__ partial_m,
     const float *__restrict__ partial_l,
@@ -1544,14 +1691,15 @@ void sliding_decode_paged_reduce_kernel(
   // when this row has fewer live splits.
   const int32_t partial_row = row * num_splits;
   const int64_t partial_acc_row =
-      int64_t(row) * num_splits * GEMMA4_SLIDING_HEAD_DIM;
+      int64_t(row) * num_splits * Spec::kHeadDim;
 
   // Recompute the live split count from device sequence lengths so fixed-shape
   // graph launches can ignore stale scratch beyond `actual_splits`.
   const int32_t seq_len =
       gemma4_warp_uniform_ldg_i32(seq_lengths + batch, lane);
-  const int32_t first_key =
-      config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
+  const int32_t first_key = Spec::kWindowed
+                                ? max(0, seq_len - config.window_size)
+                                : 0;
   const int32_t key_count = max(0, seq_len - first_key);
   const int32_t actual_splits = (key_count + split_size - 1) / split_size;
   const int32_t reduce_splits = min(actual_splits, num_splits);
@@ -1559,7 +1707,7 @@ void sliding_decode_paged_reduce_kernel(
   // A zero-length row has no attention mass. This should be rare, but returning
   // zeros keeps the kernel total for defensive tests and future graph captures.
   if (reduce_splits == 0) {
-    out[(int64_t(row) * GEMMA4_SLIDING_HEAD_DIM) + dim] = __float2bfloat16_rn(0.0f);
+    out[(int64_t(row) * Spec::kHeadDim) + dim] = __float2bfloat16_rn(0.0f);
     return;
   }
 
@@ -1571,7 +1719,7 @@ void sliding_decode_paged_reduce_kernel(
 
   // Separate CUB storage mirrors the split kernel: max-reduce and sum-reduce
   // have distinct shared temp storage so CUB internals are not repurposed.
-  using DecodeBlockReduce = cub::BlockReduce<float, kSlidingDecodeThreads>;
+  using DecodeBlockReduce = cub::BlockReduce<float, Spec::kThreads>;
   __shared__ typename DecodeBlockReduce::TempStorage reduce_m_storage;
   __shared__ typename DecodeBlockReduce::TempStorage reduce_l_storage;
   __shared__ float s_m;
@@ -1600,14 +1748,16 @@ void sliding_decode_paged_reduce_kernel(
   for (int32_t split = 0; split < reduce_splits; ++split) {
     const float split_l = partial_l[partial_row + split];
     if (split_l > 0.0f) {
-      value += partial_acc[partial_acc_row + int64_t(split) * GEMMA4_SLIDING_HEAD_DIM + dim] * __expf(partial_m[partial_row + split] - s_m);
+      value += partial_acc[partial_acc_row + int64_t(split) * Spec::kHeadDim + dim] *
+               __expf(partial_m[partial_row + split] - s_m);
     }
   }
-  out[(int64_t(row) * GEMMA4_SLIDING_HEAD_DIM) + dim] =
+  out[(int64_t(row) * Spec::kHeadDim) + dim] =
       s_l > 0.0f ? __float2bfloat16_rn(value / s_l) : __float2bfloat16_rn(0.0f);
 }
 
-bool valid_sliding_decode_paged_args(
+template <typename Spec>
+bool valid_decode_paged_args(
     const void *d_out,
     const void *d_partial_m,
     const void *d_partial_l,
@@ -1622,17 +1772,24 @@ bool valid_sliding_decode_paged_args(
     int32_t batch_size,
     int32_t split_size,
     int32_t num_splits) {
-  return d_out != nullptr && d_partial_m != nullptr &&
-         d_partial_l != nullptr && d_partial_acc != nullptr &&
-         d_q != nullptr && d_cache_k != nullptr && d_cache_v != nullptr &&
-         d_page_table != nullptr && d_seq_lengths != nullptr &&
-         batch_size > 0 && split_size > 0 && num_splits > 0 &&
-         cache_config.window_size > 0 &&
-         int64_t(split_size) * num_splits >= cache_config.window_size &&
-         gemma4_fa_valid_sliding_cache_config(cache_config, cache_layer);
+  bool valid = d_out != nullptr && d_partial_m != nullptr &&
+               d_partial_l != nullptr && d_partial_acc != nullptr &&
+               d_q != nullptr && d_cache_k != nullptr && d_cache_v != nullptr &&
+               d_page_table != nullptr && d_seq_lengths != nullptr &&
+               batch_size > 0 && split_size > 0 && num_splits > 0 &&
+               gemma4_fa_valid_cache_config(
+                   cache_config, cache_layer, Spec::kKvHeads, Spec::kHeadDim);
+  if constexpr (Spec::kWindowed) {
+    valid = valid && cache_config.window_size > 0 &&
+            int64_t(split_size) * num_splits >= cache_config.window_size;
+  } else {
+    valid = valid && cache_config.window_size == 0;
+  }
+  return valid;
 }
 
-cudaError_t launch_sliding_decode_paged(
+template <typename Spec>
+cudaError_t launch_decode_paged(
     __nv_bfloat16 *__restrict__ d_out,
     float *__restrict__ d_partial_m,
     float *__restrict__ d_partial_l,
@@ -1651,9 +1808,9 @@ cudaError_t launch_sliding_decode_paged(
     cudaStream_t stream) {
   // Phase 1 computes per-split online-softmax partials. The grid intentionally
   // launches the max split count; each CTA cheaply exits if its row has no work.
-  const dim3 split_grid(batch_size, GEMMA4_SLIDING_KV_HEADS, num_splits);
-  constexpr dim3 block_dim(kSlidingDecodeThreads);
-  sliding_decode_paged_grouped_split_kernel<<<split_grid, block_dim, 0, stream>>>(
+  const dim3 split_grid(batch_size, Spec::kKvHeads, num_splits);
+  constexpr dim3 block_dim(Spec::kThreads);
+  decode_paged_grouped_split_kernel<Spec><<<split_grid, block_dim, 0, stream>>>(
       d_partial_m, d_partial_l, d_partial_acc, d_q_prepared, d_cache_k,
       d_cache_v, d_page_table, d_seq_lengths, cache_config, cache_layer,
       softmax_scale, split_size, num_splits);
@@ -1663,7 +1820,7 @@ cudaError_t launch_sliding_decode_paged(
   // Phase 2 reduces live split partials into the final projection-ready BF16
   // attention output.
   const dim3 reduce_grid(batch_size, GEMMA4_NUM_QUERY_HEADS);
-  sliding_decode_paged_reduce_kernel<<<reduce_grid, block_dim, 0, stream>>>(
+  decode_paged_reduce_kernel<Spec><<<reduce_grid, block_dim, 0, stream>>>(
       d_out, d_partial_m, d_partial_l, d_partial_acc, d_seq_lengths, cache_config,
       split_size, num_splits);
   return cudaGetLastError();
@@ -1801,6 +1958,30 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
 }
 
+// Gemma global decode prep-cache helper: Q and K get learned RMSNorm+p-RoPE;
+// V is scale-free RMSNorm of the raw K source because global layers share K/V.
+extern "C" cudaError_t gemma4_flash_attention_global_decode_prepare_q_paged_kv_bf16(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_cache_k,
+    __nv_bfloat16 *__restrict__ d_cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_token_position,
+    int32_t batch_size,
+    int32_t cache_layer,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    cudaStream_t stream) {
+  return gemma4_flash_attention::prepare_global_decode_q_paged_kv_norm_rope(
+      d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
+      d_token_position, batch_size, cache_layer, d_q, d_k, d_q_norm_weight,
+      d_k_norm_weight, d_cos, d_sin, stream);
+}
+
 // Gemma sliding decode attention over the Layout-A paged cache. This path is
 // specialized for q_len=1 and uses CUDA cores rather than trying to force a
 // tensor-core tile shape with only one query row.
@@ -1821,13 +2002,49 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_bf16(
     int32_t split_size,
     int32_t num_splits,
     cudaStream_t stream) {
-  if (!gemma4_flash_attention::valid_sliding_decode_paged_args(
+  if (!gemma4_flash_attention::valid_decode_paged_args<
+          gemma4_flash_attention::SlidingDecodeSpec>(
           d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
           d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
           cache_layer, batch_size, split_size, num_splits)) {
     return cudaErrorInvalidValue;
   }
-  return gemma4_flash_attention::launch_sliding_decode_paged(
+  return gemma4_flash_attention::launch_decode_paged<
+      gemma4_flash_attention::SlidingDecodeSpec>(
+      d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
+      d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
+      cache_layer, batch_size, softmax_scale, split_size, num_splits, stream);
+}
+
+// Gemma global decode attention over the Layout-A paged cache. This shares the
+// split/reduce decode implementation with sliding layers, but uses full-context
+// attention, head_dim=512, and 8 query heads per KV head.
+extern "C" cudaError_t gemma4_flash_attention_global_decode_paged_bf16(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_partial_m,
+    float *__restrict__ d_partial_l,
+    float *__restrict__ d_partial_acc,
+    const __nv_bfloat16 *__restrict__ d_q_prepared,
+    const __nv_bfloat16 *__restrict__ d_cache_k,
+    const __nv_bfloat16 *__restrict__ d_cache_v,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_seq_lengths,
+    Gemma4KvCacheConfig cache_config,
+    int32_t cache_layer,
+    int32_t batch_size,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits,
+    cudaStream_t stream) {
+  if (!gemma4_flash_attention::valid_decode_paged_args<
+          gemma4_flash_attention::GlobalDecodeSpec>(
+          d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
+          d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
+          cache_layer, batch_size, split_size, num_splits)) {
+    return cudaErrorInvalidValue;
+  }
+  return gemma4_flash_attention::launch_decode_paged<
+      gemma4_flash_attention::GlobalDecodeSpec>(
       d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
       d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
       cache_layer, batch_size, softmax_scale, split_size, num_splits, stream);
