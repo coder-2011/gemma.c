@@ -12102,3 +12102,77 @@ Conclusion:
 - The old generic paged decode implementation was not deleted outright because
   it is still the only paged global decode path and still backs small-layout
   KV-cache coverage. It should go away when global paged decode FA exists.
+
+## 2026-06-18 - Projection decode GEMV helper deduplication
+
+Question: can the decode projection GEMV kernels reuse the shared
+`gemma4_matmul_device.cuh` helpers instead of carrying their own duplicate
+pack-load, swizzle, reduction, and store code?
+
+Change:
+
+- Moved the existing `GEMMA4_DECODE_GEMV_BUFFER_STAGES` register-buffering
+  experiment knob into `src/gemma4_matmul_device.cuh`.
+- Replaced the local projection decode GEMV body in
+  `src/gemma4_matmul_kernels.cu` with
+  `gemma4_matmul_device::decode_gemv_cols_device`.
+- Kept `GEMMA4_WEIGHT_LOAD_POLICY=0` for the projection decode translation unit,
+  preserving the previous `.cs` streaming weight-load behavior.
+- Added `src/gemma4_matmul_device.cuh` to the projection object dependencies.
+- Removed a tracked empty `src/src/gemma4_ffn_decode.cu` file and a tracked
+  Python bytecode cache file.
+
+Commands:
+
+```bash
+make -B decode-bench NVCC=/usr/local/cuda/bin/nvcc
+GEMMA4_DECODE_BENCH_SEED=12345 ./build/experiments/gemma4_decode_bench 10 3 1
+
+make -B test-ffn-decode NVCC=/usr/local/cuda/bin/nvcc
+make -B test-cuda-utils NVCC=/usr/local/cuda/bin/nvcc
+
+make -B decode-bench NVCC=/usr/local/cuda/bin/nvcc \
+  CPPFLAGS='-Isrc -DGEMMA4_DECODE_GEMV_BUFFER_STAGES=2'
+GEMMA4_DECODE_BENCH_SEED=12345 \
+  ./build/experiments/gemma4_decode_bench global_k 5 2 1
+make -B decode-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:04:00.0`, driver `580.126.16`,
+  persistence enabled, ECC disabled, power limit `300 W`.
+- CUDA/NVCC: CUDA compilation tools `13.0`, `V13.0.48`.
+- Timing: existing C++ decode benchmark, CUDA events on the benchmark stream.
+- Cache state: warm/repeated-buffer behavior from the harness; no L2 flush.
+- Clock policy: not locked. GPU was idle in `nvidia-smi` before the pass, but
+  clocks were free to boost during the benchmark.
+- Iterations: one process, 10 timed iterations, 3 warmups, 1 trial per op.
+- Correctness: compared against cuBLAS/cuDNN baselines as the harness reports;
+  custom identity vs custom swizzle16 remained `max_abs=0` for every op. The
+  staged-buffer smoke build also reported custom identity vs swizzle16
+  `max_abs=0` for `global_k`.
+
+Custom identity best-time comparison:
+
+```text
+op             before ms   after ms   delta
+ffn_gate_up     0.653990   0.651894   -0.32%
+ffn_down        0.329693   0.329066   -0.19%
+sliding_qkv     0.251526   0.253366   +0.73%
+sliding_o       0.129219   0.129066   -0.12%
+global_q        0.250957   0.251210   +0.10%
+global_k        0.035968   0.036800   +2.31%
+global_o        0.253219   0.252666   -0.22%
+final_logits    3.958743   3.960688   +0.05%
+```
+
+Conclusion:
+
+- The refactor removes roughly 160 lines from the projection decode kernel file
+  without a meaningful timing regression in this quick pass.
+- The small `global_k` identity delta is on a sub-40us kernel and should be
+  treated as benchmark noise unless reproduced with locked clocks and more
+  trials.
+- The moved staged-buffer path still compiles and remains numerically aligned
+  with the swizzled custom output in the smoke run.
