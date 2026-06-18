@@ -12049,3 +12049,56 @@ Conclusion:
 - Overprovisioned timing stays near exact-split timing for direct flash decode;
   the remaining cost is mostly launching empty split CTAs that now return before
   touching partial scratch.
+
+## 2026-06-18 - Sliding decode baseline redundancy check
+
+Question: can the old paged decode baseline be removed now that the sliding
+paged decode FlashAttention-ish path exists?
+
+Commands:
+
+```bash
+make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+
+./build/experiments/gemma4_kv_cache_bench \
+  1024 64 64 20 100 10 --cache warm \
+  | tee src/experiments/results/2026-06-18_decode_baseline_vs_flash_warm.txt
+
+./build/experiments/gemma4_kv_cache_bench \
+  1024 64 64 10 30 8 --cache cold --flush-bytes 67108864 \
+  | tee src/experiments/results/2026-06-18_decode_baseline_vs_flash_cold.txt
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:0F:00.0`, driver `580.126.16`,
+  persistence enabled, ECC disabled, power limit `300 W`.
+- Clock policy: not locked. GPU was idle at start; benchmark reported runtime
+  and driver as `13000`.
+- Timing: CUDA events on the benchmark stream. Warm cache uses 20 warmups, 100
+  launches per sample, 10 samples. Cold cache uses 10 warmups, 30 launches per
+  sample, 8 samples, and a 64 MiB L2 flush.
+- Shape: sliding decode, `B=1`, `seq_len=1024`, `page_size=64`,
+  `split_size=64`, `actual_splits=16`, BF16, `q_heads=32`, `kv_heads=16`,
+  `head_dim=256`.
+- Correctness: both old paged decode and direct flash decode reported
+  `max_abs=0` against the CPU reference before cleanup.
+
+Medians:
+
+```text
+path                           warm median    cold median
+old paged decode baseline       0.131868 ms    0.139665 ms
+new flash paged decode direct   0.084152 ms    0.094680 ms
+```
+
+Conclusion:
+
+- For sliding decode, the old paged decode baseline is redundant and slower:
+  flash direct is `1.57x` faster warm-cache and `1.47x` faster cold-cache.
+- Cleanup performed after measuring: removed the old baseline from the sliding
+  flash decode correctness tests and from `gemma4_kv_cache_bench`'s active
+  timing rows.
+- The old generic paged decode implementation was not deleted outright because
+  it is still the only paged global decode path and still backs small-layout
+  KV-cache coverage. It should go away when global paged decode FA exists.
