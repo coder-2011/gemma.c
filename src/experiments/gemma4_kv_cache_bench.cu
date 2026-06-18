@@ -335,6 +335,9 @@ int main(int argc, char **argv) {
   int iters = options.iters;
   int samples = options.samples;
   bool cold_cache = options.cache_mode == "cold";
+
+  // Cold-cache mode defines an explicit L2 flush before each measured sample.
+  // Warm-cache mode leaves repeated accesses to measure steady-state reuse.
   int64_t flush_bytes =
       cold_cache ? options.flush_bytes : 0;
   if (cold_cache && flush_bytes == 0) {
@@ -351,6 +354,10 @@ int main(int argc, char **argv) {
   int batch_size = 1;
   int layer = 0;
   int q_heads = GEMMA4_NUM_QUERY_HEADS;
+
+  // Decode attends over the active sliding window, not necessarily the full
+  // constructed sequence. `actual_splits` is the live work; `num_splits` is the
+  // fixed scratch/layout stride used to test graph-compatible overprovisioning.
   int key_count = config.window_size > 0 ? std::min(seq_len, config.window_size)
                                          : seq_len;
   int actual_splits = div_up(key_count, split_size);
@@ -387,6 +394,8 @@ int main(int argc, char **argv) {
   std::vector<int32_t> one_batch = {0};
   std::vector<int32_t> one_position = {seq_len - 1};
 
+  // Host K/V represent the full prefill sequence. `one_k`/`one_v` below are
+  // the final token reused by the steady-state decode-write microbenchmark.
   int kv_elems = seq_len * config.num_heads * config.head_dim;
   std::vector<__nv_bfloat16> h_k(kv_elems);
   std::vector<__nv_bfloat16> h_v(kv_elems);
@@ -418,6 +427,8 @@ int main(int argc, char **argv) {
   float *d_partial_acc = nullptr;
   uint32_t *d_l2_scratch = nullptr;
 
+  // Partial scratch is allocated for `num_splits`, including any extra empty
+  // splits requested by --extra-splits.
   CUDA_CHECK(cudaMalloc(&d_cache_k, cache_elements(config) * sizeof(*d_cache_k)));
   CUDA_CHECK(cudaMalloc(&d_cache_v, cache_elements(config) * sizeof(*d_cache_v)));
   CUDA_CHECK(cudaMalloc(&d_k, h_k.size() * sizeof(*d_k)));
@@ -491,20 +502,12 @@ int main(int argc, char **argv) {
       d_token_position, seq_len, layer, d_k, d_v, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  CUDA_CHECK(gemma4_paged_decode_attention_bf16(
-      d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
-      d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
-      q_heads, scale, split_size, num_splits, stream));
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-
   std::vector<__nv_bfloat16> expected(h_q.size());
   std::vector<__nv_bfloat16> actual(h_q.size());
   cpu_decode_reference(expected, h_q, h_k, h_v, seq_len, q_heads,
                        config.num_heads, config.head_dim, scale);
-  CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
-                        cudaMemcpyDeviceToHost));
-  check_attention_correctness(actual, expected);
 
+  // Correctness check: flash paged decode against the CPU reference.
   CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_bf16(
       d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
       d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
@@ -514,6 +517,8 @@ int main(int argc, char **argv) {
                         cudaMemcpyDeviceToHost));
   check_attention_correctness(actual, expected);
 
+  // Each lambda enqueues exactly the work named by its label. The timing helper
+  // wraps these in CUDA events on the same stream and optionally flushes L2.
   auto prefill_write = [&]() {
     CUDA_CHECK(gemma4_kv_cache_write_bf16(
         d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
@@ -524,21 +529,11 @@ int main(int argc, char **argv) {
         d_cache_k, d_cache_v, config, d_page_table, d_one_batch,
         d_one_position, 1, layer, d_one_k, d_one_v, stream));
   };
-  auto decode_attention = [&]() {
-    CUDA_CHECK(gemma4_paged_decode_attention_bf16(
-        d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
-        d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
-        q_heads, scale, split_size, num_splits, stream));
-  };
   auto flash_decode_attention = [&]() {
     CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_bf16(
         d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
         d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
         scale, split_size, num_splits, stream));
-  };
-  auto full_decode = [&]() {
-    decode_write();
-    decode_attention();
   };
   auto flash_full_decode = [&]() {
     decode_write();
@@ -553,17 +548,9 @@ int main(int argc, char **argv) {
               time_cuda_samples(decode_write, stream, warmup, iters, samples,
                                 cold_cache, d_l2_scratch,
                                 flush_bytes / sizeof(uint32_t)));
-  print_stats("paged_decode_attention",
-              time_cuda_samples(decode_attention, stream, warmup, iters, samples,
-                                cold_cache, d_l2_scratch,
-                                flush_bytes / sizeof(uint32_t)));
   print_stats("flash_decode_paged_attention_direct",
               time_cuda_samples(flash_decode_attention, stream, warmup, iters,
                                 samples, cold_cache, d_l2_scratch,
-                                flush_bytes / sizeof(uint32_t)));
-  print_stats("paged_full_decode_write_plus_attention",
-              time_cuda_samples(full_decode, stream, warmup, iters, samples,
-                                cold_cache, d_l2_scratch,
                                 flush_bytes / sizeof(uint32_t)));
   print_stats("flash_full_decode_write_plus_attention",
               time_cuda_samples(flash_full_decode, stream, warmup, iters,

@@ -118,6 +118,10 @@ extern "C" cudaError_t gemma4_kv_cache_write_bf16(
     const __nv_bfloat16 *__restrict__ d_v,
     cudaStream_t stream);
 
+// Generic paged decode reference path. Sliding production decode should use
+// gemma4_flash_attention_sliding_decode_paged_bf16; this remains for global
+// paged decode coverage and small-layout KV-cache tests until global FA decode
+// exists.
 cudaError_t gemma4_paged_decode_attention_bf16(
     __nv_bfloat16 *__restrict__ d_out,
     float *__restrict__ d_partial_m,

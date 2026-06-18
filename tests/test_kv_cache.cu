@@ -672,6 +672,8 @@ void run_sliding_flash_decode_attention_case(const char *label,
                                              int split_size,
                                              int extra_num_splits = 0,
                                              bool stagger_seq_lengths = false) {
+  // This case builds a paged sliding-cache fixture, runs the flash decode path,
+  // then checks it against a CPU reference.
   Gemma4KvCacheConfig config = {
       1,
       batch_size * max_pages_per_seq,
@@ -683,6 +685,10 @@ void run_sliding_flash_decode_attention_case(const char *label,
   };
   int layer = 0;
   int q_heads = GEMMA4_NUM_QUERY_HEADS;
+
+  // Most tests use one sequence length for the whole batch. The staggered mode
+  // gives batch rows different live split counts while keeping one max launch
+  // shape, which exercises the graph-compatible overprovisioning contract.
   std::vector<int32_t> target_seq_lengths(batch_size, seq_len);
   if (stagger_seq_lengths) {
     const int step = std::max(1, split_size + 1);
@@ -690,6 +696,10 @@ void run_sliding_flash_decode_attention_case(const char *label,
       target_seq_lengths[b] = std::max(1, seq_len - b * step);
     }
   }
+
+  // `num_splits` is the max scratch stride and launch z dimension. Individual
+  // rows may have fewer actual splits; `extra_num_splits` deliberately adds
+  // empty CTAs to prove they do not write or get reduced.
   int num_splits = 0;
   for (int batch_seq_len : target_seq_lengths) {
     const int first_key = window_size > 0 ? std::max(0, batch_seq_len - window_size) : 0;
@@ -709,7 +719,6 @@ void run_sliding_flash_decode_attention_case(const char *label,
   __nv_bfloat16 *d_one_k = nullptr;
   __nv_bfloat16 *d_one_v = nullptr;
   __nv_bfloat16 *d_q = nullptr;
-  __nv_bfloat16 *d_baseline_out = nullptr;
   __nv_bfloat16 *d_direct_out = nullptr;
   int32_t *d_page_table = nullptr;
   int32_t *d_token_batch = nullptr;
@@ -718,6 +727,9 @@ void run_sliding_flash_decode_attention_case(const char *label,
   float *d_partial_m = nullptr;
   float *d_partial_l = nullptr;
   float *d_partial_acc = nullptr;
+
+  // Scratch sizes use the overprovisioned stride. The flash reducer must read
+  // only live splits out of this layout, leaving extra slots irrelevant.
   const size_t partial_m_bytes =
       gemma4_paged_decode_partial_m_elements(batch_size, q_heads, num_splits) * sizeof(float);
   const size_t partial_acc_bytes =
@@ -729,8 +741,6 @@ void run_sliding_flash_decode_attention_case(const char *label,
   CHECK_CUDA(cudaMalloc(&d_one_k, config.num_heads * config.head_dim * sizeof(*d_one_k)));
   CHECK_CUDA(cudaMalloc(&d_one_v, config.num_heads * config.head_dim * sizeof(*d_one_v)));
   CHECK_CUDA(cudaMalloc(&d_q, batch_size * q_heads * config.head_dim * sizeof(*d_q)));
-  CHECK_CUDA(cudaMalloc(&d_baseline_out,
-                        batch_size * q_heads * config.head_dim * sizeof(*d_baseline_out)));
   CHECK_CUDA(cudaMalloc(&d_direct_out,
                         batch_size * q_heads * config.head_dim * sizeof(*d_direct_out)));
   CHECK_CUDA(cudaMalloc(&d_page_table, page_table.size() * sizeof(int32_t)));
@@ -748,6 +758,10 @@ void run_sliding_flash_decode_attention_case(const char *label,
   std::vector<__nv_bfloat16> by_pos_v(by_pos_k.size());
   std::vector<__nv_bfloat16> one_k(config.num_heads * config.head_dim);
   std::vector<__nv_bfloat16> one_v(one_k.size());
+
+  // Populate the cache through the production KV-cache writer one token at a
+  // time. This exercises page allocation, page-table entries, and sliding wrap
+  // behavior instead of constructing cache memory by hand.
   for (int b = 0; b < batch_size; ++b) {
     for (int pos = 0; pos < target_seq_lengths[b]; ++pos) {
       int ensured_page = gemma4_kv_cache_ensure_page(
@@ -808,10 +822,8 @@ void run_sliding_flash_decode_attention_case(const char *label,
                         seq_lengths.size() * sizeof(int32_t),
                         cudaMemcpyHostToDevice));
 
-  CHECK_CUDA(gemma4_paged_decode_attention_bf16(
-      d_baseline_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
-      d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
-      q_heads, scale, split_size, num_splits, 0));
+  // Poison all partial scratch before the flash run. If the flash reducer reads
+  // beyond actual_splits, these extra slots should explode the comparison.
   auto poison_partials = [&]() {
     CHECK_CUDA(cudaMemset(d_partial_m, 0x7f, partial_m_bytes));
     CHECK_CUDA(cudaMemset(d_partial_l, 0x7f, partial_m_bytes));
@@ -824,17 +836,11 @@ void run_sliding_flash_decode_attention_case(const char *label,
       scale, split_size, num_splits, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
-  std::vector<__nv_bfloat16> baseline(q.size());
   std::vector<__nv_bfloat16> direct(q.size());
-  CHECK_CUDA(cudaMemcpy(baseline.data(), d_baseline_out,
-                        baseline.size() * sizeof(baseline[0]),
-                        cudaMemcpyDeviceToHost));
   CHECK_CUDA(cudaMemcpy(direct.data(), d_direct_out,
                         direct.size() * sizeof(direct[0]),
                         cudaMemcpyDeviceToHost));
 
-  compare_bf16(baseline, expected, 0.015625f, label);
-  compare_bf16(direct, baseline, 0.015625f, "sliding flash decode direct");
   compare_bf16(direct, expected, 0.015625f, "sliding flash decode direct cpu");
 
   CHECK_CUDA(cudaFree(d_cache_k));
@@ -842,7 +848,6 @@ void run_sliding_flash_decode_attention_case(const char *label,
   CHECK_CUDA(cudaFree(d_one_k));
   CHECK_CUDA(cudaFree(d_one_v));
   CHECK_CUDA(cudaFree(d_q));
-  CHECK_CUDA(cudaFree(d_baseline_out));
   CHECK_CUDA(cudaFree(d_direct_out));
   CHECK_CUDA(cudaFree(d_page_table));
   CHECK_CUDA(cudaFree(d_token_batch));
@@ -860,6 +865,9 @@ int main() {
   run_sliding_decode_prep_cache_case();
   run_global_write_and_attention_case();
   run_sliding_wrap_case();
+
+  // Short and boundary cases cover partial final splits, exact page boundaries,
+  // overprovisioned launch z dimensions, and batch rows with different lengths.
   run_sliding_flash_decode_attention_case(
       "sliding flash decode short", 1, 5, 8, 2, 8, 3);
   run_sliding_flash_decode_attention_case(
