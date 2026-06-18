@@ -5,6 +5,146 @@ namespace {
 
 using namespace gemma4_test;
 
+void run_global_prefill_norm_rope_case() {
+  constexpr int batch_size = 1;
+  constexpr int seq_len = 4;
+  constexpr int q_heads = GEMMA4_NUM_QUERY_HEADS;
+  constexpr int kv_heads = GEMMA4_GLOBAL_KV_HEADS;
+  constexpr int head_dim = GEMMA4_GLOBAL_HEAD_DIM;
+  constexpr int rotary_half = (GEMMA4_GLOBAL_HEAD_DIM / 4) / 2;
+  const float scale = 1.0f / std::sqrt(float(head_dim));
+
+  std::vector<__nv_bfloat16> q(batch_size * seq_len * q_heads * head_dim);
+  std::vector<__nv_bfloat16> k(batch_size * seq_len * kv_heads * head_dim);
+  std::vector<__nv_bfloat16> q_weight(head_dim);
+  std::vector<__nv_bfloat16> k_weight(head_dim);
+  std::vector<float> cos(seq_len * rotary_half);
+  std::vector<float> sin(cos.size());
+  for (int i = 0; i < static_cast<int>(q.size()); ++i) {
+    q[i] = make_value(37000 + i);
+  }
+  for (int i = 0; i < static_cast<int>(k.size()); ++i) {
+    k[i] = make_value(47000 + i);
+  }
+  for (int d = 0; d < head_dim; ++d) {
+    q_weight[d] = __float2bfloat16_rn(0.80f + 0.001f * float(d % 29));
+    k_weight[d] = __float2bfloat16_rn(0.90f - 0.001f * float(d % 31));
+  }
+  fill_global_rope_tables(cos, sin, seq_len);
+
+  std::vector<__nv_bfloat16> expected_q(q.size());
+  std::vector<__nv_bfloat16> expected_k(k.size());
+  std::vector<__nv_bfloat16> expected_v(k.size());
+  for (int b = 0; b < batch_size; ++b) {
+    for (int pos = 0; pos < seq_len; ++pos) {
+      for (int h = 0; h < q_heads; ++h) {
+        reference_global_weighted_rope_head(
+            expected_q,
+            token_offset(b, pos, h, 0, seq_len, q_heads, head_dim),
+            q,
+            token_offset(b, pos, h, 0, seq_len, q_heads, head_dim),
+            q_weight, cos, sin, pos);
+      }
+      for (int h = 0; h < kv_heads; ++h) {
+        reference_global_weighted_rope_head(
+            expected_k,
+            token_offset(b, pos, h, 0, seq_len, kv_heads, head_dim),
+            k,
+            token_offset(b, pos, h, 0, seq_len, kv_heads, head_dim),
+            k_weight, cos, sin, pos);
+        reference_global_scale_head(
+            expected_v,
+            token_offset(b, pos, h, 0, seq_len, kv_heads, head_dim),
+            k,
+            token_offset(b, pos, h, 0, seq_len, kv_heads, head_dim));
+      }
+    }
+  }
+  __nv_bfloat16 *d_q = nullptr;
+  __nv_bfloat16 *d_k = nullptr;
+  __nv_bfloat16 *d_q_weight = nullptr;
+  __nv_bfloat16 *d_k_weight = nullptr;
+  __nv_bfloat16 *d_q_prepared = nullptr;
+  __nv_bfloat16 *d_k_prepared = nullptr;
+  __nv_bfloat16 *d_v_prepared = nullptr;
+  __nv_bfloat16 *d_out = nullptr;
+  __nv_bfloat16 *d_direct_out = nullptr;
+  float *d_cos = nullptr;
+  float *d_sin = nullptr;
+  CHECK_CUDA(cudaMalloc(&d_q, q.size() * sizeof(*d_q)));
+  CHECK_CUDA(cudaMalloc(&d_k, k.size() * sizeof(*d_k)));
+  CHECK_CUDA(cudaMalloc(&d_q_weight, q_weight.size() * sizeof(*d_q_weight)));
+  CHECK_CUDA(cudaMalloc(&d_k_weight, k_weight.size() * sizeof(*d_k_weight)));
+  CHECK_CUDA(cudaMalloc(&d_q_prepared, q.size() * sizeof(*d_q_prepared)));
+  CHECK_CUDA(cudaMalloc(&d_k_prepared, k.size() * sizeof(*d_k_prepared)));
+  CHECK_CUDA(cudaMalloc(&d_v_prepared, k.size() * sizeof(*d_v_prepared)));
+  CHECK_CUDA(cudaMalloc(&d_out, q.size() * sizeof(*d_out)));
+  CHECK_CUDA(cudaMalloc(&d_direct_out, q.size() * sizeof(*d_direct_out)));
+  CHECK_CUDA(cudaMalloc(&d_cos, cos.size() * sizeof(*d_cos)));
+  CHECK_CUDA(cudaMalloc(&d_sin, sin.size() * sizeof(*d_sin)));
+  CHECK_CUDA(cudaMemcpy(d_q, q.data(), q.size() * sizeof(q[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k, k.data(), k.size() * sizeof(k[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_q_weight, q_weight.data(),
+                        q_weight.size() * sizeof(q_weight[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_k_weight, k_weight.data(),
+                        k_weight.size() * sizeof(k_weight[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_cos, cos.data(), cos.size() * sizeof(cos[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_sin, sin.data(), sin.size() * sizeof(sin[0]),
+                        cudaMemcpyHostToDevice));
+
+  CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
+      d_out, nullptr, d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k,
+      d_q_weight, d_k_weight, d_cos, d_sin, batch_size, seq_len, seq_len,
+      scale, 0));
+  CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16(
+      d_direct_out, nullptr, d_q_prepared, d_k_prepared, d_v_prepared,
+      batch_size, seq_len, seq_len, scale, 0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  std::vector<__nv_bfloat16> actual_q(q.size());
+  std::vector<__nv_bfloat16> actual_k(k.size());
+  std::vector<__nv_bfloat16> actual_v(k.size());
+  std::vector<__nv_bfloat16> actual_out(q.size());
+  std::vector<__nv_bfloat16> direct_out(q.size());
+  CHECK_CUDA(cudaMemcpy(actual_q.data(), d_q_prepared,
+                        actual_q.size() * sizeof(actual_q[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(actual_k.data(), d_k_prepared,
+                        actual_k.size() * sizeof(actual_k[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(actual_v.data(), d_v_prepared,
+                        actual_v.size() * sizeof(actual_v[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(actual_out.data(), d_out,
+                        actual_out.size() * sizeof(actual_out[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(direct_out.data(), d_direct_out,
+                        direct_out.size() * sizeof(direct_out[0]),
+                        cudaMemcpyDeviceToHost));
+  compare_bf16(actual_q, expected_q, 0.03125f, "global prefill prepared Q");
+  compare_bf16(actual_k, expected_k, 0.03125f, "global prefill prepared K");
+  compare_bf16(actual_v, expected_v, 0.015625f, "global prefill prepared V");
+  compare_bf16(actual_out, direct_out, 0.0f,
+               "global prefill norm-rope direct attention");
+
+  CHECK_CUDA(cudaFree(d_sin));
+  CHECK_CUDA(cudaFree(d_cos));
+  CHECK_CUDA(cudaFree(d_direct_out));
+  CHECK_CUDA(cudaFree(d_out));
+  CHECK_CUDA(cudaFree(d_v_prepared));
+  CHECK_CUDA(cudaFree(d_k_prepared));
+  CHECK_CUDA(cudaFree(d_q_prepared));
+  CHECK_CUDA(cudaFree(d_k_weight));
+  CHECK_CUDA(cudaFree(d_q_weight));
+  CHECK_CUDA(cudaFree(d_k));
+  CHECK_CUDA(cudaFree(d_q));
+}
+
 void run_sliding_decode_prep_cache_case() {
   Gemma4KvCacheConfig config = {
       2,
@@ -575,6 +715,7 @@ void run_sliding_flash_decode_invalid_args_case() {
 }  // namespace
 
 int main() {
+  run_global_prefill_norm_rope_case();
   run_sliding_decode_prep_cache_case();
   run_global_decode_prep_cache_case();
 

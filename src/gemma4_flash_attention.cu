@@ -2,7 +2,7 @@
 //
 // This file is a Gemma-specific inline specialization of the FlashAttention-2
 // SM80 forward path. It keeps only the active BF16 forward kernels used by
-// Gemma 4 31B text attention: local sliding layers. The
+// Gemma 4 31B text attention: local sliding layers and full global layers. The
 // implementation is limited to fixed-shape model paths and omits the upstream
 // generic feature matrix.
 //
@@ -144,6 +144,8 @@ struct Gemma4FlashFwdKernelTraits {
 
 using Gemma4SlidingFa2KernelTraits =
     Gemma4FlashFwdKernelTraits<GEMMA4_SLIDING_HEAD_DIM, 64, 64, 4>;
+using Gemma4GlobalFa2KernelTraits =
+    Gemma4FlashFwdKernelTraits<GEMMA4_GLOBAL_HEAD_DIM, 32, 32, 2>;
 
 // Return the maximum value across the 4 lanes that jointly own one score row.
 __device__ __forceinline__ float gemma4_fa_quad_reduce_max(float x) {
@@ -1107,15 +1109,6 @@ cudaError_t launch_attention_maybe_lse(
                    params, batch_size, stream);
 }
 
-// Gemma 4 sliding layers: head_dim=256, block 64x64, local causal window.
-cudaError_t launch_sliding(
-    Gemma4FlashFwdParams &params,
-    int batch_size,
-    cudaStream_t stream) {
-  return launch_attention_maybe_lse<Gemma4SlidingFa2KernelTraits, true>(
-      params, batch_size, stream);
-}
-
 constexpr int kSlidingNormRopeThreads = GEMMA4_SLIDING_HEAD_DIM;
 static_assert(kSlidingNormRopeThreads % kWarpSize == 0);
 static_assert(GEMMA4_SLIDING_HEAD_DIM == 256);
@@ -1203,10 +1196,11 @@ __device__ __forceinline__ void prep_scale_head(
   }
 }
 
-// Prepare all sliding-layer Q/K/V heads for prefill attention. Each block owns
-// one sequence position, one batch, and a small group of heads.
+// Prepare all prefill Q/K/V heads. Each block owns one sequence position, one
+// batch, and a small group of heads. Global layers derive V from the K source.
+template <int HeadDim, int KvHeads, int RotaryDim, bool KEqualsV>
 __global__ __launch_bounds__(kSlidingNormRopeThreads)
-void gemma4_sliding_qkv_norm_rope_kernel(
+void gemma4_qkv_norm_rope_kernel(
     __nv_bfloat16 *__restrict__ q_prepared,
     __nv_bfloat16 *__restrict__ k_prepared,
     __nv_bfloat16 *__restrict__ v_prepared,
@@ -1219,9 +1213,9 @@ void gemma4_sliding_qkv_norm_rope_kernel(
     const float *__restrict__ sin,
     int seq_len) {
   constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
-  constexpr int kKvHeads = GEMMA4_SLIDING_KV_HEADS;
-  constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
-  constexpr int kRotaryHalf = kHeadDim / 2;
+  constexpr int kKvHeads = KvHeads;
+  constexpr int kHeadDim = HeadDim;
+  constexpr int kRotaryHalf = RotaryDim / 2;
 
   const int seq = blockIdx.x;
   const int batch = blockIdx.z;
@@ -1235,18 +1229,18 @@ void gemma4_sliding_qkv_norm_rope_kernel(
   const int64_t row = int64_t(batch) * seq_len + seq;
   const int64_t q_offset = (int64_t(row) * kQHeads + head) * kHeadDim;
   // All 32 query heads exist; every warp in the block prepares one Q head.
-  prep_weighted_rope_head<GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_HEAD_DIM>(
+  prep_weighted_rope_head<HeadDim, RotaryDim>(
       q_prepared + q_offset, q + q_offset, q_norm_weight, cos_row, sin_row,
       lane);
 
-  // Only the first 16 heads are KV heads. Extra query-head warps skip K/V.
+  // Only the low KV-head groups have K/V rows. Extra query-head warps skip K/V.
   if (head < kKvHeads) {
     const int64_t kv_offset = (int64_t(row) * kKvHeads + head) * kHeadDim;
-    prep_weighted_rope_head<GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_HEAD_DIM>(
+    prep_weighted_rope_head<HeadDim, RotaryDim>(
         k_prepared + kv_offset, k + kv_offset, k_norm_weight, cos_row,
         sin_row, lane);
-    prep_scale_head<GEMMA4_SLIDING_HEAD_DIM>(
-        v_prepared + kv_offset, v + kv_offset, lane);
+    const __nv_bfloat16 *v_source = KEqualsV ? k : v;
+    prep_scale_head<HeadDim>(v_prepared + kv_offset, v_source + kv_offset, lane);
   }
 }
 
@@ -1381,7 +1375,8 @@ void gemma4_global_decode_q_paged_kv_norm_rope_kernel(
 
 // Launch the prefill Q/K/V preparation kernel after validating the raw and
 // prepared buffers.
-cudaError_t prepare_sliding_qkv_norm_rope(
+template <int HeadDim, int KvHeads, int RotaryDim, bool KEqualsV>
+cudaError_t prepare_qkv_norm_rope(
     __nv_bfloat16 *__restrict__ d_q_prepared,
     __nv_bfloat16 *__restrict__ d_k_prepared,
     __nv_bfloat16 *__restrict__ d_v_prepared,
@@ -1397,7 +1392,7 @@ cudaError_t prepare_sliding_qkv_norm_rope(
     cudaStream_t stream) {
   if (d_q_prepared == nullptr || d_k_prepared == nullptr ||
       d_v_prepared == nullptr || d_q == nullptr || d_k == nullptr ||
-      d_v == nullptr || d_q_norm_weight == nullptr ||
+      (!KEqualsV && d_v == nullptr) || d_q_norm_weight == nullptr ||
       d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr ||
       batch_size <= 0 || seq_len <= 0) {
     return cudaErrorInvalidValue;
@@ -1409,7 +1404,8 @@ cudaError_t prepare_sliding_qkv_norm_rope(
   // grid.x = sequence row, grid.y = group of 8 heads, grid.z = batch.
   const dim3 grid_dim(seq_len, kHeadGroups, batch_size);
   constexpr dim3 block_dim(kSlidingNormRopeThreads);
-  gemma4_sliding_qkv_norm_rope_kernel<<<grid_dim, block_dim, 0, stream>>>(
+  gemma4_qkv_norm_rope_kernel<HeadDim, KvHeads, RotaryDim, KEqualsV>
+      <<<grid_dim, block_dim, 0, stream>>>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, seq_len);
   return cudaGetLastError();
@@ -1878,7 +1874,37 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
       gemma4_flash_attention::make_params(d_out, d_softmax_lse, d_q, d_k, d_v,
                                           seqlen_q, seqlen_k, window_left,
                                           softmax_scale);
-  return gemma4_flash_attention::launch_sliding(params, batch_size, stream);
+  return gemma4_flash_attention::launch_attention_maybe_lse<
+      gemma4_flash_attention::Gemma4SlidingFa2KernelTraits, true>(
+      params, batch_size, stream);
+}
+
+// C ABI wrapper for Gemma 4 global full causal attention. Inputs and output are
+// BF16 contiguous batch-major tensors:
+//   Q/O: [batch, seqlen_q, 32, 512], K/V: [batch, seqlen_k, 4, 512].
+extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_softmax_lse,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    int batch_size,
+    int seqlen_q,
+    int seqlen_k,
+    float softmax_scale,
+    cudaStream_t stream) {
+  if (!gemma4_flash_attention::gemma4_fa_valid_qkv_args(
+          d_out, d_q, d_k, d_v, batch_size, seqlen_q, seqlen_k)) {
+    return cudaErrorInvalidValue;
+  }
+
+  gemma4_flash_attention::Gemma4FlashFwdParams params =
+      gemma4_flash_attention::make_params(d_out, d_softmax_lse, d_q, d_k, d_v,
+                                          seqlen_q, seqlen_k, 0,
+                                          softmax_scale);
+  return gemma4_flash_attention::launch_attention_maybe_lse<
+      gemma4_flash_attention::Gemma4GlobalFa2KernelTraits, false>(
+      params, batch_size, stream);
 }
 
 // Gemma sliding prefill helper: Q/K get learned RMSNorm then RoPE; V gets
@@ -1919,7 +1945,11 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     return cudaErrorInvalidValue;
   }
 
-  cudaError_t status = gemma4_flash_attention::prepare_sliding_qkv_norm_rope(
+  cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
+      GEMMA4_SLIDING_HEAD_DIM,
+      GEMMA4_SLIDING_KV_HEADS,
+      GEMMA4_SLIDING_HEAD_DIM,
+      false>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seqlen_q,
       stream);
@@ -1929,7 +1959,58 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
       gemma4_flash_attention::make_params(
           d_out, d_softmax_lse, d_q_prepared, d_k_prepared, d_v_prepared,
           seqlen_q, seqlen_k, window_left, softmax_scale);
-  return gemma4_flash_attention::launch_sliding(params, batch_size, stream);
+  return gemma4_flash_attention::launch_attention_maybe_lse<
+      gemma4_flash_attention::Gemma4SlidingFa2KernelTraits, true>(
+      params, batch_size, stream);
+}
+
+// Gemma global prefill helper: Q/K get learned RMSNorm+p-RoPE; V is
+// scale-free RMSNorm of raw K because global layers share the K/V projection.
+extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_softmax_lse,
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_k_prepared,
+    __nv_bfloat16 *__restrict__ d_v_prepared,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    int batch_size,
+    int seqlen_q,
+    int seqlen_k,
+    float softmax_scale,
+    cudaStream_t stream) {
+  if (d_out == nullptr || d_q == nullptr || d_k == nullptr ||
+      batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0 ||
+      d_q_prepared == nullptr || d_k_prepared == nullptr ||
+      d_v_prepared == nullptr || d_q_norm_weight == nullptr ||
+      d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr) {
+    return cudaErrorInvalidValue;
+  }
+  if (seqlen_q != seqlen_k) {
+    return cudaErrorInvalidValue;
+  }
+
+  cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
+      GEMMA4_GLOBAL_HEAD_DIM,
+      GEMMA4_GLOBAL_KV_HEADS,
+      gemma4_flash_attention::kGlobalRotaryDim,
+      true>(
+      d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, nullptr,
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seqlen_q,
+      stream);
+  if (status != cudaSuccess) return status;
+
+  gemma4_flash_attention::Gemma4FlashFwdParams params =
+      gemma4_flash_attention::make_params(
+          d_out, d_softmax_lse, d_q_prepared, d_k_prepared, d_v_prepared,
+          seqlen_q, seqlen_k, 0, softmax_scale);
+  return gemma4_flash_attention::launch_attention_maybe_lse<
+      gemma4_flash_attention::Gemma4GlobalFa2KernelTraits, false>(
+      params, batch_size, stream);
 }
 
 // Gemma sliding decode prep-cache helper: Q gets learned RMSNorm+RoPE into the

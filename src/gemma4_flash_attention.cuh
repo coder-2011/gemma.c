@@ -22,6 +22,19 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     float softmax_scale,
     cudaStream_t stream);
 
+extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16(
+    __nv_bfloat16 *__restrict__ d_out,
+    // Optional. Pass nullptr for inference paths that do not need LSE.
+    float *__restrict__ d_softmax_lse,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    int batch_size,
+    int seqlen_q,
+    int seqlen_k,
+    float softmax_scale,
+    cudaStream_t stream);
+
 extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     __nv_bfloat16 *__restrict__ d_out,
     // Optional. Pass nullptr for inference paths that do not need LSE.
@@ -40,6 +53,25 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     int seqlen_q,
     int seqlen_k,
     int window_left,
+    float softmax_scale,
+    cudaStream_t stream);
+
+extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
+    __nv_bfloat16 *__restrict__ d_out,
+    // Optional. Pass nullptr for inference paths that do not need LSE.
+    float *__restrict__ d_softmax_lse,
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_k_prepared,
+    __nv_bfloat16 *__restrict__ d_v_prepared,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    int batch_size,
+    int seqlen_q,
+    int seqlen_k,
     float softmax_scale,
     cudaStream_t stream);
 
