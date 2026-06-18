@@ -1,12 +1,13 @@
 #include "gemma4_matmul_kernels.cuh"
-#include "gemma4_cuda_utils.cuh"
 #include "gemma4.h"
 
 // Gemma 4 31B dense projection kernels.
 
-#ifndef GEMMA4_DECODE_GEMV_BUFFER_STAGES
-#define GEMMA4_DECODE_GEMV_BUFFER_STAGES 1
+#ifndef GEMMA4_WEIGHT_LOAD_POLICY
+#define GEMMA4_WEIGHT_LOAD_POLICY 0
 #endif
+
+#include "gemma4_matmul_device.cuh"
 
 namespace {
 
@@ -32,132 +33,6 @@ struct Gemma4ProjectionShape {
   int n;
 };
 
-__device__ inline int pack_offset(int pack_idx) {
-  return pack_idx * kBf16Packed128Elements;
-}
-
-template <int K>
-__device__ inline int weight_offset(int col, int element_idx) {
-  return col * K + element_idx;
-}
-
-template <int BlockCount, int SwizzleTileBlocks>
-__device__ inline int swizzle_col_block(int block_idx) {
-  if constexpr (SwizzleTileBlocks <= 1) {
-    return block_idx;
-  } else {
-    static_assert((BlockCount % SwizzleTileBlocks) == 0,
-                  "swizzled decode GEMV block count must divide tile size");
-    constexpr int tiles = BlockCount / SwizzleTileBlocks;
-    return (block_idx % SwizzleTileBlocks) * tiles +
-           block_idx / SwizzleTileBlocks;
-  }
-}
-
-__device__ inline Bf16Packed128
-load_activation_pack(const __nv_bfloat16 *__restrict__ x, int element_idx) {
-  return load128g(x + element_idx);
-}
-
-template <int K>
-__device__ inline Bf16Packed128
-load_weight_pack(
-    const __nv_bfloat16 *__restrict__ w_col_major, int col, int element_idx) {
-  return load128cs(w_col_major + weight_offset<K>(col, element_idx));
-}
-
-template <int ColsPerBlock>
-__device__ inline void store_cols(
-    __nv_bfloat16 *__restrict__ dst, const float (&sums)[ColsPerBlock]) {
-  if constexpr (ColsPerBlock == kBf16Packed128Elements) {
-    Bf16Packed128 out;
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      out[col] = __float2bfloat16_rn(sums[col]);
-    }
-    store128(dst, out);
-  } else {
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      dst[col] = __float2bfloat16_rn(sums[col]);
-    }
-  }
-}
-
-template <int K, int ColsPerBlock, int Threads>
-__device__ inline void dot_cols(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_col_major, int col0, int thread_idx,
-    float (&sums)[ColsPerBlock]) {
-  static_assert((K % kBf16Packed128Elements) == 0,
-                "decode GEMV K must be divisible by Packed128 bf16 width");
-  static_assert((Threads % WARP_SIZE) == 0,
-                "decode thread count must be a whole number of warps");
-
-  constexpr int packs_per_col = K / kBf16Packed128Elements;
-
-#if GEMMA4_DECODE_GEMV_BUFFER_STAGES <= 1
-#pragma unroll
-  for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
-    const int element_idx = pack_offset(pack_idx);
-    const Bf16Packed128 x_pack = load_activation_pack(x, element_idx);
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      const Bf16Packed128 w_pack =
-          load_weight_pack<K>(w_col_major, col0 + col, element_idx);
-      gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
-    }
-  }
-#else
-  constexpr int kStages = GEMMA4_DECODE_GEMV_BUFFER_STAGES;
-  static_assert(kStages > 1 && kStages <= 4,
-                "decode GEMV register buffering supports 2-4 stages");
-  Bf16Packed128 x_stage[kStages];
-  Bf16Packed128 w_stage[kStages][ColsPerBlock];
-
-  int pack_idx = thread_idx;
-#pragma unroll
-  for (int stage = 0; stage < kStages; ++stage) {
-    const int stage_pack_idx = thread_idx + stage * Threads;
-    if (stage_pack_idx < packs_per_col) {
-      const int element_idx = pack_offset(stage_pack_idx);
-      x_stage[stage] = load_activation_pack(x, element_idx);
-#pragma unroll
-      for (int col = 0; col < ColsPerBlock; ++col) {
-        w_stage[stage][col] =
-            load_weight_pack<K>(w_col_major, col0 + col, element_idx);
-      }
-    }
-  }
-
-  for (int iter = 0; pack_idx < packs_per_col; ++iter, pack_idx += Threads) {
-    const int stage = iter % kStages;
-    Bf16Packed128 x_pack = x_stage[stage];
-    Bf16Packed128 w_pack[ColsPerBlock];
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      w_pack[col] = w_stage[stage][col];
-    }
-
-    const int next_pack_idx = pack_idx + kStages * Threads;
-    if (next_pack_idx < packs_per_col) {
-      const int element_idx = pack_offset(next_pack_idx);
-      x_stage[stage] = load_activation_pack(x, element_idx);
-#pragma unroll
-      for (int col = 0; col < ColsPerBlock; ++col) {
-        w_stage[stage][col] =
-            load_weight_pack<K>(w_col_major, col0 + col, element_idx);
-      }
-    }
-
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      gemma4_bf16_pack_accumulate_dot(x_pack, w_pack[col], sums[col]);
-    }
-  }
-#endif
-}
-
 template <int K,
           int N,
           int ColsPerBlock,
@@ -171,43 +46,13 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
   static_assert((N % ColsPerBlock) == 0,
                 "decode GEMV N must be divisible by columns per block");
 
-  static_assert((Threads % WARP_SIZE) == 0,
-                "decode thread count must be a whole number of warps");
-  constexpr int blocks = N / ColsPerBlock;
   constexpr int warps = Threads / WARP_SIZE;
   __shared__ float warp_sums[ColsPerBlock][warps];
 
-  const int logical_block =
-      swizzle_col_block<blocks, SwizzleTileBlocks>(blockIdx.x);
-  const int col0 = logical_block * ColsPerBlock;
-  const int lane = threadIdx.x & (WARP_SIZE - 1);
-  const int warp = threadIdx.x / WARP_SIZE;
-
   float sums[ColsPerBlock] = {};
-  dot_cols<K, ColsPerBlock, Threads>(x, w_col_major, col0, threadIdx.x, sums);
-
-  warp_reduce_sum_to_lane0(sums);
-
-  if (lane == 0) {
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      warp_sums[col][warp] = sums[col];
-    }
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int col = 0; col < ColsPerBlock; ++col) {
-    sums[col] = threadIdx.x < warps ? warp_sums[col][lane] : 0.0f;
-  }
-
-  if (warp == 0) {
-    warp_reduce_sum_to_lane0(sums);
-  }
-
-  if (threadIdx.x == 0) {
-    store_cols<ColsPerBlock>(y + col0, sums);
-  }
+  gemma4_matmul_device::decode_gemv_cols_device<
+      K, N, ColsPerBlock, Threads, SwizzleTileBlocks>(
+      x, w_col_major, y, blockIdx.x, warp_sums, sums);
 }
 
 static cudaError_t check_decode_args(
