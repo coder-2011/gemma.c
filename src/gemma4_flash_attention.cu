@@ -41,6 +41,28 @@ using namespace cute;
 // aliases pin this file to Gemma 4's BF16 attention path on SM80+ GPUs.
 constexpr int kWarpSize = 32;
 
+constexpr int kFlashSlidingBlockM = 64;
+constexpr int kFlashSlidingBlockN = 64;
+constexpr int kFlashSlidingWarps = 4;
+constexpr int kFlashGlobalBlockM = 32;
+constexpr int kFlashGlobalBlockN = 32;
+constexpr int kFlashGlobalWarps = 2;
+constexpr int kFlashGlobalLargeBlockM = 32;
+constexpr int kFlashGlobalLargeBlockN = 16;
+constexpr int kFlashGlobalLargeWarps = 2;
+constexpr int kFlashGlobalLargeMinSeqLen = 256;
+constexpr int kSlidingPrefillQkvWarps = 8;
+constexpr int kSlidingPrefillQkvLargeWarps = 32;
+constexpr int kSlidingPrefillQkvLargeMinSeqLen = 512;
+constexpr int kGlobalPrefillQkvWarps = 8;
+constexpr int kSlidingDecodeQkvWarps = 2;
+constexpr int kGlobalDecodeQkvWarps = 2;
+constexpr int kGlobalDecodeQkvLargeBatchWarps = 1;
+constexpr int kGlobalDecodeQkvLargeBatchMinBatch = 8;
+constexpr int kGlobalDecodeShortQueryHeadsPerCta = 2;
+constexpr int kGlobalDecodeLongQueryHeadsPerCta = 4;
+constexpr int kGlobalDecodeLongMinKeys = 4096;
+
 // Runtime parameters copied into constant-kernel-parameter space at launch.
 // The tensor layouts are batch-major and row-major inside each head:
 //   Q/O: [batch, seqlen_q, q_heads, head_dim]
@@ -48,7 +70,6 @@ constexpr int kWarpSize = 32;
 struct Gemma4FlashFwdParams {
   using index_t = int64_t;
 
-  // ponytail: fixed Gemma path; add fields only when a real kernel reads them.
   const cutlass::bfloat16_t *__restrict__ q_ptr;
   const cutlass::bfloat16_t *__restrict__ k_ptr;
   const cutlass::bfloat16_t *__restrict__ v_ptr;
@@ -68,7 +89,6 @@ struct Gemma4FlashFwdParams {
 // swizzles, vectorized global-memory loads, and tensor-core MMA layout.
 template <int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_>
 struct Gemma4FlashFwdKernelTraits {
-  // ponytail: RTX A6000/sm86 only; restore a trait base if pre-SM80 grows back.
   using Element = cutlass::bfloat16_t;
 
   using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>;
@@ -110,15 +130,28 @@ struct Gemma4FlashFwdKernelTraits {
   // Shared-memory layouts use a CUTE swizzle to make tensor-core LDSM loads
   // bank-conflict-friendly. Q, K, and V share the same logical tile shape, but
   // V also gets a transposed view for the P*V multiply.
-  using SmemLayoutAtomQ = decltype(composition(SmemSwizzle{}, Layout<Shape<_8, BlockKSmemInt>, Stride<BlockKSmemInt, _1>>{})); // 3, 3 changes, if we adjust layout
-  using SmemLayoutQ = decltype(tile_to_shape(SmemLayoutAtomQ{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+  using SmemLayoutAtomQ = decltype(composition(
+      SmemSwizzle{},
+      Layout<Shape<_8, BlockKSmemInt>, Stride<BlockKSmemInt, _1>>{}));
+  using SmemLayoutQ = decltype(tile_to_shape(
+      SmemLayoutAtomQ{},
+      Shape<Int<kBlockM>, Int<kHeadDim>>{}));
 
-  using SmemLayoutKV = decltype(tile_to_shape(SmemLayoutAtomQ{}, Shape<Int<kBlockN>, Int<kHeadDim>>{}));
-  using SmemLayoutVtransposed = decltype(composition(SmemLayoutKV{}, make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
-  using SmemLayoutVtransposedNoSwizzle = decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
+  using SmemLayoutKV = decltype(tile_to_shape(
+      SmemLayoutAtomQ{},
+      Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+  using SmemLayoutVtransposed = decltype(composition(
+      SmemLayoutKV{},
+      make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{}, GenRowMajor{})));
+  using SmemLayoutVtransposedNoSwizzle =
+      decltype(get_nonswizzle_portion(SmemLayoutVtransposed{}));
 
-  using SmemLayoutAtomO = decltype(composition(SmemSwizzle{}, Layout<Shape<_8, BlockKSmemInt>, Stride<BlockKSmemInt, _1>>{}));
-  using SmemLayoutO = decltype(tile_to_shape(SmemLayoutAtomO{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+  using SmemLayoutAtomO = decltype(composition(
+      SmemSwizzle{},
+      Layout<Shape<_8, BlockKSmemInt>, Stride<BlockKSmemInt, _1>>{}));
+  using SmemLayoutO = decltype(tile_to_shape(
+      SmemLayoutAtomO{},
+      Shape<Int<kBlockM>, Int<kHeadDim>>{}));
   using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
 
   static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
@@ -143,9 +176,23 @@ struct Gemma4FlashFwdKernelTraits {
 };
 
 using Gemma4SlidingFa2KernelTraits =
-    Gemma4FlashFwdKernelTraits<GEMMA4_SLIDING_HEAD_DIM, 64, 64, 4>;
+    Gemma4FlashFwdKernelTraits<
+        GEMMA4_SLIDING_HEAD_DIM,
+        kFlashSlidingBlockM,
+        kFlashSlidingBlockN,
+        kFlashSlidingWarps>;
 using Gemma4GlobalFa2KernelTraits =
-    Gemma4FlashFwdKernelTraits<GEMMA4_GLOBAL_HEAD_DIM, 32, 32, 2>;
+    Gemma4FlashFwdKernelTraits<
+        GEMMA4_GLOBAL_HEAD_DIM,
+        kFlashGlobalBlockM,
+        kFlashGlobalBlockN,
+        kFlashGlobalWarps>;
+using Gemma4GlobalLargeFa2KernelTraits =
+    Gemma4FlashFwdKernelTraits<
+        GEMMA4_GLOBAL_HEAD_DIM,
+        kFlashGlobalLargeBlockM,
+        kFlashGlobalLargeBlockN,
+        kFlashGlobalLargeWarps>;
 
 // Return the maximum value across the 4 lanes that jointly own one score row.
 __device__ __forceinline__ float gemma4_fa_quad_reduce_max(float x) {
@@ -427,8 +474,12 @@ struct Gemma4FlashSoftmax {
 #pragma unroll
       for (int mi = 0; mi < size(row_max); ++mi) {
         float scores_max_cur = row_max(mi);
-        if constexpr (CheckInf) scores_max_cur = scores_max_cur == -INFINITY ? 0.0f : scores_max_cur;
-        float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+        if constexpr (CheckInf) {
+          scores_max_cur = scores_max_cur == -INFINITY ? 0.0f
+                                                        : scores_max_cur;
+        }
+        float scores_scale = exp2f(
+            (scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
         // Bring the old denominator and O accumulator into the new max frame.
         row_sum(mi) *= scores_scale;
 #pragma unroll
@@ -798,7 +849,6 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   static_assert(GEMMA4_NUM_QUERY_HEADS % kKVHeads == 0,
                 "Gemma GQA ratio must be integral");
 
-  // ponytail: fixed batch-major tensors; add block-info back only for ragged batches.
   const index_t batch = index_t(bidb);
   const int q_tile_start = m_block * kBlockM;
   const int q_tile_remaining = params.seqlen_q - q_tile_start;
@@ -819,7 +869,9 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   int n_block_max = cute::ceil_div(params.seqlen_k, kBlockN);
   // The right edge is causal: queries in this tile never need blocks wholly in
   // the future, even when seqlen_q != seqlen_k during decode.
-  n_block_max = std::min(n_block_max, cute::ceil_div(q_tile_start + kBlockM + seqlen_delta, kBlockN));
+  n_block_max = std::min(
+      n_block_max,
+      cute::ceil_div(q_tile_start + kBlockM + seqlen_delta, kBlockN));
 
   typename KernelTraits::TiledMmaPV tiled_mma_pv;
   auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tidx);
@@ -848,7 +900,9 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   Tensor mQ = gemma4_make_bshd_view(
       params.q_ptr + q_batch_offset, params.seqlen_q,
       GEMMA4_NUM_QUERY_HEADS, kHeadDim);
-  Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{}, make_coord(m_block, 0));
+  Tensor gQ = local_tile(
+      mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+      make_coord(m_block, 0));
   const int kv_head = bidh / kHeadRatio;
   Tensor mK = gemma4_make_bshd_view(
       params.k_ptr + kv_batch_offset, params.seqlen_k, kKVHeads, kHeadDim);
@@ -859,11 +913,15 @@ inline __device__ void gemma4_compute_attn_1rowblock(
 
   // Lay out dynamic shared memory as Q | K | V. V also receives a transposed
   // logical view over the same bytes for the P*V tensor-core operation.
-  Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)), typename KernelTraits::SmemLayoutQ{});
+  Tensor sQ = make_tensor(
+      make_smem_ptr(reinterpret_cast<Element *>(smem_)),
+      typename KernelTraits::SmemLayoutQ{});
   Tensor sK = make_tensor(sQ.data() + size(sQ), typename KernelTraits::SmemLayoutKV{});
   Tensor sV = make_tensor(sK.data() + size(sK), typename KernelTraits::SmemLayoutKV{});
   Tensor sVt = make_tensor(sV.data(), typename KernelTraits::SmemLayoutVtransposed{});
-  Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename KernelTraits::SmemLayoutVtransposedNoSwizzle{});
+  Tensor sVtNoSwizzle = make_tensor(
+      sV.data().get(),
+      typename KernelTraits::SmemLayoutVtransposedNoSwizzle{});
 
   // Partition global/shared copies by thread. These objects encode which
   // vector lanes each thread owns for Q, K, and V movement.
@@ -947,16 +1005,43 @@ inline __device__ void gemma4_compute_attn_1rowblock(
         smem_tiled_copy_K, smem_tiled_copy_V, smem_thr_copy_Q,
         smem_thr_copy_K, smem_thr_copy_V);
   }
-  for (; n_block >= n_block_min; --n_block) {
-    gemma4_process_kv_block<
-        KernelTraits, IsLocal, /*IsFirst=*/false, /*MaybeMask=*/IsLocal,
-        /*GuardV=*/false>(
-        params, n_block, n_block_min, q_tile_start, valid_q_rows,
-        seqlen_delta, acc_o, softmax, tiled_mma_qk, tiled_mma_pv,
-        gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK, tKsK, tSrQ,
-        tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
-        smem_tiled_copy_K, smem_tiled_copy_V, smem_thr_copy_Q,
-        smem_thr_copy_K, smem_thr_copy_V);
+  if constexpr (IsLocal) {
+    // The middle of a local band is fully visible after the causal edge. Only
+    // the final left-window boundary block still needs the local mask check.
+    for (; n_block > n_block_min; --n_block) {
+      gemma4_process_kv_block<
+          KernelTraits, IsLocal, /*IsFirst=*/false, /*MaybeMask=*/false,
+          /*GuardV=*/false>(
+          params, n_block, n_block_min, q_tile_start, valid_q_rows,
+          seqlen_delta, acc_o, softmax, tiled_mma_qk, tiled_mma_pv,
+          gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK, tKsK, tSrQ,
+          tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
+          smem_tiled_copy_K, smem_tiled_copy_V, smem_thr_copy_Q,
+          smem_thr_copy_K, smem_thr_copy_V);
+    }
+    if (n_block == n_block_min) {
+      gemma4_process_kv_block<
+          KernelTraits, IsLocal, /*IsFirst=*/false, /*MaybeMask=*/true,
+          /*GuardV=*/false>(
+          params, n_block, n_block_min, q_tile_start, valid_q_rows,
+          seqlen_delta, acc_o, softmax, tiled_mma_qk, tiled_mma_pv,
+          gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK, tKsK, tSrQ,
+          tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
+          smem_tiled_copy_K, smem_tiled_copy_V, smem_thr_copy_Q,
+          smem_thr_copy_K, smem_thr_copy_V);
+    }
+  } else {
+    for (; n_block >= n_block_min; --n_block) {
+      gemma4_process_kv_block<
+          KernelTraits, IsLocal, /*IsFirst=*/false, /*MaybeMask=*/false,
+          /*GuardV=*/false>(
+          params, n_block, n_block_min, q_tile_start, valid_q_rows,
+          seqlen_delta, acc_o, softmax, tiled_mma_qk, tiled_mma_pv,
+          gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK, tKsK, tSrQ,
+          tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
+          smem_tiled_copy_K, smem_tiled_copy_V, smem_thr_copy_Q,
+          smem_thr_copy_K, smem_thr_copy_V);
+    }
   }
 
   // Finalize O = softmax(QK^T)V and store through shared memory so the MMA
@@ -1109,12 +1194,54 @@ cudaError_t launch_attention_maybe_lse(
                    params, batch_size, stream);
 }
 
-constexpr int kSlidingNormRopeThreads = GEMMA4_SLIDING_HEAD_DIM;
-static_assert(kSlidingNormRopeThreads % kWarpSize == 0);
-static_assert(GEMMA4_SLIDING_HEAD_DIM == 256);
-constexpr int kSlidingNormRopeHeadsPerBlock =
-    kSlidingNormRopeThreads / kWarpSize;
-static_assert(GEMMA4_NUM_QUERY_HEADS % kSlidingNormRopeHeadsPerBlock == 0);
+cudaError_t launch_global_attention_maybe_lse(
+    Gemma4FlashFwdParams &params,
+    int batch_size,
+    cudaStream_t stream) {
+  const bool use_large_tile =
+      params.seqlen_q >= kFlashGlobalLargeMinSeqLen &&
+      params.seqlen_k >= kFlashGlobalLargeMinSeqLen;
+  if (use_large_tile) {
+    return launch_attention_maybe_lse<Gemma4GlobalLargeFa2KernelTraits, false>(
+        params, batch_size, stream);
+  }
+  return launch_attention_maybe_lse<Gemma4GlobalFa2KernelTraits, false>(
+      params, batch_size, stream);
+}
+
+constexpr int kSlidingDecodeNormRopeWarpsPerBlock =
+    kSlidingDecodeQkvWarps;
+constexpr int kGlobalDecodeNormRopeWarpsPerBlock =
+    kGlobalDecodeQkvWarps;
+constexpr int kGlobalDecodeNormRopeLargeBatchWarpsPerBlock =
+    kGlobalDecodeQkvLargeBatchWarps;
+constexpr int kGlobalDecodeNormRopeLargeBatchMinBatch =
+    kGlobalDecodeQkvLargeBatchMinBatch;
+static_assert(kSlidingDecodeNormRopeWarpsPerBlock > 0);
+static_assert(kSlidingDecodeNormRopeWarpsPerBlock <= 32);
+static_assert(kGlobalDecodeNormRopeWarpsPerBlock > 0);
+static_assert(kGlobalDecodeNormRopeWarpsPerBlock <= 32);
+static_assert(kGlobalDecodeNormRopeLargeBatchWarpsPerBlock > 0);
+static_assert(kGlobalDecodeNormRopeLargeBatchWarpsPerBlock <= 32);
+static_assert(kGlobalDecodeNormRopeLargeBatchMinBatch > 0);
+static_assert(GEMMA4_NUM_QUERY_HEADS %
+                  kSlidingDecodeNormRopeWarpsPerBlock ==
+              0);
+static_assert(GEMMA4_NUM_QUERY_HEADS %
+                  kGlobalDecodeNormRopeWarpsPerBlock ==
+              0);
+static_assert(GEMMA4_NUM_QUERY_HEADS %
+                  kGlobalDecodeNormRopeLargeBatchWarpsPerBlock ==
+              0);
+constexpr int kSlidingDecodeNormRopeThreads =
+    kSlidingDecodeNormRopeWarpsPerBlock * kWarpSize;
+constexpr int kGlobalDecodeNormRopeThreads =
+    kGlobalDecodeNormRopeWarpsPerBlock * kWarpSize;
+constexpr int kGlobalDecodeNormRopeLargeBatchThreads =
+    kGlobalDecodeNormRopeLargeBatchWarpsPerBlock * kWarpSize;
+static_assert(kSlidingDecodeNormRopeThreads <= 1024);
+static_assert(kGlobalDecodeNormRopeThreads <= 1024);
+static_assert(kGlobalDecodeNormRopeLargeBatchThreads <= 1024);
 
 // Sum a per-lane value across one warp for the per-head RMSNorm denominator.
 __device__ __forceinline__ float prep_warp_sum(float value) {
@@ -1198,8 +1325,10 @@ __device__ __forceinline__ void prep_scale_head(
 
 // Prepare all prefill Q/K/V heads. Each block owns one sequence position, one
 // batch, and a small group of heads. Global layers derive V from the K source.
-template <int HeadDim, int KvHeads, int RotaryDim, bool KEqualsV>
-__global__ __launch_bounds__(kSlidingNormRopeThreads)
+template <
+    int HeadDim, int KvHeads, int RotaryDim, bool KEqualsV,
+    int WarpsPerBlock>
+__global__ __launch_bounds__(WarpsPerBlock * kWarpSize)
 void gemma4_qkv_norm_rope_kernel(
     __nv_bfloat16 *__restrict__ q_prepared,
     __nv_bfloat16 *__restrict__ k_prepared,
@@ -1216,12 +1345,14 @@ void gemma4_qkv_norm_rope_kernel(
   constexpr int kKvHeads = KvHeads;
   constexpr int kHeadDim = HeadDim;
   constexpr int kRotaryHalf = RotaryDim / 2;
+  static_assert(WarpsPerBlock > 0 && WarpsPerBlock <= 32);
+  static_assert(kQHeads % WarpsPerBlock == 0);
 
   const int seq = blockIdx.x;
   const int batch = blockIdx.z;
   const int lane = threadIdx.x & (kWarpSize - 1);
   const int warp = threadIdx.x / kWarpSize;
-  const int head = blockIdx.y * kSlidingNormRopeHeadsPerBlock + warp;
+  const int head = blockIdx.y * WarpsPerBlock + warp;
   // Cos/sin tables are row-major by position and rotary-pair index.
   const float *cos_row = cos + int64_t(seq) * kRotaryHalf;
   const float *sin_row = sin + int64_t(seq) * kRotaryHalf;
@@ -1267,7 +1398,7 @@ __device__ __forceinline__ int64_t sliding_decode_cache_head_offset(
 // Decode prep path: one token per batch. Q is prepared into a compact
 // [batch, 32, 256] buffer for paged decode attention, while K/V are normalized,
 // RoPE'd where needed, and written straight to the Layout-A paged cache.
-__global__ __launch_bounds__(kSlidingNormRopeThreads)
+__global__ __launch_bounds__(kSlidingDecodeNormRopeThreads)
 void gemma4_sliding_decode_q_paged_kv_norm_rope_kernel(
     __nv_bfloat16 *__restrict__ q_prepared,
     __nv_bfloat16 *__restrict__ cache_k,
@@ -1291,7 +1422,7 @@ void gemma4_sliding_decode_q_paged_kv_norm_rope_kernel(
   const int batch = blockIdx.x;
   const int lane = threadIdx.x & (kWarpSize - 1);
   const int warp = threadIdx.x / kWarpSize;
-  const int head = blockIdx.y * kSlidingNormRopeHeadsPerBlock + warp;
+  const int head = blockIdx.y * kSlidingDecodeNormRopeWarpsPerBlock + warp;
   if (head >= kQHeads) return;
 
   const int position =
@@ -1324,7 +1455,8 @@ static_assert(kGlobalRotaryDim == 128);
 
 // Global decode prep path. Global layers have no V projection; V is derived
 // from the raw K source, then scale-free normalized before writing the cache.
-__global__ __launch_bounds__(kSlidingNormRopeThreads)
+template <int WarpsPerBlock>
+__global__ __launch_bounds__(WarpsPerBlock * kWarpSize)
 void gemma4_global_decode_q_paged_kv_norm_rope_kernel(
     __nv_bfloat16 *__restrict__ q_prepared,
     __nv_bfloat16 *__restrict__ cache_k,
@@ -1343,11 +1475,12 @@ void gemma4_global_decode_q_paged_kv_norm_rope_kernel(
   constexpr int kKvHeads = GEMMA4_GLOBAL_KV_HEADS;
   constexpr int kHeadDim = GEMMA4_GLOBAL_HEAD_DIM;
   constexpr int kRotaryHalf = kGlobalRotaryDim / 2;
+  static_assert(WarpsPerBlock > 0 && WarpsPerBlock <= 32);
 
   const int batch = blockIdx.x;
   const int lane = threadIdx.x & (kWarpSize - 1);
   const int warp = threadIdx.x / kWarpSize;
-  const int head = blockIdx.y * kSlidingNormRopeHeadsPerBlock + warp;
+  const int head = blockIdx.y * WarpsPerBlock + warp;
   if (head >= kQHeads) return;
 
   const int position =
@@ -1375,7 +1508,9 @@ void gemma4_global_decode_q_paged_kv_norm_rope_kernel(
 
 // Launch the prefill Q/K/V preparation kernel after validating the raw and
 // prepared buffers.
-template <int HeadDim, int KvHeads, int RotaryDim, bool KEqualsV>
+template <
+    int HeadDim, int KvHeads, int RotaryDim, bool KEqualsV,
+    int WarpsPerBlock>
 cudaError_t prepare_qkv_norm_rope(
     __nv_bfloat16 *__restrict__ d_q_prepared,
     __nv_bfloat16 *__restrict__ d_k_prepared,
@@ -1398,17 +1533,54 @@ cudaError_t prepare_qkv_norm_rope(
     return cudaErrorInvalidValue;
   }
 
-  constexpr int kHeadGroups =
-      (GEMMA4_NUM_QUERY_HEADS + kSlidingNormRopeHeadsPerBlock - 1) /
-      kSlidingNormRopeHeadsPerBlock;
-  // grid.x = sequence row, grid.y = group of 8 heads, grid.z = batch.
+  static_assert(WarpsPerBlock > 0 && WarpsPerBlock <= 32);
+  static_assert(GEMMA4_NUM_QUERY_HEADS % WarpsPerBlock == 0);
+  constexpr int kHeadGroups = GEMMA4_NUM_QUERY_HEADS / WarpsPerBlock;
+  // grid.x = sequence row, grid.y = group of WarpsPerBlock heads, grid.z = batch.
   const dim3 grid_dim(seq_len, kHeadGroups, batch_size);
-  constexpr dim3 block_dim(kSlidingNormRopeThreads);
-  gemma4_qkv_norm_rope_kernel<HeadDim, KvHeads, RotaryDim, KEqualsV>
+  constexpr dim3 block_dim(WarpsPerBlock * kWarpSize);
+  gemma4_qkv_norm_rope_kernel<
+      HeadDim, KvHeads, RotaryDim, KEqualsV, WarpsPerBlock>
       <<<grid_dim, block_dim, 0, stream>>>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, seq_len);
   return cudaGetLastError();
+}
+
+cudaError_t prepare_sliding_prefill_qkv_norm_rope(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_k_prepared,
+    __nv_bfloat16 *__restrict__ d_v_prepared,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    int batch_size,
+    int seq_len,
+    cudaStream_t stream) {
+  if (seq_len >= kSlidingPrefillQkvLargeMinSeqLen) {
+    return prepare_qkv_norm_rope<
+        GEMMA4_SLIDING_HEAD_DIM,
+        GEMMA4_SLIDING_KV_HEADS,
+        GEMMA4_SLIDING_HEAD_DIM,
+        false,
+        kSlidingPrefillQkvLargeWarps>(
+        d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
+        d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size,
+        seq_len, stream);
+  }
+  return prepare_qkv_norm_rope<
+      GEMMA4_SLIDING_HEAD_DIM,
+      GEMMA4_SLIDING_KV_HEADS,
+      GEMMA4_SLIDING_HEAD_DIM,
+      false,
+      kSlidingPrefillQkvWarps>(
+      d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seq_len,
+      stream);
 }
 
 // Launch the decode prep-cache kernel. This is intentionally only the current
@@ -1442,14 +1614,43 @@ cudaError_t prepare_sliding_decode_q_paged_kv_norm_rope(
   }
 
   constexpr int kHeadGroups =
-      (GEMMA4_NUM_QUERY_HEADS + kSlidingNormRopeHeadsPerBlock - 1) /
-      kSlidingNormRopeHeadsPerBlock;
-  // grid.x = batch, grid.y = group of 8 heads. Each warp owns one head.
+      GEMMA4_NUM_QUERY_HEADS / kSlidingDecodeNormRopeWarpsPerBlock;
+  // grid.x = batch, grid.y = group of query heads. Each warp owns one head.
   const dim3 grid_dim(batch_size, kHeadGroups);
-  constexpr dim3 block_dim(kSlidingNormRopeThreads);
+  constexpr dim3 block_dim(kSlidingDecodeNormRopeThreads);
   gemma4_sliding_decode_q_paged_kv_norm_rope_kernel<<<grid_dim, block_dim, 0, stream>>>(
       d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
       d_token_position, cache_layer, d_q, d_k, d_v, d_q_norm_weight,
+      d_k_norm_weight, d_cos, d_sin);
+  return cudaGetLastError();
+}
+
+template <int WarpsPerBlock>
+cudaError_t launch_global_decode_q_paged_kv_norm_rope(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_cache_k,
+    __nv_bfloat16 *__restrict__ d_cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_token_position,
+    int32_t batch_size,
+    int32_t cache_layer,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    cudaStream_t stream) {
+  static_assert(WarpsPerBlock > 0 && WarpsPerBlock <= 32);
+  static_assert(GEMMA4_NUM_QUERY_HEADS % WarpsPerBlock == 0);
+  constexpr int kHeadGroups = GEMMA4_NUM_QUERY_HEADS / WarpsPerBlock;
+  const dim3 grid_dim(batch_size, kHeadGroups);
+  constexpr dim3 block_dim(WarpsPerBlock * kWarpSize);
+  gemma4_global_decode_q_paged_kv_norm_rope_kernel<WarpsPerBlock>
+      <<<grid_dim, block_dim, 0, stream>>>(
+      d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
+      d_token_position, cache_layer, d_q, d_k, d_q_norm_weight,
       d_k_norm_weight, d_cos, d_sin);
   return cudaGetLastError();
 }
@@ -1479,38 +1680,66 @@ cudaError_t prepare_global_decode_q_paged_kv_norm_rope(
     return cudaErrorInvalidValue;
   }
 
-  constexpr int kHeadGroups =
-      (GEMMA4_NUM_QUERY_HEADS + kSlidingNormRopeHeadsPerBlock - 1) /
-      kSlidingNormRopeHeadsPerBlock;
-  const dim3 grid_dim(batch_size, kHeadGroups);
-  constexpr dim3 block_dim(kSlidingNormRopeThreads);
-  gemma4_global_decode_q_paged_kv_norm_rope_kernel<<<grid_dim, block_dim, 0, stream>>>(
+  if (batch_size >= kGlobalDecodeNormRopeLargeBatchMinBatch) {
+    return launch_global_decode_q_paged_kv_norm_rope<
+        kGlobalDecodeNormRopeLargeBatchWarpsPerBlock>(
+        d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
+        d_token_position, batch_size, cache_layer, d_q, d_k,
+        d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
+  }
+  return launch_global_decode_q_paged_kv_norm_rope<
+      kGlobalDecodeNormRopeWarpsPerBlock>(
       d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
-      d_token_position, cache_layer, d_q, d_k, d_q_norm_weight,
-      d_k_norm_weight, d_cos, d_sin);
-  return cudaGetLastError();
+      d_token_position, batch_size, cache_layer, d_q, d_k,
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
 }
 
 struct SlidingDecodeSpec {
   static constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
   static constexpr int kKvHeads = GEMMA4_SLIDING_KV_HEADS;
   static constexpr int kGqaRatio = GEMMA4_NUM_QUERY_HEADS / kKvHeads;
+  static constexpr int kQueryHeadsPerCta = kGqaRatio;
+  static constexpr int kGroupsPerKvHead = kGqaRatio / kQueryHeadsPerCta;
   static constexpr int kThreads = kHeadDim;
   static constexpr bool kWindowed = true;
 };
 
-struct GlobalDecodeSpec {
+template <int QueryHeadsPerCta>
+struct GlobalDecodeSpecFor {
   static constexpr int kHeadDim = GEMMA4_GLOBAL_HEAD_DIM;
   static constexpr int kKvHeads = GEMMA4_GLOBAL_KV_HEADS;
   static constexpr int kGqaRatio = GEMMA4_NUM_QUERY_HEADS / kKvHeads;
+  static constexpr int kQueryHeadsPerCta = QueryHeadsPerCta;
+  static constexpr int kGroupsPerKvHead = kGqaRatio / kQueryHeadsPerCta;
   static constexpr int kThreads = kHeadDim;
   static constexpr bool kWindowed = false;
 };
 
+using GlobalDecodeShortSpec =
+    GlobalDecodeSpecFor<kGlobalDecodeShortQueryHeadsPerCta>;
+using GlobalDecodeLongSpec =
+    GlobalDecodeSpecFor<kGlobalDecodeLongQueryHeadsPerCta>;
+
 static_assert(SlidingDecodeSpec::kThreads == 256);
 static_assert(SlidingDecodeSpec::kGqaRatio == 2);
-static_assert(GlobalDecodeSpec::kThreads == 512);
-static_assert(GlobalDecodeSpec::kGqaRatio == 8);
+static_assert(SlidingDecodeSpec::kQueryHeadsPerCta > 0);
+static_assert(SlidingDecodeSpec::kQueryHeadsPerCta <= SlidingDecodeSpec::kGqaRatio);
+static_assert(SlidingDecodeSpec::kGqaRatio % SlidingDecodeSpec::kQueryHeadsPerCta == 0);
+static_assert(GlobalDecodeShortSpec::kThreads == 512);
+static_assert(GlobalDecodeShortSpec::kGqaRatio == 8);
+static_assert(GlobalDecodeShortSpec::kQueryHeadsPerCta > 0);
+static_assert(GlobalDecodeShortSpec::kQueryHeadsPerCta <= GlobalDecodeShortSpec::kGqaRatio);
+static_assert(GlobalDecodeShortSpec::kGqaRatio %
+                  GlobalDecodeShortSpec::kQueryHeadsPerCta ==
+              0);
+static_assert(GlobalDecodeLongSpec::kThreads == 512);
+static_assert(GlobalDecodeLongSpec::kGqaRatio == 8);
+static_assert(GlobalDecodeLongSpec::kQueryHeadsPerCta > 0);
+static_assert(GlobalDecodeLongSpec::kQueryHeadsPerCta <= GlobalDecodeLongSpec::kGqaRatio);
+static_assert(GlobalDecodeLongSpec::kGqaRatio %
+                  GlobalDecodeLongSpec::kQueryHeadsPerCta ==
+              0);
+static_assert(kGlobalDecodeLongMinKeys > 0);
 static_assert(GEMMA4_SLIDING_HEAD_DIM % kBf16Packed128Elements == 0);
 static_assert(GEMMA4_GLOBAL_HEAD_DIM % kBf16Packed128Elements == 0);
 
@@ -1550,10 +1779,13 @@ void decode_paged_grouped_split_kernel(
     float softmax_scale,
     int32_t split_size,
     int32_t num_splits) {
-  // CTA mapping: x=batch row, y=KV head, z=split. Within the CTA, one thread
-  // owns one head-dim lane, so the block-wide reductions cover the full dot.
+  // CTA mapping: x=batch row, y=KV-head query group, z=split. Within the CTA,
+  // one thread owns one head-dim lane, so the block-wide reductions cover the
+  // full dot for every query head assigned to this group.
   const int32_t batch = blockIdx.x;
-  const int32_t kv_head = blockIdx.y;
+  const int32_t kv_group = blockIdx.y;
+  const int32_t kv_head = kv_group / Spec::kGroupsPerKvHead;
+  const int32_t q_group = kv_group - kv_head * Spec::kGroupsPerKvHead;
   const int32_t split = blockIdx.z;
   const int32_t dim = threadIdx.x;
   const int32_t lane = dim & (kWarpSize - 1);
@@ -1575,17 +1807,18 @@ void decode_paged_grouped_split_kernel(
   // writes `actual_splits`; that preserves the fixed graph/scratch layout.
   const int32_t split_begin = first_key + split * split_size;
   const int32_t split_end = min(seq_len, split_begin + split_size);
-  const int32_t q_head0 = kv_head * Spec::kGqaRatio;
+  const int32_t q_head0 =
+      kv_head * Spec::kGqaRatio + q_group * Spec::kQueryHeadsPerCta;
 
   // Q is tiny for decode: each thread keeps its lane for every query head in
   // this GQA group resident in registers for every key in this split.
-  float q_value[Spec::kGqaRatio];
-  float acc[Spec::kGqaRatio];
-  float m[Spec::kGqaRatio];
-  float l[Spec::kGqaRatio];
-  int32_t partial[Spec::kGqaRatio];
+  float q_value[Spec::kQueryHeadsPerCta];
+  float acc[Spec::kQueryHeadsPerCta];
+  float m[Spec::kQueryHeadsPerCta];
+  float l[Spec::kQueryHeadsPerCta];
+  int32_t partial[Spec::kQueryHeadsPerCta];
   #pragma unroll
-  for (int i = 0; i < Spec::kGqaRatio; ++i) {
+  for (int i = 0; i < Spec::kQueryHeadsPerCta; ++i) {
     const int32_t q_head = q_head0 + i;
     const int64_t q_base =
         (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head) * Spec::kHeadDim;
@@ -1600,8 +1833,9 @@ void decode_paged_grouped_split_kernel(
   // one storage object for back-to-back reductions is easy to make unsafe
   // without a clean synchronization boundary around all internal CUB state.
   using DecodeBlockReduce = cub::BlockReduce<float, Spec::kThreads>;
-  __shared__ typename DecodeBlockReduce::TempStorage reduce_storage[Spec::kGqaRatio];
-  __shared__ float s_score[Spec::kGqaRatio];
+  __shared__ typename DecodeBlockReduce::TempStorage
+      reduce_storage[Spec::kQueryHeadsPerCta];
+  __shared__ float s_score[Spec::kQueryHeadsPerCta];
 
   for (int32_t page_pos = split_begin; page_pos < split_end;) {
     // Resolve one logical page span at a time. This keeps page-table loads
@@ -1630,15 +1864,15 @@ void decode_paged_grouped_split_kernel(
 
       // Reduce the per-lane products into scalar QK scores, then broadcast
       // the scores through shared memory so every output lane can update.
-      float score[Spec::kGqaRatio];
+      float score[Spec::kQueryHeadsPerCta];
       #pragma unroll
-      for (int i = 0; i < Spec::kGqaRatio; ++i) {
+      for (int i = 0; i < Spec::kQueryHeadsPerCta; ++i) {
         score[i] = DecodeBlockReduce(reduce_storage[i]).Sum(q_value[i] * k_value);
         if (dim == 0) s_score[i] = score[i];
       }
       __syncthreads();
       #pragma unroll
-      for (int i = 0; i < Spec::kGqaRatio; ++i) {
+      for (int i = 0; i < Spec::kQueryHeadsPerCta; ++i) {
         score[i] = s_score[i] * softmax_scale;
       }
       __syncthreads();
@@ -1646,7 +1880,7 @@ void decode_paged_grouped_split_kernel(
       // Fold this token into the running online softmax state for each query
       // heads. Each thread only accumulates its own V lane.
       #pragma unroll
-      for (int i = 0; i < Spec::kGqaRatio; ++i) {
+      for (int i = 0; i < Spec::kQueryHeadsPerCta; ++i) {
         decode_online_update(score[i], v_value, m[i], l[i], acc[i]);
       }
     }
@@ -1655,7 +1889,7 @@ void decode_paged_grouped_split_kernel(
   // Live split CTAs write one max/denominator scalar per query head plus one
   // FP32 accumulator row. Empty overprovisioned CTAs returned above.
   #pragma unroll
-  for (int i = 0; i < Spec::kGqaRatio; ++i) {
+  for (int i = 0; i < Spec::kQueryHeadsPerCta; ++i) {
     if (dim == 0) {
       partial_m[partial[i]] = m[i];
       partial_l[partial[i]] = l[i];
@@ -1804,7 +2038,8 @@ cudaError_t launch_decode_paged(
     cudaStream_t stream) {
   // Phase 1 computes per-split online-softmax partials. The grid intentionally
   // launches the max split count; each CTA cheaply exits if its row has no work.
-  const dim3 split_grid(batch_size, Spec::kKvHeads, num_splits);
+  const dim3 split_grid(batch_size, Spec::kKvHeads * Spec::kGroupsPerKvHead,
+                        num_splits);
   constexpr dim3 block_dim(Spec::kThreads);
   decode_paged_grouped_split_kernel<Spec><<<split_grid, block_dim, 0, stream>>>(
       d_partial_m, d_partial_l, d_partial_acc, d_q_prepared, d_cache_k,
@@ -1902,9 +2137,52 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16(
       gemma4_flash_attention::make_params(d_out, d_softmax_lse, d_q, d_k, d_v,
                                           seqlen_q, seqlen_k, 0,
                                           softmax_scale);
-  return gemma4_flash_attention::launch_attention_maybe_lse<
-      gemma4_flash_attention::Gemma4GlobalFa2KernelTraits, false>(
+  return gemma4_flash_attention::launch_global_attention_maybe_lse(
       params, batch_size, stream);
+}
+
+extern "C" cudaError_t gemma4_flash_attention_sliding_prepare_qkv_norm_rope_bf16(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_k_prepared,
+    __nv_bfloat16 *__restrict__ d_v_prepared,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    int batch_size,
+    int seq_len,
+    cudaStream_t stream) {
+  return gemma4_flash_attention::prepare_sliding_prefill_qkv_norm_rope(
+      d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seq_len,
+      stream);
+}
+
+extern "C" cudaError_t gemma4_flash_attention_global_prepare_qkv_norm_rope_bf16(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_k_prepared,
+    __nv_bfloat16 *__restrict__ d_v_prepared,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    int batch_size,
+    int seq_len,
+    cudaStream_t stream) {
+  return gemma4_flash_attention::prepare_qkv_norm_rope<
+      GEMMA4_GLOBAL_HEAD_DIM,
+      GEMMA4_GLOBAL_KV_HEADS,
+      gemma4_flash_attention::kGlobalRotaryDim,
+      true,
+      gemma4_flash_attention::kGlobalPrefillQkvWarps>(
+      d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, nullptr,
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seq_len,
+      stream);
 }
 
 // Gemma sliding prefill helper: Q/K get learned RMSNorm then RoPE; V gets
@@ -1939,17 +2217,12 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
       d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr) {
     return cudaErrorInvalidValue;
   }
-  // ponytail: prefill-only until the paged decode cache lands; decode should
-  // prep just the appended token and write Layout-A cache pages once.
   if (seqlen_q != seqlen_k) {
     return cudaErrorInvalidValue;
   }
 
-  cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
-      GEMMA4_SLIDING_HEAD_DIM,
-      GEMMA4_SLIDING_KV_HEADS,
-      GEMMA4_SLIDING_HEAD_DIM,
-      false>(
+  cudaError_t status =
+      gemma4_flash_attention::prepare_sliding_prefill_qkv_norm_rope(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seqlen_q,
       stream);
@@ -1998,7 +2271,8 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
       GEMMA4_GLOBAL_HEAD_DIM,
       GEMMA4_GLOBAL_KV_HEADS,
       gemma4_flash_attention::kGlobalRotaryDim,
-      true>(
+      true,
+      gemma4_flash_attention::kGlobalPrefillQkvWarps>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, nullptr,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seqlen_q,
       stream);
@@ -2008,8 +2282,7 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
       gemma4_flash_attention::make_params(
           d_out, d_softmax_lse, d_q_prepared, d_k_prepared, d_v_prepared,
           seqlen_q, seqlen_k, 0, softmax_scale);
-  return gemma4_flash_attention::launch_attention_maybe_lse<
-      gemma4_flash_attention::Gemma4GlobalFa2KernelTraits, false>(
+  return gemma4_flash_attention::launch_global_attention_maybe_lse(
       params, batch_size, stream);
 }
 
@@ -2118,14 +2391,22 @@ extern "C" cudaError_t gemma4_flash_attention_global_decode_paged_bf16(
     int32_t num_splits,
     cudaStream_t stream) {
   if (!gemma4_flash_attention::valid_decode_paged_args<
-          gemma4_flash_attention::GlobalDecodeSpec>(
+          gemma4_flash_attention::GlobalDecodeShortSpec>(
           d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
           d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
           cache_layer, batch_size, split_size, num_splits)) {
     return cudaErrorInvalidValue;
   }
+  const int64_t split_span = int64_t(split_size) * num_splits;
+  if (split_span >= gemma4_flash_attention::kGlobalDecodeLongMinKeys) {
+    return gemma4_flash_attention::launch_decode_paged<
+        gemma4_flash_attention::GlobalDecodeLongSpec>(
+        d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
+        d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
+        cache_layer, batch_size, softmax_scale, split_size, num_splits, stream);
+  }
   return gemma4_flash_attention::launch_decode_paged<
-      gemma4_flash_attention::GlobalDecodeSpec>(
+      gemma4_flash_attention::GlobalDecodeShortSpec>(
       d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
       d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
       cache_layer, batch_size, softmax_scale, split_size, num_splits, stream);
