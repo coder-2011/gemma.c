@@ -88,7 +88,7 @@ directly through `marlin.mul(..)`, provided that weights and scales have already
 which does not contain any dependencies beyond base-CUDA and should thus be easy to integrate into other lower-level
 frameworks.
 
-Correctness tests can be executed via `python test.py` and benchmarks via `python bench.py`. Please note that in order
+Correctness tests can be executed via `python ../../tests/experiments/marlin/test.py` and benchmarks via `python bench.py`. Please note that in order
 to reproduce our "sustainable performance" benchmarks, the GPU clocks need to be locked to their respective base values
 using:
 

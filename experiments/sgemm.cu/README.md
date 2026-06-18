@@ -22,10 +22,11 @@ python plot_benchmark_data.py benchmark_results
 
 ## Tests
 
-Use `test.sh` to test the implementation for correctness. For example, on RTX 3090:
+Use `../../tests/experiments/sgemm.cu/test.sh` to test the implementation for
+correctness. For example, on RTX 3090:
 
 ```bash
-bash test.sh 86
+bash ../../tests/experiments/sgemm.cu/test.sh 86
 ```
 
 ## Performance

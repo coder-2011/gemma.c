@@ -1,7 +1,15 @@
+import sys
+from pathlib import Path
+
 import torch
-import tuna
 import math
 import time
+
+sys.path.insert(
+    0, str(Path(__file__).resolve().parents[3] / "experiments" / "tuna")
+)
+
+import tuna
 
 
 def quantize_blockwise_dynamic_4bit(

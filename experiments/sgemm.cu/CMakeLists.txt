@@ -26,7 +26,7 @@ add_executable(benchmark benchmark.cu)
 set_target_properties(benchmark PROPERTIES CUDA_ARCHITECTURES "${GPUCC}" CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(benchmark -lcudart -lcublas)
 
-add_executable(test test.cu)
+add_executable(test "${PROJECT_SOURCE_DIR}/../../tests/experiments/sgemm.cu/test.cu")
 set_target_properties(test PROPERTIES CUDA_ARCHITECTURES "${GPUCC}" CUDA_SEPARABLE_COMPILATION ON)
 target_link_libraries(test -lcudart -lcublas)
 
