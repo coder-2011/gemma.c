@@ -442,7 +442,7 @@ size_t gemma4_paged_decode_partial_acc_elements(int32_t batch_size,
   return gemma4_paged_decode_partial_m_elements(batch_size, q_heads, num_splits) * size_t(head_dim);
 }
 
-cudaError_t gemma4_kv_cache_write_bf16(
+extern "C" cudaError_t gemma4_kv_cache_write_bf16(
     __nv_bfloat16 *__restrict__ d_cache_k,
     __nv_bfloat16 *__restrict__ d_cache_v,
     Gemma4KvCacheConfig config,

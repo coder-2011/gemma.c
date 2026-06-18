@@ -13,6 +13,8 @@
 #include <cuda/cmath>
 #include <cuda_runtime.h>
 
+#include <cub/block/block_reduce.cuh>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -26,6 +28,7 @@
 #include <cutlass/numeric_types.h>
 
 #include "gemma4_flash_attention.cuh"
+#include "gemma4_cuda_utils.cuh"
 #include "gemma4_rope.cuh"
 #include "gemma4.h"
 
@@ -342,12 +345,6 @@ __forceinline__ __device__ float gemma4_fa_scaled_max(
   return max_value * scale;
 }
 
-template <bool CheckInf>
-__forceinline__ __device__ float gemma4_fa_checked_max(float max_value) {
-  if constexpr (CheckInf) return max_value == -INFINITY ? 0.0f : max_value;
-  return max_value;
-}
-
 template <typename Engine0, typename Layout0, typename Engine1,
           typename Layout1>
 __forceinline__ __device__ void gemma4_fa_scale_apply_exp2(
@@ -400,8 +397,8 @@ struct Gemma4FlashSoftmax {
 
   // Update online-softmax state for one score tile and rescale O when the row
   // maximum changes.
-  template <bool IsFirst, bool CheckInf = false, typename Tensor0, typename Tensor1>
-  __forceinline__ __device__ void softmax_rescale_o(
+  template <bool IsFirst, bool CheckInf, typename Tensor0, typename Tensor1>
+  __forceinline__ __device__ void softmax_rescale_impl(
       Tensor0 &acc_s,
       Tensor1 &acc_o,
       float softmax_scale_log2) {
@@ -424,7 +421,8 @@ struct Gemma4FlashSoftmax {
       Tensor acc_o_rowcol = make_tensor(acc_o.data(), gemma4_fa_acc_rowcol(acc_o.layout()));
 #pragma unroll
       for (int mi = 0; mi < size(row_max); ++mi) {
-        float scores_max_cur = gemma4_fa_checked_max<CheckInf>(row_max(mi));
+        float scores_max_cur = row_max(mi);
+        if constexpr (CheckInf) scores_max_cur = scores_max_cur == -INFINITY ? 0.0f : scores_max_cur;
         float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
         // Bring the old denominator and O accumulator into the new max frame.
         row_sum(mi) *= scores_scale;
@@ -450,17 +448,22 @@ struct Gemma4FlashSoftmax {
     }
   }
 
-  template <bool IsFirst, typename Tensor0, typename Tensor1>
-  __forceinline__ __device__ void softmax_rescale_visible(
+  template <bool IsFirst, bool MaybeMask, typename Tensor0, typename Tensor1>
+  __forceinline__ __device__ void softmax_rescale(
       Tensor0 &acc_s,
       Tensor1 &acc_o,
       float softmax_scale_log2,
       bool score_block_fully_visible) {
-    if (score_block_fully_visible) {
-      this->template softmax_rescale_o<IsFirst, /*CheckInf=*/false>(
-          acc_s, acc_o, softmax_scale_log2);
+    if constexpr (MaybeMask) {
+      if (score_block_fully_visible) {
+        this->template softmax_rescale_impl<IsFirst, /*CheckInf=*/false>(
+            acc_s, acc_o, softmax_scale_log2);
+      } else {
+        this->template softmax_rescale_impl<IsFirst, /*CheckInf=*/true>(
+            acc_s, acc_o, softmax_scale_log2);
+      }
     } else {
-      this->template softmax_rescale_o<IsFirst, /*CheckInf=*/true>(
+      this->template softmax_rescale_impl<IsFirst, /*CheckInf=*/false>(
           acc_s, acc_o, softmax_scale_log2);
     }
   }
@@ -496,33 +499,33 @@ struct Gemma4FlashSoftmax {
 
 // Score mask for Gemma's causal attention variants. Local layers additionally
 // clamp the visible keys to the sliding window.
-template <bool IsLocal, typename Engine, typename Layout>
+template <bool IsLocal, typename Engine, typename Layout, typename CoordEngine,
+          typename CoordLayout>
 __forceinline__ __device__ void gemma4_apply_score_mask(
     Tensor<Engine, Layout> &tensor_,
-    const int col_idx_offset_,
+    Tensor<CoordEngine, CoordLayout> const &coords_,
+    const int col_idx_offset,
     const int row_idx_offset,
-    const int warp_row_stride,
     const int max_seqlen_k,
     const int max_seqlen_q,
     const int window_size_left) {
   Tensor tensor = make_tensor(tensor_.data(), gemma4_fa_acc_rowcol(tensor_.layout()));
-  const int lane_id = threadIdx.x % kWarpSize;
-  // Each lane owns two adjacent logical columns in the FA2 accumulator view.
-  const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+  Tensor coords = make_tensor(coords_.data(), gemma4_fa_acc_rowcol(coords_.layout()));
 #pragma unroll
   for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
-    const int row_idx_base = row_idx_offset + mi * warp_row_stride;
 #pragma unroll
     for (int i = 0; i < size<0, 0>(tensor); ++i) {
-      const int row_idx = row_idx_base + i * 8;
-      const int key_row = row_idx + max_seqlen_k - max_seqlen_q;
-      const int right = std::min(max_seqlen_k, key_row + 1);
+      const auto row_coord = make_coord(i, mi);
 #pragma unroll
       for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-        const int col_idx_base = col_idx_offset + nj * 8;
 #pragma unroll
         for (int j = 0; j < size<1, 0>(tensor); ++j) {
-          const int col_idx = col_idx_base + j;
+          const auto col_coord = make_coord(j, nj);
+          const auto score_coord = coords(row_coord, col_coord);
+          const int row_idx = row_idx_offset + int(get<0>(score_coord));
+          const int col_idx = col_idx_offset + int(get<1>(score_coord));
+          const int key_row = row_idx + max_seqlen_k - max_seqlen_q;
+          const int right = std::min(max_seqlen_k, key_row + 1);
           bool masked = col_idx >= right;
           if constexpr (IsLocal) {
             const int left = std::max(0, key_row - window_size_left);
@@ -537,44 +540,6 @@ __forceinline__ __device__ void gemma4_apply_score_mask(
   }
 }
 
-// Return true when every score in a K tile is causally visible to every valid Q
-// row in the current query tile.
-__device__ __forceinline__ bool gemma4_causal_block_fully_visible(
-    int col_idx_offset,
-    int block_n,
-    int row_idx_offset,
-    int valid_rows,
-    int seqlen_delta,
-    int max_seqlen_k) {
-  if (valid_rows <= 0) return false;
-  // The last key column in this K tile must be no later than the earliest
-  // allowed causal key for the first valid query row.
-  const int block_end = std::min(max_seqlen_k, col_idx_offset + block_n) - 1;
-  const int earliest_right = row_idx_offset + seqlen_delta;
-  return block_end <= earliest_right;
-}
-
-// Return true when every score in a local K tile is both causal and inside the
-// sliding window for every valid Q row in the current query tile.
-__device__ __forceinline__ bool gemma4_local_block_fully_visible(
-    int col_idx_offset,
-    int block_n,
-    int row_idx_offset,
-    int valid_rows,
-    int seqlen_delta,
-    int max_seqlen_k,
-    int window_size_left) {
-  if (!gemma4_causal_block_fully_visible(
-          col_idx_offset, block_n, row_idx_offset, valid_rows, seqlen_delta,
-          max_seqlen_k)) {
-    return false;
-  }
-  // The latest valid query row has the strictest left-window boundary.
-  const int latest_key_row = row_idx_offset + valid_rows - 1 + seqlen_delta;
-  const int latest_left = std::max(0, latest_key_row - window_size_left);
-  return col_idx_offset >= latest_left;
-}
-
 template <bool IsLocal>
 __device__ __forceinline__ bool gemma4_score_block_fully_visible(
     int col_idx_offset,
@@ -584,15 +549,22 @@ __device__ __forceinline__ bool gemma4_score_block_fully_visible(
     int seqlen_delta,
     int max_seqlen_k,
     int window_size_left) {
+  if (valid_rows <= 0) return false;
+
+  // The last key column in this K tile must be no later than the earliest
+  // allowed causal key for the first valid query row.
+  const int block_end = std::min(max_seqlen_k, col_idx_offset + block_n) - 1;
+  const int earliest_right = row_idx_offset + seqlen_delta;
+  if (block_end > earliest_right) return false;
+
   if constexpr (IsLocal) {
-    return gemma4_local_block_fully_visible(
-        col_idx_offset, block_n, row_idx_offset, valid_rows, seqlen_delta,
-        max_seqlen_k, window_size_left);
-  } else {
-    return gemma4_causal_block_fully_visible(
-        col_idx_offset, block_n, row_idx_offset, valid_rows, seqlen_delta,
-        max_seqlen_k);
+    // The latest valid query row has the strictest left-window boundary.
+    const int latest_key_row = row_idx_offset + valid_rows - 1 + seqlen_delta;
+    const int latest_left = std::max(0, latest_key_row - window_size_left);
+    return col_idx_offset >= latest_left;
   }
+
+  return true;
 }
 
 template <typename Pointer>
@@ -713,7 +685,6 @@ __forceinline__ __device__ void gemma4_process_kv_block(
     int q_tile_start,
     int valid_q_rows,
     int seqlen_delta,
-    int mask_row_offset,
     TensorAccO &acc_o,
     Softmax &softmax,
     TiledMmaQK tiled_mma_qk,
@@ -739,9 +710,11 @@ __forceinline__ __device__ void gemma4_process_kv_block(
   using Element = typename KernelTraits::Element;
   constexpr int kBlockM = KernelTraits::kBlockM;
   constexpr int kBlockN = KernelTraits::kBlockN;
-  constexpr int kWarpRowStride = KernelTraits::kNWarps * 16;
 
   Tensor acc_s = partition_fragment_C(tiled_mma_qk, Shape<Int<kBlockM>, Int<kBlockN>>{});
+  auto thr_mma_qk = tiled_mma_qk.get_thread_slice(threadIdx.x);
+  Tensor cS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+  Tensor tScS = thr_mma_qk.partition_C(cS);
   clear(acc_s);
   gemma4_fa_cp_async_wait<0>();
   __syncthreads();
@@ -768,8 +741,8 @@ __forceinline__ __device__ void gemma4_process_kv_block(
             seqlen_delta, params.seqlen_k, params.window_size_left);
     if (!score_block_fully_visible) {
       gemma4_apply_score_mask<IsLocal>(
-          acc_s, score_col_offset, mask_row_offset, kWarpRowStride,
-          params.seqlen_k, params.seqlen_q, params.window_size_left);
+          acc_s, tScS, score_col_offset, q_tile_start, params.seqlen_k,
+          params.seqlen_q, params.window_size_left);
     }
   }
 
@@ -780,13 +753,8 @@ __forceinline__ __device__ void gemma4_process_kv_block(
     cute::cp_async_fence();
   }
 
-  if constexpr (MaybeMask) {
-    softmax.template softmax_rescale_visible<IsFirst>(
-        acc_s, acc_o, params.scale_softmax_log2, score_block_fully_visible);
-  } else {
-    softmax.template softmax_rescale_o<IsFirst, /*CheckInf=*/false>(
-        acc_s, acc_o, params.scale_softmax_log2);
-  }
+  softmax.template softmax_rescale<IsFirst, MaybeMask>(
+      acc_s, acc_o, params.scale_softmax_log2, score_block_fully_visible);
 
   Tensor rP = gemma4_fa_convert_type<Element>(acc_s);
   Tensor tOrP = make_tensor(
@@ -833,8 +801,6 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   const int valid_q_rows = std::min(kBlockM, q_tile_remaining);
 
   const int seqlen_delta = params.seqlen_k - params.seqlen_q;
-  const int mask_row_offset =
-      q_tile_start + (tidx / kWarpSize) * 16 + (tidx % kWarpSize) / 4;
   const index_t q_batch_offset = batch * index_t(params.seqlen_q) * kQRowStride;
   const index_t kv_batch_offset = batch * index_t(params.seqlen_k) * kKVRowStride;
 
@@ -956,9 +922,9 @@ inline __device__ void gemma4_compute_attn_1rowblock(
       KernelTraits, IsLocal, /*IsFirst=*/true, /*MaybeMask=*/true,
       /*GuardV=*/true>(
       params, n_block, n_block_min, q_tile_start, valid_q_rows,
-      seqlen_delta, mask_row_offset, acc_o, softmax, tiled_mma_qk,
-      tiled_mma_pv, gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK,
-      tKsK, tSrQ, tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
+      seqlen_delta, acc_o, softmax, tiled_mma_qk, tiled_mma_pv,
+      gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK, tKsK, tSrQ,
+      tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
       smem_tiled_copy_K, smem_tiled_copy_V, smem_thr_copy_Q,
       smem_thr_copy_K, smem_thr_copy_V);
   --n_block;
@@ -970,9 +936,9 @@ inline __device__ void gemma4_compute_attn_1rowblock(
         KernelTraits, IsLocal, /*IsFirst=*/false, /*MaybeMask=*/true,
         /*GuardV=*/false>(
         params, n_block, n_block_min, q_tile_start, valid_q_rows,
-        seqlen_delta, mask_row_offset, acc_o, softmax, tiled_mma_qk,
-        tiled_mma_pv, gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK,
-        tKsK, tSrQ, tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
+        seqlen_delta, acc_o, softmax, tiled_mma_qk, tiled_mma_pv,
+        gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK, tKsK, tSrQ,
+        tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
         smem_tiled_copy_K, smem_tiled_copy_V, smem_thr_copy_Q,
         smem_thr_copy_K, smem_thr_copy_V);
   }
@@ -981,9 +947,9 @@ inline __device__ void gemma4_compute_attn_1rowblock(
         KernelTraits, IsLocal, /*IsFirst=*/false, /*MaybeMask=*/IsLocal,
         /*GuardV=*/false>(
         params, n_block, n_block_min, q_tile_start, valid_q_rows,
-        seqlen_delta, mask_row_offset, acc_o, softmax, tiled_mma_qk,
-        tiled_mma_pv, gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK,
-        tKsK, tSrQ, tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
+        seqlen_delta, acc_o, softmax, tiled_mma_qk, tiled_mma_pv,
+        gmem_tiled_copy_QKV, tVgV, tVsV, tKVcKV, tKgK, tKsK, tSrQ,
+        tSrK, tOrVt, tSsQ, tSsK, tOsVt, smem_tiled_copy_Q,
         smem_tiled_copy_K, smem_tiled_copy_V, smem_thr_copy_Q,
         smem_thr_copy_K, smem_thr_copy_V);
   }
@@ -1414,6 +1380,271 @@ cudaError_t prepare_sliding_decode_q_paged_kv_norm_rope(
   return cudaGetLastError();
 }
 
+constexpr int kSlidingDecodeThreads = GEMMA4_SLIDING_HEAD_DIM;
+constexpr int kSlidingDecodeGqaRatio = GEMMA4_NUM_QUERY_HEADS / GEMMA4_SLIDING_KV_HEADS;
+static_assert(kSlidingDecodeThreads == 256);
+static_assert(kSlidingDecodeGqaRatio == 2);
+static_assert(GEMMA4_SLIDING_HEAD_DIM % kBf16Packed128Elements == 0);
+
+template <bool UseCpAsync>
+struct SlidingDecodeCpAsyncStorage {};
+
+template <>
+struct __align__(16) SlidingDecodeCpAsyncStorage<true> {
+  __nv_bfloat16 s_k[GEMMA4_SLIDING_HEAD_DIM];
+  __nv_bfloat16 s_v[GEMMA4_SLIDING_HEAD_DIM];
+};
+
+__device__ __forceinline__ void sliding_decode_online_update(
+    float score,
+    float v_value,
+    float &m,
+    float &l,
+    float &acc) {
+  const float new_m = fmaxf(m, score);
+  const float old_scale = __expf(m - new_m);
+  const float new_scale = __expf(score - new_m);
+  acc = acc * old_scale + v_value * new_scale;
+  l = l * old_scale + new_scale;
+  m = new_m;
+}
+
+__device__ __forceinline__ void sliding_decode_cp_async_16(
+    void *smem_ptr,
+    const void *gmem_ptr) {
+  const unsigned int smem_addr = static_cast<unsigned int>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+               :
+               : "r"(smem_addr), "l"(gmem_ptr));
+}
+
+// CUDA-core decode path for q_len=1. One CTA owns a KV head and the two
+// sliding-layer query heads mapped to it, so each K/V cache vector is loaded
+// once for the GQA pair instead of once per query head.
+template <bool UseCpAsync>
+__global__ __launch_bounds__(kSlidingDecodeThreads)
+void sliding_decode_paged_grouped_split_kernel(
+    float *__restrict__ partial_m,
+    float *__restrict__ partial_l,
+    float *__restrict__ partial_acc,
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ cache_k,
+    const __nv_bfloat16 *__restrict__ cache_v,
+    const int32_t *__restrict__ page_table,
+    const int32_t *__restrict__ seq_lengths,
+    Gemma4KvCacheConfig config,
+    int32_t layer,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits) {
+  __shared__ SlidingDecodeCpAsyncStorage<UseCpAsync> cp_async_storage;
+
+  const int32_t batch = blockIdx.x;
+  const int32_t kv_head = blockIdx.y;
+  const int32_t split = blockIdx.z;
+  const int32_t dim = threadIdx.x;
+  const int32_t q_head0 = kv_head * kSlidingDecodeGqaRatio;
+  const int32_t q_head1 = q_head0 + 1;
+  const int32_t seq_len = __ldg(seq_lengths + batch);
+  const int32_t first_key = config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
+  const int32_t key_count = seq_len - first_key;
+  const int32_t split_begin = first_key + split * split_size;
+  const int32_t split_end = min(first_key + key_count, split_begin + split_size);
+  const int32_t partial0 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head0) * num_splits + split;
+  const int32_t partial1 = (batch * GEMMA4_NUM_QUERY_HEADS + q_head1) * num_splits + split;
+
+  if (split_begin >= split_end) {
+    if (dim == 0) {
+      partial_m[partial0] = -INFINITY;
+      partial_l[partial0] = 0.0f;
+      partial_m[partial1] = -INFINITY;
+      partial_l[partial1] = 0.0f;
+    }
+    partial_acc[int64_t(partial0) * GEMMA4_SLIDING_HEAD_DIM + dim] = 0.0f;
+    partial_acc[int64_t(partial1) * GEMMA4_SLIDING_HEAD_DIM + dim] = 0.0f;
+    return;
+  }
+
+  const int64_t q_base0 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head0) * GEMMA4_SLIDING_HEAD_DIM;
+  const int64_t q_base1 = (int64_t(batch) * GEMMA4_NUM_QUERY_HEADS + q_head1) * GEMMA4_SLIDING_HEAD_DIM;
+  const float q0 = __bfloat162float(loadg(q + q_base0 + dim));
+  const float q1 = __bfloat162float(loadg(q + q_base1 + dim));
+  float acc0 = 0.0f;
+  float acc1 = 0.0f;
+  float m0 = -INFINITY;
+  float m1 = -INFINITY;
+  float l0 = 0.0f;
+  float l1 = 0.0f;
+  using DecodeBlockReduce = cub::BlockReduce<float, kSlidingDecodeThreads>;
+  __shared__ typename DecodeBlockReduce::TempStorage reduce_storage;
+  __shared__ float s_score;
+
+  for (int32_t pos = split_begin; pos < split_end; ++pos) {
+    const int32_t page_slot = gemma4_kv_cache_page_slot(config, pos);
+    const int32_t physical_page =
+        __ldg(page_table + batch * config.max_pages_per_seq + page_slot);
+    if (physical_page < 0 || physical_page >= config.num_pages) continue;
+    const int32_t page_offset = gemma4_kv_cache_page_offset(config, pos);
+    const int64_t kv_base = gemma4_kv_cache_offset(config, layer, physical_page, page_offset, kv_head, 0);
+
+    float k_value;
+    float v_value;
+    if constexpr (UseCpAsync) {
+      if (threadIdx.x < GEMMA4_SLIDING_HEAD_DIM / kBf16Packed128Elements) {
+        const int32_t vec_dim = threadIdx.x * kBf16Packed128Elements;
+        sliding_decode_cp_async_16(cp_async_storage.s_k + vec_dim, cache_k + kv_base + vec_dim);
+        sliding_decode_cp_async_16(cp_async_storage.s_v + vec_dim, cache_v + kv_base + vec_dim);
+      }
+      asm volatile("cp.async.commit_group;\n" ::);
+      asm volatile("cp.async.wait_group 0;\n" ::);
+      __syncthreads();
+      k_value = __bfloat162float(cp_async_storage.s_k[dim]);
+      v_value = __bfloat162float(cp_async_storage.s_v[dim]);
+    } else {
+      k_value = __bfloat162float(loadg(cache_k + kv_base + dim));
+      v_value = __bfloat162float(loadg(cache_v + kv_base + dim));
+    }
+
+    float score0 = DecodeBlockReduce(reduce_storage).Sum(q0 * k_value);
+    if (dim == 0) s_score = score0;
+    __syncthreads();
+    score0 = s_score * softmax_scale;
+    __syncthreads();
+
+    float score1 = DecodeBlockReduce(reduce_storage).Sum(q1 * k_value);
+    if (dim == 0) s_score = score1;
+    __syncthreads();
+    score1 = s_score * softmax_scale;
+    __syncthreads();
+
+    sliding_decode_online_update(score0, v_value, m0, l0, acc0);
+    sliding_decode_online_update(score1, v_value, m1, l1, acc1);
+    if constexpr (UseCpAsync) __syncthreads();
+  }
+
+  if (dim == 0) {
+    partial_m[partial0] = m0;
+    partial_l[partial0] = l0;
+    partial_m[partial1] = m1;
+    partial_l[partial1] = l1;
+  }
+  partial_acc[int64_t(partial0) * GEMMA4_SLIDING_HEAD_DIM + dim] = acc0;
+  partial_acc[int64_t(partial1) * GEMMA4_SLIDING_HEAD_DIM + dim] = acc1;
+}
+
+__global__ __launch_bounds__(kSlidingDecodeThreads)
+void sliding_decode_paged_reduce_kernel(
+    __nv_bfloat16 *__restrict__ out,
+    const float *__restrict__ partial_m,
+    const float *__restrict__ partial_l,
+    const float *__restrict__ partial_acc,
+    int32_t batch_size,
+    int32_t num_splits) {
+  const int32_t batch = blockIdx.x;
+  const int32_t q_head = blockIdx.y;
+  const int32_t dim = threadIdx.x;
+  const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_head;
+  const int32_t partial_row = row * num_splits;
+  const int64_t partial_acc_row = int64_t(row) * num_splits * GEMMA4_SLIDING_HEAD_DIM;
+
+  float local_m = -INFINITY;
+  for (int32_t split = dim; split < num_splits; split += blockDim.x) {
+    local_m = fmaxf(local_m, partial_m[partial_row + split]);
+  }
+  using DecodeBlockReduce = cub::BlockReduce<float, kSlidingDecodeThreads>;
+  __shared__ typename DecodeBlockReduce::TempStorage reduce_storage;
+  __shared__ float s_m;
+  __shared__ float s_l;
+  const float block_m = DecodeBlockReduce(reduce_storage).Reduce(
+      local_m, [] __device__(float a, float b) { return fmaxf(a, b); });
+  if (dim == 0) s_m = block_m;
+  __syncthreads();
+
+  float local_l = 0.0f;
+  for (int32_t split = dim; split < num_splits; split += blockDim.x) {
+    const float split_l = partial_l[partial_row + split];
+    if (split_l > 0.0f) {
+      local_l += split_l * __expf(partial_m[partial_row + split] - s_m);
+    }
+  }
+  const float block_l = DecodeBlockReduce(reduce_storage).Sum(local_l);
+  if (dim == 0) s_l = block_l;
+  __syncthreads();
+
+  float value = 0.0f;
+  for (int32_t split = 0; split < num_splits; ++split) {
+    const float split_l = partial_l[partial_row + split];
+    if (split_l > 0.0f) {
+      value += partial_acc[partial_acc_row + int64_t(split) * GEMMA4_SLIDING_HEAD_DIM + dim] * __expf(partial_m[partial_row + split] - s_m);
+    }
+  }
+  out[(int64_t(row) * GEMMA4_SLIDING_HEAD_DIM) + dim] =
+      s_l > 0.0f ? __float2bfloat16_rn(value / s_l) : __float2bfloat16_rn(0.0f);
+}
+
+bool valid_sliding_decode_paged_args(
+    const void *d_out,
+    const void *d_partial_m,
+    const void *d_partial_l,
+    const void *d_partial_acc,
+    const void *d_q,
+    const void *d_cache_k,
+    const void *d_cache_v,
+    const void *d_page_table,
+    const void *d_seq_lengths,
+    const Gemma4KvCacheConfig &cache_config,
+    int32_t cache_layer,
+    int32_t batch_size,
+    int32_t split_size,
+    int32_t num_splits) {
+  return d_out != nullptr && d_partial_m != nullptr &&
+         d_partial_l != nullptr && d_partial_acc != nullptr &&
+         d_q != nullptr && d_cache_k != nullptr && d_cache_v != nullptr &&
+         d_page_table != nullptr && d_seq_lengths != nullptr &&
+         batch_size > 0 && split_size > 0 && num_splits > 0 &&
+         gemma4_fa_valid_sliding_cache_config(cache_config, cache_layer);
+}
+
+template <bool UseCpAsync>
+cudaError_t launch_sliding_decode_paged(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_partial_m,
+    float *__restrict__ d_partial_l,
+    float *__restrict__ d_partial_acc,
+    const __nv_bfloat16 *__restrict__ d_q_prepared,
+    const __nv_bfloat16 *__restrict__ d_cache_k,
+    const __nv_bfloat16 *__restrict__ d_cache_v,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_seq_lengths,
+    Gemma4KvCacheConfig cache_config,
+    int32_t cache_layer,
+    int32_t batch_size,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits,
+    cudaStream_t stream) {
+  const dim3 split_grid(batch_size, GEMMA4_SLIDING_KV_HEADS, num_splits);
+  constexpr dim3 block_dim(kSlidingDecodeThreads);
+  if constexpr (UseCpAsync) {
+    sliding_decode_paged_grouped_split_kernel<true><<<split_grid, block_dim, 0, stream>>>(
+        d_partial_m, d_partial_l, d_partial_acc, d_q_prepared, d_cache_k,
+        d_cache_v, d_page_table, d_seq_lengths, cache_config, cache_layer,
+        softmax_scale, split_size, num_splits);
+  } else {
+    sliding_decode_paged_grouped_split_kernel<false><<<split_grid, block_dim, 0, stream>>>(
+        d_partial_m, d_partial_l, d_partial_acc, d_q_prepared, d_cache_k,
+        d_cache_v, d_page_table, d_seq_lengths, cache_config, cache_layer,
+        softmax_scale, split_size, num_splits);
+  }
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) return status;
+
+  const dim3 reduce_grid(batch_size, GEMMA4_NUM_QUERY_HEADS);
+  sliding_decode_paged_reduce_kernel<<<reduce_grid, block_dim, 0, stream>>>(
+      d_out, d_partial_m, d_partial_l, d_partial_acc, batch_size, num_splits);
+  return cudaGetLastError();
+}
+
 // Small diagnostic helper for tests/benchmarks that want register count,
 // dynamic shared memory, binary target, and related CUDA function attributes.
 template <typename KernelTraits, bool IsLocal>
@@ -1544,6 +1775,70 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_
       d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
       d_token_position, batch_size, cache_layer, d_q, d_k, d_v,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
+}
+
+// Gemma sliding decode attention over the Layout-A paged cache. This path is
+// specialized for q_len=1 and uses CUDA cores rather than trying to force a
+// tensor-core tile shape with only one query row.
+extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_bf16(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_partial_m,
+    float *__restrict__ d_partial_l,
+    float *__restrict__ d_partial_acc,
+    const __nv_bfloat16 *__restrict__ d_q_prepared,
+    const __nv_bfloat16 *__restrict__ d_cache_k,
+    const __nv_bfloat16 *__restrict__ d_cache_v,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_seq_lengths,
+    Gemma4KvCacheConfig cache_config,
+    int32_t cache_layer,
+    int32_t batch_size,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits,
+    cudaStream_t stream) {
+  if (!gemma4_flash_attention::valid_sliding_decode_paged_args(
+          d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
+          d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
+          cache_layer, batch_size, split_size, num_splits)) {
+    return cudaErrorInvalidValue;
+  }
+  return gemma4_flash_attention::launch_sliding_decode_paged<false>(
+      d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
+      d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
+      cache_layer, batch_size, softmax_scale, split_size, num_splits, stream);
+}
+
+// Same semantic contract as gemma4_flash_attention_sliding_decode_paged_bf16,
+// but stages each K/V vector through shared memory using cp.async. Kept
+// separate so benchmarks can decide whether that extra path is worthwhile.
+extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_cp_async_bf16(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_partial_m,
+    float *__restrict__ d_partial_l,
+    float *__restrict__ d_partial_acc,
+    const __nv_bfloat16 *__restrict__ d_q_prepared,
+    const __nv_bfloat16 *__restrict__ d_cache_k,
+    const __nv_bfloat16 *__restrict__ d_cache_v,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_seq_lengths,
+    Gemma4KvCacheConfig cache_config,
+    int32_t cache_layer,
+    int32_t batch_size,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits,
+    cudaStream_t stream) {
+  if (!gemma4_flash_attention::valid_sliding_decode_paged_args(
+          d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
+          d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
+          cache_layer, batch_size, split_size, num_splits)) {
+    return cudaErrorInvalidValue;
+  }
+  return gemma4_flash_attention::launch_sliding_decode_paged<true>(
+      d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
+      d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
+      cache_layer, batch_size, softmax_scale, split_size, num_splits, stream);
 }
 
 // Expose launch metadata so tests and benchmarks can sanity-check occupancy and

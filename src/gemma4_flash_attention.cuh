@@ -61,6 +61,42 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_
     const float *__restrict__ d_sin,
     cudaStream_t stream);
 
+extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_bf16(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_partial_m,
+    float *__restrict__ d_partial_l,
+    float *__restrict__ d_partial_acc,
+    const __nv_bfloat16 *__restrict__ d_q_prepared,
+    const __nv_bfloat16 *__restrict__ d_cache_k,
+    const __nv_bfloat16 *__restrict__ d_cache_v,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_seq_lengths,
+    Gemma4KvCacheConfig cache_config,
+    int32_t cache_layer,
+    int32_t batch_size,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits,
+    cudaStream_t stream);
+
+extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_cp_async_bf16(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_partial_m,
+    float *__restrict__ d_partial_l,
+    float *__restrict__ d_partial_acc,
+    const __nv_bfloat16 *__restrict__ d_q_prepared,
+    const __nv_bfloat16 *__restrict__ d_cache_k,
+    const __nv_bfloat16 *__restrict__ d_cache_v,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_seq_lengths,
+    Gemma4KvCacheConfig cache_config,
+    int32_t cache_layer,
+    int32_t batch_size,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits,
+    cudaStream_t stream);
+
 extern "C" size_t gemma4_flash_attention_sliding_smem_bytes();
 extern "C" int gemma4_flash_attention_sliding_threads_per_block();
 extern "C" cudaError_t gemma4_flash_attention_sliding_kernel_attributes(
