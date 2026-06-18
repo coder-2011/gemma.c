@@ -1,0 +1,726 @@
+	.sectioninfo	@"SHI_REGISTERS=40"
+	.align	128
+
+
+
+
+        .global         _ZN22gemma4_flash_attention49gemma4_sliding_decode_q_paged_kv_norm_rope_kernelEP13__nv_bfloat16S1_S1_19Gemma4KvCacheConfigPKiS4_iPKS0_S6_S6_S6_S6_PKfS8_
+        .type           _ZN22gemma4_flash_attention49gemma4_sliding_decode_q_paged_kv_norm_rope_kernelEP13__nv_bfloat16S1_S1_19Gemma4KvCacheConfigPKiS4_iPKS0_S6_S6_S6_S6_PKfS8_,@function
+        .size           _ZN22gemma4_flash_attention49gemma4_sliding_decode_q_paged_kv_norm_rope_kernelEP13__nv_bfloat16S1_S1_19Gemma4KvCacheConfigPKiS4_iPKS0_S6_S6_S6_S6_PKfS8_,(.L_x_140 - _ZN22gemma4_flash_attention49gemma4_sliding_decode_q_paged_kv_norm_rope_kernelEP13__nv_bfloat16S1_S1_19Gemma4KvCacheConfigPKiS4_iPKS0_S6_S6_S6_S6_PKfS8_)
+        .other          _ZN22gemma4_flash_attention49gemma4_sliding_decode_q_paged_kv_norm_rope_kernelEP13__nv_bfloat16S1_S1_19Gemma4KvCacheConfigPKiS4_iPKS0_S6_S6_S6_S6_PKfS8_,@"STO_CUDA_ENTRY STV_DEFAULT"
+_ZN22gemma4_flash_attention49gemma4_sliding_decode_q_paged_kv_norm_rope_kernelEP13__nv_bfloat16S1_S1_19Gemma4KvCacheConfigPKiS4_iPKS0_S6_S6_S6_S6_PKfS8_:
+.text._ZN22gemma4_flash_attention49gemma4_sliding_decode_q_paged_kv_norm_rope_kernelEP13__nv_bfloat16S1_S1_19Gemma4KvCacheConfigPKiS4_iPKS0_S6_S6_S6_S6_PKfS8_:
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1257
+        /*0000*/                   IMAD.MOV.U32 R1, RZ, RZ, c[0x0][0x28] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1278
+        /*0010*/                   S2R R7, SR_TID.X ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1280
+        /*0020*/                   S2R R3, SR_CTAID.Y ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1279
+        /*0030*/                   SHF.R.U32.HI R2, RZ, 0x5, R7 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1280
+        /*0040*/                   IMAD R2, R3, 0x8, R2 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1281
+        /*0050*/                   ISETP.GT.AND P0, PT, R2, 0x1f, PT ;
+        /*0060*/               @P0 EXIT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1277
+        /*0070*/                   S2R R19, SR_CTAID.X ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1283
+        /*0080*/                   MOV R4, 0x4 ;
+        /*0090*/                   ULDC.64 UR6, c[0x0][0x118] ;
+        /*00a0*/                   IMAD.WIDE R4, R19, R4, c[0x0][0x1a0] ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp", line 112
+        /*00b0*/                   LDG.E.CONSTANT R18, [R4.64] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1284
+        /*00c0*/                   ISETP.GE.AND P0, PT, R18, RZ, PT ;
+        /*00d0*/              @!P0 EXIT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1288
+        /*00e0*/                   LEA R5, P0, R19, R2, 0x5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1278
+        /*00f0*/                   LOP3.LUT R6, R7, 0x1f, RZ, 0xc0, !PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1283
+        /*0100*/                   SHF.R.S32.HI R20, RZ, 0x1f, R19 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1288
+        /*0110*/                   SHF.R.S32.HI R3, RZ, 0x1f, R2 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*0120*/                   PRMT R21, R6, 0x6540, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1288
+        /*0130*/                   LEA.HI.X R0, R19, R3, R20, 0x5, P0 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*0140*/                   IMAD.SHL.U32 R22, R21, 0x2, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1288
+        /*0150*/                   SHF.L.U64.HI R0, R5, 0x8, R0 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*0160*/                   SHF.L.U64.HI R21, R21, 0x1, R0 ;
+        /*0170*/                   IADD3 R4, P0, R22, c[0x0][0x1b0], RZ ;
+        /*0180*/                   IADD3.X R5, R21, c[0x0][0x1b4], RZ, P0, !PT ;
+        /*0190*/                   LDG.E.U16.CONSTANT R0, [R4.64] ;
+        /*01a0*/                   LDG.E.U16.CONSTANT R35, [R4.64+0x40] ;
+        /*01b0*/                   LDG.E.U16.CONSTANT R11, [R4.64+0x80] ;
+        /*01c0*/                   LDG.E.U16.CONSTANT R32, [R4.64+0xc0] ;
+        /*01d0*/                   LDG.E.U16.CONSTANT R33, [R4.64+0x100] ;
+        /*01e0*/                   LDG.E.U16.CONSTANT R17, [R4.64+0x140] ;
+        /*01f0*/                   LDG.E.U16.CONSTANT R34, [R4.64+0x180] ;
+        /*0200*/                   LDG.E.U16.CONSTANT R36, [R4.64+0x1c0] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*0210*/                   IMAD.SHL.U32 R12, R7, 0x2, RZ ;
+        /*0220*/                   LOP3.LUT R12, R12, 0x3e, RZ, 0xc0, !PT ;
+        /*0230*/                   IADD3 R12, P0, R12, c[0x0][0x1c8], RZ ;
+        /*0240*/                   IADD3.X R13, RZ, c[0x0][0x1cc], RZ, P0, !PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*0250*/                   LDG.E.U16.CONSTANT R24, [R12.64+0x100] ;
+        /*0260*/                   LDG.E.U16.CONSTANT R28, [R12.64+0x180] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*0270*/                   LDG.E.U16.CONSTANT R27, [R12.64+0x80] ;
+        /*0280*/                   LDG.E.U16.CONSTANT R25, [R12.64+0x40] ;
+        /*0290*/                   LDG.E.U16.CONSTANT R29, [R12.64+0xc0] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*02a0*/                   LDG.E.U16.CONSTANT R30, [R12.64+0x1c0] ;
+        /*02b0*/                   LDG.E.U16.CONSTANT R26, [R12.64+0x140] ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*02c0*/                   PRMT R0, RZ, 0x5410, R0 ;
+        /*02d0*/                   PRMT R35, RZ, 0x5410, R35 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*02e0*/                   FFMA.FTZ R8, R0, R0, RZ ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*02f0*/                   PRMT R11, RZ, 0x5410, R11 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*0300*/                   FFMA.FTZ R8, R35, R35, R8 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0310*/                   PRMT R32, RZ, 0x5410, R32 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*0320*/                   FFMA.FTZ R9, R11, R11, R8 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0330*/                   PRMT R33, RZ, 0x5410, R33 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*0340*/                   FFMA.FTZ R8, R32, R32, R9 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0350*/                   PRMT R17, RZ, 0x5410, R17 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*0360*/                   FFMA.FTZ R8, R33, R33, R8 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0370*/                   PRMT R34, RZ, 0x5410, R34 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*0380*/                   FFMA.FTZ R5, R17, R17, R8 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0390*/                   PRMT R36, RZ, 0x5410, R36 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*03a0*/                   FFMA.FTZ R5, R34, R34, R5 ;
+        /*03b0*/                   FFMA.FTZ R8, R36, R36, R5 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*03c0*/                   SHFL.BFLY PT, R5, R8, 0x10, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*03d0*/                   FADD.FTZ R9, R8, R5 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*03e0*/                   SHFL.BFLY PT, R4, R9, 0x8, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*03f0*/                   FADD.FTZ R10, R9, R4 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*0400*/                   SHFL.BFLY PT, R5, R10, 0x4, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*0410*/                   FADD.FTZ R14, R10, R5 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*0420*/                   SHFL.BFLY PT, R5, R14, 0x2, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*0430*/                   FADD.FTZ R15, R14, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1285
+        /*0440*/                   IMAD.WIDE R4, R18, 0x80, RZ ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*0450*/                   SHFL.BFLY PT, R16, R15, 0x1, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 60
+        /*0460*/                   LOP3.LUT R23, R4, 0x1f, R7, 0xf8, !PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1139
+        /*0470*/                   MOV R7, 0x3b800000 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 60
+        /*0480*/                   SHF.L.U64.HI R5, R23.reuse, 0x2, R5 ;
+        /*0490*/                   IMAD.SHL.U32 R4, R23, 0x4, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*04a0*/                   LDG.E.U16.CONSTANT R23, [R12.64] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 60
+        /*04b0*/                   IADD3 R14, P0, R4, c[0x0][0x1d8], RZ ;
+        /*04c0*/                   IADD3 R4, P1, R4, c[0x0][0x1e0], RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*04d0*/                   FADD.FTZ R16, R15, R16 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 60
+        /*04e0*/                   IADD3.X R15, R5, c[0x0][0x1dc], RZ, P0, !PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1139
+        /*04f0*/                   FFMA.FTZ R31, R16, R7, 9.9999999747524270788e-07 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 60
+        /*0500*/                   IADD3.X R5, R5, c[0x0][0x1e4], RZ, P1, !PT ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp", line 134
+        /*0510*/                   LDG.E.CONSTANT R16, [R14.64] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1139
+        /*0520*/                   MUFU.RSQ R31, R31 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp", line 134
+        /*0530*/                   LDG.E.CONSTANT R9, [R14.64+0x100] ;
+        /*0540*/                   LDG.E.CONSTANT R10, [R14.64+0x180] ;
+        /*0550*/                   LDG.E.CONSTANT R8, [R14.64+0x80] ;
+        /*0560*/                   LDG.E.CONSTANT R12, [R4.64+0x80] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1160
+        /*0570*/                   FMUL.FTZ R37, R17, R31.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*0580*/                   FMUL.FTZ R13, R11, R31 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp", line 134
+        /*0590*/                   LDG.E.CONSTANT R17, [R4.64] ;
+        /*05a0*/                   LDG.E.CONSTANT R11, [R4.64+0x100] ;
+        /*05b0*/                   LDG.E.CONSTANT R15, [R4.64+0x180] ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*05c0*/                   PRMT R24, RZ, 0x5410, R24 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1160
+        /*05d0*/                   FMUL.FTZ R33, R33, R31.reuse ;
+        /*05e0*/                   FMUL.FTZ R34, R34, R31.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*05f0*/                   FMUL.FTZ R0, R0, R31.reuse ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0600*/                   PRMT R14, RZ, 0x5410, R27 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*0610*/                   FMUL.FTZ R33, R33, R24 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0620*/                   PRMT R5, RZ, 0x5410, R28 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*0630*/                   FMUL.FTZ R35, R35, R31.reuse ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0640*/                   PRMT R4, RZ, 0x5410, R25 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*0650*/                   FMUL.FTZ R32, R32, R31 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0660*/                   PRMT R29, RZ, 0x5410, R29 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*0670*/                   FMUL.FTZ R34, R34, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*0680*/                   FMUL.FTZ R14, R13, R14 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0690*/                   PRMT R30, RZ, 0x5410, R30 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1160
+        /*06a0*/                   FMUL.FTZ R31, R36, R31 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*06b0*/                   FMUL.FTZ R35, R35, R4 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*06c0*/                   PRMT R26, RZ, 0x5410, R26 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*06d0*/                   FMUL.FTZ R32, R32, R29 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*06e0*/                   FMUL.FTZ R31, R31, R30 ;
+        /*06f0*/                   FMUL.FTZ R37, R37, R26 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*0700*/                   IADD3 R22, P0, R22, c[0x0][0x160], RZ ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*0710*/                   PRMT R23, RZ, 0x5410, R23 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*0720*/                   FMUL.FTZ R0, R0, R23 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*0730*/                   IADD3.X R23, R21, c[0x0][0x164], RZ, P0, !PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*0740*/                   FMUL.FTZ R5, R33, R16.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*0750*/                   FMUL.FTZ R4, R0, R16 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*0760*/                   FMUL.FTZ R13, R34, R9 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1293
+        /*0770*/                   ISETP.GT.AND P0, PT, R2, 0xf, PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*0780*/                   FMUL.FTZ R24, R37, R8 ;
+        /*0790*/                   FFMA.FTZ R0, R0, R17, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*07a0*/                   FMUL.FTZ R5, R14.reuse, R9 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*07b0*/                   FFMA.FTZ R13, R14, R11, R13 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*07c0*/                   FMUL.FTZ R14, R32, R10 ;
+        /*07d0*/                   FFMA.FTZ R33, -R33, R17, R4 ;
+        /*07e0*/                   FMUL.FTZ R4, R35, R8 ;
+        /*07f0*/                   FFMA.FTZ R14, -R31.reuse, R15, R14 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*0800*/                   FMUL.FTZ R31, R31, R10 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*0810*/                   FFMA.FTZ R4, -R37, R12.reuse, R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*0820*/                   FFMA.FTZ R35, R35, R12, R24 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*0830*/                   FFMA.FTZ R34, -R34, R11, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*0840*/                   FFMA.FTZ R31, R32, R15, R31 ;
+        /*0850*/                   F2FP.BF16.PACK_AB R0, R0, R33 ;
+        /*0860*/                   F2FP.BF16.PACK_AB R4, R35, R4 ;
+        /*0870*/                   F2FP.BF16.PACK_AB R13, R13, R34 ;
+        /*0880*/                   F2FP.BF16.PACK_AB R14, R31, R14 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*0890*/                   PRMT R5, R0, 0x7632, R5 ;
+        /*08a0*/                   PRMT R21, R4, 0x7632, R21 ;
+        /*08b0*/                   PRMT R24, R13, 0x7632, R24 ;
+        /*08c0*/                   PRMT R25, R14, 0x7632, R25 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*08d0*/                   STG.E.U16 [R22.64], R0 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*08e0*/                   STG.E.U16 [R22.64+0x100], R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*08f0*/                   STG.E.U16 [R22.64+0x40], R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*0900*/                   STG.E.U16 [R22.64+0x140], R21 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*0910*/                   STG.E.U16 [R22.64+0x80], R13 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*0920*/                   STG.E.U16 [R22.64+0x180], R24 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*0930*/                   STG.E.U16 [R22.64+0xc0], R14 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*0940*/                   STG.E.U16 [R22.64+0x1c0], R25 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1293
+        /*0950*/               @P0 EXIT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 48
+        /*0960*/                   IABS R0, c[0x0][0x180] ;
+        /*0970*/                   IABS R22, R18 ;
+        /*0980*/                   I2F.RP R14, R0 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 61
+        /*0990*/                   IABS R13, c[0x0][0x184] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 48
+        /*09a0*/                   MUFU.RCP R14, R14 ;
+        /*09b0*/                   IADD3 R4, R14, 0xffffffe, RZ ;
+        /*09c0*/                   LOP3.LUT R14, R18, c[0x0][0x180], RZ, 0x3c, !PT ;
+        /*09d0*/                   F2I.FTZ.U32.TRUNC.NTZ R5, R4 ;
+        /*09e0*/                   ISETP.GE.AND P2, PT, R14, RZ, PT ;
+        /*09f0*/                   MOV R4, RZ ;
+        /*0a00*/                   IMAD.MOV R21, RZ, RZ, -R5 ;
+        /*0a10*/                   IMAD R21, R21, R0, RZ ;
+        /*0a20*/                   IMAD.HI.U32 R5, R5, R21, R4 ;
+        /*0a30*/                   IMAD.MOV.U32 R21, RZ, RZ, R22 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 61
+        /*0a40*/                   I2F.RP R22, R13 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 48
+        /*0a50*/                   IMAD.HI.U32 R4, R5, R21, RZ ;
+        /*0a60*/                   IADD3 R5, -R4, RZ, RZ ;
+        /*0a70*/                   IMAD R21, R0.reuse, R5, R21 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 61
+        /*0a80*/                   MUFU.RCP R22, R22 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 48
+        /*0a90*/                   ISETP.GT.U32.AND P1, PT, R0, R21, PT ;
+        /*0aa0*/              @!P1 IMAD.IADD R21, R21, 0x1, -R0 ;
+        /*0ab0*/              @!P1 IADD3 R4, R4, 0x1, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 61
+        /*0ac0*/                   IADD3 R5, R22, 0xffffffe, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 48
+        /*0ad0*/                   ISETP.GE.U32.AND P0, PT, R21, R0, PT ;
+        /*0ae0*/                   ISETP.NE.AND P1, PT, RZ, c[0x0][0x180], PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 61
+        /*0af0*/                   F2I.FTZ.U32.TRUNC.NTZ R5, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 48
+        /*0b00*/                   LOP3.LUT R22, RZ, c[0x0][0x180], RZ, 0x33, !PT ;
+        /*0b10*/               @P0 IADD3 R4, R4, 0x1, RZ ;
+        /*0b20*/              @!P2 IMAD.MOV R4, RZ, RZ, -R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 61
+        /*0b30*/                   IADD3 R24, RZ, -R5, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 48
+        /*0b40*/                   SEL R14, R22, R4, !P1 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 61
+        /*0b50*/                   MOV R4, RZ ;
+        /*0b60*/                   IMAD R23, R24, R13, RZ ;
+        /*0b70*/                   IABS R24, R14 ;
+        /*0b80*/                   ISETP.GE.AND P3, PT, R14, RZ, PT ;
+        /*0b90*/                   IMAD.HI.U32 R4, R5, R23, R4 ;
+        /*0ba0*/                   IMAD.MOV.U32 R5, RZ, RZ, R24 ;
+        /*0bb0*/                   IMAD.HI.U32 R4, R4, R5, RZ ;
+        /*0bc0*/                   IADD3 R4, -R4, RZ, RZ ;
+        /*0bd0*/                   IMAD R4, R13, R4, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1246
+        /*0be0*/                   IMAD R5, R19, c[0x0][0x184], RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 61
+        /*0bf0*/                   ISETP.GT.U32.AND P0, PT, R13, R4, PT ;
+        /*0c00*/              @!P0 IMAD.IADD R4, R4, 0x1, -R13 ;
+        /*0c10*/                   ISETP.NE.AND P0, PT, RZ, c[0x0][0x184], PT ;
+        /*0c20*/                   ISETP.GT.U32.AND P2, PT, R13, R4, PT ;
+        /*0c30*/              @!P2 IADD3 R4, R4, -R13, RZ ;
+        /*0c40*/              @!P3 IMAD.MOV R4, RZ, RZ, -R4 ;
+        /*0c50*/              @!P0 LOP3.LUT R4, RZ, c[0x0][0x184], RZ, 0x33, !PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1246
+        /*0c60*/                   SHF.R.S32.HI R14, RZ, 0x1f, R4 ;
+        /*0c70*/                   IADD3 R13, P0, R4, R5, RZ ;
+        /*0c80*/                   LEA.HI.X.SX32 R14, R5, R14, 0x1, P0 ;
+        /*0c90*/                   LEA R4, P0, R13, c[0x0][0x198], 0x2 ;
+        /*0ca0*/                   LEA.HI.X R5, R13, c[0x0][0x19c], R14, 0x2, P0 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_32_intrinsics.hpp", line 112
+        /*0cb0*/                   LDG.E.CONSTANT R4, [R4.64] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1247
+        /*0cc0*/                   MOV R13, 0xffffffff ;
+        /*0cd0*/                   IMAD.MOV.U32 R14, RZ, RZ, -0x1 ;
+        /*0ce0*/                   ISETP.GE.AND P0, PT, R4, c[0x0][0x17c], PT ;
+        /*0cf0*/                   ISETP.LT.OR P0, PT, R4, RZ, P0 ;
+        /*0d00*/               @P0 BRA `(.L_x_130) ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 54
+        /*0d10*/                   ISETP.GE.AND P2, PT, R18, RZ, PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 41
+        /*0d20*/                   IMAD.MOV.U32 R13, RZ, RZ, c[0x0][0x1a8] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 54
+        /*0d30*/                   ISETP.GT.U32.AND P0, PT, R0, R21.reuse, PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 42
+        /*0d40*/                   ULDC UR4, c[0x0][0x18c] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 54
+        /*0d50*/                   IADD3 R0, R21, -R0, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 42
+        /*0d60*/                   USHF.R.S32.HI UR4, URZ, 0x1f, UR4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 41
+        /*0d70*/                   SHF.R.S32.HI R5, RZ, 0x1f, R4.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 54
+        /*0d80*/                   SEL R21, R0, R21, !P0 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 41
+        /*0d90*/                   IMAD.MOV.U32 R0, RZ, RZ, c[0x0][0x180] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 42
+        /*0da0*/                   MOV R14, c[0x0][0x188] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 41
+        /*0db0*/                   IMAD.WIDE R4, R13, c[0x0][0x17c], R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 54
+        /*0dc0*/              @!P2 IADD3 R21, -R21, RZ, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 41
+        /*0dd0*/                   SHF.R.S32.HI R13, RZ, 0x1f, R0 ;
+        /*0de0*/                   IMAD R0, R5, c[0x0][0x180], RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 54
+        /*0df0*/                   SEL R22, R22, R21, !P1 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 41
+        /*0e00*/                   IMAD R13, R4, R13, R0 ;
+        /*0e10*/                   SHF.R.S32.HI R23, RZ, 0x1f, R22 ;
+        /*0e20*/                   IMAD.WIDE.U32 R4, R4, c[0x0][0x180], R22 ;
+        /*0e30*/                   IMAD.IADD R0, R5, 0x1, R13 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_kv_cache.cuh", line 42
+        /*0e40*/                   SHF.R.S32.HI R5, RZ, 0x1f, R14 ;
+        /*0e50*/                   IMAD.WIDE.U32 R22, R4, c[0x0][0x188], R2 ;
+        /*0e60*/                   IMAD R0, R0, c[0x0][0x188], RZ ;
+        /*0e70*/                   IMAD R5, R5, R4, R0 ;
+        /*0e80*/                   IADD3 R0, R23, R5, RZ ;
+        /*0e90*/                   IMAD.WIDE.U32 R4, R22, c[0x0][0x18c], RZ ;
+        /*0ea0*/                   IMAD R13, R0, c[0x0][0x18c], RZ ;
+        /*0eb0*/                   IMAD R23, R22, UR4, R13 ;
+        /*0ec0*/                   IMAD.MOV.U32 R13, RZ, RZ, R4 ;
+        /*0ed0*/                   IADD3 R14, R5, R23, RZ ;
+.L_x_130:
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1296
+        /*0ee0*/                   ISETP.GE.AND P0, PT, R14, RZ, PT ;
+        /*0ef0*/              @!P0 EXIT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1298
+        /*0f00*/                   LEA R5, P0, R19, R2, 0x4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*0f10*/                   PRMT R23, R6, 0x6540, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1298
+        /*0f20*/                   LEA.HI.X R0, R19, R3, R20, 0x4, P0 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*0f30*/                   IMAD.SHL.U32 R25, R23, 0x2, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1298
+        /*0f40*/                   SHF.L.U64.HI R0, R5, 0x8, R0 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*0f50*/                   SHF.L.U64.HI R23, R23, 0x1, R0 ;
+        /*0f60*/                   IADD3 R4, P0, R25, c[0x0][0x1b8], RZ ;
+        /*0f70*/                   IADD3.X R5, R23, c[0x0][0x1bc], RZ, P0, !PT ;
+        /*0f80*/                   LDG.E.U16.CONSTANT R0, [R4.64] ;
+        /*0f90*/                   LDG.E.U16.CONSTANT R19, [R4.64+0x40] ;
+        /*0fa0*/                   LDG.E.U16.CONSTANT R22, [R4.64+0x80] ;
+        /*0fb0*/                   LDG.E.U16.CONSTANT R29, [R4.64+0xc0] ;
+        /*0fc0*/                   LDG.E.U16.CONSTANT R30, [R4.64+0x100] ;
+        /*0fd0*/                   LDG.E.U16.CONSTANT R24, [R4.64+0x140] ;
+        /*0fe0*/                   LDG.E.U16.CONSTANT R20, [R4.64+0x180] ;
+        /*0ff0*/                   LDG.E.U16.CONSTANT R26, [R4.64+0x1c0] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*1000*/                   LEA R2, P0, R6, c[0x0][0x1d0], 0x1 ;
+        /*1010*/                   IADD3.X R3, RZ, c[0x0][0x1d4], RZ, P0, !PT ;
+        /*1020*/                   LDG.E.U16.CONSTANT R28, [R2.64] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*1030*/                   LDG.E.U16.CONSTANT R27, [R2.64+0x100] ;
+        /*1040*/                   LDG.E.U16.CONSTANT R36, [R2.64+0x1c0] ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1050*/                   PRMT R0, RZ, 0x5410, R0 ;
+        /*1060*/                   PRMT R19, RZ, 0x5410, R19 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*1070*/                   FFMA.FTZ R18, R0, R0, RZ ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1080*/                   PRMT R22, RZ, 0x5410, R22 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*1090*/                   FFMA.FTZ R21, R19, R19, R18 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*10a0*/                   PRMT R18, RZ, 0x5410, R29 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*10b0*/                   FFMA.FTZ R21, R22, R22, R21 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*10c0*/                   PRMT R30, RZ, 0x5410, R30 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*10d0*/                   FFMA.FTZ R21, R18, R18, R21 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*10e0*/                   PRMT R24, RZ, 0x5410, R24 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*10f0*/                   FFMA.FTZ R21, R30, R30, R21 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1100*/                   PRMT R20, RZ, 0x5410, R20 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*1110*/                   FFMA.FTZ R21, R24, R24, R21 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1120*/                   PRMT R26, RZ, 0x5410, R26 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*1130*/                   FFMA.FTZ R21, R20, R20, R21 ;
+        /*1140*/                   FFMA.FTZ R21, R26, R26, R21 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*1150*/                   SHFL.BFLY PT, R4, R21, 0x10, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*1160*/                   FADD.FTZ R29, R21, R4 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*1170*/                   SHFL.BFLY PT, R4, R29, 0x8, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*1180*/                   FADD.FTZ R31, R29, R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*1190*/                   LDG.E.U16.CONSTANT R29, [R2.64+0x40] ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*11a0*/                   SHFL.BFLY PT, R4, R31, 0x4, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*11b0*/                   FADD.FTZ R32, R31, R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*11c0*/                   LDG.E.U16.CONSTANT R31, [R2.64+0xc0] ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*11d0*/                   SHFL.BFLY PT, R5, R32, 0x2, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*11e0*/                   FADD.FTZ R33, R32, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*11f0*/                   LDG.E.U16.CONSTANT R32, [R2.64+0x140] ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*1200*/                   SHFL.BFLY PT, R4, R33, 0x1, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*1210*/                   FADD.FTZ R4, R33, R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1139
+        /*1220*/                   FFMA.FTZ R34, R4, R7, 9.9999999747524270788e-07 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*1230*/                   IADD3 R4, P0, R25, c[0x0][0x1c0], RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1139
+        /*1240*/                   MUFU.RSQ R21, R34 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*1250*/                   IADD3.X R5, R23, c[0x0][0x1c4], RZ, P0, !PT ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1260*/                   PRMT R23, RZ, 0x5410, R28 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*1270*/                   LDG.E.U16.CONSTANT R35, [R4.64+0x100] ;
+        /*1280*/                   LDG.E.U16.CONSTANT R34, [R4.64+0x140] ;
+        /*1290*/                   LDG.E.U16.CONSTANT R33, [R4.64+0x180] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*12a0*/                   FMUL.FTZ R0, R0, R21.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1160
+        /*12b0*/                   FMUL.FTZ R25, R30, R21 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*12c0*/                   LDG.E.U16.CONSTANT R37, [R4.64+0x1c0] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*12d0*/                   FMUL.FTZ R30, R0, R23 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*12e0*/                   PRMT R0, RZ, 0x5410, R27 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*12f0*/                   FMUL.FTZ R25, R25, R0 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*1300*/                   LDG.E.U16.CONSTANT R0, [R4.64] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*1310*/                   FMUL.FTZ R28, R16.reuse, R30.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*1320*/                   FMUL.FTZ R27, R16, R25.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*1330*/                   LDG.E.U16.CONSTANT R16, [R4.64+0x40] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*1340*/                   FFMA.FTZ R23, R17.reuse, -R25, R28 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*1350*/                   FFMA.FTZ R30, R17, R30, R27 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1135
+        /*1360*/                   LDG.E.U16.CONSTANT R25, [R4.64+0x80] ;
+        /*1370*/                   LDG.E.U16.CONSTANT R28, [R4.64+0xc0] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*1380*/                   LDG.E.U16.CONSTANT R17, [R2.64+0x80] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*1390*/                   LDG.E.U16.CONSTANT R27, [R2.64+0x180] ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*13a0*/                   IADD3 R13, P0, R6, R13, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*13b0*/                   FMUL.FTZ R19, R19, R21.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1160
+        /*13c0*/                   FMUL.FTZ R24, R24, R21.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*13d0*/                   FMUL.FTZ R22, R22, R21.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1160
+        /*13e0*/                   FMUL.FTZ R20, R20, R21.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*13f0*/                   FMUL.FTZ R18, R18, R21.reuse ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1400*/                   PRMT R36, RZ, 0x5410, R36 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1160
+        /*1410*/                   FMUL.FTZ R21, R26, R21 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*1420*/                   IMAD.X R14, RZ, RZ, R14, P0 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*1430*/                   FMUL.FTZ R21, R21, R36 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*1440*/                   F2FP.BF16.PACK_AB R23, R30, R23 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1450*/                   PRMT R35, RZ, 0x5410, R35 ;
+        /*1460*/                   PRMT R0, RZ, 0x5410, R0 ;
+        /*1470*/                   PRMT R16, RZ, 0x5410, R16 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*1480*/                   FFMA.FTZ R3, R0, R0, RZ ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1490*/                   PRMT R25, RZ, 0x5410, R25 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*14a0*/                   FFMA.FTZ R2, R16, R16, R3 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*14b0*/                   PRMT R28, RZ, 0x5410, R28 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*14c0*/                   FFMA.FTZ R3, R25, R25, R2 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*14d0*/                   PRMT R34, RZ, 0x5410, R34 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*14e0*/                   FFMA.FTZ R2, R28, R28, R3 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*14f0*/                   PRMT R33, RZ, 0x5410, R33 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*1500*/                   FFMA.FTZ R3, R35, R35, R2 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1510*/                   PRMT R37, RZ, 0x5410, R37 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1136
+        /*1520*/                   FFMA.FTZ R2, R34, R34, R3 ;
+        /*1530*/                   FFMA.FTZ R2, R33, R33, R2 ;
+        /*1540*/                   FFMA.FTZ R4, R37, R37, R2 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*1550*/                   SHFL.BFLY PT, R3, R4, 0x10, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*1560*/                   FADD.FTZ R5, R4, R3 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*1570*/                   SHFL.BFLY PT, R2, R5, 0x8, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*1580*/                   FADD.FTZ R6, R5, R2 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*1590*/                   SHFL.BFLY PT, R3, R6, 0x4, 0x1f ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*15a0*/                   FADD.FTZ R3, R6, R3 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*15b0*/                   SHFL.BFLY PT, R2, R3, 0x2, 0x1f ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*15c0*/                   PRMT R4, RZ, 0x5410, R29 ;
+        /*15d0*/                   PRMT R5, RZ, 0x5410, R32 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*15e0*/                   FADD.FTZ R2, R3, R2 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/sm_30_intrinsics.hpp", line 449
+        /*15f0*/                   SHFL.BFLY PT, R3, R2, 0x1, 0x1f ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1600*/                   PRMT R17, RZ, 0x5410, R17 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*1610*/                   FMUL.FTZ R19, R19, R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*1620*/                   FMUL.FTZ R5, R24, R5 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*1630*/                   FMUL.FTZ R22, R22, R17 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*1640*/                   FMUL.FTZ R17, R8.reuse, R19 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*1650*/                   FMUL.FTZ R8, R8, R5.reuse ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 585
+        /*1660*/                   PRMT R27, RZ, 0x5410, R27 ;
+        /*1670*/                   PRMT R31, RZ, 0x5410, R31 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*1680*/                   FFMA.FTZ R6, R12.reuse, -R5, R17 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*1690*/                   FFMA.FTZ R19, R12, R19, R8 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1161
+        /*16a0*/                   FMUL.FTZ R20, R20, R27 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*16b0*/                   FMUL.FTZ R4, R9, R22 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1159
+        /*16c0*/                   FMUL.FTZ R18, R18, R31 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1120
+        /*16d0*/                   FADD.FTZ R2, R2, R3 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*16e0*/                   F2FP.BF16.PACK_AB R19, R19, R6 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1139
+        /*16f0*/                   FFMA.FTZ R2, R2, R7, 9.9999999747524270788e-07 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*1700*/                   FMUL.FTZ R12, R9, R20.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*1710*/                   FFMA.FTZ R8, R11, -R20, R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*1720*/                   SHF.L.U64.HI R9, R13.reuse, 0x1, R14 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1139
+        /*1730*/                   MUFU.RSQ R6, R2 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*1740*/                   FMUL.FTZ R4, R10.reuse, R18.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*1750*/                   SHF.L.U32 R13, R13, 0x1, RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*1760*/                   FMUL.FTZ R10, R10, R21.reuse ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 31
+        /*1770*/                   FFMA.FTZ R21, R15, -R21, R4 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*1780*/                   IADD3 R4, P0, R13, c[0x0][0x168], RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*1790*/                   FFMA.FTZ R10, R15, R18, R10 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*17a0*/                   PRMT R3, R23, 0x7632, R3 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*17b0*/                   IADD3.X R5, R9, c[0x0][0x16c], RZ, P0, !PT ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*17c0*/                   FFMA.FTZ R11, R11, R22, R12 ;
+        /*17d0*/                   F2FP.BF16.PACK_AB R10, R10, R21 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*17e0*/                   STG.E.U16 [R4.64+0x100], R3 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1184
+        /*17f0*/                   FMUL.FTZ R0, R0, R6.reuse ;
+        /*1800*/                   FMUL.FTZ R16, R16, R6.reuse ;
+        /*1810*/                   FMUL.FTZ R25, R25, R6.reuse ;
+        /*1820*/                   FMUL.FTZ R28, R28, R6.reuse ;
+        /*1830*/                   FMUL.FTZ R35, R35, R6.reuse ;
+        /*1840*/                   FMUL.FTZ R34, R34, R6.reuse ;
+        /*1850*/                   FMUL.FTZ R33, R33, R6 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 32
+        /*1860*/                   F2FP.BF16.PACK_AB R8, R11, R8 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1184
+        /*1870*/                   FMUL.FTZ R6, R37, R6 ;
+        /*1880*/                   IADD3 R2, P0, R13, c[0x0][0x170], RZ ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*1890*/                   PRMT R3, R10, 0x7632, R3 ;
+        /*18a0*/                   PRMT R7, R19, 0x7632, R7 ;
+        /*18b0*/                   PRMT R11, R8, 0x7632, R11 ;
+        /*18c0*/                   STG.E.U16 [R4.64+0x1c0], R3 ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 491
+        /*18d0*/                   F2FP.BF16.PACK_AB R0, RZ, R0 ;
+        /*18e0*/                   F2FP.BF16.PACK_AB R16, RZ, R16 ;
+        /*18f0*/                   F2FP.BF16.PACK_AB R25, RZ, R25 ;
+        /*1900*/                   F2FP.BF16.PACK_AB R28, RZ, R28 ;
+        /*1910*/                   F2FP.BF16.PACK_AB R35, RZ, R35 ;
+        /*1920*/                   F2FP.BF16.PACK_AB R34, RZ, R34 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1184
+        /*1930*/                   IADD3.X R3, R9, c[0x0][0x174], RZ, P0, !PT ;
+	//## File "/usr/local/cuda/bin/../targets/x86_64-linux/include/cuda_bf16.hpp", line 491
+        /*1940*/                   F2FP.BF16.PACK_AB R33, RZ, R33 ;
+        /*1950*/                   F2FP.BF16.PACK_AB R6, RZ, R6 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*1960*/                   STG.E.U16 [R4.64], R23 ;
+        /*1970*/                   STG.E.U16 [R4.64+0x40], R19 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*1980*/                   STG.E.U16 [R4.64+0x140], R7 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*1990*/                   STG.E.U16 [R4.64+0x80], R8 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 63
+        /*19a0*/                   STG.E.U16 [R4.64+0x180], R11 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_rope.cuh", line 62
+        /*19b0*/                   STG.E.U16 [R4.64+0xc0], R10 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1184
+        /*19c0*/                   STG.E.U16 [R2.64], R0 ;
+        /*19d0*/                   STG.E.U16 [R2.64+0x40], R16 ;
+        /*19e0*/                   STG.E.U16 [R2.64+0x80], R25 ;
+        /*19f0*/                   STG.E.U16 [R2.64+0xc0], R28 ;
+        /*1a00*/                   STG.E.U16 [R2.64+0x100], R35 ;
+        /*1a10*/                   STG.E.U16 [R2.64+0x140], R34 ;
+        /*1a20*/                   STG.E.U16 [R2.64+0x180], R33 ;
+        /*1a30*/                   STG.E.U16 [R2.64+0x1c0], R6 ;
+	//## File "/home/ubuntu/gemma.c/src/gemma4_flash_attention.cu", line 1302
+        /*1a40*/                   EXIT ;
+.L_x_131:
+        /*1a50*/                   BRA `(.L_x_131);
+        /*1a60*/                   NOP;
+        /*1a70*/                   NOP;
+        /*1a80*/                   NOP;
+        /*1a90*/                   NOP;
+        /*1aa0*/                   NOP;
+        /*1ab0*/                   NOP;
+        /*1ac0*/                   NOP;
+        /*1ad0*/                   NOP;
+        /*1ae0*/                   NOP;
+        /*1af0*/                   NOP;
+.L_x_140:
+
+
+//--------------------- .text._ZN22gemma4_flash_attention35gemma4_sliding_qkv_norm_rope_kernelEP13__nv_bfloat16S1_S1_PKS0_S3_S3_S3_S3_PKfS5_i --------------------------
+	.section	.text._ZN22gemma4_flash_attention35gemma4_sliding_qkv_norm_rope_kernelEP13__nv_bfloat16S1_S1_PKS0_S3_S3_S3_S3_PKfS5_i,"ax",@progbits

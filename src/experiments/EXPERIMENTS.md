@@ -11894,3 +11894,158 @@ Decision:
   an ablation path rather than the default.
 - Code was pruned to keep only `cp.async.cg.shared.global` for the cp.async
   ablation and remove the `.ca`/`.L2::128B` policy switch.
+
+## 2026-06-18 - Final sliding paged decode benchmark after pruning
+
+Question:
+
+- Benchmark the current `codex/flash-attn-cleanups` implementation after
+  pruning cp.async to the `.cg` ablation only.
+
+Commands:
+
+```bash
+make -B build/experiments/gemma4_kv_cache_bench \
+  build/libgemma4_flash_attention.so NVCC=/usr/local/cuda/bin/nvcc
+
+./build/experiments/gemma4_kv_cache_bench \
+  4096 64 64 50 200 30 --cache warm \
+  | tee src/experiments/results/2026-06-18_final_paged_decode_cpp_warm.txt
+
+./build/experiments/gemma4_kv_cache_bench \
+  4096 64 64 20 30 15 --cache cold --flush-bytes 67108864 \
+  | tee src/experiments/results/2026-06-18_final_paged_decode_cpp_cold.txt
+
+python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+  --seq-len 4096 --prefill-seq-len 64 --page-size 64 --split-size 64 \
+  --warmup 10 --iters 20 --samples 5 --cache warm --sample-delay-s 1.0 \
+  --output src/experiments/results/2026-06-18_final_paged_decode_torch_graph_warm.json
+
+python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+  --seq-len 4096 --prefill-seq-len 64 --page-size 64 --split-size 64 \
+  --warmup 10 --iters 10 --samples 5 --cache cold --flush-mib 128 \
+  --sample-delay-s 1.0 \
+  --output src/experiments/results/2026-06-18_final_paged_decode_torch_graph_cold.json
+```
+
+Contract:
+
+- Commit: `3c80283`, branch `codex/flash-attn-cleanups`.
+- Hardware: NVIDIA RTX A6000, bus `00000000:07:00.0`, driver `580.126.16`,
+  persistence enabled, ECC disabled, power limit `300 W`.
+- Clock policy: not locked. GPU was idle at start and after the run.
+- C++ timing: CUDA events on the benchmark stream. Warm cache batches 200
+  launches per sample for 30 samples. Cold cache flushes 64 MiB before each
+  measured iteration, 30 iterations per sample for 15 samples.
+- PyTorch timing: CUDA graphs with CUDA events on the current PyTorch stream,
+  one-second host delay before each measured sample, warm and cold separated.
+- Shape: sliding decode, `B=1`, `seq_len=4096`, sliding `key_count=1024`,
+  `page_size=64`, `split_size=64`, `num_splits=16`, BF16, `q_heads=32`,
+  `kv_heads=16`, `head_dim=256`. Prefill comparison uses `S=64`.
+
+C++ CUDA-event medians:
+
+```text
+path                                warm median    cold median
+baseline paged decode attention      0.128799 ms    0.129323 ms
+flash paged decode direct            0.087743 ms    0.090304 ms
+flash paged decode cp.async.cg       0.088860 ms    0.093365 ms
+baseline write + attention           0.131306 ms    0.131628 ms
+flash direct write + attention       0.090087 ms    0.092681 ms
+```
+
+PyTorch CUDA-graph medians:
+
+```text
+path                                warm median    cold median
+custom decode direct                 0.093152 ms    0.095197 ms
+custom decode cp.async.cg            0.095480 ms    0.098026 ms
+PyTorch decode graph                 0.673456 ms    0.675603 ms
+custom prefill tensor-core FA        0.008400 ms    0.015363 ms
+PyTorch SDPA prefill graph           0.019472 ms    0.021949 ms
+```
+
+Correctness:
+
+```text
+decode direct vs PyTorch max_abs:   0.000244140625
+decode cp.async vs PyTorch max_abs: 0.000244140625
+decode direct vs cp.async max_abs:  0
+prefill custom vs PyTorch max_abs:  0.001953125
+```
+
+Conclusion:
+
+- Direct sliding paged decode is the keeper. It is `1.47x` faster than the old
+  C++ paged baseline warm-cache and `1.43x` faster cold-cache.
+- The `.cg` cp.async ablation is slower than direct in both C++ event timing and
+  PyTorch graph timing, so it should stay as a measured ablation, not default.
+- Against PyTorch CUDA graphs at this decode shape, direct custom decode is
+  `7.23x` faster warm-cache and `7.10x` faster cold-cache.
+- Remaining threats: clocks were not locked, no process-level reruns, and cold
+  cache uses synthetic L2 flushes rather than an end-to-end serving trace.
+
+## 2026-06-18 - Sliding paged decode actual-split cleanup
+
+Goal: remove neutral scratch writes for overprovisioned sliding decode split
+CTAs, then make the reducer consume only the live per-row split count while
+preserving the `num_splits` scratch stride for graph-compatible max launches.
+
+Build and test:
+
+```bash
+make -B test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Timing commands:
+
+```bash
+./build/experiments/gemma4_kv_cache_bench 1024 64 64 5 10 3 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 64 5 10 3 --cache warm --extra-splits 16
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, SM 86, driver/runtime reported as `13000`.
+- Clock policy: not locked.
+- Timing: CUDA events on the benchmark stream, warm cache, `warmup=5`,
+  `iters_per_sample=10`, `samples=3`.
+- Shape: `B=1`, `seq_len=1024`, `page_size=64`, `split_size=64`,
+  sliding `key_count=1024`, BF16, `q_heads=32`, `kv_heads=16`,
+  `head_dim=256`.
+- Correctness: benchmark reported `max_abs=0` for baseline and direct flash
+  paths after the cp.async decode ablation was removed. `test-kv-cache` also
+  poisons partial scratch before the direct flash run, including exact split,
+  partial final split, overprovisioned split, `seq_len < split_size`, wrap, and
+  varlen batch cases.
+
+Warm-cache medians:
+
+```text
+case                         baseline paged    flash direct
+exact 16/16 splits              0.138067 ms      0.092544 ms
+overprovision 16/32 splits      0.139456 ms      0.095152 ms
+```
+
+Pre-change exact-split comparison from the same session:
+
+```text
+flash direct       0.096211 ms
+flash cp.async.cg  0.098582 ms
+```
+
+Conclusion:
+
+- Correctness is unchanged, and stale overprovisioned partial slots are no
+  longer required to contain neutral values.
+- The split kernel now uses separate CUB temp storage for the two GQA query-head
+  reductions, and the final reduce kernel uses separate temp storage for max and
+  sum reductions.
+- The stale decode cp.async ablation path was removed from the public ABI, tests,
+  C++ benchmark, and PyTorch CUDA-graph benchmark. Prefill FlashAttention still
+  uses its active CUTE cp.async path.
+- Exact-split timing is effectively unchanged, as expected.
+- Overprovisioned timing stays near exact-split timing for direct flash decode;
+  the remaining cost is mostly launching empty split CTAs that now return before
+  touching partial scratch.
