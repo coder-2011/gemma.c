@@ -10,7 +10,7 @@
 - Benchmark the RMSNorm kernels again after the current cleanup/recovery work.
   - Include hidden width `5376` plus Q/K widths `256` and `512`.
   - Confirm the hidden-width-only fused residual+RMSNorm path is skipped for non-hidden widths.
-  - Log commands, GPU/clocks, warmup/iteration counts, cache policy, and results in `src/experiments/EXPERIMENTS.md`.
+  - Keep benchmark harnesses and raw outputs under `src/benches/`, and log commands, GPU/clocks, warmup/iteration counts, cache policy, and results in `src/experiments/EXPERIMENTS.md`.
 - Fuse token embedding gather with the first matrix multiplication in the language path once the unfused baseline is correct.
   - Avoid materializing the initial `[M, 5376]` hidden buffer when the first projection can consume embedding rows directly.
   - Benchmark against the standalone embedding gather plus cuBLAS/cuBLASLt baseline before keeping the fusion.
@@ -22,8 +22,8 @@
 ## Remaining Unfused Inference Buildout
 
 Build the remaining model-path pieces in this rough order. Keep each kernel
-standalone, numerically tested, benchmarked, and logged in
-`src/experiments/EXPERIMENTS.md` before wiring it into the full path.
+standalone, numerically tested, benchmarked under `src/benches/`, and logged
+in `src/experiments/EXPERIMENTS.md` before wiring it into the full path.
 
 1. Q/K per-head RMSNorm
    - Sliding layers: learned-weight RMSNorm over head dim `256`.
@@ -46,6 +46,8 @@ standalone, numerically tested, benchmarked, and logged in
    - Head dim `512`.
    - GQA ratio: `32` Q heads / `4` KV heads = `8` Q heads per KV head.
    - Support prefill full causal attention and decode over the full KV cache.
+   - Later: add chunked/paged prefill for very long prompts, prefix-cache reuse,
+     and serving paths where contiguous prompt K/V is too limiting.
 
 5. Attention output packing
    - Sliding layers produce projection input width `8192`.

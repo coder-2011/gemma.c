@@ -2,7 +2,7 @@
 #include "gemma4_flash_attention.cuh"
 #include "gemma4.h"
 #include "gemma4_cuda_utils.cuh"
-#include "experiments/gemma4_bench_utils.cuh"
+#include "gemma4_bench_utils.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>

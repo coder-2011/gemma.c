@@ -13,6 +13,8 @@ CUDNN_FRONTEND_INCLUDE ?= /tmp/cudnn-frontend/include
 CUTLASS_INCLUDE ?= /tmp/cutlass/include
 
 BUILD_DIR := build
+BENCH_SRC_DIR := src/benches
+BENCH_BUILD_DIR := $(BUILD_DIR)/benches
 
 FLASH_ATTN_SRC_DIR ?= experiments/flash-attention/csrc/flash_attn/src
 FLASH_ATTN_CUTLASS_INCLUDE ?= experiments/flash-attention/csrc/cutlass/include
@@ -27,20 +29,20 @@ PYTHON_INCLUDE ?= /usr/include/python3.11
 all: $(BUILD_DIR)/gemma4.o
 
 cuda-kernels: $(BUILD_DIR)/gemma4_matmul_kernels.o $(BUILD_DIR)/gemma4_rmsnorm.o $(BUILD_DIR)/gemma4_rope.o $(BUILD_DIR)/gemma4_flash_attention.o $(BUILD_DIR)/gemma4_ffn_decode.o $(BUILD_DIR)/gemma4_kv_cache.o
-decode-bench: $(BUILD_DIR)/experiments/gemma4_decode_bench
-embedding-gather-bench: $(BUILD_DIR)/experiments/gemma4_embedding_gather_bench
-rmsnorm-bench: $(BUILD_DIR)/experiments/gemma4_rmsnorm_bench
-rmsnorm-hidden-fused-bench: $(BUILD_DIR)/experiments/gemma4_rmsnorm_hidden_fused_bench
-rope-bench: $(BUILD_DIR)/experiments/gemma4_rope_bench
-ffn-cudnn-bench: $(BUILD_DIR)/experiments/gemma4_ffn_cudnn_bench
-ffn-decode-load-bench: $(BUILD_DIR)/experiments/gemma4_ffn_decode_load_bench
-flash-attn-bench: $(BUILD_DIR)/experiments/gemma4_flash_attention_bench
-kv-cache-bench: $(BUILD_DIR)/experiments/gemma4_kv_cache_bench
+decode-bench: $(BENCH_BUILD_DIR)/gemma4_decode_bench
+embedding-gather-bench: $(BENCH_BUILD_DIR)/gemma4_embedding_gather_bench
+rmsnorm-bench: $(BENCH_BUILD_DIR)/gemma4_rmsnorm_bench
+rmsnorm-hidden-fused-bench: $(BENCH_BUILD_DIR)/gemma4_rmsnorm_hidden_fused_bench
+rope-bench: $(BENCH_BUILD_DIR)/gemma4_rope_bench
+ffn-cudnn-bench: $(BENCH_BUILD_DIR)/gemma4_ffn_cudnn_bench
+ffn-decode-load-bench: $(BENCH_BUILD_DIR)/gemma4_ffn_decode_load_bench
+flash-attn-bench: $(BENCH_BUILD_DIR)/gemma4_flash_attention_bench
+kv-cache-bench: $(BENCH_BUILD_DIR)/gemma4_kv_cache_bench
 flash-attn-lib: $(BUILD_DIR)/libgemma4_flash_attention.so
 flash-attn-reference-lib: $(BUILD_DIR)/libgemma4_flash_attention_reference.so
-tuna-prefill-bench: $(BUILD_DIR)/experiments/gemma4_tuna_prefill_bench
-sgemm-prefill-bench: $(BUILD_DIR)/experiments/gemma4_sgemm_prefill_bench
-sgemm-bf16-prefill-bench: $(BUILD_DIR)/experiments/gemma4_sgemm_bf16_prefill_bench
+tuna-prefill-bench: $(BENCH_BUILD_DIR)/gemma4_tuna_prefill_bench
+sgemm-prefill-bench: $(BENCH_BUILD_DIR)/gemma4_sgemm_prefill_bench
+sgemm-bf16-prefill-bench: $(BENCH_BUILD_DIR)/gemma4_sgemm_bf16_prefill_bench
 test-cuda-utils: $(BUILD_DIR)/tests/cuda_utils/test_cuda_utils
 	./$<
 test-embedding-gather: $(BUILD_DIR)/tests/test_embedding_gather
@@ -83,11 +85,11 @@ $(BUILD_DIR)/gemma4_kv_cache.o: src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh s
 $(BUILD_DIR)/libgemma4_flash_attention.so: src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) -Xcompiler -fPIC -shared $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) src/gemma4_flash_attention.cu src/gemma4_kv_cache.cu src/gemma4.cpp -o $@
 
-$(BUILD_DIR)/libgemma4_flash_attention_reference.so: src/experiments/gemma4_flash_attention_reference.cu src/gemma4.h $(FLASH_ATTN_SRC_DIR)/flash_fwd_hdim256_bf16_sm80.cu | $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) -Xcompiler -fPIC -shared $(CPPFLAGS) -Isrc/third_party_stubs -I$(FLASH_ATTN_SRC_DIR) -I$(FLASH_ATTN_CUTLASS_INCLUDE) -I$(TORCH_INCLUDE) -I$(TORCH_API_INCLUDE) -I$(PYTHON_INCLUDE) src/experiments/gemma4_flash_attention_reference.cu $(FLASH_ATTN_SRC_DIR)/flash_fwd_hdim256_bf16_sm80.cu -L$(TORCH_LIB) -Xlinker -rpath -Xlinker $(abspath $(TORCH_LIB)) -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -o $@
+$(BUILD_DIR)/libgemma4_flash_attention_reference.so: $(BENCH_SRC_DIR)/gemma4_flash_attention_reference.cu src/gemma4.h $(FLASH_ATTN_SRC_DIR)/flash_fwd_hdim256_bf16_sm80.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) -Xcompiler -fPIC -shared $(CPPFLAGS) -Isrc/third_party_stubs -I$(FLASH_ATTN_SRC_DIR) -I$(FLASH_ATTN_CUTLASS_INCLUDE) -I$(TORCH_INCLUDE) -I$(TORCH_API_INCLUDE) -I$(PYTHON_INCLUDE) $(BENCH_SRC_DIR)/gemma4_flash_attention_reference.cu $(FLASH_ATTN_SRC_DIR)/flash_fwd_hdim256_bf16_sm80.cu -L$(TORCH_LIB) -Xlinker -rpath -Xlinker $(abspath $(TORCH_LIB)) -lc10 -lc10_cuda -ltorch_cpu -ltorch_cuda -o $@
 
-$(BUILD_DIR)/experiments:
-	mkdir -p $(BUILD_DIR)/experiments
+$(BENCH_BUILD_DIR):
+	mkdir -p $(BENCH_BUILD_DIR)
 
 $(BUILD_DIR)/tests:
 	mkdir -p $(BUILD_DIR)/tests
@@ -95,40 +97,40 @@ $(BUILD_DIR)/tests:
 $(BUILD_DIR)/tests/cuda_utils:
 	mkdir -p $(BUILD_DIR)/tests/cuda_utils
 
-$(BUILD_DIR)/experiments/gemma4_decode_bench: src/experiments/gemma4_decode_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_matmul_device.cuh src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu $(CUDA_LDFLAGS) -lcublas $(CUDNN_LDFLAGS) -o $@
+$(BENCH_BUILD_DIR)/gemma4_decode_bench: $(BENCH_SRC_DIR)/gemma4_decode_bench.cu $(BENCH_SRC_DIR)/gemma4_bench_utils.cuh src/gemma4_matmul_device.cuh src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BENCH_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) $(BENCH_SRC_DIR)/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu $(CUDA_LDFLAGS) -lcublas $(CUDNN_LDFLAGS) -o $@
 
-$(BUILD_DIR)/experiments/gemma4_embedding_gather_bench: src/experiments/gemma4_embedding_gather_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_embedding_gather.cu src/gemma4_embedding_gather.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/experiments/gemma4_embedding_gather_bench.cu src/gemma4_embedding_gather.cu -o $@
+$(BENCH_BUILD_DIR)/gemma4_embedding_gather_bench: $(BENCH_SRC_DIR)/gemma4_embedding_gather_bench.cu $(BENCH_SRC_DIR)/gemma4_bench_utils.cuh src/gemma4_embedding_gather.cu src/gemma4_embedding_gather.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BENCH_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) $(BENCH_SRC_DIR)/gemma4_embedding_gather_bench.cu src/gemma4_embedding_gather.cu -o $@
 
-$(BUILD_DIR)/experiments/gemma4_rmsnorm_bench: src/experiments/gemma4_rmsnorm_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) -I$(CUDNN_FRONTEND_INCLUDE) src/experiments/gemma4_rmsnorm_bench.cu src/gemma4_rmsnorm.cu $(CUDA_LDFLAGS) $(CUDNN_LDFLAGS) -lnvrtc -lcuda -o $@
+$(BENCH_BUILD_DIR)/gemma4_rmsnorm_bench: $(BENCH_SRC_DIR)/gemma4_rmsnorm_bench.cu $(BENCH_SRC_DIR)/gemma4_bench_utils.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BENCH_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) -I$(CUDNN_FRONTEND_INCLUDE) $(BENCH_SRC_DIR)/gemma4_rmsnorm_bench.cu src/gemma4_rmsnorm.cu $(CUDA_LDFLAGS) $(CUDNN_LDFLAGS) -lnvrtc -lcuda -o $@
 
-$(BUILD_DIR)/experiments/gemma4_rmsnorm_hidden_fused_bench: src/experiments/gemma4_rmsnorm_hidden_fused_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/experiments/gemma4_rmsnorm_hidden_fused_bench.cu src/gemma4_rmsnorm.cu -o $@
+$(BENCH_BUILD_DIR)/gemma4_rmsnorm_hidden_fused_bench: $(BENCH_SRC_DIR)/gemma4_rmsnorm_hidden_fused_bench.cu $(BENCH_SRC_DIR)/gemma4_bench_utils.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BENCH_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) $(BENCH_SRC_DIR)/gemma4_rmsnorm_hidden_fused_bench.cu src/gemma4_rmsnorm.cu -o $@
 
-$(BUILD_DIR)/experiments/gemma4_rope_bench: src/experiments/gemma4_rope_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_rope.cu src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) src/experiments/gemma4_rope_bench.cu src/gemma4_rope.cu $(CUDA_LDFLAGS) $(CUDNN_LDFLAGS) -o $@
+$(BENCH_BUILD_DIR)/gemma4_rope_bench: $(BENCH_SRC_DIR)/gemma4_rope_bench.cu $(BENCH_SRC_DIR)/gemma4_bench_utils.cuh src/gemma4_rope.cu src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BENCH_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) $(BENCH_SRC_DIR)/gemma4_rope_bench.cu src/gemma4_rope.cu $(CUDA_LDFLAGS) $(CUDNN_LDFLAGS) -o $@
 
-$(BUILD_DIR)/experiments/gemma4_ffn_cudnn_bench: src/experiments/gemma4_ffn_cudnn_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_ffn_decode.cu src/gemma4_ffn_decode.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) -I$(CUDNN_FRONTEND_INCLUDE) src/experiments/gemma4_ffn_cudnn_bench.cu src/gemma4_ffn_decode.cu $(CUDA_LDFLAGS) $(CUDNN_LDFLAGS) -lnvrtc -lcuda -o $@
+$(BENCH_BUILD_DIR)/gemma4_ffn_cudnn_bench: $(BENCH_SRC_DIR)/gemma4_ffn_cudnn_bench.cu $(BENCH_SRC_DIR)/gemma4_bench_utils.cuh src/gemma4_ffn_decode.cu src/gemma4_ffn_decode.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BENCH_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) -I$(CUDNN_FRONTEND_INCLUDE) $(BENCH_SRC_DIR)/gemma4_ffn_cudnn_bench.cu src/gemma4_ffn_decode.cu $(CUDA_LDFLAGS) $(CUDNN_LDFLAGS) -lnvrtc -lcuda -o $@
 
-$(BUILD_DIR)/experiments/gemma4_ffn_decode_load_bench: src/experiments/gemma4_ffn_decode_load_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_ffn_decode.cu src/gemma4_ffn_decode.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/experiments/gemma4_ffn_decode_load_bench.cu src/gemma4_ffn_decode.cu -o $@
+$(BENCH_BUILD_DIR)/gemma4_ffn_decode_load_bench: $(BENCH_SRC_DIR)/gemma4_ffn_decode_load_bench.cu $(BENCH_SRC_DIR)/gemma4_bench_utils.cuh src/gemma4_ffn_decode.cu src/gemma4_ffn_decode.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BENCH_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) $(BENCH_SRC_DIR)/gemma4_ffn_decode_load_bench.cu src/gemma4_ffn_decode.cu -o $@
 
-$(BUILD_DIR)/experiments/gemma4_flash_attention_bench: src/experiments/gemma4_flash_attention_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) src/experiments/gemma4_flash_attention_bench.cu src/gemma4_flash_attention.cu -o $@
+$(BENCH_BUILD_DIR)/gemma4_flash_attention_bench: $(BENCH_SRC_DIR)/gemma4_flash_attention_bench.cu $(BENCH_SRC_DIR)/gemma4_bench_utils.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BENCH_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) $(BENCH_SRC_DIR)/gemma4_flash_attention_bench.cu src/gemma4_flash_attention.cu -o $@
 
-$(BUILD_DIR)/experiments/gemma4_kv_cache_bench: src/experiments/gemma4_kv_cache_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/experiments
-	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) src/experiments/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4.cpp -o $@
+$(BENCH_BUILD_DIR)/gemma4_kv_cache_bench: $(BENCH_SRC_DIR)/gemma4_kv_cache_bench.cu $(BENCH_SRC_DIR)/gemma4_bench_utils.cuh src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BENCH_BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) $(BENCH_SRC_DIR)/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4.cpp -o $@
 
-$(BUILD_DIR)/experiments/gemma4_tuna_prefill_bench: experiments/tuna/gemma4_prefill_bench.cu src/gemma4.h | $(BUILD_DIR)/experiments
+$(BENCH_BUILD_DIR)/gemma4_tuna_prefill_bench: experiments/tuna/gemma4_prefill_bench.cu src/gemma4.h | $(BENCH_BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) experiments/tuna/gemma4_prefill_bench.cu $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
 
-$(BUILD_DIR)/experiments/gemma4_sgemm_prefill_bench: experiments/sgemm.cu/gemma4_prefill_bench.cu experiments/sgemm.cu/src/sgemm.cuh src/gemma4.h | $(BUILD_DIR)/experiments
+$(BENCH_BUILD_DIR)/gemma4_sgemm_prefill_bench: experiments/sgemm.cu/gemma4_prefill_bench.cu experiments/sgemm.cu/src/sgemm.cuh src/gemma4.h | $(BENCH_BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -Iexperiments/sgemm.cu/src -Iexperiments/sgemm.cu/common -DGPUCC=86 experiments/sgemm.cu/gemma4_prefill_bench.cu $(CUDA_LDFLAGS) -lcublas -o $@
 
-$(BUILD_DIR)/experiments/gemma4_sgemm_bf16_prefill_bench: experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu src/gemma4.h | $(BUILD_DIR)/experiments
+$(BENCH_BUILD_DIR)/gemma4_sgemm_bf16_prefill_bench: experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu src/gemma4.h | $(BENCH_BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUTLASS_INCLUDE) experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu $(CUDA_LDFLAGS) -lcublas -lcublasLt -o $@
 
 $(BUILD_DIR)/tests/test_embedding_gather: tests/test_embedding_gather.cu src/gemma4_embedding_gather.cu src/gemma4_embedding_gather.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests

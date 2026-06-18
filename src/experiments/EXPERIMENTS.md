@@ -3,6 +3,121 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-18 - Global prefill cold PyTorch comparison, 100 samples
+
+Question:
+
+- Benchmark the new global prefill path against a simple PyTorch implementation.
+- Use cold-cache timing with an L2 flush and a delay between measured path
+  invocations.
+
+Command:
+
+```bash
+python3 -m py_compile src/benches/gemma4_global_prefill_torch_bench.py
+python3 src/benches/gemma4_global_prefill_torch_bench.py \
+  --seq-len 1024 --batch-size 1 --samples 100 --warmup 8 \
+  --delay-s 0.1 --flush-mib 256 \
+  --output src/benches/results/2026-06-18_global_prefill_torch_cold_100.json
+```
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, PyTorch `2.11.0+cu130`,
+  CUDA runtime `13.0`.
+- Shape: global prefill, BF16, `batch=1`, `seq_len=1024`, `q_heads=32`,
+  `kv_heads=4`, `head_dim=512`, `rotary_dim=128`.
+- Timing: CUDA events on PyTorch's current stream for both custom and PyTorch
+  paths. Host enqueue overhead excluded; GPU timeline includes all kernels in
+  each measured path.
+- Cache policy: cold. Flushes a 256 MiB device buffer before every measured path
+  invocation, synchronizes, then sleeps `0.1s` before timing.
+- Trial order alternates forward/reverse across 100 samples to reduce drift
+  bias. GPU clocks were not locked.
+
+Correctness:
+
+```text
+fused custom vs direct custom max_abs: 0
+direct custom vs PyTorch max_abs:      0.00390625
+fused custom vs PyTorch max_abs:       0.00390625
+```
+
+Results:
+
+| path | median ms | mean ms | min ms | p95 ms | max ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| direct custom global prefill | 1.953696 | 2.102998 | 1.913984 | 3.126778 | 4.577216 |
+| direct PyTorch SDPA | 1.340016 | 1.469559 | 1.310944 | 1.986219 | 3.747328 |
+| fused custom norm/p-RoPE + prefill | 2.075104 | 2.141897 | 2.040544 | 2.166349 | 4.742816 |
+| fused PyTorch norm/p-RoPE + SDPA | 3.673296 | 3.864781 | 3.210496 | 5.274776 | 6.564480 |
+
+Conclusion:
+
+- Direct attention is not tuned: PyTorch SDPA is faster by median
+  `1.953696 / 1.340016 = 1.46x`.
+- The fused custom path is useful despite the direct-attention deficit:
+  the simple PyTorch norm/p-RoPE+SDPA implementation is `1.77x` slower by
+  median.
+- Next tuning target is the direct global FA body/resource usage, not the prep
+  fusion. Compare our simplified global body against upstream FA2's direct
+  global kernel and inspect register count/SASS before changing tile shape.
+
+## 2026-06-18 - Global prefill FlashAttention bring-up
+
+Question:
+
+- Add global-layer prefill without cloning the current FlashAttention kernel.
+- Use the upstream FA2 forward kernel as shape/loop inspiration, especially the
+  `head_dim=512`, `block_m=32`, `block_n=32`, `warps=2` global trait.
+
+Change:
+
+- Added a global prefill trait to the existing Gemma FA kernel/launcher.
+- Generalized the existing prefill Q/K/V norm-RoPE prep kernel so sliding and
+  global differ by compile-time constants instead of separate implementations.
+- Global prefill derives V from raw K and applies scale-free RMSNorm, matching
+  Gemma 4's shared K/V projection semantics.
+
+Build and correctness:
+
+```bash
+make -B test-flash-decode flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
+make test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+git diff --check -- src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh \
+  tests/test_decode_common.cuh tests/test_flash_decode.cu
+```
+
+Smoke timing:
+
+- Hardware: NVIDIA RTX A6000, clocks not locked.
+- Custom path timed with CUDA events after warmup; PyTorch path timed with
+  `torch.utils.benchmark.Timer` and an explicit `torch.cuda.synchronize()`.
+- Shape: global prefill direct attention, `batch=1`, BF16, `q_heads=32`,
+  `kv_heads=4`, `head_dim=512`, causal full attention.
+
+```text
+seq=256:
+  correctness max_abs=0.0001220703125
+  custom CUDA-event median=0.190608 ms
+  PyTorch SDPA Timer median=0.154858 ms
+
+seq=1024:
+  correctness max_abs=0.00006103515625
+  custom CUDA-event median=1.934672 ms
+  PyTorch SDPA Timer median=0.177667 ms
+```
+
+Conclusion:
+
+- Keep the correctness/API changes: global prefill now uses the current FA
+  kernel path and is covered by tests.
+- Do not call global prefill tuned yet. The 1024-token smoke is much slower
+  than PyTorch SDPA, so the next performance pass should compare directly
+  against the upstream FA2 global body and inspect resource/SASS differences
+  before making speed claims. A reference-lib build was started for this A/B
+  but interrupted after a long compile; rerun it separately if needed.
+
 ## 2026-06-18 - FlashAttention cache-hint review and decode metadata loads
 
 Question:
@@ -47,23 +162,23 @@ Benchmark contract:
 Commands:
 
 ```bash
-./build/experiments/gemma4_flash_attention_bench 4096 200 50 10 1 64 warm 64 \
-  | tee src/experiments/results/2026-06-18_cache_hints_baseline_flash_warm.txt
-./build/experiments/gemma4_kv_cache_bench 4096 64 64 50 200 20 --cache warm \
-  | tee src/experiments/results/2026-06-18_cache_hints_baseline_kv_warm.txt
-./build/experiments/gemma4_flash_attention_bench 4096 30 20 6 1 64 cold 64 \
-  | tee src/experiments/results/2026-06-18_cache_hints_baseline_flash_cold.txt
-./build/experiments/gemma4_kv_cache_bench 4096 64 64 20 30 10 --cache cold --flush-bytes 67108864 \
-  | tee src/experiments/results/2026-06-18_cache_hints_baseline_kv_cold.txt
+./build/benches/gemma4_flash_attention_bench 4096 200 50 10 1 64 warm 64 \
+  | tee src/benches/results/2026-06-18_cache_hints_baseline_flash_warm.txt
+./build/benches/gemma4_kv_cache_bench 4096 64 64 50 200 20 --cache warm \
+  | tee src/benches/results/2026-06-18_cache_hints_baseline_kv_warm.txt
+./build/benches/gemma4_flash_attention_bench 4096 30 20 6 1 64 cold 64 \
+  | tee src/benches/results/2026-06-18_cache_hints_baseline_flash_cold.txt
+./build/benches/gemma4_kv_cache_bench 4096 64 64 20 30 10 --cache cold --flush-bytes 67108864 \
+  | tee src/benches/results/2026-06-18_cache_hints_baseline_kv_cold.txt
 
-./build/experiments/gemma4_flash_attention_bench 4096 200 50 10 1 64 warm 64 \
-  | tee src/experiments/results/2026-06-18_cache_hints_after_flash_warm.txt
-./build/experiments/gemma4_kv_cache_bench 4096 64 64 50 200 20 --cache warm \
-  | tee src/experiments/results/2026-06-18_cache_hints_after_kv_warm.txt
-./build/experiments/gemma4_flash_attention_bench 4096 30 20 6 1 64 cold 64 \
-  | tee src/experiments/results/2026-06-18_cache_hints_after_flash_cold.txt
-./build/experiments/gemma4_kv_cache_bench 4096 64 64 20 30 10 --cache cold --flush-bytes 67108864 \
-  | tee src/experiments/results/2026-06-18_cache_hints_after_kv_cold.txt
+./build/benches/gemma4_flash_attention_bench 4096 200 50 10 1 64 warm 64 \
+  | tee src/benches/results/2026-06-18_cache_hints_after_flash_warm.txt
+./build/benches/gemma4_kv_cache_bench 4096 64 64 50 200 20 --cache warm \
+  | tee src/benches/results/2026-06-18_cache_hints_after_kv_warm.txt
+./build/benches/gemma4_flash_attention_bench 4096 30 20 6 1 64 cold 64 \
+  | tee src/benches/results/2026-06-18_cache_hints_after_flash_cold.txt
+./build/benches/gemma4_kv_cache_bench 4096 64 64 20 30 10 --cache cold --flush-bytes 67108864 \
+  | tee src/benches/results/2026-06-18_cache_hints_after_kv_cold.txt
 ```
 
 Median results:
@@ -119,25 +234,25 @@ make -B test-kv-cache flash-attn-bench kv-cache-bench \
   --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
   -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_DECODE_CACHE_LOAD_POLICY=1 \
   -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
-  src/experiments/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu \
+  src/benches/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu \
   src/gemma4_flash_attention.cu src/gemma4.cpp \
-  -o build/experiments/gemma4_kv_cache_bench_decode_cg
+  -o build/benches/gemma4_kv_cache_bench_decode_cg
 
 /usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
   --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
   -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_DECODE_CACHE_LOAD_POLICY=2 \
   -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
-  src/experiments/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu \
+  src/benches/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu \
   src/gemma4_flash_attention.cu src/gemma4.cpp \
-  -o build/experiments/gemma4_kv_cache_bench_decode_cs
+  -o build/benches/gemma4_kv_cache_bench_decode_cs
 
 /usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
   --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
   -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_PREFILL_CP_ASYNC_CACHE_POLICY=1 \
   -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
-  src/experiments/gemma4_flash_attention_bench.cu \
+  src/benches/gemma4_flash_attention_bench.cu \
   src/gemma4_flash_attention.cu \
-  -o build/experiments/gemma4_flash_attention_bench_cpasync_ca
+  -o build/benches/gemma4_flash_attention_bench_cpasync_ca
 ```
 
 Benchmark contract:
@@ -180,7 +295,7 @@ Conclusion:
 
 Runtime file:
 
-- `src/experiments/gemma4_flash_attention_bench.cu`
+- `src/benches/gemma4_flash_attention_bench.cu`
 
 Change:
 
@@ -198,8 +313,8 @@ Verification:
 
 ```bash
 make flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
-./build/experiments/gemma4_flash_attention_bench 256 20 10 5 1 64 cold 64
-./build/experiments/gemma4_flash_attention_bench 1024 50 20 10 1 0 cold 64
+./build/benches/gemma4_flash_attention_bench 256 20 10 5 1 64 cold 64
+./build/benches/gemma4_flash_attention_bench 1024 50 20 10 1 0 cold 64
 ```
 
 Result:
@@ -271,9 +386,9 @@ Build commands:
   --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
   -D_GLIBCXX_USE_CXX11_ABI=1 -Xptxas=-v \
   -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
-  src/experiments/gemma4_flash_attention_bench.cu \
+  src/benches/gemma4_flash_attention_bench.cu \
   src/gemma4_flash_attention.cu \
-  -o build/experiments/gemma4_flash_attention_bench_softmax_<tag>
+  -o build/benches/gemma4_flash_attention_bench_softmax_<tag>
 
 make flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
 ```
@@ -338,8 +453,8 @@ Conclusion:
 Scope:
 
 - `src/gemma4_flash_attention.cu`
-- `src/experiments/gemma4_flash_attention_compare.py`
-- `src/experiments/gemma4_flash_attention_reference.cu`
+- `src/benches/gemma4_flash_attention_compare.py`
+- `src/benches/gemma4_flash_attention_reference.cu`
 - `experiments/flash-attention/`
 - stale experiment checkouts under `experiments/` and `src/experiments/`
 
@@ -361,7 +476,7 @@ Verification:
 
 ```bash
 make -B flash-attn-bench flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
-./build/experiments/gemma4_flash_attention_bench 256 10 3 1 1 64 warm 64
+./build/benches/gemma4_flash_attention_bench 256 10 3 1 1 64 warm 64
 ```
 
 Result:
@@ -389,7 +504,7 @@ Runtime files:
 
 - `src/gemma4_flash_attention.cu`
 - `src/gemma4_flash_attention.cuh`
-- `src/experiments/gemma4_flash_attention_bench.cu`
+- `src/benches/gemma4_flash_attention_bench.cu`
 
 Change:
 
@@ -416,8 +531,8 @@ Verification:
 ```bash
 make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
 make -B flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
-./build/experiments/gemma4_flash_attention_bench 256 10 3 1 1 64 warm 64
-./build/experiments/gemma4_flash_attention_bench 1024 50 20 5 1 64 warm 64
+./build/benches/gemma4_flash_attention_bench 256 10 3 1 1 64 warm 64
+./build/benches/gemma4_flash_attention_bench 1024 50 20 5 1 64 warm 64
 ```
 
 Smoke results:
@@ -446,8 +561,8 @@ Conclusion:
 Runtime files:
 
 - `Makefile`
-- `src/experiments/gemma4_decode_bench.cu`
-- `src/experiments/gemma4_ffn_cudnn_bench.cu`
+- `src/benches/gemma4_decode_bench.cu`
+- `src/benches/gemma4_ffn_cudnn_bench.cu`
 
 Change:
 
@@ -468,7 +583,7 @@ Verification:
 
 ```bash
 make -B decode-bench NVCC=/usr/local/cuda/bin/nvcc
-./build/experiments/gemma4_decode_bench global_k 1 0 1
+./build/benches/gemma4_decode_bench global_k 1 0 1
 
 make -B embedding-gather-bench rmsnorm-hidden-fused-bench rope-bench \
   ffn-decode-load-bench flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
@@ -485,7 +600,7 @@ Runtime files:
 
 - `src/gemma4_flash_attention.cu`
 - `src/gemma4_flash_attention.cuh`
-- `src/experiments/gemma4_flash_attention_bench.cu`
+- `src/benches/gemma4_flash_attention_bench.cu`
 
 Change:
 
@@ -524,7 +639,7 @@ GPU/tooling:
 Correctness smoke:
 
 ```bash
-./build/experiments/gemma4_flash_attention_bench 1024 100 20 3 1 64
+./build/benches/gemma4_flash_attention_bench 1024 100 20 3 1 64
 ```
 
 ```text
@@ -625,7 +740,7 @@ Validation:
 
 ```bash
 make -B test-rope flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
-./build/experiments/gemma4_flash_attention_bench 1024 200 30 5 1 64
+./build/benches/gemma4_flash_attention_bench 1024 200 30 5 1 64
 ```
 
 Result:
@@ -686,8 +801,8 @@ Conclusion:
 Runtime files:
 
 - `src/gemma4_flash_attention.cu`
-- `src/experiments/gemma4_flash_attention_bench.cu`
-- `src/experiments/results/2026-06-16_fa_rope_helper_*.txt`
+- `src/benches/gemma4_flash_attention_bench.cu`
+- `src/benches/results/2026-06-16_fa_rope_helper_*.txt`
 
 Change:
 
@@ -708,17 +823,17 @@ Build commands:
   --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
   -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_USE_SHARED_ROPE_HELPER=1 \
   -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
-  src/experiments/gemma4_flash_attention_bench.cu \
+  src/benches/gemma4_flash_attention_bench.cu \
   src/gemma4_flash_attention.cu \
-  -o build/experiments/gemma4_flash_attention_bench_shared
+  -o build/benches/gemma4_flash_attention_bench_shared
 
 /usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
   --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
   -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_USE_SHARED_ROPE_HELPER=0 \
   -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
-  src/experiments/gemma4_flash_attention_bench.cu \
+  src/benches/gemma4_flash_attention_bench.cu \
   src/gemma4_flash_attention.cu \
-  -o build/experiments/gemma4_flash_attention_bench_inline
+  -o build/benches/gemma4_flash_attention_bench_inline
 ```
 
 Correctness:
@@ -754,24 +869,24 @@ Benchmark contract:
 - Contention check: `nvidia-smi --query-compute-apps=...` showed no compute
   apps after the run; `nvidia-smi pmon` is unsupported here.
 - Telemetry: one-second `nvidia-smi` sampling saved to
-  `src/experiments/results/2026-06-16_fa_rope_helper_telemetry.txt`. The runs
+  `src/benches/results/2026-06-16_fa_rope_helper_telemetry.txt`. The runs
   are short enough that most samples caught idle clocks; one loaded sample saw
   about `1800 MHz` SM and `7601 MHz` memory.
 
 Persisted raw outputs:
 
 ```text
-src/experiments/results/2026-06-16_fa_rope_helper_shared_warm_1024_rep1.txt
-src/experiments/results/2026-06-16_fa_rope_helper_inline_warm_1024_rep1.txt
-src/experiments/results/2026-06-16_fa_rope_helper_inline_warm_1024_rep2.txt
-src/experiments/results/2026-06-16_fa_rope_helper_shared_warm_1024_rep2.txt
-src/experiments/results/2026-06-16_fa_rope_helper_shared_warm_4096.txt
-src/experiments/results/2026-06-16_fa_rope_helper_inline_warm_4096.txt
-src/experiments/results/2026-06-16_fa_rope_helper_shared_cold_1024.txt
-src/experiments/results/2026-06-16_fa_rope_helper_inline_cold_1024.txt
-src/experiments/results/2026-06-16_fa_rope_helper_inline_cold_1024_rep2.txt
-src/experiments/results/2026-06-16_fa_rope_helper_shared_cold_1024_rep2.txt
-src/experiments/results/2026-06-16_fa_rope_helper_telemetry.txt
+src/benches/results/2026-06-16_fa_rope_helper_shared_warm_1024_rep1.txt
+src/benches/results/2026-06-16_fa_rope_helper_inline_warm_1024_rep1.txt
+src/benches/results/2026-06-16_fa_rope_helper_inline_warm_1024_rep2.txt
+src/benches/results/2026-06-16_fa_rope_helper_shared_warm_1024_rep2.txt
+src/benches/results/2026-06-16_fa_rope_helper_shared_warm_4096.txt
+src/benches/results/2026-06-16_fa_rope_helper_inline_warm_4096.txt
+src/benches/results/2026-06-16_fa_rope_helper_shared_cold_1024.txt
+src/benches/results/2026-06-16_fa_rope_helper_inline_cold_1024.txt
+src/benches/results/2026-06-16_fa_rope_helper_inline_cold_1024_rep2.txt
+src/benches/results/2026-06-16_fa_rope_helper_shared_cold_1024_rep2.txt
+src/benches/results/2026-06-16_fa_rope_helper_telemetry.txt
 ```
 
 Warm cache, `seq=1024`, `warmup=50`, `iters=100`, `samples=31` per process,
@@ -821,7 +936,7 @@ Runtime files:
 
 - `src/gemma4_flash_attention.cu`
 - `src/gemma4_flash_attention.cuh`
-- `src/experiments/gemma4_flash_attention_bench.cu`
+- `src/benches/gemma4_flash_attention_bench.cu`
 - `Makefile`
 
 Change:
@@ -942,7 +1057,7 @@ Runtime files:
 - `src/gemma4_matmul_device.cuh`
 - `src/experiments/gemma4_matmul_device_kernels.cu`
 - `src/experiments/gemma4_matmul_device_kernels.cuh`
-- `src/experiments/gemma4_decode_bench.cu`
+- `src/benches/gemma4_decode_bench.cu`
 - `src/gemma4_ffn_decode.cu`
 - `Makefile`
 
@@ -972,9 +1087,9 @@ Device-wrapper matmul timing:
 
 ```bash
 GEMMA4_DECODE_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_decode_bench ffn_gate_up 100 20 3
+  build/benches/gemma4_decode_bench ffn_gate_up 100 20 3
 GEMMA4_DECODE_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_decode_bench ffn_down 100 20 3
+  build/benches/gemma4_decode_bench ffn_down 100 20 3
 ```
 
 GPU/tooling:
@@ -1029,7 +1144,7 @@ FFN decode after integration:
 
 ```bash
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 100 20 3
+  build/benches/gemma4_ffn_cudnn_bench 100 20 3
 ```
 
 Baseline captured before the FFN edit:
@@ -1082,7 +1197,7 @@ Runtime files:
 
 - `src/gemma4_ffn_decode.cu`
 - `tests/test_ffn_decode.cu`
-- `src/experiments/gemma4_ffn_cudnn_bench.cu`
+- `src/benches/gemma4_ffn_cudnn_bench.cu`
 
 Change:
 
@@ -1308,7 +1423,7 @@ Runtime files:
 - `src/gemma4_cuda_utils.cuh`
 - `src/gemma4_ffn_decode.cuh`
 - `src/gemma4_ffn_decode.cu`
-- `src/experiments/gemma4_ffn_cache_policy_bench.cu`
+- `src/benches/gemma4_ffn_cache_policy_bench.cu`
 - `Makefile`
 
 Policy IDs:
@@ -1347,7 +1462,7 @@ for gu in 0 1 2 3 4 5 6; do
       -DGEMMA4_FFN_GATE_LOAD_POLICY=${gu} \
       -DGEMMA4_FFN_UP_LOAD_POLICY=${gu} \
       -DGEMMA4_FFN_DOWN_LOAD_POLICY=${down} \
-      src/experiments/gemma4_ffn_cache_policy_bench.cu \
+      src/benches/gemma4_ffn_cache_policy_bench.cu \
       src/gemma4_ffn_decode.cu -o /tmp/gemma4_ffn_cache_gu${gu}_down${down}
     /tmp/gemma4_ffn_cache_gu${gu}_down${down} 30 5 1
   done
@@ -1410,7 +1525,7 @@ Runtime files:
 - `src/gemma4_ffn_decode.cu`
 - `src/gemma4_ffn_decode.cuh`
 - `tests/test_ffn_decode.cu`
-- `src/experiments/gemma4_ffn_cudnn_bench.cu`
+- `src/benches/gemma4_ffn_cudnn_bench.cu`
 
 Change:
 
@@ -1443,7 +1558,7 @@ rg -n "ld\\.global|st\\.global|\\.v4\\.u32" \
   build/ptx/gemma4_ffn_decode_vectorized.ptx
 cuobjdump --dump-sass build/ptx/gemma4_ffn_decode_vectorized.o | rg -n "LDG|STG"
 
-./build/experiments/gemma4_ffn_cudnn_bench 20 5 2 1
+./build/benches/gemma4_ffn_cudnn_bench 20 5 2 1
 ```
 
 PTX/compiler result:
@@ -1501,7 +1616,7 @@ Conclusion:
 
 Runtime files:
 
-- `src/experiments/gemma4_ffn_cudnn_bench.cu`
+- `src/benches/gemma4_ffn_cudnn_bench.cu`
 - `Makefile`
 
 Change:
@@ -1524,7 +1639,7 @@ Command:
 
 ```bash
 make ffn-cudnn-bench
-./build/experiments/gemma4_ffn_cudnn_bench 100 10 3 1
+./build/benches/gemma4_ffn_cudnn_bench 100 10 3 1
 ```
 
 Environment:
@@ -1583,7 +1698,7 @@ Conclusion:
 Runtime files:
 
 - `src/gemma4_matmul_kernels.cu`
-- `src/experiments/gemma4_decode_bench.cu`
+- `src/benches/gemma4_decode_bench.cu`
 
 Change:
 
@@ -1610,22 +1725,22 @@ Commands:
 ```bash
 make decode-bench
 GEMMA4_DECODE_BENCH_SEED=0x1234 \
-  ./build/experiments/gemma4_decode_bench ffn_down 80 20 3
+  ./build/benches/gemma4_decode_bench ffn_down 80 20 3
 
 nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_GEMV_BUFFER_STAGES=2 \
-  -Isrc src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu \
+  -Isrc src/benches/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu \
   -lcublas -lcudnn -o /tmp/gemma4_stage2/gemma4_decode_bench
 GEMMA4_DECODE_BENCH_SEED=0x1234 \
   /tmp/gemma4_stage2/gemma4_decode_bench ffn_down 80 20 3
 
 nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_GEMV_BUFFER_STAGES=3 \
-  -Isrc src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu \
+  -Isrc src/benches/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu \
   -lcublas -lcudnn -o /tmp/gemma4_stage3/gemma4_decode_bench
 GEMMA4_DECODE_BENCH_SEED=0x1234 \
   /tmp/gemma4_stage3/gemma4_decode_bench ffn_down 80 20 3
 
 nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_GEMV_BUFFER_STAGES=4 \
-  -Isrc src/experiments/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu \
+  -Isrc src/benches/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu \
   -lcublas -lcudnn -o /tmp/gemma4_stage4/gemma4_decode_bench
 GEMMA4_DECODE_BENCH_SEED=0x1234 \
   /tmp/gemma4_stage4/gemma4_decode_bench ffn_down 80 20 3
@@ -1677,7 +1792,7 @@ Conclusion:
 Runtime files:
 
 - `src/gemma4_matmul_kernels.cu`
-- `src/experiments/gemma4_decode_bench.cu`
+- `src/benches/gemma4_decode_bench.cu`
 
 Change:
 
@@ -1700,7 +1815,7 @@ Command:
 ```bash
 make decode-bench
 GEMMA4_DECODE_BENCH_SEED=0x1234 \
-  ./build/experiments/gemma4_decode_bench ffn_down 80 20 3
+  ./build/benches/gemma4_decode_bench ffn_down 80 20 3
 ```
 
 Results:
@@ -1734,7 +1849,7 @@ Runtime file:
 - `src/gemma4_rope.cu`
 - `src/gemma4_rope.cuh`
 - `tests/test_rope.cu`
-- `src/experiments/gemma4_rope_bench.cu`
+- `src/benches/gemma4_rope_bench.cu`
 - `docs/rope.md`
 
 Change:
@@ -1783,7 +1898,7 @@ Benchmark command:
 ```bash
 make rope-bench
 GEMMA4_ROPE_BENCH_SEED=0x20260521 \
-  ./build/experiments/gemma4_rope_bench 100 20 3 1024 1 1
+  ./build/benches/gemma4_rope_bench 100 20 3 1024 1 1
 ```
 
 Environment:
@@ -1814,7 +1929,7 @@ Compact-table follow-up:
 make test-rope
 make rope-bench
 GEMMA4_ROPE_BENCH_SEED=0x20260521 \
-  ./build/experiments/gemma4_rope_bench 100 20 3 1024 1 1
+  ./build/benches/gemma4_rope_bench 100 20 3 1024 1 1
 ```
 
 Correctness:
@@ -1871,7 +1986,7 @@ Benchmark command:
 
 ```bash
 GEMMA4_ROPE_BENCH_SEED=0x20260521 \
-  ./build/experiments/gemma4_rope_bench 100 20 3 1024 1 1
+  ./build/benches/gemma4_rope_bench 100 20 3 1024 1 1
 ```
 
 Selected custom graph timings versus the compact-table packed run:
@@ -1911,15 +2026,15 @@ Build pattern:
 nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
   -DGEMMA4_ROPE_HEAD_FAST_GRID=<0|1> \
   -DGEMMA4_ROPE_QK_LOAD_CS=<0|1> \
-  src/experiments/gemma4_rope_bench.cu src/gemma4_rope.cu -lcudnn \
-  -o build/experiments/rope_variants/<variant>
+  src/benches/gemma4_rope_bench.cu src/gemma4_rope.cu -lcudnn \
+  -o build/benches/rope_variants/<variant>
 ```
 
 Benchmark command for each variant:
 
 ```bash
 GEMMA4_ROPE_BENCH_SEED=0x20260521 \
-  ./build/experiments/rope_variants/<variant> 100 20 3 1024 1 1
+  ./build/benches/rope_variants/<variant> 100 20 3 1024 1 1
 ```
 
 Custom CUDA graph timings:
@@ -1981,8 +2096,8 @@ Build and run:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
   src/experiments/gemma4_rope_numeric_check.cu src/gemma4_rope.cu \
-  -o build/experiments/gemma4_rope_numeric_check
-./build/experiments/gemma4_rope_numeric_check 64 53 2 0x20260521
+  -o build/benches/gemma4_rope_numeric_check
+./build/benches/gemma4_rope_numeric_check 64 53 2 0x20260521
 ```
 
 Environment:
@@ -2018,7 +2133,7 @@ Conclusion:
 Runtime files:
 
 - `src/gemma4_matmul_kernels.cu`
-- `src/experiments/gemma4_decode_bench.cu`
+- `src/benches/gemma4_decode_bench.cu`
 
 Reason:
 
@@ -2036,7 +2151,7 @@ Command:
 ```bash
 make decode-bench
 GEMMA4_DECODE_BENCH_SEED=0x1234 \
-  ./build/experiments/gemma4_decode_bench ffn_down 80 20 3
+  ./build/benches/gemma4_decode_bench ffn_down 80 20 3
 ```
 
 Results:
@@ -2073,7 +2188,7 @@ Runtime file:
 Change:
 
 - Added a cuBLASLt comparison path to the same benchmark file.
-- The Python script builds a tiny C++ shared helper under `build/experiments/` on first
+- The Python script builds a tiny C++ shared helper under `build/benches/` on first
   use so cuBLASLt descriptors, heuristics, and opaque algorithm structs stay in C++.
 - cuBLASLt uses the same column-major equivalence as the simple cuBLAS path:
   `C_col[n,m] = B_col[n,k] * A_col[k,m]`, matching row-major
@@ -2431,14 +2546,14 @@ Conclusion:
 
 After the fresh tinygrad reclone, the local BF16 source files and C++ harness that had
 been under `experiments/tinygrad` were gone, but the previously built BF16 binaries still
-existed under `build/experiments/tinygrad`. I used those binaries only as a no-build
+existed under `build/benches/tinygrad`. I used those binaries only as a no-build
 checkpoint before deciding whether source restoration/tuning was worth doing.
 
 Command pattern:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
-  ./build/experiments/tinygrad/<binary> \
+  ./build/benches/tinygrad/<binary> \
   64,128,192,256,320,384,448,512,640,768,896,1024,1280,1536,1792,1984 \
   5 20 2
 ```
@@ -2516,7 +2631,7 @@ make tinygrad-ffn-down-bench
 Timing command:
 
 ```bash
-./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_max_bench 64,128,192,256,320 25 200 7
+./build/benches/tinygrad/gemma4_ffn_down_tinygrad_max_bench 64,128,192,256,320 25 200 7
 ```
 
 Environment:
@@ -2541,7 +2656,7 @@ Selected stable results:
 Transition check:
 
 ```bash
-./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_max_bench 64,128,192,256,320,384,448,512 20 100 5
+./build/benches/tinygrad/gemma4_ffn_down_tinygrad_max_bench 64,128,192,256,320,384,448,512 20 100 5
 ```
 
 - tinygrad continued to win through `M=320`.
@@ -2583,7 +2698,7 @@ Short-M retest:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
-  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_max_bench 64,128,192,256,320 10 50 3
+  ./build/benches/tinygrad/gemma4_ffn_down_tinygrad_max_bench 64,128,192,256,320 10 50 3
 ```
 
 | M | tinygrad median ms | cuBLASLt median ms | Speedup | Winner |
@@ -2598,7 +2713,7 @@ Representative large-M retest:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
-  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_max_bench 1024,1536,1984 5 20 2
+  ./build/benches/tinygrad/gemma4_ffn_down_tinygrad_max_bench 1024,1536,1984 5 20 2
 ```
 
 | M | tinygrad median ms | cuBLASLt median ms | Speedup | Winner |
@@ -2632,7 +2747,7 @@ BF16 short-M command:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
-  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_bench 64,128,192,256,320 10 50 3
+  ./build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_bench 64,128,192,256,320 10 50 3
 ```
 
 | M | tinygrad BF16 median ms | cuBLASLt BF16 median ms | Speedup | Winner | Max abs |
@@ -2647,7 +2762,7 @@ BF16 representative large-M command:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
-  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_bench 1024,1536,1984 5 20 2
+  ./build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_bench 1024,1536,1984 5 20 2
 ```
 
 | M | tinygrad BF16 median ms | cuBLASLt BF16 median ms | Speedup | Winner | Max abs |
@@ -2696,10 +2811,10 @@ nvcc -std=c++17 -O3 -arch=sm_86 -maxrregcount=128 -Isrc \
   experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
   experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max.cu \
   -lcublas -lcublasLt \
-  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_r128_bench
+  -o build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_r128_bench
 
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
-  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_r128_bench \
+  ./build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_r128_bench \
   64,128,192,256,320 10 50 3
 ```
 
@@ -2743,7 +2858,7 @@ Command:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
-  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_m32_bench \
+  ./build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_m32_bench \
   32,64,128,192,256,320 10 50 3
 ```
 
@@ -2772,7 +2887,7 @@ Command:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
-  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_lb2_bench \
+  ./build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_lb2_bench \
   64,128,192,256,320 10 50 3
 ```
 
@@ -2806,7 +2921,7 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
   experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
   experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max_splitk_partial.cu \
   -lcublas -lcublasLt \
-  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_splitk3_bench
+  -o build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_splitk3_bench
 
 nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
   -DTINYGRAD_BF16 -DTINYGRAD_SPLITK_PARTS=4 \
@@ -2816,14 +2931,14 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
   experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
   experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max_splitk_partial.cu \
   -lcublas -lcublasLt \
-  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_splitk4_bench
+  -o build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_splitk4_bench
 ```
 
 Each benchmark used:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
-  ./build/experiments/tinygrad/<binary> 64,128,192,256,320 10 50 3
+  ./build/benches/tinygrad/<binary> 64,128,192,256,320 10 50 3
 ```
 
 | Variant | M=64 | M=128 | M=192 | M=256 | M=320 |
@@ -2858,7 +2973,7 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas -dlcm=ca -Isrc \
   experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
   experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max.cu \
   -lcublas -lcublasLt \
-  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_ca_bench
+  -o build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_ca_bench
 
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas -dlcm=cg -Isrc \
   -DTINYGRAD_BF16 \
@@ -2868,14 +2983,14 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas -dlcm=cg -Isrc \
   experiments/tinygrad/gemma4_ffn_down_tinygrad_bench.cu \
   experiments/tinygrad/extra/gemm/max_kernels/nv.bf16_f32_bf16.max.cu \
   -lcublas -lcublasLt \
-  -o build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_cg_bench
+  -o build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_cg_bench
 ```
 
 Each benchmark used:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=20 \
-  ./build/experiments/tinygrad/<binary> 64,128,192,256,320 10 50 3
+  ./build/benches/tinygrad/<binary> 64,128,192,256,320 10 50 3
 ```
 
 | Variant | M=64 | M=128 | M=192 | M=256 | M=320 |
@@ -2903,7 +3018,7 @@ Final no-codegen retest:
 make tinygrad-ffn-down-bf16-bench
 
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
-  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_bench \
+  ./build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_max_bench \
   1024,1536,1984 5 20 2
 ```
 
@@ -2939,7 +3054,7 @@ Large-M static variant check:
 
 ```bash
 GEMMA4_PREFILL_CUBLASLT_HEURISTICS=64 GEMMA4_PREFILL_GRAPH_REPEATS=10 \
-  ./build/experiments/tinygrad/gemma4_ffn_down_tinygrad_bf16_<variant>_bench \
+  ./build/benches/tinygrad/gemma4_ffn_down_tinygrad_bf16_<variant>_bench \
   1024,1536,1984 5 20 2
 ```
 
@@ -3040,9 +3155,9 @@ Correctness:
 Benchmark commands:
 
 ```bash
-./build/experiments/gemma4_tuna_prefill_bench global_k 80 20 1,16,64,256,1024
-./build/experiments/gemma4_tuna_prefill_bench ffn_gate_up 10 3 16,64,256,1024 wmma_64x64
-./build/experiments/gemma4_tuna_prefill_bench sliding_qkv 20 5 16,64,256,1024 wmma_64x64
+./build/benches/gemma4_tuna_prefill_bench global_k 80 20 1,16,64,256,1024
+./build/benches/gemma4_tuna_prefill_bench ffn_gate_up 10 3 16,64,256,1024 wmma_64x64
+./build/benches/gemma4_tuna_prefill_bench sliding_qkv 20 5 16,64,256,1024 wmma_64x64
 ```
 
 Selected results:
@@ -3064,7 +3179,7 @@ Profiling:
 
 ```bash
 ncu --metric gpu__time_duration.sum --target-processes all \
-  ./build/experiments/gemma4_tuna_prefill_bench global_k 1 0 256 wmma_16x16
+  ./build/benches/gemma4_tuna_prefill_bench global_k 1 0 256 wmma_16x16
 ```
 
 - `ncu` failed on this Thunder instance with an internal Thunder runtime assertion for
@@ -3113,8 +3228,8 @@ make sgemm-prefill-bench
 Benchmark commands:
 
 ```bash
-./build/experiments/gemma4_sgemm_prefill_bench global_k 20 5 16,64,256
-./build/experiments/gemma4_sgemm_prefill_bench ffn_gate_up 5 2 16,64
+./build/benches/gemma4_sgemm_prefill_bench global_k 20 5 16,64,256
+./build/benches/gemma4_sgemm_prefill_bench ffn_gate_up 5 2 16,64
 ```
 
 Selected results:
@@ -3171,9 +3286,9 @@ make sgemm-bf16-prefill-bench
 Benchmark commands:
 
 ```bash
-./build/experiments/gemma4_sgemm_bf16_prefill_bench global_k 40 10 16,64,256
-./build/experiments/gemma4_sgemm_bf16_prefill_bench ffn_gate_up 10 3 16,64,256 bf16_64x64
-./build/experiments/gemma4_sgemm_bf16_prefill_bench sliding_qkv 20 5 16,64,256 bf16_64x64
+./build/benches/gemma4_sgemm_bf16_prefill_bench global_k 40 10 16,64,256
+./build/benches/gemma4_sgemm_bf16_prefill_bench ffn_gate_up 10 3 16,64,256 bf16_64x64
+./build/benches/gemma4_sgemm_bf16_prefill_bench sliding_qkv 20 5 16,64,256 bf16_64x64
 ```
 
 Selected results:
@@ -3204,9 +3319,9 @@ Conclusion:
 
 Runtime files:
 
-- `src/experiments/gemma4_prefill_tune.py`
-- `build/experiments/gemma4_prefill_tune/tuna_focused.csv`
-- `build/experiments/gemma4_prefill_tune/sgemm_bf16_focused.csv`
+- `src/benches/gemma4_prefill_tune.py`
+- `build/benches/gemma4_prefill_tune/tuna_focused.csv`
+- `build/benches/gemma4_prefill_tune/sgemm_bf16_focused.csv`
 
 Reason:
 
@@ -3218,41 +3333,41 @@ Reason:
 Validation:
 
 ```bash
-python3 -m py_compile src/experiments/gemma4_prefill_tune.py
+python3 -m py_compile src/benches/gemma4_prefill_tune.py
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops global_k \
   --configs bf16_16x32,bf16_64x64 --m 16,64 --iters 5 --warmup 2 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_smoke.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_smoke.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend tuna --ops global_k \
   --configs wmma_16x32,wmma_64x64 --m 16,64 --iters 5 --warmup 2 \
-  --out build/experiments/gemma4_prefill_tune/tuna_smoke.csv
+  --out build/benches/gemma4_prefill_tune/tuna_smoke.csv
 ```
 
 Focused tuning commands:
 
 ```bash
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend tuna --ops global_k,sliding_qkv,ffn_gate_up \
   --configs wmma_16x32,wmma_16x64,wmma_32x64,wmma_64x64 \
   --m 16,64,256 --iters 10 --warmup 3 \
-  --out build/experiments/gemma4_prefill_tune/tuna_focused.csv
+  --out build/benches/gemma4_prefill_tune/tuna_focused.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops global_k,sliding_qkv,ffn_gate_up \
   --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_64x128,bf16_128x64 \
   --m 16,64,256 --iters 10 --warmup 3 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_focused.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_focused.csv
 ```
 
 Dispatch summary command:
 
 ```bash
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/tuna_focused.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_focused.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/tuna_focused.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_focused.csv \
   --custom-threshold 1.0
 ```
 
@@ -3302,23 +3417,23 @@ Caveats:
 All-shape follow-up:
 
 ```bash
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend tuna \
   --ops ffn_gate_up,ffn_down,sliding_qkv,sliding_o,global_q,global_k,global_o,final_logits \
   --configs wmma_16x32,wmma_32x64,wmma_64x64 \
   --m 16,64,256 --iters 5 --warmup 2 \
-  --out build/experiments/gemma4_prefill_tune/tuna_all_shapes.csv
+  --out build/benches/gemma4_prefill_tune/tuna_all_shapes.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 \
   --ops ffn_gate_up,ffn_down,sliding_qkv,sliding_o,global_q,global_k,global_o,final_logits \
   --configs bf16_16x32,bf16_32x64,bf16_64x64 \
   --m 16,64,256 --iters 5 --warmup 2 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_all_shapes.csv
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/tuna_all_shapes.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/tuna_all_shapes.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_all_shapes.csv \
   --custom-threshold 1.0
 ```
 
@@ -3368,21 +3483,21 @@ After the all-shape sweep narrowed the search space, I reran only the surviving 
 ops over a denser M range and the full config sets.
 
 ```bash
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend tuna --ops ffn_down,global_k,sliding_o \
   --configs wmma_16x16,wmma_16x32,wmma_16x64,wmma_32x64,wmma_64x64,smem_16x64,smem_16x128,smem_32x64,smem_32x128,smem_64x64 \
   --m 16,32,64,128,256,512 --iters 10 --warmup 3 \
-  --out build/experiments/gemma4_prefill_tune/tuna_candidate_deep.csv
+  --out build/benches/gemma4_prefill_tune/tuna_candidate_deep.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down,global_k,sliding_o \
   --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_64x128,bf16_128x64 \
   --m 16,32,64,128,256,512 --iters 10 --warmup 3 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_deep.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_candidate_deep.csv
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/tuna_candidate_deep.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_deep.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/tuna_candidate_deep.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_candidate_deep.csv \
   --custom-threshold 1.0
 ```
 
@@ -3422,7 +3537,7 @@ Runtime files:
 
 - `src/gemma4_matmul_kernels.cu`
 - `src/gemma4_matmul_kernels.cuh`
-- `src/experiments/gemma4_decode_bench.cu`
+- `src/benches/gemma4_decode_bench.cu`
 
 Research notes:
 
@@ -3451,9 +3566,9 @@ Commands:
 
 ```bash
 make decode-bench
-GEMMA4_DECODE_BENCH_SEED=0x20260520 ./build/experiments/gemma4_decode_bench ffn_gate_up 50 10 3
-GEMMA4_DECODE_BENCH_SEED=0x20260520 ./build/experiments/gemma4_decode_bench global_k 50 10 3
-GEMMA4_DECODE_BENCH_SEED=0x20260520 ./build/experiments/gemma4_decode_bench final_logits 20 5 2
+GEMMA4_DECODE_BENCH_SEED=0x20260520 ./build/benches/gemma4_decode_bench ffn_gate_up 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x20260520 ./build/benches/gemma4_decode_bench global_k 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x20260520 ./build/benches/gemma4_decode_bench final_logits 20 5 2
 ```
 
 Results:
@@ -3481,7 +3596,7 @@ Runtime files:
 - `src/gemma4_rmsnorm.cu`
 - `src/gemma4_rmsnorm.cuh`
 - `tests/test_rmsnorm.cu`
-- `src/experiments/gemma4_rmsnorm_bench.cu`
+- `src/benches/gemma4_rmsnorm_bench.cu`
 
 Reason:
 
@@ -3527,10 +3642,10 @@ Benchmark commands:
 
 ```bash
 GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
-  ./build/experiments/gemma4_rmsnorm_bench 30 5 2 1024 256
+  ./build/benches/gemma4_rmsnorm_bench 30 5 2 1024 256
 
 GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
-  ./build/experiments/gemma4_rmsnorm_bench 30 5 2 1024 512
+  ./build/benches/gemma4_rmsnorm_bench 30 5 2 1024 512
 ```
 
 Key CUDA graph-captured timing results:
@@ -3553,7 +3668,7 @@ Interpretation:
 
 ## 2026-05-20 - Gemma 4 RoPE baseline vs cuDNN tensor ops
 
-Benchmark file: `src/experiments/gemma4_rope_bench.cu`
+Benchmark file: `src/benches/gemma4_rope_bench.cu`
 
 Research notes:
 
@@ -3578,7 +3693,7 @@ make rope-bench
 Timing command:
 
 ```bash
-GEMMA4_ROPE_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rope_bench 200 30 5 4096 1 1
+GEMMA4_ROPE_BENCH_SEED=0x20260520 ./build/benches/gemma4_rope_bench 200 30 5 4096 1 1
 ```
 
 Key CUDA-event timing results:
@@ -3615,7 +3730,7 @@ Follow-up static profile:
 
 ## 2026-05-17 - 16384x512x4096 CUTE matmul vs cuBLAS
 
-Experiment file: `src/experiments/16384_512_4096.cu`
+Experiment file: `src/benches/16384_512_4096.cu`
 
 Important correction: I initially started wiring this against raw cuDNN backend matmul, but that was the wrong baseline for this experiment. cuDNN matmul is exposed through backend/frontend graph descriptors, which is not the simple GEMM call we want here. For a short library matmul baseline, use cuBLAS/cuBLASLt. This run uses `cublasGemmEx`.
 
@@ -3631,8 +3746,8 @@ Build:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_STANDALONE_BENCH \
   -I/tmp/cutlass/include -I/tmp/cutlass/tools/util/include \
-  src/experiments/16384_512_4096.cu -lcublas \
-  -o build/experiments/16384_512_4096_bench
+  src/benches/16384_512_4096.cu -lcublas \
+  -o build/benches/16384_512_4096_bench
 ```
 
 Hardware/software:
@@ -3645,7 +3760,7 @@ Hardware/software:
 Timing command:
 
 ```bash
-./build/experiments/16384_512_4096_bench both 100 20
+./build/benches/16384_512_4096_bench both 100 20
 ```
 
 CUDA-event timing results:
@@ -3795,7 +3910,7 @@ CUDA guide note:
 
 Runtime file: `src/gemma4_matmul_kernels.cu`
 
-Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+Benchmark file: `src/benches/gemma4_decode_bench.cu`
 
 Target:
 
@@ -3818,7 +3933,7 @@ make decode-bench
 Final timing command:
 
 ```bash
-./build/experiments/gemma4_decode_bench both 200 30
+./build/benches/gemma4_decode_bench both 200 30
 ```
 
 Final CUDA-event timing results:
@@ -3855,9 +3970,9 @@ Tuning/resource notes:
 
 Profiler status:
 
-- `ncu --set full --target-processes all --kernel-name regex:gemma4_ffn_gate_up_decode_kernel --launch-count 1 ./build/experiments/gemma4_decode_bench custom 1 0` fails in this Thunder Compute environment with an internal unsupported-library assertion before producing metrics.
-- `nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt --stats=true -o build/experiments/gemma4_decode_bench_nsys ./build/experiments/gemma4_decode_bench both 10 2` completes and writes `.nsys-rep`/`.sqlite`, but the generated sqlite contains no CUDA trace, kernel, or GPU memory data.
-- `nvprof ./build/experiments/gemma4_decode_bench custom 5 1` is unavailable for this GPU class; it reports that `nvprof` is not supported on compute capability 8.0 and higher.
+- `ncu --set full --target-processes all --kernel-name regex:gemma4_ffn_gate_up_decode_kernel --launch-count 1 ./build/benches/gemma4_decode_bench custom 1 0` fails in this Thunder Compute environment with an internal unsupported-library assertion before producing metrics.
+- `nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt --stats=true -o build/benches/gemma4_decode_bench_nsys ./build/benches/gemma4_decode_bench both 10 2` completes and writes `.nsys-rep`/`.sqlite`, but the generated sqlite contains no CUDA trace, kernel, or GPU memory data.
+- `nvprof ./build/benches/gemma4_decode_bench custom 5 1` is unavailable for this GPU class; it reports that `nvprof` is not supported on compute capability 8.0 and higher.
 - Because profiler CUDA data is blocked here, the reliable evidence for this entry is CUDA-event timing, exact-output comparison against cuDNN, `ptxas` resource data, and the explicit profiler failure output.
 
 Tooling/source notes:
@@ -3867,7 +3982,7 @@ Tooling/source notes:
 
 ## 2026-05-18 - M=1 decode vs cuBLAS GEMM/GEMV baselines
 
-Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+Benchmark file: `src/benches/gemma4_decode_bench.cu`
 
 Reason:
 
@@ -3879,7 +3994,7 @@ Reason:
 Command:
 
 ```bash
-./build/experiments/gemma4_decode_bench both 50 10 3
+./build/benches/gemma4_decode_bench both 50 10 3
 ```
 
 Results:
@@ -3908,7 +4023,7 @@ Tooling/source notes:
 
 Runtime file: `src/gemma4_matmul_kernels.cu`
 
-Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+Benchmark file: `src/benches/gemma4_decode_bench.cu`
 
 Change:
 
@@ -3935,7 +4050,7 @@ make cuda-kernels
 Smoke timing command:
 
 ```bash
-./build/experiments/gemma4_decode_bench all 2 1 1
+./build/benches/gemma4_decode_bench all 2 1 1
 ```
 
 Smoke results from the first low-iteration run:
@@ -3960,7 +4075,7 @@ Notes:
 Sequential stability check:
 
 ```bash
-./build/experiments/gemma4_decode_bench all 50 10 3
+./build/benches/gemma4_decode_bench all 50 10 3
 ```
 
 | Op | Custom best ms | cuBLAS GEMV best ms | cuBLAS GEMM M=1 best ms | Best custom speedup vs GEMV |
@@ -3984,7 +4099,7 @@ Interpretation:
 
 Runtime file: `src/gemma4_matmul_kernels.cu`
 
-Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+Benchmark file: `src/benches/gemma4_decode_bench.cu`
 
 Goal:
 
@@ -4034,9 +4149,9 @@ Fresh baseline before tuning:
 
 ```bash
 make decode-bench
-./build/experiments/gemma4_decode_bench ffn_down 80 20 5
-./build/experiments/gemma4_decode_bench global_o 80 20 5
-./build/experiments/gemma4_decode_bench final_logits 40 10 3
+./build/benches/gemma4_decode_bench ffn_down 80 20 5
+./build/benches/gemma4_decode_bench global_o 80 20 5
+./build/benches/gemma4_decode_bench final_logits 40 10 3
 ```
 
 | Op | Custom best ms | cuBLAS GEMV best ms | Custom weight GB/s | Speedup vs GEMV |
@@ -4069,11 +4184,11 @@ Sweep notes:
 Final verification:
 
 ```bash
-rm -f build/experiments/gemma4_decode_bench build/gemma4_matmul_kernels.o
+rm -f build/benches/gemma4_decode_bench build/gemma4_matmul_kernels.o
 make decode-bench cuda-kernels
-./build/experiments/gemma4_decode_bench ffn_down 100 25 5
-./build/experiments/gemma4_decode_bench global_o 100 25 5
-./build/experiments/gemma4_decode_bench final_logits 50 12 5
+./build/benches/gemma4_decode_bench ffn_down 100 25 5
+./build/benches/gemma4_decode_bench global_o 100 25 5
+./build/benches/gemma4_decode_bench final_logits 50 12 5
 ```
 
 | Op | Final custom best ms | cuBLAS GEMV best ms | Custom weight GB/s | Peak % | Speedup vs GEMV | Gain vs fresh custom |
@@ -4138,7 +4253,7 @@ Covered instantiations:
 
 Runtime file: `src/gemma4_embedding_gather.cu`
 
-Benchmark file: `src/experiments/gemma4_embedding_gather_bench.cu`
+Benchmark file: `src/benches/gemma4_embedding_gather_bench.cu`
 
 Target:
 
@@ -4168,7 +4283,7 @@ Result: `embedding gather tests passed`.
 Timing command:
 
 ```bash
-./build/experiments/gemma4_embedding_gather_bench 200 30 5 4096
+./build/benches/gemma4_embedding_gather_bench 200 30 5 4096
 ```
 
 CUDA-event timing results:
@@ -4186,7 +4301,7 @@ CUDA-event timing results:
 Larger sweep command:
 
 ```bash
-./build/experiments/gemma4_embedding_gather_bench 100 20 3 8192
+./build/benches/gemma4_embedding_gather_bench 100 20 3 8192
 ```
 
 Extended sweep results:
@@ -4252,7 +4367,7 @@ Interpretation:
 
 Runtime file: `src/gemma4_matmul_kernels.cu`
 
-Benchmark file: `src/experiments/gemma4_decode_bench.cu`
+Benchmark file: `src/benches/gemma4_decode_bench.cu`
 
 Reason:
 
@@ -4277,16 +4392,16 @@ Implementation:
 Build:
 
 ```bash
-rm -f build/experiments/gemma4_decode_bench build/gemma4_matmul_kernels.o
+rm -f build/benches/gemma4_decode_bench build/gemma4_matmul_kernels.o
 make decode-bench cuda-kernels
 ```
 
 Representative BF16 randomized checks:
 
 ```bash
-./build/experiments/gemma4_decode_bench ffn_down 10 3 2
-./build/experiments/gemma4_decode_bench final_logits 5 2 1
-./build/experiments/gemma4_decode_bench all 2 1 1
+./build/benches/gemma4_decode_bench ffn_down 10 3 2
+./build/benches/gemma4_decode_bench final_logits 5 2 1
+./build/benches/gemma4_decode_bench all 2 1 1
 ```
 
 `ffn_down` result:
@@ -4303,7 +4418,7 @@ Representative BF16 randomized checks:
 
 Full smoke observations:
 
-- `./build/experiments/gemma4_decode_bench all 2 1 1` completed for all decode projection shapes.
+- `./build/benches/gemma4_decode_bench all 2 1 1` completed for all decode projection shapes.
 - BF16 cuBLAS GEMV/GEMM agree with each other for the reported differences.
 - Some shapes now show BF16-scale nonzero differences, which is expected from different FP32 reduction orders before BF16 output rounding.
 - The old exact `max_abs_diff = 0` expectation is no longer the right acceptance signal for randomized BF16 validation.
@@ -4363,7 +4478,7 @@ Benchmark command:
 
 ```bash
 make decode-bench
-./build/experiments/gemma4_decode_bench all 20 5 2
+./build/benches/gemma4_decode_bench all 20 5 2
 ```
 
 Representative results:
@@ -4406,7 +4521,7 @@ Runtime files:
 - `src/gemma4_rmsnorm.cu`
 - `src/gemma4_rmsnorm.cuh`
 - `tests/test_rmsnorm.cu`
-- `src/experiments/gemma4_rmsnorm_bench.cu`
+- `src/benches/gemma4_rmsnorm_bench.cu`
 
 Reason:
 
@@ -4451,7 +4566,7 @@ Results:
 Primary benchmark command:
 
 ```bash
-GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 50 10 3 4096
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/benches/gemma4_rmsnorm_bench 50 10 3 4096
 ```
 
 Representative `width=5376` results on RTX A6000:
@@ -4469,7 +4584,7 @@ Representative `width=5376` results on RTX A6000:
 Larger sweep command:
 
 ```bash
-GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 30 5 2 8192
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/benches/gemma4_rmsnorm_bench 30 5 2 8192
 ```
 
 Additional `8192 x 5376` result:
@@ -4494,9 +4609,9 @@ Reason:
 
 Implementation:
 
-- Added `time_ms_graph` in `src/experiments/gemma4_bench_utils.cuh`.
+- Added `time_ms_graph` in `src/benches/gemma4_bench_utils.cuh`.
 - The helper stream-captures `iters` repeats of the target operation into a CUDA graph, instantiates it once, warms up graph replay, then records CUDA events around one graph replay and divides by the captured repeat count. This excludes CUDA graph capture, graph instantiation, warmup launches, and per-call host/API submission from the returned graph timing.
-- `src/experiments/gemma4_rmsnorm_bench.cu` now reports both the original stream-loop timings and raw graph-captured timings:
+- `src/benches/gemma4_rmsnorm_bench.cu` now reports both the original stream-loop timings and raw graph-captured timings:
   - `rms_ms` / `cudnn_ms`: repeated host/API execute path.
   - `rms_graph_kernel_ms` / `cudnn_graph_kernel_ms`: graph replay timing of already-captured device work.
 
@@ -4524,7 +4639,7 @@ Custom graph introspection from a one-off `cudaGraphGetNodes` checker:
 Benchmark command:
 
 ```bash
-GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 50 10 3 4096
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/benches/gemma4_rmsnorm_bench 50 10 3 4096
 ```
 
 Representative `width=5376` results on RTX A6000:
@@ -4542,7 +4657,7 @@ Representative `width=5376` results on RTX A6000:
 Larger sweep:
 
 ```bash
-GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 30 5 2 8192
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/benches/gemma4_rmsnorm_bench 30 5 2 8192
 ```
 
 Largest-row result:
@@ -4554,7 +4669,7 @@ Largest-row result:
 Production-size sweep:
 
 ```bash
-GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 5 2 1 262144
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/benches/gemma4_rmsnorm_bench 5 2 1 262144
 ```
 
 Production-shape results:
@@ -4582,7 +4697,7 @@ Reason:
 
 Implementation:
 
-- Added a BF16 cuDNN 1x1 convolution comparator to `src/experiments/gemma4_decode_bench.cu` for every production decode projection.
+- Added a BF16 cuDNN 1x1 convolution comparator to `src/benches/gemma4_decode_bench.cu` for every production decode projection.
 - Updated `make decode-bench` to link `-lcudnn`.
 - Kept the production decode GEMV kernel unchanged after testing narrow warp-owned-column and column-grouping variants; those variants did not improve the tight `ffn_gate_up` case enough to keep.
 
@@ -4591,7 +4706,7 @@ Verification:
 ```bash
 make decode-bench
 make cuda-kernels
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 ```
 
 Production decode projection results on RTX A6000:
@@ -4631,9 +4746,9 @@ Method:
 
 ```bash
 make decode-bench
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench <op> 30 5 2
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 100 20 5
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench <op> 30 5 2
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 100 20 5
 make cuda-kernels
 git diff --check
 ```
@@ -4728,7 +4843,7 @@ Implementation:
 
 - Added decode-specialized `rows=1,width=5376` kernels in `src/gemma4_rmsnorm.cu`.
 - Kept the existing multi-row shared/warp paths unchanged.
-- Added graph timings for fused residual+RMSNorm and split residual-add-plus-RMSNorm in `src/experiments/gemma4_rmsnorm_bench.cu`.
+- Added graph timings for fused residual+RMSNorm and split residual-add-plus-RMSNorm in `src/benches/gemma4_rmsnorm_bench.cu`.
 - Retained settings:
   - standalone decode RMSNorm: `768` threads.
   - fused decode residual+RMSNorm: `1024` threads.
@@ -4738,7 +4853,7 @@ Commands:
 ```bash
 make test-rmsnorm rmsnorm-bench
 ./build/tests/test_rmsnorm
-GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/experiments/gemma4_rmsnorm_bench 400 50 7 1
+GEMMA4_RMSNORM_BENCH_SEED=0x1234 ./build/benches/gemma4_rmsnorm_bench 400 50 7 1
 make cuda-kernels
 git diff --check
 ```
@@ -4925,7 +5040,7 @@ SASS evidence:
 Correctness and timing smoke test:
 
 ```bash
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 3 1 1
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 3 1 1
 ```
 
 | Op | Custom ms | Custom GB/s | cuBLAS GEMV ms | cuDNN conv1x1 ms | Max abs diff vs cuBLAS GEMV |
@@ -4974,7 +5089,7 @@ Helper cleanup retained:
 ```bash
 make cuda-kernels
 make decode-bench
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 3 1 1
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 3 1 1
 git diff --check
 ```
 
@@ -4993,7 +5108,7 @@ Baseline timing before accumulator variants:
 
 ```bash
 make decode-bench
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench <op> 80 20 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench <op> 80 20 3
 ```
 
 | Op | Baseline custom best ms |
@@ -5061,9 +5176,9 @@ Shuffle-reduction variants:
 - Built each mode with:
 
 ```bash
-rm -f build/experiments/gemma4_decode_bench
+rm -f build/benches/gemma4_decode_bench
 make decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v -DGEMMA4_SHUFFLE_REDUCE_MODE=<mode>"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 ```
 
 Resource observations:
@@ -5127,7 +5242,7 @@ Commands:
 
 ```bash
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 80 20 5
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 80 20 5
 ```
 
 Resource result:
@@ -5175,7 +5290,7 @@ env GEMMA4_DECODE_BENCH_SEED=0x1234 \
   ncu --target-processes all --set speedOfLight \
   --kernel-name "regex:gemma4_decode_gemv_cols_kernel" \
   --launch-count 1 \
-  ./build/experiments/gemma4_decode_bench ffn_gate_up 1 0 1
+  ./build/benches/gemma4_decode_bench ffn_gate_up 1 0 1
 ```
 
 - `ncu` is installed (`2025.2.1.0`), but the benchmark process aborted under the Thunder runtime with an unsupported-library/internal-assertion failure.
@@ -5186,7 +5301,7 @@ Roofline-style check from benchmark timings:
 - The custom benchmark already prints effective weight-streaming throughput:
 
 ```bash
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 80 20 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 80 20 3
 ```
 
 | Op | Best ms | Weight GB/s | FP32 TFLOP/s from `2*K*N` |
@@ -5239,7 +5354,7 @@ Commands:
 
 ```bash
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v <variant macro>"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 ```
 
 Variants tested:
@@ -5356,7 +5471,7 @@ Commands:
 
 ```bash
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v -DGEMMA4_DECODE_DOUBLE_BUFFER_WEIGHT_COLS=1"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 ```
 
 Resource result:
@@ -5418,8 +5533,8 @@ make cuda-kernels decode-bench
 nvcc -std=c++17 -O3 -arch=sm_86 -Isrc --ptx src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_kernels_load_policy.ptx
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc -c src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_kernels_load_policy.o
 nvcc -std=c++17 -O3 -arch=sm_86 -Isrc /tmp/gemma4_decode_arg_guard_test.cu src/gemma4_matmul_kernels.cu -lcublas -lcudnn -o /tmp/gemma4_decode_arg_guard_test
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 2 1 1
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 2 1 1
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 ```
 
 PTX/resource result:
@@ -5493,12 +5608,12 @@ Commands:
 
 ```bash
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_REGISTER_DOUBLE_BUFFER"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 2 1 1
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 2 1 1
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_REGISTER_DOUBLE_BUFFER -Xptxas=-v -Isrc -c src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_register_double_buffer.o
 
 make -B decode-bench
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 ```
 
 Correctness:
@@ -5571,13 +5686,13 @@ Commands:
 
 ```bash
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 2 1 1
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 2 1 1
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER -Xptxas=-v -Isrc -c src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_cp_async.o
 nvcc -std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER -Isrc --ptx src/gemma4_matmul_kernels.cu -o /tmp/gemma4_matmul_cp_async.ptx
 
 make -B decode-bench
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 ```
 
 PTX/resource result:
@@ -5739,16 +5854,16 @@ Commands:
 
 ```bash
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_LOAD128"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_LOAD128CS"
-GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
+GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/benches/gemma4_decode_bench all 50 10 3
 ```
 
 Timing, seeded `all 50 10 3`:
@@ -5831,8 +5946,8 @@ Result:
 
 Runtime files:
 
-- `src/experiments/gemma4_rope_bench.cu`
-- `src/experiments/gemma4_bench_utils.cuh`
+- `src/benches/gemma4_rope_bench.cu`
+- `src/benches/gemma4_bench_utils.cuh`
 - `src/gemma4_rope.cu`
 
 Reason:
@@ -5851,7 +5966,7 @@ Commands:
 
 ```bash
 make rope-bench
-./build/experiments/gemma4_rope_bench 100 20 3 1024
+./build/benches/gemma4_rope_bench 100 20 3 1024
 make test-rope
 ```
 
@@ -5888,7 +6003,7 @@ Correctness:
 Runtime files:
 
 - `src/gemma4_rmsnorm.cu`
-- `src/experiments/gemma4_rmsnorm_bench.cu`
+- `src/benches/gemma4_rmsnorm_bench.cu`
 - `tests/test_rmsnorm.cu`
 
 Reason:
@@ -5906,9 +6021,9 @@ Commands:
 
 ```bash
 make -B rmsnorm-bench
-GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 80 20 3 1024 5376
-GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 80 20 3 16384 256
-GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 80 20 3 4096 512
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/benches/gemma4_rmsnorm_bench 80 20 3 1024 5376
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/benches/gemma4_rmsnorm_bench 80 20 3 16384 256
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/benches/gemma4_rmsnorm_bench 80 20 3 4096 512
 make test-rmsnorm
 make cuda-kernels
 ```
@@ -5970,8 +6085,8 @@ Result:
 Runtime files:
 
 - `src/gemma4_rmsnorm.cu`
-- `src/experiments/gemma4_rmsnorm_bench.cu`
-- `src/experiments/gemma4_bench_utils.cuh`
+- `src/benches/gemma4_rmsnorm_bench.cu`
+- `src/benches/gemma4_bench_utils.cuh`
 
 Reason:
 
@@ -5988,9 +6103,9 @@ Commands:
 ```bash
 make -B test-rmsnorm rmsnorm-bench
 mkdir -p /tmp/gemma4_rmsnorm_real_20260520
-GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 100 30 5 1024 5376 > /tmp/gemma4_rmsnorm_real_20260520/hidden_w5376.csv
-GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 100 30 5 16384 256 > /tmp/gemma4_rmsnorm_real_20260520/sliding_v_w256.csv
-GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/experiments/gemma4_rmsnorm_bench 100 30 5 4096 512 > /tmp/gemma4_rmsnorm_real_20260520/global_v_w512.csv
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/benches/gemma4_rmsnorm_bench 100 30 5 1024 5376 > /tmp/gemma4_rmsnorm_real_20260520/hidden_w5376.csv
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/benches/gemma4_rmsnorm_bench 100 30 5 16384 256 > /tmp/gemma4_rmsnorm_real_20260520/sliding_v_w256.csv
+GEMMA4_RMSNORM_BENCH_SEED=0x20260520 ./build/benches/gemma4_rmsnorm_bench 100 30 5 4096 512 > /tmp/gemma4_rmsnorm_real_20260520/global_v_w512.csv
 ```
 
 Environment:
@@ -6087,7 +6202,7 @@ Command:
 
 ```bash
 GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
-  ./build/experiments/gemma4_rmsnorm_bench 100 30 5 1024 5376 \
+  ./build/benches/gemma4_rmsnorm_bench 100 30 5 1024 5376 \
   > /tmp/gemma4_rmsnorm_prefill_blockrow_20260520/hidden_w5376.csv
 ```
 
@@ -6146,7 +6261,7 @@ Commands:
 ```bash
 make -B rmsnorm-bench
 GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
-  ./build/experiments/gemma4_rmsnorm_bench 100 30 5 1024 5376 \
+  ./build/benches/gemma4_rmsnorm_bench 100 30 5 1024 5376 \
   > /tmp/gemma4_rmsnorm_gamma_prefetch_20260520/hidden_w5376.csv
 make test-rmsnorm
 ```
@@ -6186,7 +6301,7 @@ small-prefill regression.
 Runtime files:
 
 - `src/gemma4_rmsnorm.cu`
-- `src/experiments/gemma4_rmsnorm_hidden_fused_bench.cu`
+- `src/benches/gemma4_rmsnorm_hidden_fused_bench.cu`
 - `Makefile`
 
 Reason:
@@ -6205,7 +6320,7 @@ Commands:
 make -B rmsnorm-hidden-fused-bench \
   NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -Xptxas=-v"
 GEMMA4_RMSNORM_BENCH_SEED=0x20260520 \
-  ./build/experiments/gemma4_rmsnorm_hidden_fused_bench 300 20 7 1024 \
+  ./build/benches/gemma4_rmsnorm_hidden_fused_bench 300 20 7 1024 \
   > /tmp/gemma4_hidden_fused_tune_20260520/final_simplified.csv
 make -B test-rmsnorm
 ```
@@ -6277,7 +6392,7 @@ make -B test-rmsnorm
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -c src/gemma4_rmsnorm.cu -o /tmp/gemma4_rmsnorm.o
 make -B rmsnorm-hidden-fused-bench
-./build/experiments/gemma4_rmsnorm_hidden_fused_bench
+./build/benches/gemma4_rmsnorm_hidden_fused_bench
 ```
 
 Environment:
@@ -6334,7 +6449,7 @@ make -B test-rmsnorm
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -c src/gemma4_rmsnorm.cu -o /tmp/gemma4_rmsnorm.o
 make -B rmsnorm-hidden-fused-bench
-./build/experiments/gemma4_rmsnorm_hidden_fused_bench
+./build/benches/gemma4_rmsnorm_hidden_fused_bench
 make -B rmsnorm-bench
 ```
 
@@ -6373,15 +6488,15 @@ Correctness and build checks:
 
 Runtime files:
 
-- `src/experiments/gemma4_prefill_tune.py`
-- `build/experiments/gemma4_prefill_tune/candidate_deep_dispatch.csv`
-- `build/experiments/gemma4_prefill_tune/all_shapes_dispatch.csv`
-- `build/experiments/gemma4_prefill_tune/tuna_stability_globalk_slidingo.csv`
-- `build/experiments/gemma4_prefill_tune/sgemm_bf16_stability_globalk_slidingo.csv`
-- `build/experiments/gemma4_prefill_tune/stability_globalk_slidingo_dispatch.csv`
-- `build/experiments/gemma4_prefill_tune/stability_globalk_slidingo_dispatch_threshold_1p25.csv`
-- `build/experiments/gemma4_prefill_tune/tuna_cublas_algo_probe_global_k_m512.txt`
-- `build/experiments/gemma4_prefill_tune/tuna_cublas_algo_probe_sliding_o_m256.txt`
+- `src/benches/gemma4_prefill_tune.py`
+- `build/benches/gemma4_prefill_tune/candidate_deep_dispatch.csv`
+- `build/benches/gemma4_prefill_tune/all_shapes_dispatch.csv`
+- `build/benches/gemma4_prefill_tune/tuna_stability_globalk_slidingo.csv`
+- `build/benches/gemma4_prefill_tune/sgemm_bf16_stability_globalk_slidingo.csv`
+- `build/benches/gemma4_prefill_tune/stability_globalk_slidingo_dispatch.csv`
+- `build/benches/gemma4_prefill_tune/stability_globalk_slidingo_dispatch_threshold_1p25.csv`
+- `build/benches/gemma4_prefill_tune/tuna_cublas_algo_probe_global_k_m512.txt`
+- `build/benches/gemma4_prefill_tune/tuna_cublas_algo_probe_sliding_o_m256.txt`
 
 Reason:
 
@@ -6405,46 +6520,46 @@ Implementation:
 Validation:
 
 ```bash
-python3 -m py_compile src/experiments/gemma4_prefill_tune.py
+python3 -m py_compile src/benches/gemma4_prefill_tune.py
 rm -rf src/experiments/__pycache__
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/tuna_candidate_deep.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_deep.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/tuna_candidate_deep.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_candidate_deep.csv \
   --custom-threshold 1.0 \
-  --dispatch-out build/experiments/gemma4_prefill_tune/candidate_deep_dispatch.csv
+  --dispatch-out build/benches/gemma4_prefill_tune/candidate_deep_dispatch.csv
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/tuna_all_shapes.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/tuna_all_shapes.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_all_shapes.csv \
   --custom-threshold 1.0 \
-  --dispatch-out build/experiments/gemma4_prefill_tune/all_shapes_dispatch.csv
+  --dispatch-out build/benches/gemma4_prefill_tune/all_shapes_dispatch.csv
 
 make tuna-prefill-bench sgemm-bf16-prefill-bench
 GEMMA4_PREFILL_CUBLAS_ALGO=algo7 \
-  ./build/experiments/gemma4_sgemm_bf16_prefill_bench global_k 5 2 512 bf16_16x64
+  ./build/benches/gemma4_sgemm_bf16_prefill_bench global_k 5 2 512 bf16_16x64
 ```
 
 Focused stability commands:
 
 ```bash
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend tuna --ops global_k,sliding_o \
   --configs wmma_16x16,wmma_16x32,wmma_16x64,wmma_32x64,wmma_64x64 \
   --m 256,512 --iters 100 --warmup 25 \
-  --out build/experiments/gemma4_prefill_tune/tuna_stability_globalk_slidingo.csv
+  --out build/benches/gemma4_prefill_tune/tuna_stability_globalk_slidingo.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops global_k,sliding_o \
   --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_64x128,bf16_128x64 \
   --m 256,512 --iters 100 --warmup 25 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_stability_globalk_slidingo.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_stability_globalk_slidingo.csv
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/tuna_stability_globalk_slidingo.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_stability_globalk_slidingo.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/tuna_stability_globalk_slidingo.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_stability_globalk_slidingo.csv \
   --custom-threshold 1.25 \
-  --dispatch-out build/experiments/gemma4_prefill_tune/stability_globalk_slidingo_dispatch_threshold_1p25.csv
+  --dispatch-out build/benches/gemma4_prefill_tune/stability_globalk_slidingo_dispatch_threshold_1p25.csv
 ```
 
 Focused stability results:
@@ -6466,11 +6581,11 @@ Conservative dispatch with threshold `1.25`:
 Direct repeat checks:
 
 ```bash
-./build/experiments/gemma4_tuna_prefill_bench global_k 200 50 512 wmma_16x64
-./build/experiments/gemma4_tuna_prefill_bench global_k 200 50 512 wmma_16x64
-./build/experiments/gemma4_tuna_prefill_bench global_k 200 50 256 wmma_16x64
-./build/experiments/gemma4_tuna_prefill_bench sliding_o 200 50 256 wmma_64x64
-./build/experiments/gemma4_tuna_prefill_bench sliding_o 200 50 512 wmma_64x64
+./build/benches/gemma4_tuna_prefill_bench global_k 200 50 512 wmma_16x64
+./build/benches/gemma4_tuna_prefill_bench global_k 200 50 512 wmma_16x64
+./build/benches/gemma4_tuna_prefill_bench global_k 200 50 256 wmma_16x64
+./build/benches/gemma4_tuna_prefill_bench sliding_o 200 50 256 wmma_64x64
+./build/benches/gemma4_tuna_prefill_bench sliding_o 200 50 512 wmma_64x64
 ```
 
 Observed direct checks:
@@ -6503,16 +6618,16 @@ Explicit cuBLAS algorithm probe:
 for algo in default_tensor algo0 algo1 algo2 algo3 algo4 algo5 algo6 algo7 \
     algo8 algo9 algo10 algo11 algo12 algo13 algo14 algo15; do
   GEMMA4_PREFILL_CUBLAS_ALGO=$algo \
-    ./build/experiments/gemma4_tuna_prefill_bench global_k 50 15 512 wmma_16x64 |
+    ./build/benches/gemma4_tuna_prefill_bench global_k 50 15 512 wmma_16x64 |
     awk -v algo=$algo '/global_k/{print algo ",global_k," $0} /wmma_16x64/{print algo ",global_k," $0}'
-done > build/experiments/gemma4_prefill_tune/tuna_cublas_algo_probe_global_k_m512.txt
+done > build/benches/gemma4_prefill_tune/tuna_cublas_algo_probe_global_k_m512.txt
 
 for algo in default_tensor algo0 algo1 algo2 algo3 algo4 algo5 algo6 algo7 \
     algo8 algo9 algo10 algo11 algo12 algo13 algo14 algo15; do
   GEMMA4_PREFILL_CUBLAS_ALGO=$algo \
-    ./build/experiments/gemma4_tuna_prefill_bench sliding_o 50 15 256 wmma_64x64 |
+    ./build/benches/gemma4_tuna_prefill_bench sliding_o 50 15 256 wmma_64x64 |
     awk -v algo=$algo '/sliding_o/{print algo ",sliding_o," $0} /wmma_64x64/{print algo ",sliding_o," $0}'
-done > build/experiments/gemma4_prefill_tune/tuna_cublas_algo_probe_sliding_o_m256.txt
+done > build/benches/gemma4_prefill_tune/tuna_cublas_algo_probe_sliding_o_m256.txt
 ```
 
 Best observed explicit-algorithm checks:
@@ -6537,13 +6652,13 @@ Runtime files:
 
 - `experiments/tuna/gemma4_prefill_bench.cu`
 - `experiments/sgemm.cu/gemma4_bf16_prefill_bench.cu`
-- `src/experiments/gemma4_prefill_tune.py`
-- `build/experiments/gemma4_prefill_tune/tuna_candidate_cublaslt.csv`
-- `build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_cublaslt.csv`
-- `build/experiments/gemma4_prefill_tune/candidate_cublaslt_dispatch.csv`
-- `build/experiments/gemma4_prefill_tune/tuna_all_shapes_cublaslt.csv`
-- `build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes_cublaslt.csv`
-- `build/experiments/gemma4_prefill_tune/all_shapes_cublaslt_dispatch.csv`
+- `src/benches/gemma4_prefill_tune.py`
+- `build/benches/gemma4_prefill_tune/tuna_candidate_cublaslt.csv`
+- `build/benches/gemma4_prefill_tune/sgemm_bf16_candidate_cublaslt.csv`
+- `build/benches/gemma4_prefill_tune/candidate_cublaslt_dispatch.csv`
+- `build/benches/gemma4_prefill_tune/tuna_all_shapes_cublaslt.csv`
+- `build/benches/gemma4_prefill_tune/sgemm_bf16_all_shapes_cublaslt.csv`
+- `build/benches/gemma4_prefill_tune/all_shapes_cublaslt_dispatch.csv`
 
 Reason:
 
@@ -6571,12 +6686,12 @@ Validation:
 make tuna-prefill-bench sgemm-bf16-prefill-bench
 
 GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
-  ./build/experiments/gemma4_tuna_prefill_bench global_k 5 2 16 wmma_16x32
+  ./build/benches/gemma4_tuna_prefill_bench global_k 5 2 16 wmma_16x32
 
 GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
-  ./build/experiments/gemma4_sgemm_bf16_prefill_bench global_k 5 2 16 bf16_16x32
+  ./build/benches/gemma4_sgemm_bf16_prefill_bench global_k 5 2 16 bf16_16x32
 
-python3 -m py_compile src/experiments/gemma4_prefill_tune.py
+python3 -m py_compile src/benches/gemma4_prefill_tune.py
 rm -rf src/experiments/__pycache__
 ```
 
@@ -6590,19 +6705,19 @@ Smoke results:
 Candidate cuBLASLt sweeps:
 
 ```bash
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend tuna --ops ffn_down,global_k,sliding_o \
   --configs wmma_16x16,wmma_16x32,wmma_16x64,wmma_32x64,wmma_64x64,smem_16x64,smem_16x128,smem_32x64,smem_32x128,smem_64x64 \
   --m 16,32,64,128,256,512 --iters 20 --warmup 5 \
   --cublas-backend lt \
-  --out build/experiments/gemma4_prefill_tune/tuna_candidate_cublaslt.csv
+  --out build/benches/gemma4_prefill_tune/tuna_candidate_cublaslt.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down,global_k,sliding_o \
   --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_64x128,bf16_128x64 \
   --m 16,32,64,128,256,512 --iters 20 --warmup 5 \
   --cublas-backend lt \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_candidate_cublaslt.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_candidate_cublaslt.csv
 ```
 
 Candidate cuBLASLt summary:
@@ -6619,25 +6734,25 @@ Candidate cuBLASLt summary:
 All-shape cuBLASLt sweeps:
 
 ```bash
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend tuna \
   --ops ffn_gate_up,ffn_down,sliding_qkv,sliding_o,global_q,global_k,global_o,final_logits \
   --configs wmma_16x32,wmma_32x64,wmma_64x64 \
   --m 16,64,256 --iters 10 --warmup 3 --cublas-backend lt \
-  --out build/experiments/gemma4_prefill_tune/tuna_all_shapes_cublaslt.csv
+  --out build/benches/gemma4_prefill_tune/tuna_all_shapes_cublaslt.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 \
   --ops ffn_gate_up,ffn_down,sliding_qkv,sliding_o,global_q,global_k,global_o,final_logits \
   --configs bf16_16x32,bf16_32x64,bf16_64x64 \
   --m 16,64,256 --iters 10 --warmup 3 --cublas-backend lt \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes_cublaslt.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_all_shapes_cublaslt.csv
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/tuna_all_shapes_cublaslt.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_all_shapes_cublaslt.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/tuna_all_shapes_cublaslt.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_all_shapes_cublaslt.csv \
   --custom-threshold 1.0 \
-  --dispatch-out build/experiments/gemma4_prefill_tune/all_shapes_cublaslt_dispatch.csv
+  --dispatch-out build/benches/gemma4_prefill_tune/all_shapes_cublaslt_dispatch.csv
 ```
 
 All-shape cuBLASLt dispatch:
@@ -6693,7 +6808,7 @@ Files changed:
     `bf16_warp_16x32`, `bf16_warp_16x64`, `bf16_warp_16x128`.
   - Added split-K variants for `ffn_down`: `bf16_splitk4_16x32`,
     `bf16_splitk4_32x64`.
-- `src/experiments/gemma4_prefill_tune.py`
+- `src/benches/gemma4_prefill_tune.py`
   - Added the new SGEMM BF16 configs to the tuner.
   - Fixed duplicated CSV field names for `cublas_backend` and `cublas_algo`.
 
@@ -6711,41 +6826,41 @@ Commands:
 make sgemm-bf16-prefill-bench
 
 GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
-  ./build/experiments/gemma4_sgemm_bf16_prefill_bench \
+  ./build/benches/gemma4_sgemm_bf16_prefill_bench \
   ffn_down 10 3 16,64 bf16_smem64_64x64
 
 GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
-  ./build/experiments/gemma4_sgemm_bf16_prefill_bench \
+  ./build/benches/gemma4_sgemm_bf16_prefill_bench \
   ffn_down 10 3 16,64 bf16_warp_16x64
 
 GEMMA4_PREFILL_CUBLAS_BACKEND=lt \
-  ./build/experiments/gemma4_sgemm_bf16_prefill_bench \
+  ./build/benches/gemma4_sgemm_bf16_prefill_bench \
   ffn_down 10 3 16,64 bf16_splitk4_32x64
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_16x32,bf16_16x64,bf16_32x64,bf16_64x64,bf16_128x64,bf16_smem64_32x64,bf16_smem64_64x64,bf16_warp_16x64,bf16_splitk4_32x64 \
   --m 8,16,32,64,128,256 --iters 10 --warmup 3 \
   --cublas-backend lt \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_selected_arch.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_selected_arch.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down --configs bf16_32x64 \
   --m 8,16,32,64,128,256 --iters 100 --warmup 25 \
   --cublas-backend lt \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_best_stability.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_best_stability.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_16x16,bf16_16x32,bf16_16x64,bf16_16x128,bf16_32x32,bf16_32x64,bf16_32x128,bf16_64x64,bf16_64x128,bf16_128x64,bf16_smem64_32x64,bf16_smem64_64x64,bf16_warp_16x32,bf16_warp_16x64,bf16_warp_16x128,bf16_splitk4_16x32,bf16_splitk4_32x64 \
   --m 8,16,32,64,128,256 --iters 10 --warmup 3 \
   --cublas-backend lt \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_extreme.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_extreme.csv
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_extreme.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_extreme.csv \
   --custom-threshold 1.0 \
-  --dispatch-out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_extreme_dispatch.csv
+  --dispatch-out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_extreme_dispatch.csv
 ```
 
 Tried and rejected:
@@ -6763,7 +6878,7 @@ Tried and rejected:
 
 ```bash
 ncu --metric gpu__time_duration.sum --target-processes all \
-  ./build/experiments/gemma4_sgemm_bf16_prefill_bench ffn_down 1 0 32 bf16_32x64
+  ./build/benches/gemma4_sgemm_bf16_prefill_bench ffn_down 1 0 32 bf16_32x64
 ```
 
 This failed in the Thunder runtime with an unsupported-library assertion, so the recorded
@@ -6874,24 +6989,24 @@ Important rejected configs:
 Commands:
 
 ```bash
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down \
   --m 8,16,32,64,96,128,256 --iters 100 --warmup 20 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_auto_gemmex_win.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_auto_gemmex_win.csv
 
-python3 src/experiments/gemma4_prefill_tune.py \
+python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_cutlass_64x128x64,bf16_cutlass_128x128x64,bf16_cutlass_64x64 \
   --m 8,16,32,64,96,128,256 --iters 50 --warmup 10 \
   --cublas-backend lt \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_cutlass_cublaslt.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_cutlass_cublaslt.csv
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_auto_gemmex_win.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_cutlass_cublaslt.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_auto_gemmex_win.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_cutlass_cublaslt.csv \
   --custom-threshold 1.05 \
-  --dispatch-out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_goal_dispatch.csv
+  --dispatch-out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_goal_dispatch.csv
 ```
 
 Dynamic route versus default cuBLAS `cublasGemmEx`:
@@ -6946,25 +7061,25 @@ Commands:
 
 ```bash
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_cutlass_64x128x64,bf16_cutlass_128x128x64,bf16_cutlass_64x64 \
   --m 8,16,32,64,96,128,256 --iters 50 --warmup 10 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_gemmex.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_gemmex.csv
 
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_cutlass_64x128x64,bf16_cutlass_128x128x64,bf16_cutlass_64x64 \
   --m 8,16,32,64,96,128,256 --iters 50 --warmup 10 \
   --cublas-backend lt \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_cublaslt.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_cublaslt.csv
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_gemmex.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_cublaslt.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_gemmex.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_cublaslt.csv \
   --custom-threshold 1.05 \
-  --dispatch-out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_dispatch.csv
+  --dispatch-out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_dispatch.csv
 ```
 
 Graph-timed default cuBLAS `cublasGemmEx` comparison:
@@ -7023,28 +7138,28 @@ Commands:
 
 ```bash
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_cutlass_64x128x64,bf16_cutlass_128x128x64,bf16_cutlass_64x64 \
   --m 8,16,32,64,96,128,256 --iters 30 --warmup 8 \
   --cublas-backend lt --cublaslt-heuristics 32 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_cublaslt_h32.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_graph_cublaslt_h32.csv
 
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_cutlass_64x128x64,bf16_streamk_64x64x64,bf16_streamk_64x128x64,bf16_streamk_128x128x64 \
   --m 8,16,32,64,96,128,256 --iters 30 --warmup 8 \
   --cublas-backend lt --cublaslt-heuristics 32 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_cublaslt_h32.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_cublaslt_h32.csv
 
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_streamk_64x64x64,bf16_streamk_64x128x64,bf16_streamk_128x128x64 \
   --m 512,1024 --iters 20 --warmup 5 \
   --cublas-backend lt --cublaslt-heuristics 32 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_large_m_cublaslt_h32.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_large_m_cublaslt_h32.csv
 ```
 
 Best custom versus graph-timed cuBLASLt h32 over `M=8..1024`:
@@ -7099,20 +7214,20 @@ Commands:
 
 ```bash
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_cutlass_64x128x64,bf16_streamk_64x64x64,bf16_streamk_64x128x64,bf16_streamk_128x128x64 \
   --m 8,16,32,64,96,128,256 --iters 30 --warmup 8 \
   --cublas-backend lt --cublaslt-heuristics 32 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_both_graph_streamk_cublaslt_h32.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_both_graph_streamk_cublaslt_h32.csv
 
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_cutlass_64x64,bf16_cutlass_64x128,bf16_cutlass_64x128x64,bf16_cutlass_128x64,bf16_cutlass_128x64x64,bf16_cutlass_128x128,bf16_cutlass_128x128x64,bf16_cutlass_128x256,bf16_streamk_64x64x64,bf16_streamk_64x128x64,bf16_streamk_128x128x64 \
   --m 256,512 --iters 20 --warmup 5 \
   --cublas-backend lt --cublaslt-heuristics 32 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_large_m_tiles_both_graph_cublaslt_h32.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_large_m_tiles_both_graph_cublaslt_h32.csv
 ```
 
 Both-sides graph timing over `M=8..256`:
@@ -7166,18 +7281,18 @@ Commands:
 
 ```bash
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_streamk_64x64x64,bf16_streamk_s2_64x64x64,bf16_streamk_s4_64x64x64,bf16_streamk_64x128x64,bf16_streamk_s2_64x128x64,bf16_streamk_s4_64x128x64,bf16_streamk_128x128x64,bf16_streamk_s2_128x128x64,bf16_streamk_s4_128x128x64 \
   --m 64,96,128 --iters 20 --warmup 5 \
   --cublas-backend lt --cublaslt-heuristics 32 \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_split_both_graph_cublaslt_h32.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_split_both_graph_cublaslt_h32.csv
 
-python3 src/experiments/gemma4_prefill_tune.py summarize \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_both_graph_streamk_cublaslt_h32.csv \
-  build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_split_both_graph_cublaslt_h32.csv \
+python3 src/benches/gemma4_prefill_tune.py summarize \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_both_graph_streamk_cublaslt_h32.csv \
+  build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_streamk_split_both_graph_cublaslt_h32.csv \
   --custom-threshold 1.05 \
-  --dispatch-out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_both_graph_with_split_cublaslt_h32_dispatch.csv
+  --dispatch-out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_both_graph_with_split_cublaslt_h32_dispatch.csv
 ```
 
 Targeted split-factor sweep:
@@ -7244,12 +7359,12 @@ Commands:
 
 ```bash
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_cutlass_64x64_s10,bf16_cutlass_64x64x64_s5,bf16_cutlass_64x128_s6,bf16_cutlass_64x256_s4,bf16_cutlass_128x64_s6,bf16_cutlass_128x128_s5,bf16_cutlass_128x256x64,bf16_cutlass_256x64,bf16_cutlass_256x64_s4,bf16_cutlass_256x64x64,bf16_cutlass_256x128,bf16_cutlass_256x128x64 \
   --m 64,96,128,256 --iters 16 --warmup 4 \
   --cublas-backend lt --cublaslt-heuristics 16 --keep-going \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_generated_cutlass_both_graph_cublaslt_h16.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_generated_cutlass_both_graph_cublaslt_h16.csv
 ```
 
 Best valid generated shapes:
@@ -7285,12 +7400,12 @@ Command:
 
 ```bash
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_cutlass_128x128_s5,bf16_cutlass_128x128x64,bf16_cutlass_128x256,bf16_cutlass_256x128,bf16_streamk_128x128x64 \
   --m 256,512,1024,2048 --iters 20 --warmup 5 \
   --cublas-backend lt --cublaslt-heuristics 32 --skip-build \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_m256_2048_check_cublaslt_h32.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_m256_2048_check_cublaslt_h32.csv
 ```
 
 Results using the best custom config per `M` and the best graph-timed cuBLASLt h32 time:
@@ -7324,12 +7439,12 @@ Command:
 
 ```bash
 GEMMA4_PREFILL_GRAPH_REPEATS=16 \
-  python3 src/experiments/gemma4_prefill_tune.py \
+  python3 src/benches/gemma4_prefill_tune.py \
   --backend sgemm-bf16 --ops ffn_down \
   --configs bf16_auto_ffn_down,bf16_cutlass_64x64_s10,bf16_cutlass_64x128_s6,bf16_cutlass_128x128_s5,bf16_cutlass_128x256,bf16_cutlass_256x128,bf16_streamk_64x64x64,bf16_streamk_s2_128x128x64 \
   --m 64,96,128,256,512,1024 --iters 16 --warmup 4 \
   --cublas-backend lt --cublaslt-heuristics 64 --skip-build \
-  --out build/experiments/gemma4_prefill_tune/sgemm_bf16_ffn_down_h64_check_cublaslt.csv
+  --out build/benches/gemma4_prefill_tune/sgemm_bf16_ffn_down_h64_check_cublaslt.csv
 ```
 
 Best custom config per `M`:
@@ -7415,10 +7530,10 @@ python3 src/experiments/quack_rmsnorm/gemma4_quack_rmsnorm_bench.py \
 
 make -B rmsnorm-bench
 GEMMA4_RMSNORM_BENCH_SEED=0x20260521 \
-  ./build/experiments/gemma4_rmsnorm_bench 100 10 2 64 5376 \
+  ./build/benches/gemma4_rmsnorm_bench 100 10 2 64 5376 \
   > /tmp/gemma4_quack_rmsnorm_20260521/native_w5376_rows64.csv
 GEMMA4_RMSNORM_BENCH_SEED=0x20260521 \
-  ./build/experiments/gemma4_rmsnorm_bench 100 10 2 64 256 \
+  ./build/benches/gemma4_rmsnorm_bench 100 10 2 64 256 \
   > /tmp/gemma4_quack_rmsnorm_20260521/native_w256_rows64.csv
 ```
 
@@ -7461,7 +7576,7 @@ Conclusion:
 Runtime files:
 
 - `src/gemma4_flash_attention.cu`
-- `src/experiments/gemma4_flash_attention_bench.cu`
+- `src/benches/gemma4_flash_attention_bench.cu`
 - `src/third_party_stubs/ATen/cuda/detail/UnpackRaw.cuh`
 - `Makefile`
 - `experiments/flash-attention/csrc/flash_attn/src/*`
@@ -7491,9 +7606,9 @@ git -C experiments/flash-attention submodule update --init --recursive csrc/cutl
 
 make flash-attn-bench
 
-./build/experiments/gemma4_flash_attention_bench 64 10 3 1 1 64
+./build/benches/gemma4_flash_attention_bench 64 10 3 1 1 64
 
-./build/experiments/gemma4_flash_attention_bench 1024 100 20 3 1 64
+./build/benches/gemma4_flash_attention_bench 1024 100 20 3 1 64
 
 nvcc -std=c++17 -O3 -arch=sm_86 --expt-relaxed-constexpr -Xptxas -v \
   -Isrc -Isrc/third_party_stubs \
@@ -7503,7 +7618,7 @@ nvcc -std=c++17 -O3 -arch=sm_86 --expt-relaxed-constexpr -Xptxas -v \
   -o /tmp/gemma4_flash_attention_resource.o
 
 ncu --metric gpu__time_duration.sum --target-processes all \
-  ./build/experiments/gemma4_flash_attention_bench 1024 10 5 1 1 0
+  ./build/benches/gemma4_flash_attention_bench 1024 10 5 1 1 0
 ```
 
 Environment:
@@ -7555,8 +7670,8 @@ Conclusion:
 Runtime files:
 
 - `src/gemma4_flash_attention.cu`
-- `src/experiments/gemma4_flash_attention_reference.cu`
-- `src/experiments/gemma4_flash_attention_compare.py`
+- `src/benches/gemma4_flash_attention_reference.cu`
+- `src/benches/gemma4_flash_attention_compare.py`
 - `src/third_party_stubs/ATen/cuda/CUDAGeneratorImpl.h`
 - `src/third_party_stubs/ATen/cuda/detail/UnpackRaw.cuh`
 - `src/third_party_stubs/c10/cuda/CUDAException.h`
@@ -7581,11 +7696,11 @@ Commands:
 ```bash
 make -B flash-attn-bench flash-attn-lib flash-attn-reference-lib
 
-./build/experiments/gemma4_flash_attention_bench 64 10 3 1 1 64
+./build/benches/gemma4_flash_attention_bench 64 10 3 1 1 64
 
-./build/experiments/gemma4_flash_attention_bench 1024 100 20 3 1 1
+./build/benches/gemma4_flash_attention_bench 1024 100 20 3 1 1
 
-uv run python src/experiments/gemma4_flash_attention_compare.py \
+uv run python src/benches/gemma4_flash_attention_compare.py \
   --seq 1024 --warmup 20 --iters 100
 
 nvcc -std=c++17 -O3 -arch=sm_86 \
@@ -7650,11 +7765,11 @@ Deep verification rerun after adding direct `cudaFuncGetAttributes` checks:
 ```bash
 make -B flash-attn-bench flash-attn-lib flash-attn-reference-lib
 
-./build/experiments/gemma4_flash_attention_bench 64 10 3 1 1 64
+./build/benches/gemma4_flash_attention_bench 64 10 3 1 1 64
 
-./build/experiments/gemma4_flash_attention_bench 1024 100 20 3 1 64
+./build/benches/gemma4_flash_attention_bench 1024 100 20 3 1 64
 
-uv run python src/experiments/gemma4_flash_attention_compare.py \
+uv run python src/benches/gemma4_flash_attention_compare.py \
   --seq 1024 --warmup 50 --iters 1000 --trials 5 --skip-python-flash-attn
 ```
 
@@ -7704,7 +7819,7 @@ Conclusion:
 Follow-up confirmation rerun:
 
 ```bash
-uv run python src/experiments/gemma4_flash_attention_compare.py \
+uv run python src/benches/gemma4_flash_attention_compare.py \
   --seq 1024 --warmup 50 --iters 1000 --trials 5 --skip-python-flash-attn
 
 nvcc -std=c++17 -O3 -arch=sm_86 \
@@ -7810,10 +7925,10 @@ Import result:
 Smoke checks:
 
 ```bash
-uv run python src/experiments/gemma4_flash_attention_compare.py \
+uv run python src/benches/gemma4_flash_attention_compare.py \
   --seq 1024 --warmup 5 --iters 20 --trials 2
 
-uv run python src/experiments/gemma4_flash_attention_compare.py \
+uv run python src/benches/gemma4_flash_attention_compare.py \
   --seq 2048 --warmup 5 --iters 10 --trials 2
 ```
 
@@ -7825,10 +7940,10 @@ Smoke results:
 Clean sequential timing runs:
 
 ```bash
-uv run python src/experiments/gemma4_flash_attention_compare.py \
+uv run python src/benches/gemma4_flash_attention_compare.py \
   --seq 1024 --warmup 50 --iters 1000 --trials 5
 
-uv run python src/experiments/gemma4_flash_attention_compare.py \
+uv run python src/benches/gemma4_flash_attention_compare.py \
   --seq 2048 --warmup 50 --iters 500 --trials 5
 ```
 
@@ -7896,7 +8011,7 @@ Common benchmark setup:
 
 ```bash
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/<binary> 100 20 3
+  build/benches/<binary> 100 20 3
 ```
 
 - GPU: NVIDIA RTX A6000.
@@ -7924,13 +8039,13 @@ Build and run:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
   -Isrc -I/tmp/cudnn-frontend/include \
-  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/benches/gemma4_ffn_cudnn_bench.cu \
   src/gemma4_ffn_decode.cu \
   -lcudnn -lnvrtc -lcuda \
-  -o build/experiments/gemma4_ffn_cudnn_bench_regpipe
+  -o build/benches/gemma4_ffn_cudnn_bench_regpipe
 
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench_regpipe 100 20 3
+  build/benches/gemma4_ffn_cudnn_bench_regpipe 100 20 3
 ```
 
 Compiler resource result:
@@ -7969,13 +8084,13 @@ Build and run:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
   -Isrc -I/tmp/cudnn-frontend/include \
-  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/benches/gemma4_ffn_cudnn_bench.cu \
   src/gemma4_ffn_decode.cu \
   -lcudnn -lnvrtc -lcuda \
-  -o build/experiments/gemma4_ffn_cudnn_bench_async3
+  -o build/benches/gemma4_ffn_cudnn_bench_async3
 
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench_async3 100 20 3
+  build/benches/gemma4_ffn_cudnn_bench_async3 100 20 3
 ```
 
 Compiler resource result:
@@ -8010,13 +8125,13 @@ Build and run:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
   -Isrc -I/tmp/cudnn-frontend/include \
-  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/benches/gemma4_ffn_cudnn_bench.cu \
   src/gemma4_ffn_decode.cu \
   -lcudnn -lnvrtc -lcuda \
-  -o build/experiments/gemma4_ffn_cudnn_bench_sharedx
+  -o build/benches/gemma4_ffn_cudnn_bench_sharedx
 
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench_sharedx 100 20 3
+  build/benches/gemma4_ffn_cudnn_bench_sharedx 100 20 3
 ```
 
 Compiler resource result:
@@ -8075,13 +8190,13 @@ Build and run:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
   -Isrc -I/tmp/cudnn-frontend/include \
-  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/benches/gemma4_ffn_cudnn_bench.cu \
   src/gemma4_ffn_decode.cu \
   -lcudnn -lnvrtc -lcuda \
-  -o build/experiments/gemma4_ffn_cudnn_bench_swizzled
+  -o build/benches/gemma4_ffn_cudnn_bench_swizzled
 
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench_swizzled 100 20 3
+  build/benches/gemma4_ffn_cudnn_bench_swizzled 100 20 3
 ```
 
 Compiler resource result:
@@ -8126,7 +8241,7 @@ Common setup:
 
 ```bash
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/<binary> 100 20 3
+  build/benches/<binary> 100 20 3
 ```
 
 - GPU: NVIDIA RTX A6000.
@@ -8139,10 +8254,10 @@ Canonical hidden-pack layout:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
   -Isrc -I/tmp/cudnn-frontend/include \
-  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/benches/gemma4_ffn_cudnn_bench.cu \
   src/gemma4_ffn_decode.cu \
   -lcudnn -lnvrtc -lcuda \
-  -o build/experiments/gemma4_ffn_cudnn_bench_unswizzled
+  -o build/benches/gemma4_ffn_cudnn_bench_unswizzled
 ```
 
 - FFN registers/thread: `48`
@@ -8157,10 +8272,10 @@ Pre-swizzled hidden-pack layout:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
   -Isrc -I/tmp/cudnn-frontend/include \
-  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/benches/gemma4_ffn_cudnn_bench.cu \
   src/gemma4_ffn_decode.cu \
   -lcudnn -lnvrtc -lcuda \
-  -o build/experiments/gemma4_ffn_cudnn_bench_swizzled
+  -o build/benches/gemma4_ffn_cudnn_bench_swizzled
 ```
 
 - FFN registers/thread: `46`
@@ -8190,7 +8305,7 @@ Benchmark setup:
 
 ```bash
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/<binary> <iters> <warmup> <trials>
+  build/benches/<binary> <iters> <warmup> <trials>
 ```
 
 - GPU: NVIDIA RTX A6000.
@@ -8335,13 +8450,13 @@ Build and run:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v \
   -Isrc -I/tmp/cudnn-frontend/include \
-  src/experiments/gemma4_ffn_cudnn_bench.cu \
+  src/benches/gemma4_ffn_cudnn_bench.cu \
   src/gemma4_ffn_decode.cu \
   -lcudnn -lnvrtc -lcuda \
-  -o build/experiments/ffn_ablate/ffn_best_cold
+  -o build/benches/ffn_ablate/ffn_best_cold
 
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/ffn_ablate/ffn_best_cold 20 5 2
+  build/benches/ffn_ablate/ffn_best_cold 20 5 2
 ```
 
 Results:
@@ -8502,7 +8617,7 @@ Implementation:
   hidden 128-bit packs were owned by threads. Threads now cover hidden packs
   in rounds.
 - Added a focused custom-only benchmark:
-  `src/experiments/gemma4_ffn_decode_load_bench.cu`.
+  `src/benches/gemma4_ffn_decode_load_bench.cu`.
 - Added compile-time experiment toggles:
   - `GEMMA4_FFN_DECODE_PRELOAD_DOWN`
   - `GEMMA4_MATMUL_DEVICE_PRELOAD_PAIR_COLS`
@@ -8542,11 +8657,11 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
 
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+  build/benches/gemma4_ffn_decode_load_bench 30 8 3
 
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 GPU/tooling:
@@ -8637,7 +8752,7 @@ ncu --target-processes all --kernel-name-base demangled \
   --kernel-name regex:gemma4_ffn_decode_fused_bf16_kernel \
   --metrics gpu__time_duration.sum,dram__bytes_read.sum,dram__bytes_write.sum \
   --csv --log-file build/analysis/ffn_load_play/final_default_ncu.csv \
-  build/experiments/gemma4_ffn_decode_load_bench 1 0 1
+  build/benches/gemma4_ffn_decode_load_bench 1 0 1
 ```
 
 The `ncu` run was stopped after several minutes without returning useful
@@ -8760,7 +8875,7 @@ Runtime checks:
 make test-ffn-decode
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+  build/benches/gemma4_ffn_decode_load_bench 30 8 3
 ```
 
 Results:
@@ -8886,7 +9001,7 @@ Final focused source timing:
 ```bash
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+  build/benches/gemma4_ffn_decode_load_bench 30 8 3
 ```
 
 ```text
@@ -8901,7 +9016,7 @@ Full cuDNN comparison harness:
 ```bash
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 ```text
@@ -9005,7 +9120,7 @@ Focused load bench after lock-only clear accounting and release handoff:
 ```bash
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+  build/benches/gemma4_ffn_decode_load_bench 30 8 3
 ```
 
 ```text
@@ -9023,7 +9138,7 @@ Full cuDNN comparison after release handoff:
 ```bash
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 ```text
@@ -9142,9 +9257,9 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -o build/ptx/ffn_final_check/gemma4_ffn_decode.o
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+  build/benches/gemma4_ffn_decode_load_bench 30 8 3
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 ```
 
 Source baseline recheck:
@@ -9272,7 +9387,7 @@ Focused load bench:
 ```bash
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 ```
 
 ```text
@@ -9294,7 +9409,7 @@ Full cuDNN comparison harness:
 ```bash
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 ```text
@@ -9400,12 +9515,12 @@ cuobjdump --dump-sass build/ptx/ffn_final/gemma4_ffn_decode.o | \
 compute-sanitizer --tool racecheck ./build/tests/test_ffn_decode
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 30 8 3
+  build/benches/gemma4_ffn_decode_load_bench 30 8 3
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 make ffn-cudnn-bench
 GEMMA4_FFN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 Correctness/resource checks:
@@ -9533,10 +9648,10 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -o build/ptx/ffn_tile896_default/gemma4_ffn_decode.o
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 make ffn-cudnn-bench
 GEMMA4_FFN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 Correctness/resource checks:
@@ -9665,10 +9780,10 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -o build/ptx/ffn_final_helper_directx/gemma4_ffn_decode.o
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 make ffn-cudnn-bench
 GEMMA4_FFN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 Correctness/resource checks:
@@ -9893,7 +10008,7 @@ l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum,\
 l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,\
 l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
 dram__sectors_read.sum,dram__sectors_write.sum \
-  --csv build/experiments/gemma4_ffn_decode_load_bench 1 0 1
+  --csv build/benches/gemma4_ffn_decode_load_bench 1 0 1
 timeout 90s ncu --target-processes all --launch-count 1 \
   --print-summary per-kernel ./build/tests/test_ffn_decode
 ```
@@ -10005,10 +10120,10 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -o build/ptx/ffn_atomic_tile168_final/gemma4_ffn_decode.o
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 Additional diagnostic:
@@ -10170,10 +10285,10 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -o build/ptx/ffn_direct_final/gemma4_ffn_decode.o
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 Final resource check:
@@ -10304,10 +10419,10 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -o build/ptx/ffn_static_one_pack/gemma4_ffn_decode.o
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 Final resource check:
@@ -10449,7 +10564,7 @@ l1tex__t_requests_pipe_lsu_mem_global_op_ld.sum,\
 l1tex__t_sectors_pipe_lsu_mem_global_op_ld.sum,\
 l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,\
 l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum \
-  --csv build/experiments/gemma4_ffn_decode_load_bench 1 0 1
+  --csv build/benches/gemma4_ffn_decode_load_bench 1 0 1
 ```
 
 The NCU command again timed out with `==WARNING== No kernels were profiled.`
@@ -10465,10 +10580,10 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -o build/ptx/ffn_final_after_sweep/gemma4_ffn_decode.o
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 Final resource check:
@@ -10579,10 +10694,10 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -o build/ptx/ffn_interleave_retained/gemma4_ffn_decode.o
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 Final resource check:
@@ -10728,10 +10843,10 @@ nvcc -std=c++17 -O3 -arch=sm_86 -Xptxas=-v -Isrc \
   -o build/ptx/ffn_goal_variants/gemma4_ffn_decode_default_grid.o
 make ffn-decode-load-bench
 GEMMA4_FFN_LOAD_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_decode_load_bench 80 12 5
+  build/benches/gemma4_ffn_decode_load_bench 80 12 5
 make ffn-cudnn-bench
 GEMMA4_FFN_CUDNN_BENCH_SEED=0x20260522 \
-  build/experiments/gemma4_ffn_cudnn_bench 50 10 3
+  build/benches/gemma4_ffn_cudnn_bench 50 10 3
 ```
 
 Final resource check:
@@ -10800,9 +10915,9 @@ make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
 
 Benchmark contract:
 
-- Harness: `build/experiments/gemma4_flash_attention_bench`
+- Harness: `build/benches/gemma4_flash_attention_bench`
 - Command per process:
-  `./build/experiments/gemma4_flash_attention_bench 1024 500 50 1 1 64`
+  `./build/benches/gemma4_flash_attention_bench 1024 500 50 1 1 64`
 - Measures custom sliding BF16 attention with CUDA events in the harness.
 - Shape: `batch=1`, `seq=1024`, `window_left=1024`; correctness reference uses
   `seq=64`.
@@ -10891,7 +11006,7 @@ make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
 Benchmark contract:
 
 - Same as the prior FlashAttention cleanup entry:
-  `./build/experiments/gemma4_flash_attention_bench 1024 500 50 1 1 64`
+  `./build/benches/gemma4_flash_attention_bench 1024 500 50 1 1 64`
 - Warm-cache repeated buffers, CUDA-event timing in the harness, launch
   included, `9` fresh processes per retained step.
 - Clocks were not locked.
@@ -10996,7 +11111,7 @@ Validation:
 
 ```bash
 make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
-./build/experiments/gemma4_flash_attention_bench 1024 500 50 1 1 64
+./build/benches/gemma4_flash_attention_bench 1024 500 50 1 1 64
 ```
 
 Retained split benchmark, `9` fresh processes, same warm-cache CUDA-event
@@ -11084,7 +11199,7 @@ Custom paged KV command:
 
 ```bash
 make NVCC=/usr/local/cuda/bin/nvcc kv-cache-bench
-./build/experiments/gemma4_kv_cache_bench 4096 64 64 25 100 15
+./build/benches/gemma4_kv_cache_bench 4096 64 64 25 100 15
 ```
 
 Custom paged KV result:
@@ -11109,7 +11224,7 @@ split=256 attention median_ms=0.926520 full_decode median_ms=0.927453
 PyTorch comparable baseline:
 
 ```bash
-python3 src/experiments/gemma4_kv_cache_torch_bench.py \
+python3 src/benches/gemma4_kv_cache_torch_bench.py \
   --seq-len 4096 --warmup 25 --iters 100 --samples 15
 ```
 
@@ -11157,7 +11272,7 @@ Quick benchmark, same warm-cache CUDA-event contract as the split sweep above:
 
 ```bash
 make NVCC=/usr/local/cuda/bin/nvcc kv-cache-bench
-./build/experiments/gemma4_kv_cache_bench 4096 64 64 5 20 5
+./build/benches/gemma4_kv_cache_bench 4096 64 64 5 20 5
 ```
 
 Result:
@@ -11206,7 +11321,7 @@ Quick benchmark, same warm-cache CUDA-event contract:
 
 ```bash
 make NVCC=/usr/local/cuda/bin/nvcc kv-cache-bench
-./build/experiments/gemma4_kv_cache_bench 4096 64 64 5 20 5
+./build/benches/gemma4_kv_cache_bench 4096 64 64 5 20 5
 ```
 
 Result:
@@ -11263,7 +11378,7 @@ Useful references found:
 Baseline before this pass, warm-cache CUDA-event quick contract:
 
 ```bash
-./build/experiments/gemma4_kv_cache_bench 4096 64 64 10 100 5
+./build/benches/gemma4_kv_cache_bench 4096 64 64 10 100 5
 ```
 
 ```text
@@ -11287,7 +11402,7 @@ paged_full_decode_write_plus_attention median_ms=0.743927 mean_ms=0.743703 min_m
 `__grid_constant__` only on the cache-write kernels, longer contract:
 
 ```bash
-./build/experiments/gemma4_kv_cache_bench 4096 64 64 25 100 15
+./build/benches/gemma4_kv_cache_bench 4096 64 64 25 100 15
 ```
 
 ```text
@@ -11331,7 +11446,7 @@ Scope:
   is recorded after the flush, so reported kernel time excludes flush overhead.
 - Upgraded the PyTorch SDPA comparator to report the same tail stats and raw
   samples, with matching warm/cold cache modes.
-- Persisted raw-sample outputs under `src/experiments/results/`.
+- Persisted raw-sample outputs under `src/benches/results/`.
 
 Clock and environment controls:
 
@@ -11385,10 +11500,10 @@ Benchmark contract:
 Persisted outputs:
 
 ```text
-src/experiments/results/2026-06-16_kv_cache_custom_warm.txt
-src/experiments/results/2026-06-16_kv_cache_custom_cold.txt
-src/experiments/results/2026-06-16_kv_cache_torch_warm.json
-src/experiments/results/2026-06-16_kv_cache_torch_cold.json
+src/benches/results/2026-06-16_kv_cache_custom_warm.txt
+src/benches/results/2026-06-16_kv_cache_custom_cold.txt
+src/benches/results/2026-06-16_kv_cache_torch_warm.json
+src/benches/results/2026-06-16_kv_cache_torch_cold.json
 ```
 
 Custom paged KV, warm cache:
@@ -11465,7 +11580,7 @@ kv cache tests passed
 Benchmark command:
 
 ```bash
-./build/experiments/gemma4_flash_attention_bench 1024 20 20 30 1 64 cold 128
+./build/benches/gemma4_flash_attention_bench 1024 20 20 30 1 64 cold 128
 ```
 
 Benchmark contract:
@@ -11533,13 +11648,13 @@ The current user does not have permission to change clocks
 Benchmark commands:
 
 ```bash
-python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+python3 src/benches/gemma4_decode_prep_torch_bench.py \
   --cache warm --warmup 20 --iters 50 --samples 30 \
-  --output src/experiments/results/2026-06-17_decode_prep_torch_warm.json
+  --output src/benches/results/2026-06-17_decode_prep_torch_warm.json
 
-python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+python3 src/benches/gemma4_decode_prep_torch_bench.py \
   --cache cold --flush-mib 128 --warmup 20 --iters 50 --samples 30 \
-  --output src/experiments/results/2026-06-17_decode_prep_torch_cold.json
+  --output src/benches/results/2026-06-17_decode_prep_torch_cold.json
 ```
 
 Benchmark contract:
@@ -11626,13 +11741,13 @@ The current user does not have permission to change clocks
 Benchmark commands:
 
 ```bash
-python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+python3 src/benches/gemma4_decode_prep_torch_bench.py \
   --cache warm --warmup 25 --iters 100 --samples 31 \
-  --output src/experiments/results/2026-06-17_decode_prep_torch_graph_warm.json
+  --output src/benches/results/2026-06-17_decode_prep_torch_graph_warm.json
 
-python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+python3 src/benches/gemma4_decode_prep_torch_bench.py \
   --cache cold --flush-mib 128 --warmup 25 --iters 100 --samples 31 \
-  --output src/experiments/results/2026-06-17_decode_prep_torch_graph_cold.json
+  --output src/benches/results/2026-06-17_decode_prep_torch_graph_cold.json
 ```
 
 Benchmark contract:
@@ -11689,15 +11804,15 @@ Scope:
 Benchmark commands:
 
 ```bash
-python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+python3 src/benches/gemma4_decode_prep_torch_bench.py \
   --cache warm --warmup 25 --iters 100 --samples 31 \
   --sleep-cycles 1000000 \
-  --output src/experiments/results/2026-06-17_decode_prep_torch_graph_sleep_warm.json
+  --output src/benches/results/2026-06-17_decode_prep_torch_graph_sleep_warm.json
 
-python3 src/experiments/gemma4_decode_prep_torch_bench.py \
+python3 src/benches/gemma4_decode_prep_torch_bench.py \
   --cache cold --flush-mib 128 --warmup 25 --iters 100 --samples 31 \
   --sleep-cycles 1000000 \
-  --output src/experiments/results/2026-06-17_decode_prep_torch_graph_sleep_cold.json
+  --output src/benches/results/2026-06-17_decode_prep_torch_graph_sleep_cold.json
 ```
 
 Clock controls:
@@ -11812,7 +11927,7 @@ Validation:
 
 ```bash
 make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
-./build/experiments/gemma4_flash_attention_bench 1024 20 5 3 1 64
+./build/benches/gemma4_flash_attention_bench 1024 20 5 3 1 64
 make flash-attn-lib test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
 make -B flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
 ```
@@ -11863,7 +11978,7 @@ Validation:
 
 ```bash
 make -B test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
-python3 -m py_compile src/experiments/gemma4_paged_decode_torch_bench.py
+python3 -m py_compile src/benches/gemma4_paged_decode_torch_bench.py
 make -B flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
 make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
 ```
@@ -11892,10 +12007,10 @@ Correctness coverage:
 C++ old-vs-new benchmark commands:
 
 ```bash
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   1024 64 64 5 10 3 --cache warm
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   1024 64 64 3 5 3 --cache cold --flush-bytes 134217728
 ```
 
@@ -11935,16 +12050,16 @@ flash_full_decode_write_plus_attention median=0.101690 ms
 PyTorch graph benchmark commands:
 
 ```bash
-python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+python3 src/benches/gemma4_paged_decode_torch_bench.py \
   --seq-len 1024 --prefill-seq-len 64 --page-size 64 --split-size 64 \
   --warmup 5 --iters 10 --samples 3 --cache warm --sample-delay-s 1.0 \
-  --output src/experiments/results/2026-06-17_paged_decode_torch_graph_warm.json
+  --output src/benches/results/2026-06-17_paged_decode_torch_graph_warm.json
 
-python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+python3 src/benches/gemma4_paged_decode_torch_bench.py \
   --seq-len 1024 --prefill-seq-len 64 --page-size 64 --split-size 64 \
   --warmup 5 --iters 5 --samples 3 --cache cold --flush-mib 128 \
   --sample-delay-s 1.0 \
-  --output src/experiments/results/2026-06-17_paged_decode_torch_graph_cold.json
+  --output src/benches/results/2026-06-17_paged_decode_torch_graph_cold.json
 ```
 
 PyTorch graph benchmark contract:
@@ -12014,23 +12129,23 @@ Commands:
 ```bash
 for spec in "0 ca" "1 cg" "2 ca_l2_128" "3 cg_l2_128"; do
   set -- $spec
-  make -B build/experiments/gemma4_kv_cache_bench \
+  make -B build/benches/gemma4_kv_cache_bench \
     NVCC=/usr/local/cuda/bin/nvcc \
     NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_SLIDING_DECODE_CP_ASYNC_CACHE_POLICY=$1"
   sleep 1
-  ./build/experiments/gemma4_kv_cache_bench 4096 64 64 20 100 12 --cache warm \
-    | tee "src/experiments/results/2026-06-18_cp_async_${2}_warm.txt"
+  ./build/benches/gemma4_kv_cache_bench 4096 64 64 20 100 12 --cache warm \
+    | tee "src/benches/results/2026-06-18_cp_async_${2}_warm.txt"
   sleep 1
 done
 
 for spec in "0 ca" "1 cg" "2 ca_l2_128" "3 cg_l2_128"; do
   set -- $spec
-  make -B build/experiments/gemma4_kv_cache_bench \
+  make -B build/benches/gemma4_kv_cache_bench \
     NVCC=/usr/local/cuda/bin/nvcc \
     NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_SLIDING_DECODE_CP_ASYNC_CACHE_POLICY=$1"
   sleep 1
-  ./build/experiments/gemma4_kv_cache_bench 4096 64 64 10 20 8 --cache cold \
-    | tee "src/experiments/results/2026-06-18_cp_async_${2}_cold.txt"
+  ./build/benches/gemma4_kv_cache_bench 4096 64 64 10 20 8 --cache cold \
+    | tee "src/benches/results/2026-06-18_cp_async_${2}_cold.txt"
   sleep 1
 done
 ```
@@ -12078,27 +12193,27 @@ Question:
 Commands:
 
 ```bash
-make -B build/experiments/gemma4_kv_cache_bench \
+make -B build/benches/gemma4_kv_cache_bench \
   build/libgemma4_flash_attention.so NVCC=/usr/local/cuda/bin/nvcc
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   4096 64 64 50 200 30 --cache warm \
-  | tee src/experiments/results/2026-06-18_final_paged_decode_cpp_warm.txt
+  | tee src/benches/results/2026-06-18_final_paged_decode_cpp_warm.txt
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   4096 64 64 20 30 15 --cache cold --flush-bytes 67108864 \
-  | tee src/experiments/results/2026-06-18_final_paged_decode_cpp_cold.txt
+  | tee src/benches/results/2026-06-18_final_paged_decode_cpp_cold.txt
 
-python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+python3 src/benches/gemma4_paged_decode_torch_bench.py \
   --seq-len 4096 --prefill-seq-len 64 --page-size 64 --split-size 64 \
   --warmup 10 --iters 20 --samples 5 --cache warm --sample-delay-s 1.0 \
-  --output src/experiments/results/2026-06-18_final_paged_decode_torch_graph_warm.json
+  --output src/benches/results/2026-06-18_final_paged_decode_torch_graph_warm.json
 
-python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+python3 src/benches/gemma4_paged_decode_torch_bench.py \
   --seq-len 4096 --prefill-seq-len 64 --page-size 64 --split-size 64 \
   --warmup 10 --iters 10 --samples 5 --cache cold --flush-mib 128 \
   --sample-delay-s 1.0 \
-  --output src/experiments/results/2026-06-18_final_paged_decode_torch_graph_cold.json
+  --output src/benches/results/2026-06-18_final_paged_decode_torch_graph_cold.json
 ```
 
 Contract:
@@ -12174,8 +12289,8 @@ make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
 Timing commands:
 
 ```bash
-./build/experiments/gemma4_kv_cache_bench 1024 64 64 5 10 3 --cache warm
-./build/experiments/gemma4_kv_cache_bench 1024 64 64 5 10 3 --cache warm --extra-splits 16
+./build/benches/gemma4_kv_cache_bench 1024 64 64 5 10 3 --cache warm
+./build/benches/gemma4_kv_cache_bench 1024 64 64 5 10 3 --cache warm --extra-splits 16
 ```
 
 Contract:
@@ -12233,13 +12348,13 @@ Commands:
 ```bash
 make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   1024 64 64 20 100 10 --cache warm \
-  | tee src/experiments/results/2026-06-18_decode_baseline_vs_flash_warm.txt
+  | tee src/benches/results/2026-06-18_decode_baseline_vs_flash_warm.txt
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   1024 64 64 10 30 8 --cache cold --flush-bytes 67108864 \
-  | tee src/experiments/results/2026-06-18_decode_baseline_vs_flash_cold.txt
+  | tee src/benches/results/2026-06-18_decode_baseline_vs_flash_cold.txt
 ```
 
 Contract:
@@ -12299,7 +12414,7 @@ Commands:
 
 ```bash
 make -B decode-bench NVCC=/usr/local/cuda/bin/nvcc
-GEMMA4_DECODE_BENCH_SEED=12345 ./build/experiments/gemma4_decode_bench 10 3 1
+GEMMA4_DECODE_BENCH_SEED=12345 ./build/benches/gemma4_decode_bench 10 3 1
 
 make -B test-ffn-decode NVCC=/usr/local/cuda/bin/nvcc
 make -B test-cuda-utils NVCC=/usr/local/cuda/bin/nvcc
@@ -12307,7 +12422,7 @@ make -B test-cuda-utils NVCC=/usr/local/cuda/bin/nvcc
 make -B decode-bench NVCC=/usr/local/cuda/bin/nvcc \
   CPPFLAGS='-Isrc -DGEMMA4_DECODE_GEMV_BUFFER_STAGES=2'
 GEMMA4_DECODE_BENCH_SEED=12345 \
-  ./build/experiments/gemma4_decode_bench global_k 5 2 1
+  ./build/benches/gemma4_decode_bench global_k 5 2 1
 make -B decode-bench NVCC=/usr/local/cuda/bin/nvcc
 ```
 
@@ -12374,24 +12489,24 @@ Commands:
 ```bash
 make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   4096 64 64 50 200 20 --cache warm \
-  | tee src/experiments/results/2026-06-18_fa_page_span_before_warm.txt
+  | tee src/benches/results/2026-06-18_fa_page_span_before_warm.txt
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   4096 64 64 20 30 12 --cache cold --flush-bytes 67108864 \
-  | tee src/experiments/results/2026-06-18_fa_page_span_before_cold.txt
+  | tee src/benches/results/2026-06-18_fa_page_span_before_cold.txt
 
 make -B test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
 make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   4096 64 64 50 200 20 --cache warm \
-  | tee src/experiments/results/2026-06-18_fa_page_span_after_warm.txt
+  | tee src/benches/results/2026-06-18_fa_page_span_after_warm.txt
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   4096 64 64 20 30 12 --cache cold --flush-bytes 67108864 \
-  | tee src/experiments/results/2026-06-18_fa_page_span_after_cold.txt
+  | tee src/benches/results/2026-06-18_fa_page_span_after_cold.txt
 ```
 
 Contract:
@@ -12468,7 +12583,7 @@ Build and correctness:
 make -B test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
 make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
 make -B flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
-python3 -m py_compile src/experiments/gemma4_paged_decode_torch_bench.py
+python3 -m py_compile src/benches/gemma4_paged_decode_torch_bench.py
 ```
 
 All commands passed. `test-kv-cache` ended with `kv cache tests passed`.
@@ -12495,24 +12610,24 @@ Benchmark contract:
 Commands:
 
 ```bash
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   4096 64 64 10 50 8 --cache warm --mode global \
-  | tee src/experiments/results/2026-06-18_global_decode_cpp_warm.txt
+  | tee src/benches/results/2026-06-18_global_decode_cpp_warm.txt
 
-./build/experiments/gemma4_kv_cache_bench \
+./build/benches/gemma4_kv_cache_bench \
   4096 64 64 5 20 6 --cache cold --flush-bytes 67108864 --mode global \
-  | tee src/experiments/results/2026-06-18_global_decode_cpp_cold.txt
+  | tee src/benches/results/2026-06-18_global_decode_cpp_cold.txt
 
-python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+python3 src/benches/gemma4_paged_decode_torch_bench.py \
   --mode global --seq-len 4096 --page-size 64 --split-size 64 \
   --warmup 5 --iters 10 --samples 5 --cache warm --sample-delay-s 1 \
-  --output src/experiments/results/2026-06-18_global_decode_torch_graph_warm.json
+  --output src/benches/results/2026-06-18_global_decode_torch_graph_warm.json
 
-python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+python3 src/benches/gemma4_paged_decode_torch_bench.py \
   --mode global --seq-len 4096 --page-size 64 --split-size 64 \
   --warmup 3 --iters 5 --samples 3 --cache cold --flush-mib 128 \
   --sample-delay-s 1 \
-  --output src/experiments/results/2026-06-18_global_decode_torch_graph_cold.json
+  --output src/benches/results/2026-06-18_global_decode_torch_graph_cold.json
 ```
 
 Median results:
