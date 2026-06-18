@@ -11580,3 +11580,317 @@ Conclusion:
 - Cold-cache median improved, but custom cold tails had large outliers because
   clocks are unlocked and each sample repeats flush/sleep/replay many times.
   Use the median for the headline comparison and keep p95/p99 visible.
+
+## 2026-06-17 - FlashAttention KV block loop fuse cleanup
+
+Scope:
+
+- Factored the duplicated masking/steady K/V loop body in
+  `src/gemma4_flash_attention.cu` into a templated `gemma4_process_kv_block`
+  helper.
+- Kept masking compile-time-specialized through `MaybeMask`; the global
+  steady-loop instantiation uses `MaybeMask=false`.
+- Unified `softmax_rescale_o` so the first-vs-later block distinction is just
+  O/denominator rescaling plus row-sum initialization.
+- Follow-up cleanup folded `softmax_rescale_visible` into
+  `softmax_rescale<IsFirst, MaybeMask>` while keeping the `CheckInf` branch as a
+  compile-time specialization through `softmax_rescale_impl`.
+- Folded causal and local block-visibility helpers into the single templated
+  `gemma4_score_block_fully_visible<IsLocal>` helper.
+- Reused one O-store helper and one LSE-row writer for the empty-block path and
+  normal epilogue.
+- Removed dead FA helper generality: `ScaleMax`, `AInRegs`/`BInRegs`, and the
+  unpredicated `gemma4_fa_copy` wrapper.
+
+Build and SASS/resource commands:
+
+```bash
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -Isrc \
+  -Iexperiments/flash-attention/csrc/cutlass/include -Xptxas=-v \
+  -c src/gemma4_flash_attention.cu \
+  -o build/ptx/gemma4_flash_attention_after_loop_fuse.o
+
+/usr/local/cuda/bin/cuobjdump --dump-sass \
+  build/ptx/gemma4_flash_attention_after_loop_fuse.o \
+  > build/ptx/gemma4_flash_attention_after_loop_fuse.sass
+```
+
+ptxas check versus the pre-refactor object:
+
+```text
+global D512 ReturnLse=true:  255 regs, stack 744 -> 704 B, spills 1512/1696 -> 1488/1664 B
+global D512 ReturnLse=false: 255 regs, stack 728 -> 704 B, spills 1476/1652 -> 1436/1604 B
+sliding D256 ReturnLse=true:  245 -> 244 regs, 0 spills
+sliding D256 ReturnLse=false: 244 -> 245 regs, 0 spills
+```
+
+Coarse SASS instruction-count check:
+
+```text
+global D512 ReturnLse=true:  4096 -> 4096 instructions
+global D512 ReturnLse=false: 4096 -> 4096 instructions
+sliding D256 ReturnLse=true:  3560 -> 3824 instructions
+sliding D256 ReturnLse=false: 3488 -> 3704 instructions
+```
+
+Validation:
+
+```bash
+make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_flash_attention_bench 1024 20 5 3 1 64
+make flash-attn-lib test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+make -B flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Quick benchmark/correctness result:
+
+```text
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+norm_rope_plus_fa median_ms=0.335512 samples=3 warm-cache, launch included
+decode_norm_rope_paged_kv_write median_ms=0.0138224 samples=3 warm-cache, launch included
+kv cache tests passed
+```
+
+Conclusion:
+
+- The global D=512 path preserved the coarse SASS instruction count and did not
+  increase register pressure; stack/spill bytes improved slightly.
+- Sliding stayed spill-free. Its coarse SASS text grew because the local
+  steady-loop still carries the compile-time `MaybeMask=true` window-edge path.
+- The `softmax_rescale_visible` fold matched the pre-follow-up ptxas resource
+  profile exactly; only ptxas compile-time timings changed.
+- The visibility-helper fold kept sliding registers/spills unchanged and reduced
+  global spill stores/loads by 4 bytes in the ptxas check.
+- The quick correctness-bearing benchmark passed; this run was not a locked-clock
+  performance claim.
+
+## 2026-06-17 - Sliding paged decode attention CUDA-core path
+
+Scope:
+
+- Added `gemma4_flash_attention_sliding_decode_paged_bf16`, a sliding-only
+  q_len=1 paged decode attention path that consumes Layout-A paged K/V directly.
+- The split kernel is CUDA-core based, not tensor-core based. One CTA owns one
+  KV head plus its two sliding GQA query heads, so K/V vectors are loaded once
+  for the pair instead of once per query head.
+- Kept the existing `gemma4_paged_decode_attention_bf16` implementation as the
+  simple reference baseline.
+- Added `gemma4_flash_attention_sliding_decode_paged_cp_async_bf16` as an
+  explicit cp.async ablation. It stages one K/V vector at a time through shared
+  memory with immediate wait; it is benchmarked separately rather than chosen
+  implicitly.
+- Exported `gemma4_kv_cache_write_bf16` with C ABI so Python graph benchmarks
+  can populate the same CUDA KV cache layout used by the C++ path.
+
+Validation:
+
+```bash
+make -B test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+python3 -m py_compile src/experiments/gemma4_paged_decode_torch_bench.py
+make -B flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
+make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Result:
+
+```text
+kv cache tests passed
+```
+
+Correctness coverage:
+
+- Existing KV cache address, write, global paged attention, and sliding wrap
+  tests still pass.
+- New sliding paged decode cases compare direct and cp.async paths against both
+  the existing CUDA paged baseline and the CPU reference for:
+  - short context below one page;
+  - page-boundary crossing;
+  - sliding window slot wrap.
+- PyTorch graph benchmark correctness:
+  - decode direct vs PyTorch max abs: `0.000244140625`
+  - decode cp.async vs PyTorch max abs: `0.000244140625`
+  - decode direct vs cp.async max abs: `0`
+  - prefill tensor-core FA vs PyTorch SDPA max abs: `0.001953125`
+
+C++ old-vs-new benchmark commands:
+
+```bash
+./build/experiments/gemma4_kv_cache_bench \
+  1024 64 64 5 10 3 --cache warm
+
+./build/experiments/gemma4_kv_cache_bench \
+  1024 64 64 3 5 3 --cache cold --flush-bytes 134217728
+```
+
+C++ benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, driver/runtime reported as CUDA `13.0`.
+- Compiler: `/usr/local/cuda/bin/nvcc`, target `sm_86`, flags include
+  `-O3`, `--expt-relaxed-constexpr`, `--expt-extended-lambda`,
+  `--use_fast_math`.
+- Shape: sliding decode, `B=1`, `seq_len=1024`, `key_count=1024`,
+  `page_size=64`, `split_size=64`, `num_splits=16`, `Q heads=32`,
+  `KV heads=16`, `head_dim=256`, BF16.
+- Timing: CUDA events on the benchmark stream. Warm run batches ten launches per
+  sample; cold run flushes 128 MiB before each measured iteration.
+- Clock policy: not locked in this quick run.
+
+C++ warm-cache results:
+
+```text
+paged_decode_attention                 median=0.140064 ms
+flash_decode_paged_attention_direct    median=0.100266 ms
+flash_decode_paged_attention_cp_async  median=0.099850 ms
+paged_full_decode_write_plus_attention median=0.143840 ms
+flash_full_decode_write_plus_attention median=0.104509 ms
+```
+
+C++ cold-cache results:
+
+```text
+paged_decode_attention                 median=0.139514 ms
+flash_decode_paged_attention_direct    median=0.099296 ms
+flash_decode_paged_attention_cp_async  median=0.099277 ms
+paged_full_decode_write_plus_attention median=0.141274 ms
+flash_full_decode_write_plus_attention median=0.101690 ms
+```
+
+PyTorch graph benchmark commands:
+
+```bash
+python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+  --seq-len 1024 --prefill-seq-len 64 --page-size 64 --split-size 64 \
+  --warmup 5 --iters 10 --samples 3 --cache warm --sample-delay-s 1.0 \
+  --output src/experiments/results/2026-06-17_paged_decode_torch_graph_warm.json
+
+python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+  --seq-len 1024 --prefill-seq-len 64 --page-size 64 --split-size 64 \
+  --warmup 5 --iters 5 --samples 3 --cache cold --flush-mib 128 \
+  --sample-delay-s 1.0 \
+  --output src/experiments/results/2026-06-17_paged_decode_torch_graph_cold.json
+```
+
+PyTorch graph benchmark contract:
+
+- Hardware: NVIDIA RTX A6000.
+- PyTorch: `2.11.0+cu130`, CUDA runtime `13.0`.
+- Timing: CUDA events on the current PyTorch CUDA stream.
+- Execution: explicit CUDA graph replay for both custom CUDA and PyTorch paths.
+- Delay: host `sleep(1.0)` before each measured sample, outside the CUDA event
+  window, per request.
+- Decode q_len=1 uses the new CUDA-core paged path and a PyTorch graph over the
+  equivalent BF16 GQA attention. The cache is filled with
+  `gemma4_kv_cache_write_bf16`.
+- q_len>1 uses the existing tensor-core contiguous sliding FA path at
+  `prefill_seq_len=64` and compares against PyTorch SDPA.
+- Warm cache uses `graph_inner_iters=10`. Cold cache uses one graph op per
+  replay and flushes 128 MiB before each measured replay.
+
+PyTorch warm-cache graph results:
+
+```text
+decode_custom_direct       median=0.097398 ms
+decode_custom_cp_async     median=0.097398 ms
+decode_torch_graph         median=0.674688 ms
+prefill_custom_tensor_core median=0.009715 ms
+prefill_torch_sdpa_graph   median=0.022365 ms
+```
+
+PyTorch cold-cache graph results:
+
+```text
+decode_custom_direct       median=0.097946 ms
+decode_custom_cp_async     median=0.097766 ms
+decode_torch_graph         median=0.679328 ms
+prefill_custom_tensor_core median=0.019296 ms
+prefill_torch_sdpa_graph   median=0.021574 ms
+```
+
+Conclusion:
+
+- The GQA-aware CUDA-core paged decode kernel is a clear improvement over the
+  old simple paged baseline at this shape: roughly `1.39-1.40x` faster for
+  attention-only and about `1.37-1.39x` faster for cache-write-plus-attention.
+- Against the PyTorch CUDA-graph decode implementation, the custom paged decode
+  path is about `6.9x` faster at the median for both warm and cold runs.
+- The cp.async ablation is effectively tied with direct global loads in these
+  quick runs. It did not demonstrate a meaningful win, which matches the risk
+  that one-use K/V staging through shared memory adds traffic without enough
+  overlap. Keep it as a measured ablation for now, not as the default.
+- The q_len>1 tensor-core custom FA path remains faster than PyTorch SDPA in the
+  warm graph run (`~2.3x` median at `S=64`), but the cold run is much closer
+  (`~1.12x`) and only used three samples. Do not make a broad prefill claim from
+  this small graph run.
+- Clocks were not locked and sample counts were intentionally small; repeat with
+  more samples and clock controls before claiming small deltas, especially for
+  direct-vs-cp.async.
+
+## 2026-06-18 - Sliding decode cp.async cache-policy sweep
+
+Question:
+
+- For the sliding paged decode cp.async ablation, test whether `.cg` and/or
+  `.L2::128B` beats the original `.ca` copy.
+
+Commands:
+
+```bash
+for spec in "0 ca" "1 cg" "2 ca_l2_128" "3 cg_l2_128"; do
+  set -- $spec
+  make -B build/experiments/gemma4_kv_cache_bench \
+    NVCC=/usr/local/cuda/bin/nvcc \
+    NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_SLIDING_DECODE_CP_ASYNC_CACHE_POLICY=$1"
+  sleep 1
+  ./build/experiments/gemma4_kv_cache_bench 4096 64 64 20 100 12 --cache warm \
+    | tee "src/experiments/results/2026-06-18_cp_async_${2}_warm.txt"
+  sleep 1
+done
+
+for spec in "0 ca" "1 cg" "2 ca_l2_128" "3 cg_l2_128"; do
+  set -- $spec
+  make -B build/experiments/gemma4_kv_cache_bench \
+    NVCC=/usr/local/cuda/bin/nvcc \
+    NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_SLIDING_DECODE_CP_ASYNC_CACHE_POLICY=$1"
+  sleep 1
+  ./build/experiments/gemma4_kv_cache_bench 4096 64 64 10 20 8 --cache cold \
+    | tee "src/experiments/results/2026-06-18_cp_async_${2}_cold.txt"
+  sleep 1
+done
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, CUDA runtime reported as
+  `13.0`, persistence enabled, ECC disabled, power limit `300 W`.
+- Shape: sliding decode, `B=1`, `seq_len=4096`, sliding `key_count=1024`,
+  `page_size=64`, `split_size=64`, `num_splits=16`, BF16, `q_heads=32`,
+  `kv_heads=16`, `head_dim=256`.
+- Timing: CUDA events on the benchmark stream. Warm run batches 100 launches per
+  sample for 12 samples. Cold run flushes 64 MiB before each measured iteration,
+  20 iterations per sample for 8 samples.
+- A host `sleep 1` separated policy runs. Clocks were not locked.
+
+cp.async attention-only medians:
+
+```text
+policy              warm median      cold median
+cp.async.ca         0.091628 ms      0.099900 ms
+cp.async.cg         0.090102 ms      0.099613 ms
+cp.async.ca.L2::128 0.091033 ms      0.099838 ms
+cp.async.cg.L2::128 0.091144 ms      0.099797 ms
+```
+
+Decision:
+
+- `.cg` was the best cp.async policy in both warm and cold medians.
+- Neither `.L2::128B` variant earned its codepath; both were slower than plain
+  `.cg`.
+- The direct non-cp.async decode path remained faster than cp.async in this
+  sweep (`~0.088-0.089 ms` warm, `~0.096-0.097 ms` cold), so cp.async remains
+  an ablation path rather than the default.
+- Code was pruned to keep only `cp.async.cg.shared.global` for the cp.async
+  ablation and remove the `.ca`/`.L2::128B` policy switch.

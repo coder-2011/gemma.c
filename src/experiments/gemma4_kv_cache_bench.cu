@@ -1,4 +1,5 @@
 #include "gemma4_kv_cache.cuh"
+#include "gemma4_flash_attention.cuh"
 #include "gemma4.h"
 #include "gemma4_cuda_utils.cuh"
 #include "experiments/gemma4_bench_utils.cuh"
@@ -338,13 +339,18 @@ int main(int argc, char **argv) {
                                     int64_t(prop.l2CacheSize) * 4);
   }
 
-  int max_pages = div_up(seq_len, page_size);
+  int pages_for_seq = div_up(seq_len, page_size);
+  int max_pages_per_seq =
+      std::max(pages_for_seq, div_up(GEMMA4_SLIDING_WINDOW, page_size) + 1);
   Gemma4KvCacheConfig config =
-      gemma4_kv_cache_make_config(true, max_pages, page_size, max_pages);
+      gemma4_kv_cache_make_config(false, max_pages_per_seq, page_size,
+                                  max_pages_per_seq);
   int batch_size = 1;
   int layer = 0;
   int q_heads = GEMMA4_NUM_QUERY_HEADS;
-  int num_splits = div_up(seq_len, split_size);
+  int key_count = config.window_size > 0 ? std::min(seq_len, config.window_size)
+                                         : seq_len;
+  int num_splits = div_up(key_count, split_size);
   float scale = 1.0f / std::sqrt(float(config.head_dim));
 
   print_environment(prop, driver, runtime, clock_rate_khz,
@@ -354,9 +360,9 @@ int main(int argc, char **argv) {
       "cache_mode=%s l2_flush_bytes=%lld launch_overhead=queued_launches_only "
       "host_wall_time=excluded stability_scope=single_process "
       "min_effect_for_claim_pct=5 seq_len=%d page_size=%d split_size=%d "
-      "splits=%d warmup=%d iters_per_sample=%d samples=%d\n",
+      "key_count=%d splits=%d warmup=%d iters_per_sample=%d samples=%d\n",
       options.cache_mode.c_str(), static_cast<long long>(flush_bytes), seq_len,
-      page_size, split_size, num_splits, warmup, iters, samples);
+      page_size, split_size, key_count, num_splits, warmup, iters, samples);
   std::printf(
       "build=nvcc flags=\"-std=c++17 -O3 -arch=sm_86 -Isrc\" "
       "dtype=bf16 layout=\"cache=[layers,pages,page_size,kv_heads,head_dim]\" "
@@ -366,7 +372,7 @@ int main(int argc, char **argv) {
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreate(&stream));
 
-  std::vector<int32_t> page_table(max_pages);
+  std::vector<int32_t> page_table(max_pages_per_seq);
   std::iota(page_table.begin(), page_table.end(), 0);
   std::vector<int32_t> seq_lengths = {seq_len};
   std::vector<int32_t> token_batch(seq_len, 0);
@@ -493,6 +499,24 @@ int main(int argc, char **argv) {
                         cudaMemcpyDeviceToHost));
   check_attention_correctness(actual, expected);
 
+  CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_bf16(
+      d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
+      d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
+      scale, split_size, num_splits, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
+                        cudaMemcpyDeviceToHost));
+  check_attention_correctness(actual, expected);
+
+  CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_cp_async_bf16(
+      d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
+      d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
+      scale, split_size, num_splits, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
+                        cudaMemcpyDeviceToHost));
+  check_attention_correctness(actual, expected);
+
   auto prefill_write = [&]() {
     CUDA_CHECK(gemma4_kv_cache_write_bf16(
         d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
@@ -509,9 +533,25 @@ int main(int argc, char **argv) {
         d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
         q_heads, scale, split_size, num_splits, stream));
   };
+  auto flash_decode_attention = [&]() {
+    CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_bf16(
+        d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
+        d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
+        scale, split_size, num_splits, stream));
+  };
+  auto flash_decode_attention_cp_async = [&]() {
+    CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_cp_async_bf16(
+        d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
+        d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
+        scale, split_size, num_splits, stream));
+  };
   auto full_decode = [&]() {
     decode_write();
     decode_attention();
+  };
+  auto flash_full_decode = [&]() {
+    decode_write();
+    flash_decode_attention();
   };
 
   print_stats("prefill_cache_write",
@@ -526,9 +566,21 @@ int main(int argc, char **argv) {
               time_cuda_samples(decode_attention, stream, warmup, iters, samples,
                                 cold_cache, d_l2_scratch,
                                 flush_bytes / sizeof(uint32_t)));
+  print_stats("flash_decode_paged_attention_direct",
+              time_cuda_samples(flash_decode_attention, stream, warmup, iters,
+                                samples, cold_cache, d_l2_scratch,
+                                flush_bytes / sizeof(uint32_t)));
+  print_stats("flash_decode_paged_attention_cp_async",
+              time_cuda_samples(flash_decode_attention_cp_async, stream, warmup,
+                                iters, samples, cold_cache, d_l2_scratch,
+                                flush_bytes / sizeof(uint32_t)));
   print_stats("paged_full_decode_write_plus_attention",
               time_cuda_samples(full_decode, stream, warmup, iters, samples,
                                 cold_cache, d_l2_scratch,
+                                flush_bytes / sizeof(uint32_t)));
+  print_stats("flash_full_decode_write_plus_attention",
+              time_cuda_samples(flash_full_decode, stream, warmup, iters,
+                                samples, cold_cache, d_l2_scratch,
                                 flush_bytes / sizeof(uint32_t)));
 
   CUDA_CHECK(cudaFree(d_cache_k));

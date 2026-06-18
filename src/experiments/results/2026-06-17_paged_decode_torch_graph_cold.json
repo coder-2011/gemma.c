@@ -1,0 +1,134 @@
+{
+  "contract": {
+    "timing": "CUDA events on current PyTorch CUDA stream",
+    "execution": "CUDA graph replay for custom CUDA and PyTorch paths",
+    "cache_mode": "cold",
+    "l2_flush_bytes": 134217728,
+    "sample_delay_s": 1.0,
+    "delay_location": "host sleep before each measured sample, outside event window",
+    "launch_overhead": "excluded by CUDA graph replay",
+    "host_wall_time": "excluded from elapsed timings",
+    "warmup": 5,
+    "iters_per_sample": 5,
+    "graph_inner_iters": 1,
+    "samples": 3,
+    "min_effect_for_claim_pct": 5
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T00:00:43Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "batch_size": 1,
+    "decode_q_len": 1,
+    "decode_seq_len": 1024,
+    "decode_key_count": 1024,
+    "page_size": 64,
+    "max_pages_per_seq": 17,
+    "num_pages": 17,
+    "split_size": 64,
+    "num_splits": 16,
+    "prefill_seq_len": 64,
+    "q_heads": 32,
+    "kv_heads": 16,
+    "head_dim": 256
+  },
+  "correctness": {
+    "decode_direct_vs_torch_max_abs": 0.000244140625,
+    "decode_cp_async_vs_torch_max_abs": 0.000244140625,
+    "decode_direct_vs_cp_async_max_abs": 0.0,
+    "prefill_custom_vs_torch_max_abs": 0.001953125
+  },
+  "checksum": 764.474996805191,
+  "timings": {
+    "decode_custom_direct": {
+      "median_ms": 0.09794560074806213,
+      "mean_ms": 0.12369066774845124,
+      "trimmed_mean_ms": 0.12369066774845124,
+      "min_ms": 0.09749759882688522,
+      "max_ms": 0.17562880367040634,
+      "p95_ms": 0.16786048337817192,
+      "p99_ms": 0.17407513961195945,
+      "stddev_ms": 0.03672626352458558,
+      "iqr_ms": 0.03906560242176056,
+      "samples_ms": [
+        0.09794560074806213,
+        0.17562880367040634,
+        0.09749759882688522
+      ]
+    },
+    "decode_custom_cp_async": {
+      "median_ms": 0.09776639938354492,
+      "mean_ms": 0.09782186746597289,
+      "trimmed_mean_ms": 0.09782186746597289,
+      "min_ms": 0.09763840138912201,
+      "max_ms": 0.09806080162525177,
+      "p95_ms": 0.09803136140108108,
+      "p99_ms": 0.09805491358041762,
+      "stddev_ms": 0.00017684837384380377,
+      "iqr_ms": 0.00021120011806488592,
+      "samples_ms": [
+        0.09763840138912201,
+        0.09806080162525177,
+        0.09776639938354492
+      ]
+    },
+    "decode_torch_graph": {
+      "median_ms": 0.6793280005455017,
+      "mean_ms": 0.6785109321276347,
+      "trimmed_mean_ms": 0.6785109321276347,
+      "min_ms": 0.6746560096740722,
+      "max_ms": 0.68154878616333,
+      "p95_ms": 0.6813267076015471,
+      "p99_ms": 0.6815043704509735,
+      "stddev_ms": 0.002872663402062395,
+      "iqr_ms": 0.0034463882446288396,
+      "samples_ms": [
+        0.6746560096740722,
+        0.68154878616333,
+        0.6793280005455017
+      ]
+    },
+    "prefill_custom_tensor_core": {
+      "median_ms": 0.01929600052535534,
+      "mean_ms": 0.019389866789182027,
+      "trimmed_mean_ms": 0.019389866789182027,
+      "min_ms": 0.01569279991090298,
+      "max_ms": 0.023180799931287764,
+      "p95_ms": 0.02279231999069452,
+      "p99_ms": 0.023103103943169116,
+      "stddev_ms": 0.003057683680275449,
+      "iqr_ms": 0.003744000010192393,
+      "samples_ms": [
+        0.01929600052535534,
+        0.01569279991090298,
+        0.023180799931287764
+      ]
+    },
+    "prefill_torch_sdpa_graph": {
+      "median_ms": 0.021574399992823602,
+      "mean_ms": 0.022169599930445354,
+      "trimmed_mean_ms": 0.022169599930445354,
+      "min_ms": 0.021503999829292297,
+      "max_ms": 0.02343039996922016,
+      "p95_ms": 0.023244799971580507,
+      "p99_ms": 0.02339327996969223,
+      "stddev_ms": 0.0008919834075763309,
+      "iqr_ms": 0.0009632000699639313,
+      "samples_ms": [
+        0.021503999829292297,
+        0.02343039996922016,
+        0.021574399992823602
+      ]
+    }
+  },
+  "speedups": {
+    "decode_direct_vs_torch_median": 6.935768379152468,
+    "decode_cp_async_vs_torch_median": 6.948481327213933,
+    "decode_direct_vs_cp_async_median": 0.9981703990465263,
+    "prefill_custom_vs_torch_median": 1.1180762544276674
+  }
+}
