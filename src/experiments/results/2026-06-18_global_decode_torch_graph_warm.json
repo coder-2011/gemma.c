@@ -1,0 +1,86 @@
+{
+  "contract": {
+    "timing": "CUDA events on current PyTorch CUDA stream",
+    "execution": "CUDA graph replay for custom CUDA and PyTorch paths",
+    "cache_mode": "warm",
+    "l2_flush_bytes": 0,
+    "sample_delay_s": 1.0,
+    "delay_location": "host sleep before each measured sample, outside event window",
+    "launch_overhead": "excluded by CUDA graph replay",
+    "host_wall_time": "excluded from elapsed timings",
+    "warmup": 5,
+    "iters_per_sample": 10,
+    "graph_inner_iters": 10,
+    "samples": 5,
+    "min_effect_for_claim_pct": 5
+  },
+  "env": {
+    "gpu": "NVIDIA RTX A6000",
+    "torch": "2.11.0+cu130",
+    "cuda_runtime": "13.0",
+    "time_utc": "2026-06-18T07:37:20Z",
+    "custom_lib": "build/libgemma4_flash_attention.so"
+  },
+  "shape": {
+    "mode": "global",
+    "batch_size": 1,
+    "decode_q_len": 1,
+    "decode_seq_len": 4096,
+    "decode_key_count": 4096,
+    "page_size": 64,
+    "max_pages_per_seq": 64,
+    "num_pages": 64,
+    "split_size": 64,
+    "num_splits": 64,
+    "prefill_seq_len": null,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "window_size": 0
+  },
+  "correctness": {
+    "decode_direct_vs_torch_max_abs": 7.62939453125e-06
+  },
+  "checksum": -2.901099681854248,
+  "timings": {
+    "decode_custom_direct": {
+      "median_ms": 0.4181920051574707,
+      "mean_ms": 0.4385408020019531,
+      "trimmed_mean_ms": 0.4385408020019531,
+      "min_ms": 0.4155744075775146,
+      "max_ms": 0.4787295818328857,
+      "p95_ms": 0.47559486389160155,
+      "p99_ms": 0.4781026382446289,
+      "stddev_ms": 0.02688918455705978,
+      "iqr_ms": 0.0459039688110352,
+      "samples_ms": [
+        0.4155744075775146,
+        0.4787295818328857,
+        0.41715202331542967,
+        0.4181920051574707,
+        0.46305599212646487
+      ]
+    },
+    "decode_torch_graph": {
+      "median_ms": 4.760780715942383,
+      "mean_ms": 4.746162567138672,
+      "trimmed_mean_ms": 4.746162567138672,
+      "min_ms": 4.707548904418945,
+      "max_ms": 4.764547348022461,
+      "p95_ms": 4.764327774047851,
+      "p99_ms": 4.764503433227539,
+      "stddev_ms": 0.02226151753903802,
+      "iqr_ms": 0.028963088989257812,
+      "samples_ms": [
+        4.707548904418945,
+        4.734486389160156,
+        4.760780715942383,
+        4.763449478149414,
+        4.764547348022461
+      ]
+    }
+  },
+  "speedups": {
+    "decode_direct_vs_torch_median": 11.38419830419691
+  }
+}

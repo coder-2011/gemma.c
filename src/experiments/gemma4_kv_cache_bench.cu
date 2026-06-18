@@ -39,7 +39,7 @@ struct BenchOptions {
   int warmup = 25;
   int iters = 100;
   int samples = 15;
-  int extra_splits = 0;
+  std::string mode = "sliding";
   std::string cache_mode = "warm";
   int64_t flush_bytes = 0;
 };
@@ -279,8 +279,8 @@ BenchOptions parse_args(int argc, char **argv) {
       options.iters = std::stoi(need_value("--iters"));
     } else if (arg == "--samples") {
       options.samples = std::stoi(need_value("--samples"));
-    } else if (arg == "--extra-splits") {
-      options.extra_splits = std::stoi(need_value("--extra-splits"));
+    } else if (arg == "--mode") {
+      options.mode = need_value("--mode");
     } else {
       positional.push_back(arg);
     }
@@ -295,14 +295,17 @@ BenchOptions parse_args(int argc, char **argv) {
   if (positional.size() > 6) {
     throw std::runtime_error("usage: gemma4_kv_cache_bench [seq page split "
                              "warmup iters samples] [--cache warm|cold] "
-                             "[--flush-bytes N] [--extra-splits N]");
+                             "[--flush-bytes N] [--mode sliding|global]");
+  }
+  if (options.mode != "sliding" && options.mode != "global") {
+    throw std::runtime_error("--mode must be sliding or global");
   }
   if (options.cache_mode != "warm" && options.cache_mode != "cold") {
     throw std::runtime_error("--cache must be warm or cold");
   }
   if (options.seq_len <= 0 || options.page_size <= 0 ||
       options.split_size <= 0 || options.warmup < 0 || options.iters <= 0 ||
-      options.samples <= 0 || options.extra_splits < 0) {
+      options.samples <= 0) {
     throw std::runtime_error("benchmark dimensions/counts must be positive");
   }
   return options;
@@ -335,6 +338,7 @@ int main(int argc, char **argv) {
   int iters = options.iters;
   int samples = options.samples;
   bool cold_cache = options.cache_mode == "cold";
+  bool global_mode = options.mode == "global";
 
   // Cold-cache mode defines an explicit L2 flush before each measured sample.
   // Warm-cache mode leaves repeated accesses to measure steady-state reuse.
@@ -346,22 +350,22 @@ int main(int argc, char **argv) {
   }
 
   int pages_for_seq = div_up(seq_len, page_size);
-  int max_pages_per_seq =
-      std::max(pages_for_seq, div_up(GEMMA4_SLIDING_WINDOW, page_size) + 1);
+  int max_pages_per_seq = global_mode
+                              ? pages_for_seq
+                              : std::max(pages_for_seq,
+                                         div_up(GEMMA4_SLIDING_WINDOW, page_size) + 1);
   Gemma4KvCacheConfig config =
-      gemma4_kv_cache_make_config(false, max_pages_per_seq, page_size,
+      gemma4_kv_cache_make_config(global_mode, max_pages_per_seq, page_size,
                                   max_pages_per_seq);
   int batch_size = 1;
   int layer = 0;
   int q_heads = GEMMA4_NUM_QUERY_HEADS;
 
   // Decode attends over the active sliding window, not necessarily the full
-  // constructed sequence. `actual_splits` is the live work; `num_splits` is the
-  // fixed scratch/layout stride used to test graph-compatible overprovisioning.
+  // constructed sequence.
   int key_count = config.window_size > 0 ? std::min(seq_len, config.window_size)
                                          : seq_len;
-  int actual_splits = div_up(key_count, split_size);
-  int num_splits = actual_splits + options.extra_splits;
+  int num_splits = div_up(key_count, split_size);
   float scale = 1.0f / std::sqrt(float(config.head_dim));
 
   print_environment(prop, driver, runtime, clock_rate_khz,
@@ -370,12 +374,11 @@ int main(int argc, char **argv) {
       "contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline "
       "cache_mode=%s l2_flush_bytes=%lld launch_overhead=queued_launches_only "
       "host_wall_time=excluded stability_scope=single_process "
-      "min_effect_for_claim_pct=5 seq_len=%d page_size=%d split_size=%d "
-      "key_count=%d actual_splits=%d splits=%d extra_splits=%d warmup=%d "
-      "iters_per_sample=%d samples=%d\n",
-      options.cache_mode.c_str(), static_cast<long long>(flush_bytes), seq_len,
-      page_size, split_size, key_count, actual_splits, num_splits,
-      options.extra_splits, warmup, iters, samples);
+      "min_effect_for_claim_pct=5 mode=%s seq_len=%d page_size=%d split_size=%d "
+      "key_count=%d splits=%d warmup=%d iters_per_sample=%d samples=%d\n",
+      options.cache_mode.c_str(), static_cast<long long>(flush_bytes),
+      options.mode.c_str(), seq_len, page_size, split_size, key_count,
+      num_splits, warmup, iters, samples);
   std::printf(
       "build=nvcc flags=\"-std=c++17 -O3 -arch=sm_86 -Isrc\" "
       "dtype=bf16 layout=\"cache=[layers,pages,page_size,kv_heads,head_dim]\" "
@@ -427,8 +430,7 @@ int main(int argc, char **argv) {
   float *d_partial_acc = nullptr;
   uint32_t *d_l2_scratch = nullptr;
 
-  // Partial scratch is allocated for `num_splits`, including any extra empty
-  // splits requested by --extra-splits.
+  // Partial scratch is allocated for exactly the live split count.
   CUDA_CHECK(cudaMalloc(&d_cache_k, cache_elements(config) * sizeof(*d_cache_k)));
   CUDA_CHECK(cudaMalloc(&d_cache_v, cache_elements(config) * sizeof(*d_cache_v)));
   CUDA_CHECK(cudaMalloc(&d_k, h_k.size() * sizeof(*d_k)));
@@ -507,11 +509,29 @@ int main(int argc, char **argv) {
   cpu_decode_reference(expected, h_q, h_k, h_v, seq_len, q_heads,
                        config.num_heads, config.head_dim, scale);
 
-  // Correctness check: flash paged decode against the CPU reference.
-  CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_bf16(
+  // Correctness checks: generic paged decode and the grouped flash decode path
+  // both compare against the same CPU reference.
+  CUDA_CHECK(gemma4_paged_decode_attention_bf16(
       d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
       d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
-      scale, split_size, num_splits, stream));
+      q_heads, scale, split_size, num_splits, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
+                        cudaMemcpyDeviceToHost));
+  check_attention_correctness(actual, expected);
+
+  auto flash_decode_status = [&]() {
+    return global_mode
+               ? gemma4_flash_attention_global_decode_paged_bf16(
+                     d_out, d_partial_m, d_partial_l, d_partial_acc, d_q,
+                     d_cache_k, d_cache_v, d_page_table, d_seq_lengths, config,
+                     layer, batch_size, scale, split_size, num_splits, stream)
+               : gemma4_flash_attention_sliding_decode_paged_bf16(
+                     d_out, d_partial_m, d_partial_l, d_partial_acc, d_q,
+                     d_cache_k, d_cache_v, d_page_table, d_seq_lengths, config,
+                     layer, batch_size, scale, split_size, num_splits, stream);
+  };
+  CUDA_CHECK(flash_decode_status());
   CUDA_CHECK(cudaStreamSynchronize(stream));
   CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
                         cudaMemcpyDeviceToHost));
@@ -529,11 +549,14 @@ int main(int argc, char **argv) {
         d_cache_k, d_cache_v, config, d_page_table, d_one_batch,
         d_one_position, 1, layer, d_one_k, d_one_v, stream));
   };
-  auto flash_decode_attention = [&]() {
-    CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_bf16(
+  auto generic_decode_attention = [&]() {
+    CUDA_CHECK(gemma4_paged_decode_attention_bf16(
         d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
         d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
-        scale, split_size, num_splits, stream));
+        q_heads, scale, split_size, num_splits, stream));
+  };
+  auto flash_decode_attention = [&]() {
+    CUDA_CHECK(flash_decode_status());
   };
   auto flash_full_decode = [&]() {
     decode_write();
@@ -547,6 +570,10 @@ int main(int argc, char **argv) {
   print_stats("decode_cache_write",
               time_cuda_samples(decode_write, stream, warmup, iters, samples,
                                 cold_cache, d_l2_scratch,
+                                flush_bytes / sizeof(uint32_t)));
+  print_stats("generic_decode_paged_attention",
+              time_cuda_samples(generic_decode_attention, stream, warmup, iters,
+                                samples, cold_cache, d_l2_scratch,
                                 flush_bytes / sizeof(uint32_t)));
   print_stats("flash_decode_paged_attention_direct",
               time_cuda_samples(flash_decode_attention, stream, warmup, iters,

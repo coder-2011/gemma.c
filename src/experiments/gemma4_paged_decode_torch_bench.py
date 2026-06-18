@@ -9,11 +9,14 @@ import time
 
 import torch
 import torch.nn.functional as F
+import torch.utils.benchmark as torch_benchmark
 
 
 GEMMA4_NUM_QUERY_HEADS = 32
 GEMMA4_SLIDING_KV_HEADS = 16
+GEMMA4_GLOBAL_KV_HEADS = 4
 GEMMA4_SLIDING_HEAD_DIM = 256
+GEMMA4_GLOBAL_HEAD_DIM = 512
 GEMMA4_SLIDING_WINDOW = 1024
 
 
@@ -118,6 +121,50 @@ def time_cuda_graph(
     return summarize(values)
 
 
+def time_torch_timer(
+    fn,
+    name,
+    warmup,
+    iters,
+    samples,
+    cache_mode,
+    flush_buf,
+    sample_delay_s,
+):
+    for _ in range(warmup):
+        flush_l2(flush_buf)
+        fn()
+    torch.cuda.synchronize()
+
+    timer = torch_benchmark.Timer(
+        stmt=f"{name}()",
+        globals={name: fn},
+        label="gemma4_paged_decode",
+        sub_label=name,
+        description=f"{cache_mode}_cache",
+        num_threads=1,
+    )
+    values = []
+    for _ in range(samples):
+        time.sleep(sample_delay_s)
+        if cache_mode == "cold":
+            total_ms = 0.0
+            for _ in range(iters):
+                flush_l2(flush_buf)
+                torch.cuda.synchronize()
+                measurement = timer.timeit(1)
+                total_ms += measurement.median * 1000.0
+            values.append(total_ms / iters)
+        else:
+            measurement = timer.timeit(iters)
+            values.append(measurement.median * 1000.0)
+
+    stats = summarize(values)
+    stats["timer"] = "torch.utils.benchmark.Timer"
+    stats["number_per_run"] = 1 if cache_mode == "cold" else iters
+    return stats
+
+
 def load_lib(path):
     lib = ctypes.CDLL(path)
 
@@ -139,8 +186,8 @@ def load_lib(path):
     ]
     kv_write.restype = ctypes.c_int
 
-    decode_direct = lib.gemma4_flash_attention_sliding_decode_paged_bf16
-    decode_direct.argtypes = [
+    decode_sliding = lib.gemma4_flash_attention_sliding_decode_paged_bf16
+    decode_argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
         ctypes.c_void_p,
@@ -158,7 +205,12 @@ def load_lib(path):
         ctypes.c_int32,
         ctypes.c_void_p,
     ]
-    decode_direct.restype = ctypes.c_int
+    decode_sliding.argtypes = decode_argtypes
+    decode_sliding.restype = ctypes.c_int
+
+    decode_global = lib.gemma4_flash_attention_global_decode_paged_bf16
+    decode_global.argtypes = decode_argtypes
+    decode_global.restype = ctypes.c_int
 
     prefill = lib.gemma4_flash_attention_sliding_fwd_bf16
     prefill.argtypes = [
@@ -175,7 +227,7 @@ def load_lib(path):
         ctypes.c_void_p,
     ]
     prefill.restype = ctypes.c_int
-    return kv_write, decode_direct, prefill
+    return kv_write, decode_sliding, decode_global, prefill
 
 
 def check_status(status, label):
@@ -183,12 +235,14 @@ def check_status(status, label):
         raise RuntimeError(f"{label} returned cudaError_t={status}")
 
 
-def build_page_table(batch_size, seq_len, page_size):
-    first_key = max(0, seq_len - GEMMA4_SLIDING_WINDOW)
+def build_page_table(batch_size, seq_len, page_size, window_size):
+    first_key = max(0, seq_len - window_size) if window_size > 0 else 0
     key_count = seq_len - first_key
-    max_pages_per_seq = max(
-        math.ceil(GEMMA4_SLIDING_WINDOW / page_size) + 1,
-        math.ceil(key_count / page_size) + 1,
+    pages_for_keys = math.ceil(max(1, key_count) / page_size)
+    max_pages_per_seq = (
+        max(math.ceil(window_size / page_size) + 1, pages_for_keys + 1)
+        if window_size > 0
+        else pages_for_keys
     )
     page_table = torch.full((batch_size, max_pages_per_seq), -1, dtype=torch.int32)
     next_page = 0
@@ -205,31 +259,36 @@ def build_page_table(batch_size, seq_len, page_size):
 def make_decode_inputs(args, device):
     dtype = torch.bfloat16
     torch.manual_seed(args.seed)
+    kv_heads, head_dim, window_size = (
+        (GEMMA4_GLOBAL_KV_HEADS, GEMMA4_GLOBAL_HEAD_DIM, 0)
+        if args.mode == "global"
+        else (GEMMA4_SLIDING_KV_HEADS, GEMMA4_SLIDING_HEAD_DIM, GEMMA4_SLIDING_WINDOW)
+    )
     page_table_cpu, first_key, key_count, max_pages_per_seq, num_pages = build_page_table(
-        args.batch_size, args.seq_len, args.page_size
+        args.batch_size, args.seq_len, args.page_size, window_size
     )
     config = Gemma4KvCacheConfig(
         1,
         num_pages,
         args.page_size,
         max_pages_per_seq,
-        GEMMA4_SLIDING_KV_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
-        GEMMA4_SLIDING_WINDOW,
+        kv_heads,
+        head_dim,
+        window_size,
     )
 
     q = torch.randn(
         args.batch_size,
         GEMMA4_NUM_QUERY_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
+        head_dim,
         device=device,
         dtype=dtype,
     )
     k_window = torch.randn(
         args.batch_size,
         key_count,
-        GEMMA4_SLIDING_KV_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
+        kv_heads,
+        head_dim,
         device=device,
         dtype=dtype,
     )
@@ -240,7 +299,7 @@ def make_decode_inputs(args, device):
     token_positions = torch.arange(first_key, args.seq_len, device=device, dtype=torch.int32).repeat(
         args.batch_size
     )
-    k_flat = k_window.reshape(args.batch_size * key_count, GEMMA4_SLIDING_KV_HEADS, -1)
+    k_flat = k_window.reshape(args.batch_size * key_count, kv_heads, -1)
     v_flat = v_window.reshape_as(k_flat)
     cache_shape = (
         config.num_layers,
@@ -253,6 +312,9 @@ def make_decode_inputs(args, device):
         "config": config,
         "first_key": first_key,
         "key_count": key_count,
+        "kv_heads": kv_heads,
+        "head_dim": head_dim,
+        "window_size": window_size,
         "page_table": page_table_cpu.to(device),
         "seq_lengths": torch.full((args.batch_size,), args.seq_len, device=device, dtype=torch.int32),
         "token_batch": token_batch.contiguous(),
@@ -266,9 +328,9 @@ def make_decode_inputs(args, device):
     }
 
 
-def torch_decode_attention(q, k_window, v_window, out, scale):
+def torch_decode_attention(q, k_window, v_window, out, scale, kv_heads):
     kv_map = torch.arange(GEMMA4_NUM_QUERY_HEADS, device=q.device) // (
-        GEMMA4_NUM_QUERY_HEADS // GEMMA4_SLIDING_KV_HEADS
+        GEMMA4_NUM_QUERY_HEADS // kv_heads
     )
     k_gqa = k_window[:, :, kv_map, :].float()
     v_gqa = v_window[:, :, kv_map, :].float()
@@ -328,6 +390,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--page-size", type=int, default=64)
     parser.add_argument("--split-size", type=int, default=64)
+    parser.add_argument("--mode", choices=["sliding", "global"], default="sliding")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--samples", type=int, default=5)
@@ -340,9 +403,9 @@ def main():
 
     if args.sample_delay_s < 1.0:
         raise RuntimeError("--sample-delay-s must be at least 1.0")
-    if args.prefill_seq_len <= 1:
+    if args.mode == "sliding" and args.prefill_seq_len <= 1:
         raise RuntimeError("--prefill-seq-len must be > 1 for the tensor-core section")
-    if args.prefill_seq_len > GEMMA4_SLIDING_WINDOW:
+    if args.mode == "sliding" and args.prefill_seq_len > GEMMA4_SLIDING_WINDOW:
         raise RuntimeError("--prefill-seq-len must be <= sliding window for this benchmark")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -350,17 +413,21 @@ def main():
         raise RuntimeError(f"missing custom library: {args.lib}")
 
     device = torch.device("cuda")
-    kv_write, decode_direct, prefill = load_lib(args.lib)
+    kv_write, decode_sliding, decode_global, prefill = load_lib(args.lib)
     stream = lambda: ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-    scale = 1.0 / math.sqrt(GEMMA4_SLIDING_HEAD_DIM)
 
     decode = make_decode_inputs(args, device)
     config = decode["config"]
     key_count = decode["key_count"]
+    kv_heads = decode["kv_heads"]
+    head_dim = decode["head_dim"]
+    decode_direct = decode_global if args.mode == "global" else decode_sliding
+    scale = 1.0 / math.sqrt(head_dim)
 
-    # The PyTorch comparison uses only live decode splits. The C++ benchmark has
-    # a separate --extra-splits knob for overprovisioned graph-shape testing.
-    num_splits = math.ceil(key_count / args.split_size)
+    # Sliding decode uses a fixed scratch stride large enough for the configured
+    # window, even when the live sequence is still shorter than that window.
+    split_key_count = decode["window_size"] or key_count
+    num_splits = math.ceil(split_key_count / args.split_size)
     cache_k = torch.zeros(decode["cache_shape"], device=device, dtype=torch.bfloat16)
     cache_v = torch.zeros_like(cache_k)
     decode_out_direct = torch.empty_like(decode["q"])
@@ -372,7 +439,7 @@ def main():
     )
     partial_l = torch.empty_like(partial_m)
     partial_acc = torch.empty(
-        args.batch_size * GEMMA4_NUM_QUERY_HEADS * num_splits * GEMMA4_SLIDING_HEAD_DIM,
+        args.batch_size * GEMMA4_NUM_QUERY_HEADS * num_splits * head_dim,
         device=device,
         dtype=torch.float32,
     )
@@ -416,7 +483,7 @@ def main():
                 num_splits,
                 stream(),
             ),
-            "gemma4_flash_attention_sliding_decode_paged_bf16",
+            f"gemma4_flash_attention_{args.mode}_decode_paged_bf16",
         )
 
     def torch_decode():
@@ -426,11 +493,15 @@ def main():
             decode["v_window"],
             decode_out_torch,
             scale,
+            kv_heads,
         )
 
-    q_prefill, k_prefill, v_prefill = make_prefill_inputs(args, device)
-    custom_prefill_out = torch.empty_like(q_prefill)
-    torch_prefill_out = torch.empty_like(q_prefill)
+    q_prefill = k_prefill = v_prefill = None
+    custom_prefill_out = torch_prefill_out = None
+    if args.mode == "sliding":
+        q_prefill, k_prefill, v_prefill = make_prefill_inputs(args, device)
+        custom_prefill_out = torch.empty_like(q_prefill)
+        torch_prefill_out = torch.empty_like(q_prefill)
 
     def custom_prefill():
         check_status(
@@ -444,7 +515,7 @@ def main():
                 args.prefill_seq_len,
                 args.prefill_seq_len,
                 GEMMA4_SLIDING_WINDOW,
-                ctypes.c_float(scale),
+                ctypes.c_float(1.0 / math.sqrt(GEMMA4_SLIDING_HEAD_DIM)),
                 stream(),
             ),
             "gemma4_flash_attention_sliding_fwd_bf16",
@@ -453,17 +524,27 @@ def main():
     def torch_prefill():
         torch_prefill_attention(q_prefill, k_prefill, v_prefill, torch_prefill_out, scale)
 
+    def wait_between_paths():
+        torch.cuda.synchronize()
+        time.sleep(args.sample_delay_s)
+
     with torch.no_grad():
         torch_decode()
+        wait_between_paths()
         custom_decode_direct()
-        torch_prefill()
-        custom_prefill()
+        if args.mode == "sliding":
+            torch_prefill()
+            wait_between_paths()
+            custom_prefill()
         torch.cuda.synchronize()
 
         correctness = {
             "decode_direct_vs_torch_max_abs": max_abs(decode_out_direct, decode_out_torch),
-            "prefill_custom_vs_torch_max_abs": max_abs(custom_prefill_out, torch_prefill_out),
         }
+        if args.mode == "sliding":
+            correctness["prefill_custom_vs_torch_max_abs"] = max_abs(
+                custom_prefill_out, torch_prefill_out
+            )
 
         flush_buf = None
         if args.cache == "cold":
@@ -478,13 +559,18 @@ def main():
 
         # Cold-cache samples replay one path invocation between L2 flushes. Warm
         # samples capture repeated work per graph replay to improve event timing.
-        graph_inner_iters = 1 if args.cache == "cold" else args.iters
-        graphs = {
-            "decode_custom_direct": make_cuda_graph(custom_decode_direct, graph_inner_iters),
-            "decode_torch_graph": make_cuda_graph(torch_decode, graph_inner_iters),
-            "prefill_custom_tensor_core": make_cuda_graph(custom_prefill, graph_inner_iters),
-            "prefill_torch_sdpa_graph": make_cuda_graph(torch_prefill, graph_inner_iters),
+        custom_graph_inner_iters = 1 if args.cache == "cold" else args.iters
+        custom_graphs = {
+            "decode_custom_direct": make_cuda_graph(
+                custom_decode_direct, custom_graph_inner_iters
+            ),
         }
+        torch_timers = {"decode_torch_timer": torch_decode}
+        if args.mode == "sliding":
+            custom_graphs["prefill_custom_tensor_core"] = make_cuda_graph(
+                custom_prefill, custom_graph_inner_iters
+            )
+            torch_timers["prefill_torch_sdpa_timer"] = torch_prefill
 
         timings = {
             name: time_cuda_graph(
@@ -494,32 +580,46 @@ def main():
                 args.samples,
                 args.cache,
                 flush_buf,
-                graph_inner_iters,
+                custom_graph_inner_iters,
                 args.sample_delay_s,
             )
-            for name, replay in graphs.items()
+            for name, replay in custom_graphs.items()
         }
+        for name, fn in torch_timers.items():
+            timings[name] = time_torch_timer(
+                fn,
+                name,
+                args.warmup,
+                args.iters,
+                args.samples,
+                args.cache,
+                flush_buf,
+                args.sample_delay_s,
+            )
         torch.cuda.synchronize()
         checksum = float(
             decode_out_direct.float().sum().item()
             + decode_out_torch.float().sum().item()
-            + custom_prefill_out.float().sum().item()
-            + torch_prefill_out.float().sum().item()
         )
+        if args.mode == "sliding":
+            checksum += float(
+                custom_prefill_out.float().sum().item()
+                + torch_prefill_out.float().sum().item()
+            )
 
     result = {
         "contract": {
-            "timing": "CUDA events on current PyTorch CUDA stream",
-            "execution": "CUDA graph replay for custom CUDA and PyTorch paths",
+            "timing": "custom CUDA uses CUDA events; PyTorch uses torch.utils.benchmark.Timer",
+            "execution": "CUDA graph replay for custom CUDA paths; Timer measurements for PyTorch paths",
             "cache_mode": args.cache,
             "l2_flush_bytes": 0 if flush_buf is None else flush_buf.numel() * 4,
             "sample_delay_s": args.sample_delay_s,
-            "delay_location": "host sleep before each measured sample, outside event window",
-            "launch_overhead": "excluded by CUDA graph replay",
+            "delay_location": "host sleep between initial path checks and before each measured sample",
+            "launch_overhead": "custom CUDA excludes launch overhead by graph replay; PyTorch Timer includes the timed Python statement",
             "host_wall_time": "excluded from elapsed timings",
             "warmup": args.warmup,
             "iters_per_sample": args.iters,
-            "graph_inner_iters": graph_inner_iters,
+            "custom_graph_inner_iters": custom_graph_inner_iters,
             "samples": args.samples,
             "min_effect_for_claim_pct": 5,
         },
@@ -531,6 +631,7 @@ def main():
             "custom_lib": args.lib,
         },
         "shape": {
+            "mode": args.mode,
             "batch_size": args.batch_size,
             "decode_q_len": 1,
             "decode_seq_len": args.seq_len,
@@ -540,21 +641,25 @@ def main():
             "num_pages": config.num_pages,
             "split_size": args.split_size,
             "num_splits": num_splits,
-            "prefill_seq_len": args.prefill_seq_len,
+            "prefill_seq_len": args.prefill_seq_len if args.mode == "sliding" else None,
             "q_heads": GEMMA4_NUM_QUERY_HEADS,
-            "kv_heads": GEMMA4_SLIDING_KV_HEADS,
-            "head_dim": GEMMA4_SLIDING_HEAD_DIM,
+            "kv_heads": kv_heads,
+            "head_dim": head_dim,
+            "window_size": decode["window_size"],
         },
         "correctness": correctness,
         "checksum": checksum,
         "timings": timings,
         "speedups": {
-            "decode_direct_vs_torch_median": timings["decode_torch_graph"]["median_ms"]
+            "decode_direct_vs_torch_median": timings["decode_torch_timer"]["median_ms"]
             / timings["decode_custom_direct"]["median_ms"],
-            "prefill_custom_vs_torch_median": timings["prefill_torch_sdpa_graph"]["median_ms"]
-            / timings["prefill_custom_tensor_core"]["median_ms"],
         },
     }
+    if args.mode == "sliding":
+        result["speedups"]["prefill_custom_vs_torch_median"] = (
+            timings["prefill_torch_sdpa_timer"]["median_ms"]
+            / timings["prefill_custom_tensor_core"]["median_ms"]
+        )
     text = json.dumps(result, indent=2)
     if args.output:
         os.makedirs(os.path.dirname(args.output), exist_ok=True)

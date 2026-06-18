@@ -1,0 +1,10 @@
+gpu=NVIDIA RTX A6000 sm=86 memory_gb=50.90 driver=13000 runtime=13000 l2_cache_bytes=6291456 sms=84 clock_rate_khz=1800000 memory_clock_rate_khz=8001000
+contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline cache_mode=cold l2_flush_bytes=67108864 launch_overhead=queued_launches_only host_wall_time=excluded stability_scope=single_process min_effect_for_claim_pct=5 mode=global seq_len=4096 page_size=64 split_size=64 key_count=4096 actual_splits=64 splits=64 extra_splits=0 warmup=5 iters_per_sample=20 samples=6
+build=nvcc flags="-std=c++17 -O3 -arch=sm_86 -Isrc" dtype=bf16 layout="cache=[layers,pages,page_size,kv_heads,head_dim]" batch_size=1 q_heads=32 kv_heads=4 head_dim=512
+correctness max_abs=0.000244 mean_abs=0.000000
+correctness max_abs=0.000244 mean_abs=0.000000
+prefill_cache_write median_ms=0.104617 mean_ms=0.143805 trimmed_mean_ms=0.143805 min_ms=0.104467 max_ms=0.223485 p95_ms=0.222897 p99_ms=0.223367 stddev_ms=0.055515 iqr_ms=0.087493 samples_ms=[0.104669,0.223485,0.104565,0.104467,0.221133,0.104510]
+decode_cache_write median_ms=0.005009 mean_ms=0.024591 trimmed_mean_ms=0.024591 min_ms=0.004994 max_ms=0.122262 p95_ms=0.093016 p99_ms=0.116413 stddev_ms=0.043680 iqr_ms=0.000210 samples_ms=[0.122262,0.005016,0.005002,0.005000,0.004994,0.005275]
+generic_decode_paged_attention median_ms=0.719468 mean_ms=0.731614 trimmed_mean_ms=0.731614 min_ms=0.717091 max_ms=0.780256 p95_ms=0.769213 p99_ms=0.778047 stddev_ms=0.022717 iqr_ms=0.014107 samples_ms=[0.717091,0.717315,0.780256,0.719406,0.719530,0.736083]
+flash_decode_paged_attention_direct median_ms=0.393011 mean_ms=0.395419 trimmed_mean_ms=0.395419 min_ms=0.392901 max_ms=0.407576 p95_ms=0.403955 p99_ms=0.406852 stddev_ms=0.005437 iqr_ms=0.000132 samples_ms=[0.407576,0.392901,0.393021,0.392923,0.393093,0.393002]
+flash_full_decode_write_plus_attention median_ms=0.410828 mean_ms=0.433398 trimmed_mean_ms=0.433398 min_ms=0.395296 max_ms=0.532866 p95_ms=0.513436 p99_ms=0.528980 stddev_ms=0.049567 iqr_ms=0.052393 samples_ms=[0.395632,0.395296,0.426024,0.455149,0.395422,0.532866]

@@ -12432,3 +12432,107 @@ Conclusion:
   block-wide reductions per token; the next cache-adjacent experiment should
   avoid further metadata work only if it does not disturb the coalesced K/V
   read-only load pattern.
+
+## 2026-06-18 - Global paged decode FlashAttention baseline
+
+Question:
+
+- Can the existing sliding paged decode attention path be generalized cleanly
+  for Gemma global layers instead of copied into a separate kernel?
+- How does the first global decode implementation compare with the generic
+  paged CUDA reference and with a simple PyTorch implementation?
+
+Change:
+
+- Templated the grouped paged decode split/reduce kernels over layer shape:
+  sliding uses `head_dim=256`, `kv_heads=16`, `GQA=2`, and local-window
+  indexing; global uses `head_dim=512`, `kv_heads=4`, `GQA=8`, and full-context
+  indexing.
+- Added the global decode C ABI:
+  `gemma4_flash_attention_global_decode_paged_bf16`.
+- Generalized the decode Q/K/V prep helpers over head dimension and rotary
+  dimension, then added global decode prep:
+  `gemma4_flash_attention_global_decode_prepare_q_paged_kv_bf16`.
+- Global prep applies learned Q/K RMSNorm plus p-RoPE over rotary dim `128`,
+  leaves the NoPE tail unrotated, and derives V from the raw K source with
+  scale-free RMSNorm because global layers have no V projection.
+- Extended `test-kv-cache` with global prep coverage and global flash decode
+  cases for short, exact split, overprovisioned split, and staggered varlen
+  sequences.
+- Added `--mode sliding|global` to the C++ KV-cache benchmark and to the
+  PyTorch decode benchmark.
+
+Build and correctness:
+
+```bash
+make -B test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+make -B flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
+python3 -m py_compile src/experiments/gemma4_paged_decode_torch_bench.py
+```
+
+All commands passed. `test-kv-cache` ended with `kv cache tests passed`.
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, CUDA driver/runtime `13000`,
+  L2 cache `6291456` bytes, `84` SMs.
+- Clock policy: clocks were not locked; persistence was enabled and the GPU was
+  checked idle before the runs.
+- Shape: global decode, `B=1`, `seq_len=4096`, `page_size=64`,
+  `split_size=64`, `num_splits=64`, BF16, `q_heads=32`, `kv_heads=4`,
+  `head_dim=512`, full context.
+- C++ timing: CUDA events on the benchmark stream. Warm and cold cache measured
+  separately. Cold C++ uses a `67108864` byte L2 flush buffer.
+- PyTorch timing: CUDA events on the current PyTorch CUDA stream. Both the
+  custom CUDA path and the simple PyTorch `einsum`/softmax/value path were
+  captured in CUDA graphs, so Python launch overhead is excluded. Cold PyTorch
+  uses a `134217728` byte L2 flush buffer.
+- Correctness: C++ benchmark custom/global flash and generic reference both
+  reported `max_abs=0.000244`, `mean_abs=0.000000` vs CPU reference. PyTorch
+  benchmark reported custom direct vs PyTorch `max_abs=7.62939453125e-06`.
+
+Commands:
+
+```bash
+./build/experiments/gemma4_kv_cache_bench \
+  4096 64 64 10 50 8 --cache warm --mode global \
+  | tee src/experiments/results/2026-06-18_global_decode_cpp_warm.txt
+
+./build/experiments/gemma4_kv_cache_bench \
+  4096 64 64 5 20 6 --cache cold --flush-bytes 67108864 --mode global \
+  | tee src/experiments/results/2026-06-18_global_decode_cpp_cold.txt
+
+python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+  --mode global --seq-len 4096 --page-size 64 --split-size 64 \
+  --warmup 5 --iters 10 --samples 5 --cache warm --sample-delay-s 1 \
+  --output src/experiments/results/2026-06-18_global_decode_torch_graph_warm.json
+
+python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+  --mode global --seq-len 4096 --page-size 64 --split-size 64 \
+  --warmup 3 --iters 5 --samples 3 --cache cold --flush-mib 128 \
+  --sample-delay-s 1 \
+  --output src/experiments/results/2026-06-18_global_decode_torch_graph_cold.json
+```
+
+Median results:
+
+```text
+cache  comparison                         baseline ms  custom ms  speedup
+warm   generic CUDA paged decode             0.926452   0.464732   1.99x
+cold   generic CUDA paged decode             0.719468   0.393011   1.83x
+warm   simple PyTorch graph decode           4.760781   0.418192  11.38x
+cold   simple PyTorch graph decode           4.783226   0.416474  11.49x
+```
+
+Conclusion:
+
+- The shared decode template was enough for global decode; no separate copied
+  kernel was needed.
+- The initial global flash path is already about `1.8-2.0x` faster than the
+  generic CUDA paged decode reference at this 4096-token shape.
+- Against the simple PyTorch graph baseline, the custom path is about `11.4x`
+  faster while matching within BF16-level tolerance.
+- The saved runs include some unlocked-clock and system noise, especially in
+  cache-write rows, but the decode attention speedups are much larger than the
+  `5%` claim threshold.
