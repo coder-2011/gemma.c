@@ -1,0 +1,8 @@
+correctness seq=64 max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+no_lse_correctness max_abs=0.015625 mean_abs=0.000260142 max_rel=0.00775194
+norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0.0078125 v_max_abs=0.000976562
+benchmark batch=1 seq=4096 window_left=1024 warmup=20 iters=30 samples=6 cache=cold flush_bytes=67108864 timing=cuda_events_same_stream return_lse=false launch_overhead=included
+norm_rope_plus_fa median_ms=1.77039 mean_ms=1.7724 trimmed_mean_ms=1.7724 min_ms=1.74826 max_ms=1.80471 p95_ms=1.80139 p99_ms=1.80404 stddev_ms=0.0218608 iqr_ms=0.0381097 samples_ms=[1.80471,1.79143,1.78332,1.74826,1.75747,1.74924]
+decode_norm_rope_paged_kv_write median_ms=0.00755467 mean_ms=0.00753138 trimmed_mean_ms=0.00753138 min_ms=0.0068736 max_ms=0.00817387 p95_ms=0.00812187 p99_ms=0.00816347 stddev_ms=0.000458739 iqr_ms=0.000711201 samples_ms=[0.00796587,0.0068736,0.0070656,0.00817387,0.00748267,0.00762667]
+approx_attention_tflops_in_total_path_median=67.9943
+kernel threads_per_block=128 dynamic_smem_bytes=98304

@@ -3,6 +3,179 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-18 - FlashAttention cache-hint review and decode metadata loads
+
+Question:
+
+- Six subagents reviewed disjoint sections of `src/gemma4_flash_attention.cu`
+  for cache/cache-hint changes, then a seventh pass chose the low-risk edits.
+- Consensus: keep prefill `SM80_CP_ASYNC_CACHEGLOBAL` and direct decode K/V
+  `loadg` as the default; do not promote `.ca`, scalar `.cg/.cs`, or shared
+  staging without a dedicated A/B.
+
+Change:
+
+- Added warp-uniform read-only loads for decode metadata:
+  `token_position`, `page_table`, and `seq_lengths`.
+- Loaded Q/K norm weights through the existing read-only `loadg` helper.
+- Rejected invalid sliding decode configs when `window_size <= 0` or when
+  `split_size * num_splits` cannot cover the configured sliding window.
+- Extended `test-kv-cache` to size direct decode scratch for the configured
+  window contract and to reject invalid window/split arguments.
+
+Build and correctness:
+
+```bash
+make -B test-kv-cache flash-attn-bench kv-cache-bench \
+  NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`; benchmark reports CUDA
+  driver/runtime `13000`.
+- Clock policy: not locked. GPU was checked idle with `nvidia-smi` before runs.
+- Timing: CUDA events on the benchmark stream. Setup excluded; launch enqueue
+  included. Single process. Warm and cold cache measured separately.
+- Cold cache: 64 MiB L2 flush before measured iterations.
+- Shape: `seq_len=4096`, `page_size=64`, `split_size=64`, sliding
+  `window=1024`, `actual_splits=16`, `batch=1`, BF16, `q_heads=32`,
+  `kv_heads=16`, `head_dim=256`.
+- `ncu` was not installed on this machine, so this pass has CUDA-event timings
+  but no Nsight Compute counter confirmation.
+
+Commands:
+
+```bash
+./build/experiments/gemma4_flash_attention_bench 4096 200 50 10 1 64 warm 64 \
+  | tee src/experiments/results/2026-06-18_cache_hints_baseline_flash_warm.txt
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 50 200 20 --cache warm \
+  | tee src/experiments/results/2026-06-18_cache_hints_baseline_kv_warm.txt
+./build/experiments/gemma4_flash_attention_bench 4096 30 20 6 1 64 cold 64 \
+  | tee src/experiments/results/2026-06-18_cache_hints_baseline_flash_cold.txt
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 20 30 10 --cache cold --flush-bytes 67108864 \
+  | tee src/experiments/results/2026-06-18_cache_hints_baseline_kv_cold.txt
+
+./build/experiments/gemma4_flash_attention_bench 4096 200 50 10 1 64 warm 64 \
+  | tee src/experiments/results/2026-06-18_cache_hints_after_flash_warm.txt
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 50 200 20 --cache warm \
+  | tee src/experiments/results/2026-06-18_cache_hints_after_kv_warm.txt
+./build/experiments/gemma4_flash_attention_bench 4096 30 20 6 1 64 cold 64 \
+  | tee src/experiments/results/2026-06-18_cache_hints_after_flash_cold.txt
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 20 30 10 --cache cold --flush-bytes 67108864 \
+  | tee src/experiments/results/2026-06-18_cache_hints_after_kv_cold.txt
+```
+
+Median results:
+
+```text
+path                                  baseline      after         delta
+norm_rope_plus_fa warm                 1.871930 ms   1.885210 ms  -0.71%
+decode_norm_rope_paged_kv_write warm   0.022179 ms   0.018513 ms  +16.53%
+flash_decode_paged_attention warm      0.063786 ms   0.061696 ms  +3.28%
+flash_full_decode warm                 0.066363 ms   0.064191 ms  +3.27%
+
+norm_rope_plus_fa cold                 1.770390 ms   1.769090 ms  +0.07%
+decode_norm_rope_paged_kv_write cold   0.007555 ms   0.006781 ms  +10.24%
+flash_decode_paged_attention cold      0.072176 ms   0.069677 ms  +3.46%
+flash_full_decode cold                 0.075029 ms   0.072134 ms  +3.86%
+```
+
+Conclusion:
+
+- Kept the changes. Correctness passed, and the stable paged decode attention
+  benchmark improved `~3.3-3.5%` median under the same CUDA-event contract.
+- This is a useful small win, but it is below the project's `5%` minimum effect
+  threshold for a strong speed claim. Treat it as a low-risk cleanup plus
+  directionally positive timing until repeated under locked clocks and with NCU
+  counters.
+- Decode prep-cache medians improved, but that microkernel is noisy at this
+  duration; do not overfit the `10-16%` medians without process-level reruns.
+
+## 2026-06-18 - FlashAttention cache policy ablation matrix
+
+Question:
+
+- Test the remaining cache/cache-parameter variants that are practical on this
+  machine without Nsight Compute:
+  - scalar decode K/V cache loads: default `__ldg` vs `__ldcg` vs `__ldcs`;
+  - prefill CUTE cp.async: default `.cg` vs `.ca`;
+  - decode kernel `Gemma4KvCacheConfig` as `__grid_constant__`.
+
+Change:
+
+- Temporarily added compile-time switches for the ablation, then pruned them
+  after the matrix rejected every non-default policy.
+- Retained production source stays hardwired to prefill `.cg`, decode K/V
+  `__ldg`, and ordinary by-value `Gemma4KvCacheConfig` kernel params.
+
+Temporary build commands used before pruning:
+
+```bash
+make -B test-kv-cache flash-attn-bench kv-cache-bench \
+  NVCC=/usr/local/cuda/bin/nvcc
+
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_DECODE_CACHE_LOAD_POLICY=1 \
+  -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
+  src/experiments/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu \
+  src/gemma4_flash_attention.cu src/gemma4.cpp \
+  -o build/experiments/gemma4_kv_cache_bench_decode_cg
+
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_DECODE_CACHE_LOAD_POLICY=2 \
+  -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
+  src/experiments/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu \
+  src/gemma4_flash_attention.cu src/gemma4.cpp \
+  -o build/experiments/gemma4_kv_cache_bench_decode_cs
+
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -DGEMMA4_FA_PREFILL_CP_ASYNC_CACHE_POLICY=1 \
+  -Isrc -Iexperiments/flash-attention/csrc/cutlass/include \
+  src/experiments/gemma4_flash_attention_bench.cu \
+  src/gemma4_flash_attention.cu \
+  -o build/experiments/gemma4_flash_attention_bench_cpasync_ca
+```
+
+Benchmark contract:
+
+- Same A6000 CUDA-event contract as the prior cache-hint entry.
+- GPU was checked idle before each matrix group.
+- `ncu`, `cuobjdump`, and `nvdisasm` were not available on this machine, so no
+  counter/SASS/resource confirmation was possible.
+
+Paged decode K/V load policy, `gemma4_kv_cache_bench`:
+
+```text
+variant             warm direct    warm full      cold direct    cold full
+ldg default          0.062280 ms    0.065080 ms    0.069442 ms    0.071838 ms
+scalar .cg           0.067521 ms    0.072502 ms    0.075919 ms    0.078511 ms
+scalar .cs           0.066943 ms    0.069015 ms    0.074331 ms    0.076383 ms
+__grid_constant__    0.062298 ms    0.064884 ms    0.069671 ms    0.073546 ms
+```
+
+Prefill cp.async policy, `gemma4_flash_attention_bench`:
+
+```text
+variant                  warm norm_rope+fa    cold norm_rope+fa
+cp.async .cg default       1.851200 ms          1.768670 ms
+cp.async .ca               1.954830 ms          1.831510 ms
+__grid_constant__          1.852430 ms          1.756240 ms
+```
+
+Conclusion:
+
+- Keep defaults. Scalar `.cg` and `.cs` decode K/V loads regress both warm and
+  cold decode attention by roughly `7-9%`.
+- Keep prefill cp.async `.cg`; `.ca` regressed `~5.6%` warm and `~3.6%` cold.
+- Do not enable `__grid_constant__` by default. It tied the warm direct decode
+  metric and was slightly worse cold; any prefill movement in that binary is
+  noise because the prefill kernel does not consume `Gemma4KvCacheConfig`.
+- The benchmark-only branches were deleted after this pass.
+
 ## 2026-06-17 - FA benchmark uses real Norm/RoPE path only
 
 Runtime file:
@@ -12176,3 +12349,86 @@ Conclusion:
   trials.
 - The moved staged-buffer path still compiles and remains numerically aligned
   with the swizzled custom output in the smoke run.
+
+## 2026-06-18 - Sliding decode page-span cache addressing
+
+Question: does the `docs/memory-movements-fa.md` recommendation to stop loading
+the page table and recomputing page offsets once per token improve sliding paged
+decode attention?
+
+Change:
+
+- Updated `sliding_decode_paged_grouped_split_kernel` to iterate by logical
+  cache-page spans.
+- Each touched page now performs one read-only page-table load and one full
+  cache-base calculation.
+- The inner token loop advances the K/V base pointer by the fixed
+  `num_heads * head_dim` stride.
+- Q, K, V, sequence lengths, and page table loads keep the same read-only global
+  cache policy recommended in `docs/memory-movements-fa.md`; the change removes
+  redundant metadata traffic and address math rather than adding shared-memory
+  staging.
+
+Commands:
+
+```bash
+make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+
+./build/experiments/gemma4_kv_cache_bench \
+  4096 64 64 50 200 20 --cache warm \
+  | tee src/experiments/results/2026-06-18_fa_page_span_before_warm.txt
+
+./build/experiments/gemma4_kv_cache_bench \
+  4096 64 64 20 30 12 --cache cold --flush-bytes 67108864 \
+  | tee src/experiments/results/2026-06-18_fa_page_span_before_cold.txt
+
+make -B test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+
+./build/experiments/gemma4_kv_cache_bench \
+  4096 64 64 50 200 20 --cache warm \
+  | tee src/experiments/results/2026-06-18_fa_page_span_after_warm.txt
+
+./build/experiments/gemma4_kv_cache_bench \
+  4096 64 64 20 30 12 --cache cold --flush-bytes 67108864 \
+  | tee src/experiments/results/2026-06-18_fa_page_span_after_cold.txt
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:0F:00.0`, driver `580.126.16`,
+  persistence enabled, ECC disabled, power limit `300 W`.
+- CUDA/NVCC: CUDA compilation tools `13.0`, `V13.0.48`.
+- Timing: existing C++ KV-cache benchmark, CUDA events on the benchmark stream.
+- Shape: sliding decode, `B=1`, `seq_len=4096`, `page_size=64`,
+  `split_size=64`, sliding key count `1024`, `actual_splits=16`, BF16,
+  `q_heads=32`, `kv_heads=16`, `head_dim=256`.
+- Cache state: warm and cold measured separately. Cold uses a `67108864` byte
+  L2 flush buffer, larger than the reported `6291456` byte L2.
+- Launch overhead: included as queued launches on the GPU timeline; host wall
+  time excluded.
+- Clock policy: clocks were not locked; `nvidia-smi` showed the GPU idle after
+  the run, so boost/thermal drift remains the main small-delta threat.
+- Correctness: `test-kv-cache` passed. Benchmark correctness remained
+  `max_abs=0.023438`, `mean_abs=0.000202`.
+
+Median comparison:
+
+```text
+cache  path                                  before ms  after ms  delta    speedup
+warm   flash_decode_paged_attention_direct   0.085141  0.064318  -24.46%  1.324x
+warm   full write + attention                 0.088132  0.066948  -24.04%  1.316x
+cold   flash_decode_paged_attention_direct   0.093894  0.071836  -23.49%  1.307x
+cold   full write + attention                 0.096359  0.074256  -22.94%  1.298x
+```
+
+Conclusion:
+
+- Page-span iteration is a clear win for this shape: roughly `23-24%` lower
+  median attention time in both warm and cold cache conditions.
+- The result is much larger than the declared `5%` minimum effect size, so it is
+  robust enough to keep despite unlocked clocks.
+- The remaining hot path is still dominated by K/V vector loads plus two
+  block-wide reductions per token; the next cache-adjacent experiment should
+  avoid further metadata work only if it does not disturb the coalesced K/V
+  read-only load pattern.
