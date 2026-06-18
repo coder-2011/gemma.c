@@ -663,6 +663,195 @@ void run_sliding_wrap_case() {
   CHECK_CUDA(cudaFree(d_partial_acc));
 }
 
+void run_sliding_flash_decode_attention_case(const char *label,
+                                             int batch_size,
+                                             int seq_len,
+                                             int page_size,
+                                             int max_pages_per_seq,
+                                             int window_size,
+                                             int split_size) {
+  Gemma4KvCacheConfig config = {
+      1,
+      batch_size * max_pages_per_seq,
+      page_size,
+      max_pages_per_seq,
+      GEMMA4_SLIDING_KV_HEADS,
+      GEMMA4_SLIDING_HEAD_DIM,
+      window_size,
+  };
+  int layer = 0;
+  int q_heads = GEMMA4_NUM_QUERY_HEADS;
+  int key_count = seq_len - (window_size > 0 ? std::max(0, seq_len - window_size) : 0);
+  int num_splits = (key_count + split_size - 1) / split_size;
+  float scale = 1.0f / std::sqrt(float(config.head_dim));
+
+  std::vector<int32_t> page_table(batch_size * config.max_pages_per_seq, -1);
+  std::vector<int32_t> slot_logical_pages(page_table.size(), -1);
+  std::vector<int32_t> seq_lengths(batch_size, 0);
+  Gemma4KvPageAllocator allocator(config.num_pages);
+
+  __nv_bfloat16 *d_cache_k = nullptr;
+  __nv_bfloat16 *d_cache_v = nullptr;
+  __nv_bfloat16 *d_one_k = nullptr;
+  __nv_bfloat16 *d_one_v = nullptr;
+  __nv_bfloat16 *d_q = nullptr;
+  __nv_bfloat16 *d_baseline_out = nullptr;
+  __nv_bfloat16 *d_direct_out = nullptr;
+  __nv_bfloat16 *d_cp_async_out = nullptr;
+  int32_t *d_page_table = nullptr;
+  int32_t *d_token_batch = nullptr;
+  int32_t *d_token_position = nullptr;
+  int32_t *d_seq_lengths = nullptr;
+  float *d_partial_m = nullptr;
+  float *d_partial_l = nullptr;
+  float *d_partial_acc = nullptr;
+
+  CHECK_CUDA(cudaMalloc(&d_cache_k, cache_elements(config) * sizeof(*d_cache_k)));
+  CHECK_CUDA(cudaMalloc(&d_cache_v, cache_elements(config) * sizeof(*d_cache_v)));
+  CHECK_CUDA(cudaMalloc(&d_one_k, config.num_heads * config.head_dim * sizeof(*d_one_k)));
+  CHECK_CUDA(cudaMalloc(&d_one_v, config.num_heads * config.head_dim * sizeof(*d_one_v)));
+  CHECK_CUDA(cudaMalloc(&d_q, batch_size * q_heads * config.head_dim * sizeof(*d_q)));
+  CHECK_CUDA(cudaMalloc(&d_baseline_out,
+                        batch_size * q_heads * config.head_dim * sizeof(*d_baseline_out)));
+  CHECK_CUDA(cudaMalloc(&d_direct_out,
+                        batch_size * q_heads * config.head_dim * sizeof(*d_direct_out)));
+  CHECK_CUDA(cudaMalloc(&d_cp_async_out,
+                        batch_size * q_heads * config.head_dim * sizeof(*d_cp_async_out)));
+  CHECK_CUDA(cudaMalloc(&d_page_table, page_table.size() * sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc(&d_token_batch, sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc(&d_token_position, sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc(&d_seq_lengths, seq_lengths.size() * sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc(&d_partial_m,
+                        gemma4_paged_decode_partial_m_elements(
+                            batch_size, q_heads, num_splits) *
+                            sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_partial_l,
+                        gemma4_paged_decode_partial_m_elements(
+                            batch_size, q_heads, num_splits) *
+                            sizeof(float)));
+  CHECK_CUDA(cudaMalloc(&d_partial_acc,
+                        gemma4_paged_decode_partial_acc_elements(
+                            batch_size, q_heads, num_splits, config.head_dim) *
+                            sizeof(float)));
+  CHECK_CUDA(cudaMemset(d_cache_k, 0, cache_elements(config) * sizeof(*d_cache_k)));
+  CHECK_CUDA(cudaMemset(d_cache_v, 0, cache_elements(config) * sizeof(*d_cache_v)));
+
+  std::vector<__nv_bfloat16> by_pos_k(batch_size * seq_len *
+                                      config.num_heads * config.head_dim);
+  std::vector<__nv_bfloat16> by_pos_v(by_pos_k.size());
+  std::vector<__nv_bfloat16> one_k(config.num_heads * config.head_dim);
+  std::vector<__nv_bfloat16> one_v(one_k.size());
+  for (int b = 0; b < batch_size; ++b) {
+    for (int pos = 0; pos < seq_len; ++pos) {
+      int ensured_page = gemma4_kv_cache_ensure_page(
+          page_table, slot_logical_pages, allocator, config, batch_size, b, pos);
+      if (ensured_page < 0) {
+        std::fprintf(stderr, "%s page allocation failed\n", label);
+        std::exit(1);
+      }
+      seq_lengths[b] = pos + 1;
+      for (int h = 0; h < config.num_heads; ++h) {
+        for (int d = 0; d < config.head_dim; ++d) {
+          __nv_bfloat16 kv = make_value(17000 + 1000 * b + 101 * pos + 17 * h + d);
+          __nv_bfloat16 vv = make_value(27000 + 1000 * b + 101 * pos + 17 * h + d);
+          one_k[h * config.head_dim + d] = kv;
+          one_v[h * config.head_dim + d] = vv;
+          by_pos_k[token_offset(b, pos, h, d, seq_len, config.num_heads,
+                                config.head_dim)] = kv;
+          by_pos_v[token_offset(b, pos, h, d, seq_len, config.num_heads,
+                                config.head_dim)] = vv;
+        }
+      }
+
+      int32_t h_batch = b;
+      int32_t h_position = pos;
+      CHECK_CUDA(cudaMemcpy(d_page_table, page_table.data(),
+                            page_table.size() * sizeof(int32_t),
+                            cudaMemcpyHostToDevice));
+      CHECK_CUDA(cudaMemcpy(d_token_batch, &h_batch, sizeof(int32_t),
+                            cudaMemcpyHostToDevice));
+      CHECK_CUDA(cudaMemcpy(d_token_position, &h_position, sizeof(int32_t),
+                            cudaMemcpyHostToDevice));
+      CHECK_CUDA(cudaMemcpy(d_one_k, one_k.data(),
+                            one_k.size() * sizeof(one_k[0]),
+                            cudaMemcpyHostToDevice));
+      CHECK_CUDA(cudaMemcpy(d_one_v, one_v.data(),
+                            one_v.size() * sizeof(one_v[0]),
+                            cudaMemcpyHostToDevice));
+      CHECK_CUDA(gemma4_kv_cache_write_bf16(
+          d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
+          d_token_position, 1, layer, d_one_k, d_one_v, 0));
+    }
+  }
+
+  std::vector<__nv_bfloat16> q(batch_size * q_heads * config.head_dim);
+  for (int i = 0; i < static_cast<int>(q.size()); ++i) {
+    q[i] = make_value(37000 + i);
+  }
+  std::vector<__nv_bfloat16> expected(q.size());
+  reference_decode_attention(expected, q, by_pos_k, by_pos_v, seq_lengths,
+                             config, batch_size, q_heads, seq_len, scale);
+
+  CHECK_CUDA(cudaMemcpy(d_q, q.data(), q.size() * sizeof(q[0]),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_page_table, page_table.data(),
+                        page_table.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(d_seq_lengths, seq_lengths.data(),
+                        seq_lengths.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
+
+  CHECK_CUDA(gemma4_paged_decode_attention_bf16(
+      d_baseline_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
+      d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
+      q_heads, scale, split_size, num_splits, 0));
+  CHECK_CUDA(gemma4_flash_attention_sliding_decode_paged_bf16(
+      d_direct_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
+      d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
+      scale, split_size, num_splits, 0));
+  CHECK_CUDA(gemma4_flash_attention_sliding_decode_paged_cp_async_bf16(
+      d_cp_async_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
+      d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
+      scale, split_size, num_splits, 0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  std::vector<__nv_bfloat16> baseline(q.size());
+  std::vector<__nv_bfloat16> direct(q.size());
+  std::vector<__nv_bfloat16> cp_async(q.size());
+  CHECK_CUDA(cudaMemcpy(baseline.data(), d_baseline_out,
+                        baseline.size() * sizeof(baseline[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(direct.data(), d_direct_out,
+                        direct.size() * sizeof(direct[0]),
+                        cudaMemcpyDeviceToHost));
+  CHECK_CUDA(cudaMemcpy(cp_async.data(), d_cp_async_out,
+                        cp_async.size() * sizeof(cp_async[0]),
+                        cudaMemcpyDeviceToHost));
+
+  compare_bf16(baseline, expected, 0.015625f, label);
+  compare_bf16(direct, baseline, 0.015625f, "sliding flash decode direct");
+  compare_bf16(direct, expected, 0.015625f, "sliding flash decode direct cpu");
+  compare_bf16(cp_async, baseline, 0.015625f, "sliding flash decode cp.async");
+  compare_bf16(cp_async, expected, 0.015625f,
+               "sliding flash decode cp.async cpu");
+
+  CHECK_CUDA(cudaFree(d_cache_k));
+  CHECK_CUDA(cudaFree(d_cache_v));
+  CHECK_CUDA(cudaFree(d_one_k));
+  CHECK_CUDA(cudaFree(d_one_v));
+  CHECK_CUDA(cudaFree(d_q));
+  CHECK_CUDA(cudaFree(d_baseline_out));
+  CHECK_CUDA(cudaFree(d_direct_out));
+  CHECK_CUDA(cudaFree(d_cp_async_out));
+  CHECK_CUDA(cudaFree(d_page_table));
+  CHECK_CUDA(cudaFree(d_token_batch));
+  CHECK_CUDA(cudaFree(d_token_position));
+  CHECK_CUDA(cudaFree(d_seq_lengths));
+  CHECK_CUDA(cudaFree(d_partial_m));
+  CHECK_CUDA(cudaFree(d_partial_l));
+  CHECK_CUDA(cudaFree(d_partial_acc));
+}
+
 }  // namespace
 
 int main() {
@@ -670,6 +859,12 @@ int main() {
   run_sliding_decode_prep_cache_case();
   run_global_write_and_attention_case();
   run_sliding_wrap_case();
+  run_sliding_flash_decode_attention_case(
+      "sliding flash decode short", 1, 5, 8, 2, 8, 3);
+  run_sliding_flash_decode_attention_case(
+      "sliding flash decode boundary", 2, 10, 4, 3, 8, 3);
+  run_sliding_flash_decode_attention_case(
+      "sliding flash decode wrap", 1, 13, 4, 3, 8, 5);
   std::puts("kv cache tests passed");
   return 0;
 }
