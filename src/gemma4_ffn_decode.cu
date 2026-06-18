@@ -6,6 +6,10 @@
 
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_matmul_device.cuh"
+#include "gemma4_rmsnorm.cuh"
+
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/numeric_types.h>
 
 #ifndef GEMMA4_FFN_DECODE_ACT_TILE
 #define GEMMA4_FFN_DECODE_ACT_TILE 2
