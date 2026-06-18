@@ -39,6 +39,8 @@ __global__ void fill_random_bf16_kernel(__nv_bfloat16 *ptr,
   uint32_t x = uint32_t(i) ^ uint32_t(i >> 32) ^ uint32_t(seed) ^
                uint32_t(seed >> 32);
   x = mix_u32(x);
+  // Device-side fill avoids timing host-to-device copies and gives every run a
+  // deterministic-but-nontrivial weight/input pattern from one seed.
   const float u = float(x >> 8) * (1.0f / 16777216.0f);
   ptr[i] = __float2bfloat16_rn((u * 2.0f - 1.0f) * scale);
 }
@@ -47,6 +49,8 @@ __global__ void flush_cache_kernel(const uint32_t *__restrict__ in,
                                    uint32_t *__restrict__ out,
                                    size_t count) {
   uint32_t acc = 0;
+  // Stride over a large buffer to evict the FFN working set from L2 before the
+  // cold-cache timing path. The output write keeps the loop from becoming dead.
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
        i += size_t(blockDim.x) * gridDim.x) {
     acc ^= in[i] + uint32_t(i);
@@ -156,6 +160,21 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaStreamSynchronize(stream));
   CUDA_CHECK(gemma4_ffn_decode_configure_scratch_l2(d_scratch, stream));
 
+  Gemma4FfnBf16Args ffn_args = {};
+  ffn_args.residual_out = d_residual_out;
+  ffn_args.normed_out = d_normed_out;
+  ffn_args.x = d_x;
+  ffn_args.residual = d_residual;
+  ffn_args.rms_weight = d_rms_weight;
+  ffn_args.w_gate_up_decode = d_gate_up;
+  ffn_args.w_down_decode = d_down;
+  ffn_args.decode_scratch = d_scratch;
+  ffn_args.rows = 1;
+  ffn_args.eps = GEMMA4_RMS_NORM_EPS;
+  ffn_args.stream = stream;
+
+  // Size the flush buffer from the actual GPU, with 256 MiB as a practical
+  // floor for A6000-class cache flushing.
   int device = 0;
   cudaDeviceProp prop{};
   CUDA_CHECK(cudaGetDevice(&device));
@@ -172,11 +191,11 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   auto run_custom = [&]() {
-    CUDA_CHECK(gemma4_ffn_decode_fused_bf16(
-        d_residual_out, d_normed_out, d_x, d_residual, d_rms_weight,
-        d_gate_up, d_down, d_scratch, GEMMA4_RMS_NORM_EPS, stream));
+    CUDA_CHECK(gemma4_ffn_bf16(ffn_args));
   };
   auto run_clear = [&]() {
+    // Measure scratch clearing separately so we can subtract the bookkeeping
+    // cost from cold-cache runs where memset behavior is otherwise hidden.
     auto *scratch = static_cast<Gemma4FfnDecodeScratch *>(d_scratch);
     CUDA_CHECK(cudaMemsetAsync(scratch, 0, sizeof(*scratch), stream));
   };
@@ -196,6 +215,8 @@ int main(int argc, char **argv) {
                                            iters, trials);
   const TimingStats clear = time_ms_graph(run_clear, stream, warmup,
                                           iters, trials);
+  // Cold runs include the flush in the CUDA stream for ordering, then subtract
+  // a matched flush-only measurement in the printed derived metrics.
   const TimingStats cold_custom = time_ms(run_cold_custom, stream, warmup,
                                           iters, trials);
   const TimingStats cold_clear = time_ms(run_cold_clear, stream, warmup,

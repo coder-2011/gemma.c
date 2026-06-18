@@ -50,6 +50,8 @@ __global__ void fill_random_bf16_kernel(__nv_bfloat16 *ptr,
   uint32_t x = uint32_t(i) ^ uint32_t(i >> 32) ^ uint32_t(seed) ^
                uint32_t(seed >> 32);
   x = mix_u32(x);
+  // Generate data on device so benchmark setup does not spend time staging
+  // giant FFN matrices through pageable host memory.
   const float u = float(x >> 8) * (1.0f / 16777216.0f);
   ptr[i] = __float2bfloat16_rn((u * 2.0f - 1.0f) * scale);
 }
@@ -70,6 +72,8 @@ __global__ void flush_cache_kernel(const uint32_t *__restrict__ in,
                                    uint32_t *__restrict__ out,
                                    size_t count) {
   uint32_t acc = 0;
+  // A real output dependency keeps the flush loop observable while the large
+  // read stream forces subsequent FFN measurements into a cold-L2 regime.
   for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
        i += size_t(blockDim.x) * gridDim.x) {
     acc ^= in[i] + uint32_t(i);
@@ -190,6 +194,8 @@ struct CudnnGraphBase {
   int64_t workspace_size = 0;
 
   explicit CudnnGraphBase(cudaStream_t stream) : cudnn(stream) {
+    // Match the custom path's BF16 IO with FP32 accumulation where cuDNN exposes
+    // it, so this benchmark compares math choices rather than precision modes.
     graph.set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
   }
@@ -201,6 +207,8 @@ struct CudnnGraphBase {
   }
 
   void build(const char *name) {
+    // Build and plan creation are setup costs. main() constructs these graph
+    // objects before timing and then benchmarks only graph execution.
     check_fe(graph.validate(), (std::string(name) + ".validate").c_str());
     check_fe(graph.build_operation_graph(cudnn.handle),
              (std::string(name) + ".build_operation_graph").c_str());
@@ -252,6 +260,8 @@ struct CudnnGeGlu : public CudnnGraphBase {
   std::shared_ptr<fe::graph::Tensor_attributes> act;
 
   CudnnGeGlu(int tokens, cudaStream_t stream) : CudnnGraphBase(stream) {
+    // Split gate/up keeps this cuDNN baseline close to the graph API's natural
+    // matmul nodes; the custom CUDA benchmark uses packed gate/up storage.
     x = make_bf16_tensor(graph, "x", {1, tokens, kHidden},
                          {tokens * kHidden, kHidden, 1});
     w_gate = make_bf16_tensor(graph, "w_gate", {1, kHidden, kIntermediate},
@@ -323,6 +333,8 @@ struct CudnnFullFfn : public CudnnGraphBase {
   std::shared_ptr<fe::graph::Tensor_attributes> out;
 
   CudnnFullFfn(int tokens, cudaStream_t stream) : CudnnGraphBase(stream) {
+    // This graph is the most apples-to-apples cuDNN FFN baseline: two gate/up
+    // matmuls, tanh GELU, multiply, and down matmul in one planned graph.
     x = make_bf16_tensor(graph, "x", {1, tokens, kHidden},
                          {tokens * kHidden, kHidden, 1});
     w_gate = make_bf16_tensor(graph, "w_gate", {1, kHidden, kIntermediate},
@@ -478,6 +490,19 @@ int main(int argc, char **argv) {
 #else
   std::printf("cudnn_version=%zu\n", cudnnGetVersion());
 
+  Gemma4FfnBf16Args custom_ffn_args = {};
+  custom_ffn_args.residual_out = d_custom_residual_out;
+  custom_ffn_args.normed_out = d_custom_normed_out;
+  custom_ffn_args.x = d_x;
+  custom_ffn_args.residual = d_residual;
+  custom_ffn_args.rms_weight = d_rms_weight;
+  custom_ffn_args.w_gate_up_decode = d_w_gate_up_col_major;
+  custom_ffn_args.w_down_decode = d_w_down_swizzled;
+  custom_ffn_args.decode_scratch = d_custom_scratch;
+  custom_ffn_args.rows = 1;
+  custom_ffn_args.eps = GEMMA4_RMS_NORM_EPS;
+  custom_ffn_args.stream = stream;
+
   try {
     CudnnGeGlu geglu(tokens, stream);
     CudnnDown down(tokens, stream);
@@ -493,10 +518,7 @@ int main(int argc, char **argv) {
       down.run(d_act, d_w_down, d_out);
     };
     auto run_custom = [&]() {
-      CUDA_CHECK(gemma4_ffn_decode_fused_bf16(
-          d_custom_residual_out, d_custom_normed_out, d_x, d_residual,
-          d_rms_weight, d_w_gate_up_col_major, d_w_down_swizzled,
-          d_custom_scratch, GEMMA4_RMS_NORM_EPS, stream));
+      CUDA_CHECK(gemma4_ffn_bf16(custom_ffn_args));
     };
     auto run_custom_clear = [&]() {
       CUDA_CHECK(cudaMemsetAsync(d_custom_scratch, 0,

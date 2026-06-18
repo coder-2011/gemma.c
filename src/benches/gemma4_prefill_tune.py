@@ -16,7 +16,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILD_DIR = REPO_ROOT / "build" / "experiments"
+BUILD_DIR = REPO_ROOT / "build" / "benches"
 
 OPS = [
     "ffn_gate_up",

@@ -16,6 +16,11 @@
 #include <string>
 #include <vector>
 
+struct DecodeBenchOptions {
+  bool run_cublas = true;
+  bool run_cudnn = true;
+};
+
 struct DecodeOp {
   const char *name;
   Gemma4Projection projection;
@@ -233,7 +238,7 @@ static bool should_run_op(const std::string &selected, const DecodeOp &op) {
 
 static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
                    cudaStream_t stream, CublasDecode &cublas,
-                   uint64_t base_seed) {
+                   uint64_t base_seed, const DecodeBenchOptions &options) {
   __nv_bfloat16 *x = nullptr;
   __nv_bfloat16 *w = nullptr;
   __nv_bfloat16 *custom_y = nullptr;
@@ -249,9 +254,13 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   CUDA_CHECK(cudaMalloc(&w, w_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&custom_y, y_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&swizzled_y, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&gemv_y, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&gemm_y, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&cudnn_y, y_count * sizeof(__nv_bfloat16)));
+  if (options.run_cublas) {
+    CUDA_CHECK(cudaMalloc(&gemv_y, y_count * sizeof(__nv_bfloat16)));
+    CUDA_CHECK(cudaMalloc(&gemm_y, y_count * sizeof(__nv_bfloat16)));
+  }
+  if (options.run_cudnn) {
+    CUDA_CHECK(cudaMalloc(&cudnn_y, y_count * sizeof(__nv_bfloat16)));
+  }
 
   const uint64_t x_seed = base_seed ^ (uint64_t(op.k) << 32) ^ uint64_t(op.n);
   const uint64_t w_seed =
@@ -263,9 +272,13 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   fill_random_bf16(w, w_count, w_seed, kWeightScale, stream);
   CUDA_CHECK(cudaMemsetAsync(custom_y, 0, y_count * sizeof(__nv_bfloat16), stream));
   CUDA_CHECK(cudaMemsetAsync(swizzled_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  CUDA_CHECK(cudaMemsetAsync(gemv_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  CUDA_CHECK(cudaMemsetAsync(gemm_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  CUDA_CHECK(cudaMemsetAsync(cudnn_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+  if (options.run_cublas) {
+    CUDA_CHECK(cudaMemsetAsync(gemv_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+    CUDA_CHECK(cudaMemsetAsync(gemm_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+  }
+  if (options.run_cudnn) {
+    CUDA_CHECK(cudaMemsetAsync(cudnn_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   auto run_custom = [&]() {
@@ -281,32 +294,58 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
 
   run_custom();
   run_swizzled();
-  run_gemv();
-  run_gemm();
+  if (options.run_cublas) {
+    run_gemv();
+    run_gemm();
+  }
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   const DiffStats swizzled_diff = diff_stats_bf16(custom_y, swizzled_y, op.n);
-  const DiffStats gemv_diff = diff_stats_bf16(custom_y, gemv_y, op.n);
-  const DiffStats gemm_diff = diff_stats_bf16(custom_y, gemm_y, op.n);
+  DiffStats gemv_diff = {};
+  DiffStats gemm_diff = {};
+  if (options.run_cublas) {
+    gemv_diff = diff_stats_bf16(custom_y, gemv_y, op.n);
+    gemm_diff = diff_stats_bf16(custom_y, gemm_y, op.n);
+  } else {
+    gemv_diff.max_abs = gemv_diff.mean_abs = gemv_diff.max_rel = -1.0f;
+    gemm_diff.max_abs = gemm_diff.mean_abs = gemm_diff.max_rel = -1.0f;
+  }
 
   const TimingStats custom = time_ms(run_custom, stream, warmup, iters, trials);
   const TimingStats swizzled =
       time_ms(run_swizzled, stream, warmup, iters, trials);
-  const TimingStats gemv = time_ms(run_gemv, stream, warmup, iters, trials);
-  const TimingStats gemm = time_ms(run_gemm, stream, warmup, iters, trials);
+  TimingStats gemv = {};
+  TimingStats gemm = {};
+  if (options.run_cublas) {
+    gemv = time_ms(run_gemv, stream, warmup, iters, trials);
+    gemm = time_ms(run_gemm, stream, warmup, iters, trials);
+  } else {
+    gemv.best_ms = gemv.avg_ms = -1.0f;
+    gemm.best_ms = gemm.avg_ms = -1.0f;
+  }
   const double bytes = double(op.n) * double(op.k) * sizeof(__nv_bfloat16);
   const double per_token_gb = bytes * double(op.layers_per_token) / 1.0e9;
+  const double custom_gbps = bytes / (custom.best_ms * 1.0e6);
+  const double swizzled_gbps = bytes / (swizzled.best_ms * 1.0e6);
+  const double gemv_gbps =
+      options.run_cublas ? bytes / (gemv.best_ms * 1.0e6) : -1.0;
+  const double gemm_gbps =
+      options.run_cublas ? bytes / (gemm.best_ms * 1.0e6) : -1.0;
+  const float gemv_speedup =
+      options.run_cublas ? gemv.best_ms / custom.best_ms : -1.0f;
+  const float gemm_speedup =
+      options.run_cublas ? gemm.best_ms / custom.best_ms : -1.0f;
 
   float cudnn_best_ms = -1.0f;
   float cudnn_avg_ms = -1.0f;
-  double cudnn_gbps = 0.0;
+  double cudnn_gbps = -1.0;
   float cudnn_speedup = -1.0f;
   float cudnn_max_abs = -1.0f;
   float cudnn_mean_abs = -1.0f;
   float cudnn_max_rel = -1.0f;
   int cudnn_algo = -1;
   size_t cudnn_workspace_bytes = 0;
-  try {
+  if (options.run_cudnn) try {
     CudnnDecodeConv cudnn(stream, op.k, op.n);
     auto run_cudnn = [&]() { cudnn.conv(x, w, cudnn_y); };
     run_cudnn();
@@ -335,30 +374,27 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
               static_cast<unsigned long long>(w_seed), kInputScale,
               kWeightScale);
   std::printf("custom_best_ms=%.6f,custom_avg_ms=%.6f,custom_best_weight_gbps=%.3f\n",
-              custom.best_ms, custom.avg_ms, bytes / (custom.best_ms * 1.0e6));
+              custom.best_ms, custom.avg_ms, custom_gbps);
   std::printf("custom_swizzle16_best_ms=%.6f,"
               "custom_swizzle16_avg_ms=%.6f,"
               "custom_swizzle16_best_weight_gbps=%.3f,"
               "custom_swizzle16_vs_identity=%.6f\n",
-              swizzled.best_ms, swizzled.avg_ms,
-              bytes / (swizzled.best_ms * 1.0e6),
+              swizzled.best_ms, swizzled.avg_ms, swizzled_gbps,
               custom.best_ms / swizzled.best_ms);
   std::printf("cublas_bf16_gemv_best_ms=%.6f,"
               "cublas_bf16_gemv_avg_ms=%.6f,"
               "cublas_bf16_gemv_best_weight_gbps=%.3f\n",
-              gemv.best_ms, gemv.avg_ms, bytes / (gemv.best_ms * 1.0e6));
+              gemv.best_ms, gemv.avg_ms, gemv_gbps);
   std::printf("cublas_bf16_gemm_m1_best_ms=%.6f,"
               "cublas_bf16_gemm_m1_avg_ms=%.6f,"
               "cublas_bf16_gemm_m1_best_weight_gbps=%.3f\n",
-              gemm.best_ms, gemm.avg_ms, bytes / (gemm.best_ms * 1.0e6));
+              gemm.best_ms, gemm.avg_ms, gemm_gbps);
   std::printf("cudnn_bf16_conv1x1_best_ms=%.6f,"
               "cudnn_bf16_conv1x1_avg_ms=%.6f,"
               "cudnn_bf16_conv1x1_best_weight_gbps=%.3f\n",
               cudnn_best_ms, cudnn_avg_ms, cudnn_gbps);
-  std::printf("custom_vs_cublas_gemv_speedup=%.6f\n",
-              gemv.best_ms / custom.best_ms);
-  std::printf("custom_vs_cublas_gemm_m1_speedup=%.6f\n",
-              gemm.best_ms / custom.best_ms);
+  std::printf("custom_vs_cublas_gemv_speedup=%.6f\n", gemv_speedup);
+  std::printf("custom_vs_cublas_gemm_m1_speedup=%.6f\n", gemm_speedup);
   std::printf("custom_vs_cudnn_conv1x1_speedup=%.6f\n", cudnn_speedup);
   std::printf("cublas_bf16_gemv_max_abs_diff=%.6g,"
               "cublas_bf16_gemv_mean_abs_diff=%.6g,"
@@ -384,9 +420,9 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   CUDA_CHECK(cudaFree(w));
   CUDA_CHECK(cudaFree(custom_y));
   CUDA_CHECK(cudaFree(swizzled_y));
-  CUDA_CHECK(cudaFree(gemv_y));
-  CUDA_CHECK(cudaFree(gemm_y));
-  CUDA_CHECK(cudaFree(cudnn_y));
+  if (gemv_y != nullptr) CUDA_CHECK(cudaFree(gemv_y));
+  if (gemm_y != nullptr) CUDA_CHECK(cudaFree(gemm_y));
+  if (cudnn_y != nullptr) CUDA_CHECK(cudaFree(cudnn_y));
 }
 
 int main(int argc, char **argv) {
@@ -399,14 +435,23 @@ int main(int argc, char **argv) {
   const int iters = argc > iter_arg ? std::atoi(argv[iter_arg]) : 20;
   const int warmup = argc > warmup_arg ? std::atoi(argv[warmup_arg]) : 5;
   const int trials = argc > trials_arg ? std::atoi(argv[trials_arg]) : 2;
+  DecodeBenchOptions options;
+  if (const char *env = std::getenv("GEMMA4_DECODE_BENCH_RUN_CUBLAS")) {
+    options.run_cublas = std::atoi(env) != 0;
+  }
+  if (const char *env = std::getenv("GEMMA4_DECODE_BENCH_RUN_CUDNN")) {
+    options.run_cudnn = std::atoi(env) != 0;
+  }
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   CublasDecode cublas(stream);
   const uint64_t seed = make_seed();
 
-  std::printf("selected=%s,iters=%d,warmup_iters=%d,trials=%d,dtype=bf16,base_seed=%llu\n\n",
+  std::printf("selected=%s,iters=%d,warmup_iters=%d,trials=%d,dtype=bf16,"
+              "run_cublas=%d,run_cudnn=%d,base_seed=%llu\n\n",
               selected.c_str(), iters, warmup, trials,
+              options.run_cublas ? 1 : 0, options.run_cudnn ? 1 : 0,
               static_cast<unsigned long long>(seed));
 
   bool ran_any = false;
@@ -415,7 +460,7 @@ int main(int argc, char **argv) {
       continue;
     }
     ran_any = true;
-    run_op(op, iters, warmup, trials, stream, cublas, seed);
+    run_op(op, iters, warmup, trials, stream, cublas, seed, options);
   }
 
   if (!ran_any) {

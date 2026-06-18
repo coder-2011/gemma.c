@@ -95,7 +95,25 @@ def load_lib(path):
         ctypes.c_void_p,
     ]
     global_fwd_norm_rope.restype = ctypes.c_int
-    return global_fwd, global_fwd_norm_rope
+
+    global_prepare = lib.gemma4_flash_attention_global_prepare_qkv_norm_rope_bf16
+    global_prepare.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_void_p,
+    ]
+    global_prepare.restype = ctypes.c_int
+
+    return global_fwd, global_fwd_norm_rope, global_prepare
 
 
 def check_status(status, label):
@@ -180,7 +198,7 @@ def make_inputs(args, device):
     return q, k, q_weight, k_weight, cos, sin
 
 
-def time_paths(paths, samples, delay_s, flush_buf):
+def time_paths(paths, samples, delay_s, flush_buf, cache_mode):
     timings = {name: [] for name in paths}
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
@@ -188,8 +206,10 @@ def time_paths(paths, samples, delay_s, flush_buf):
     for sample in range(samples):
         order = names if sample % 2 == 0 else list(reversed(names))
         for name in order:
-            flush_l2(flush_buf)
-            time.sleep(delay_s)
+            if cache_mode == "cold":
+                flush_l2(flush_buf)
+            if delay_s > 0.0:
+                time.sleep(delay_s)
             start.record()
             paths[name]()
             stop.record()
@@ -213,6 +233,7 @@ def nvidia_smi_snapshot():
 
 def print_table(result):
     rows = [
+        ("prep custom", "custom_global_prefill_norm_rope_prep"),
         ("direct custom", "direct_custom_global_prefill"),
         ("direct PyTorch", "direct_pytorch_sdpa"),
         ("fused custom", "fused_custom_norm_rope_global_prefill"),
@@ -221,6 +242,8 @@ def print_table(result):
     print("| path | median ms | mean ms | min ms | p95 ms | max ms |")
     print("| --- | ---: | ---: | ---: | ---: | ---: |")
     for label, key in rows:
+        if key not in result["timings"]:
+            continue
         stats = result["timings"][key]
         print(
             f"| {label} | {stats['median_ms']:.6f} | {stats['mean_ms']:.6f} | "
@@ -243,6 +266,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--delay-s", type=float, default=0.1)
     parser.add_argument("--flush-mib", type=int, default=256)
+    parser.add_argument("--cache", choices=("cold", "warm"), default="cold")
+    parser.add_argument("--paths", choices=("all", "custom", "prep"), default="all")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--output", default="")
     args = parser.parse_args()
@@ -255,9 +280,11 @@ def main():
         raise RuntimeError("--samples must be > 0 and --warmup must be >= 0")
     if args.delay_s < 0.0:
         raise RuntimeError("--delay-s must be nonnegative")
+    if args.cache == "cold" and args.flush_mib <= 0:
+        raise RuntimeError("--flush-mib must be > 0 for cold-cache timing")
 
     device = torch.device("cuda")
-    global_fwd, global_fwd_norm_rope = load_lib(args.lib)
+    global_fwd, global_fwd_norm_rope, global_prepare = load_lib(args.lib)
     scale = 1.0 / math.sqrt(GEMMA4_GLOBAL_HEAD_DIM)
     q, k, q_weight, k_weight, cos, sin = make_inputs(args, device)
 
@@ -297,6 +324,25 @@ def main():
             "gemma4_flash_attention_global_fwd_bf16_norm_rope",
         )
 
+    def custom_prepare():
+        check_status(
+            global_prepare(
+                ptr(q_prepared),
+                ptr(k_prepared),
+                ptr(v_prepared),
+                ptr(q),
+                ptr(k),
+                ptr(q_weight),
+                ptr(k_weight),
+                ptr(cos),
+                ptr(sin),
+                args.batch_size,
+                args.seq_len,
+                current_stream_ptr(),
+            ),
+            "gemma4_flash_attention_global_prepare_qkv_norm_rope_bf16",
+        )
+
     def custom_direct():
         check_status(
             global_fwd(
@@ -324,63 +370,99 @@ def main():
         sdpa_bshd(tq, tk, tv, fused_torch_out, scale)
 
     with torch.no_grad():
+        timed_paths = {
+            "direct_custom_global_prefill": custom_direct,
+            "fused_custom_norm_rope_global_prefill": custom_fused,
+        }
+        if args.paths == "prep":
+            timed_paths = {
+                "custom_global_prefill_norm_rope_prep": custom_prepare,
+            }
+        if args.paths == "all":
+            timed_paths = {
+                "custom_global_prefill_norm_rope_prep": custom_prepare,
+                "direct_custom_global_prefill": custom_direct,
+                "direct_pytorch_sdpa": torch_direct,
+                "fused_custom_norm_rope_global_prefill": custom_fused,
+                "fused_pytorch_norm_rope_sdpa": torch_fused,
+            }
+
         for _ in range(args.warmup):
-            custom_fused()
-            custom_direct()
-            torch_direct()
-            torch_fused()
+            for path in timed_paths.values():
+                path()
         torch.cuda.synchronize()
 
         correctness = {
             "fused_custom_vs_direct_custom_max_abs": None,
             "direct_custom_vs_pytorch_max_abs": None,
             "fused_custom_vs_pytorch_max_abs": None,
+            "prepared_q_custom_vs_pytorch_max_abs": None,
+            "prepared_k_custom_vs_pytorch_max_abs": None,
+            "prepared_v_custom_vs_pytorch_max_abs": None,
         }
-        custom_fused()
-        custom_direct()
-        torch_direct()
-        torch_fused()
-        torch.cuda.synchronize()
-        correctness["fused_custom_vs_direct_custom_max_abs"] = float(
-            (fused_custom_out.float() - direct_custom_out.float()).abs().max().item()
-        )
-        correctness["direct_custom_vs_pytorch_max_abs"] = float(
-            (direct_custom_out.float() - direct_torch_out.float()).abs().max().item()
-        )
-        correctness["fused_custom_vs_pytorch_max_abs"] = float(
-            (fused_custom_out.float() - fused_torch_out.float()).abs().max().item()
-        )
+        if args.paths == "prep":
+            custom_prepare()
+            tq = apply_global_weighted_rope(q, q_weight, cos, sin)
+            tk = apply_global_weighted_rope(k, k_weight, cos, sin)
+            tv = apply_global_v_norm(k)
+            torch.cuda.synchronize()
+            correctness["prepared_q_custom_vs_pytorch_max_abs"] = float(
+                (q_prepared.float() - tq.float()).abs().max().item()
+            )
+            correctness["prepared_k_custom_vs_pytorch_max_abs"] = float(
+                (k_prepared.float() - tk.float()).abs().max().item()
+            )
+            correctness["prepared_v_custom_vs_pytorch_max_abs"] = float(
+                (v_prepared.float() - tv.float()).abs().max().item()
+            )
+        else:
+            custom_fused()
+            custom_direct()
+            torch_direct()
+            torch_fused()
+            torch.cuda.synchronize()
+            correctness["fused_custom_vs_direct_custom_max_abs"] = float(
+                (fused_custom_out.float() - direct_custom_out.float()).abs().max().item()
+            )
+            correctness["direct_custom_vs_pytorch_max_abs"] = float(
+                (direct_custom_out.float() - direct_torch_out.float()).abs().max().item()
+            )
+            correctness["fused_custom_vs_pytorch_max_abs"] = float(
+                (fused_custom_out.float() - fused_torch_out.float()).abs().max().item()
+            )
 
         timings = time_paths(
-            {
-                "direct_custom_global_prefill": custom_direct,
-                "direct_pytorch_sdpa": torch_direct,
-                "fused_custom_norm_rope_global_prefill": custom_fused,
-                "fused_pytorch_norm_rope_sdpa": torch_fused,
-            },
-            args.samples,
-            args.delay_s,
-            flush_buf,
-        )
-        checksum = float(
-            direct_custom_out.float().sum().item()
-            + direct_torch_out.float().sum().item()
-            + fused_custom_out.float().sum().item()
-            + fused_torch_out.float().sum().item()
-        )
+            timed_paths, args.samples, args.delay_s, flush_buf, args.cache)
+        if args.paths == "prep":
+            checksum = float(
+                q_prepared.float().sum().item()
+                + k_prepared.float().sum().item()
+                + v_prepared.float().sum().item()
+            )
+        else:
+            checksum = float(
+                direct_custom_out.float().sum().item()
+                + direct_torch_out.float().sum().item()
+                + fused_custom_out.float().sum().item()
+                + fused_torch_out.float().sum().item()
+            )
 
     result = {
         "contract": {
-            "benchmark": "global prefill BF16, cold L2 before every measured path invocation",
+            "benchmark": f"global prefill BF16, {args.cache} cache custom/library path timing",
             "timing": "CUDA events on PyTorch current stream for both custom and PyTorch paths",
-            "cache_mode": "cold",
-            "l2_flush_bytes": flush_buf.numel() * 4,
+            "cache_mode": args.cache,
+            "l2_flush_bytes": flush_buf.numel() * 4 if args.cache == "cold" else 0,
             "delay_s": args.delay_s,
-            "delay_location": "after L2 flush and before each timed path invocation",
+            "delay_location": "before each timed path invocation",
             "samples": args.samples,
             "warmup": args.warmup,
-            "launch_overhead": "host enqueue overhead excluded; GPU timeline includes all kernels in the path",
+            "launch_overhead": (
+                "host enqueue overhead excluded; GPU timeline includes all "
+                "kernels in the path"
+            ),
             "path_order": "alternates forward/reverse each sample to reduce drift bias",
+            "timed_paths": list(timings.keys()),
         },
         "env": {
             "gpu": torch.cuda.get_device_name(),
@@ -401,18 +483,19 @@ def main():
         },
         "correctness": correctness,
         "timings": timings,
-        "speedups": {
-            "direct attention": (
-                timings["direct_pytorch_sdpa"]["median_ms"]
-                / timings["direct_custom_global_prefill"]["median_ms"]
-            ),
-            "fused norm_rope+attention": (
-                timings["fused_pytorch_norm_rope_sdpa"]["median_ms"]
-                / timings["fused_custom_norm_rope_global_prefill"]["median_ms"]
-            ),
-        },
+        "speedups": {},
         "checksum": checksum,
     }
+    if "direct_pytorch_sdpa" in timings:
+        result["speedups"]["direct attention"] = (
+            timings["direct_pytorch_sdpa"]["median_ms"]
+            / timings["direct_custom_global_prefill"]["median_ms"]
+        )
+    if "fused_pytorch_norm_rope_sdpa" in timings:
+        result["speedups"]["fused norm_rope+attention"] = (
+            timings["fused_pytorch_norm_rope_sdpa"]["median_ms"]
+            / timings["fused_custom_norm_rope_global_prefill"]["median_ms"]
+        )
     if args.output:
         os.makedirs(os.path.dirname(args.output), exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as f:

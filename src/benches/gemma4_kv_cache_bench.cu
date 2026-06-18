@@ -35,13 +35,15 @@ struct SampleStats {
 struct BenchOptions {
   int seq_len = 4096;
   int page_size = 64;
-  int split_size = 64;
+  int split_size = 16;
   int warmup = 25;
   int iters = 100;
   int samples = 15;
   std::string mode = "sliding";
   std::string cache_mode = "warm";
   int64_t flush_bytes = 0;
+  bool write_only = false;
+  int head_dim_override = 0;
 };
 
 float bf16_to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
@@ -281,6 +283,10 @@ BenchOptions parse_args(int argc, char **argv) {
       options.samples = std::stoi(need_value("--samples"));
     } else if (arg == "--mode") {
       options.mode = need_value("--mode");
+    } else if (arg == "--write-only") {
+      options.write_only = true;
+    } else if (arg == "--head-dim") {
+      options.head_dim_override = std::stoi(need_value("--head-dim"));
     } else {
       positional.push_back(arg);
     }
@@ -305,8 +311,11 @@ BenchOptions parse_args(int argc, char **argv) {
   }
   if (options.seq_len <= 0 || options.page_size <= 0 ||
       options.split_size <= 0 || options.warmup < 0 || options.iters <= 0 ||
-      options.samples <= 0) {
+      options.samples <= 0 || options.head_dim_override < 0) {
     throw std::runtime_error("benchmark dimensions/counts must be positive");
+  }
+  if (options.head_dim_override > 512) {
+    throw std::runtime_error("--head-dim must be <= 512");
   }
   return options;
 }
@@ -357,6 +366,9 @@ int main(int argc, char **argv) {
   Gemma4KvCacheConfig config =
       gemma4_kv_cache_make_config(global_mode, max_pages_per_seq, page_size,
                                   max_pages_per_seq);
+  if (options.head_dim_override > 0) {
+    config.head_dim = options.head_dim_override;
+  }
   int batch_size = 1;
   int layer = 0;
   int q_heads = GEMMA4_NUM_QUERY_HEADS;
@@ -365,7 +377,10 @@ int main(int argc, char **argv) {
   // constructed sequence.
   int key_count = config.window_size > 0 ? std::min(seq_len, config.window_size)
                                          : seq_len;
-  int num_splits = div_up(key_count, split_size);
+  // Sliding decode uses a scratch stride sized for the whole configured window
+  // so CUDA graph replays can keep one static partial layout as rows grow.
+  int split_key_count = config.window_size > 0 ? config.window_size : key_count;
+  int num_splits = div_up(split_key_count, split_size);
   float scale = 1.0f / std::sqrt(float(config.head_dim));
 
   print_environment(prop, driver, runtime, clock_rate_khz,
@@ -375,16 +390,16 @@ int main(int argc, char **argv) {
       "cache_mode=%s l2_flush_bytes=%lld launch_overhead=queued_launches_only "
       "host_wall_time=excluded stability_scope=single_process "
       "min_effect_for_claim_pct=5 mode=%s seq_len=%d page_size=%d split_size=%d "
-      "key_count=%d splits=%d warmup=%d iters_per_sample=%d samples=%d\n",
+      "key_count=%d splits=%d warmup=%d iters_per_sample=%d samples=%d "
+      "write_only=%d\n",
       options.cache_mode.c_str(), static_cast<long long>(flush_bytes),
       options.mode.c_str(), seq_len, page_size, split_size, key_count,
-      num_splits, warmup, iters, samples);
+      num_splits, warmup, iters, samples, options.write_only ? 1 : 0);
   std::printf(
       "build=nvcc flags=\"-std=c++17 -O3 -arch=sm_86 -Isrc\" "
       "dtype=bf16 layout=\"cache=[layers,pages,page_size,kv_heads,head_dim]\" "
       "batch_size=%d q_heads=%d kv_heads=%d head_dim=%d\n",
       batch_size, q_heads, config.num_heads, config.head_dim);
-
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreate(&stream));
 
@@ -430,7 +445,8 @@ int main(int argc, char **argv) {
   float *d_partial_acc = nullptr;
   uint32_t *d_l2_scratch = nullptr;
 
-  // Partial scratch is allocated for exactly the live split count.
+  // Partial scratch is allocated for the fixed split stride used by this run.
+  // Sliding mode may overprovision to the full window for CUDA graph replay.
   CUDA_CHECK(cudaMalloc(&d_cache_k, cache_elements(config) * sizeof(*d_cache_k)));
   CUDA_CHECK(cudaMalloc(&d_cache_v, cache_elements(config) * sizeof(*d_cache_v)));
   CUDA_CHECK(cudaMalloc(&d_k, h_k.size() * sizeof(*d_k)));
@@ -504,6 +520,49 @@ int main(int argc, char **argv) {
       d_token_position, seq_len, layer, d_k, d_v, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
+  auto prefill_write = [&]() {
+    CUDA_CHECK(gemma4_kv_cache_write_bf16(
+        d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
+        d_token_position, seq_len, layer, d_k, d_v, stream));
+  };
+  auto decode_write = [&]() {
+    CUDA_CHECK(gemma4_kv_cache_write_bf16(
+        d_cache_k, d_cache_v, config, d_page_table, d_one_batch,
+        d_one_position, 1, layer, d_one_k, d_one_v, stream));
+  };
+
+  if (options.write_only) {
+    print_stats("prefill_cache_write",
+                time_cuda_samples(prefill_write, stream, warmup, iters, samples,
+                                  cold_cache, d_l2_scratch,
+                                  flush_bytes / sizeof(uint32_t)));
+    print_stats("decode_cache_write",
+                time_cuda_samples(decode_write, stream, warmup, iters, samples,
+                                  cold_cache, d_l2_scratch,
+                                  flush_bytes / sizeof(uint32_t)));
+
+    CUDA_CHECK(cudaFree(d_cache_k));
+    CUDA_CHECK(cudaFree(d_cache_v));
+    CUDA_CHECK(cudaFree(d_k));
+    CUDA_CHECK(cudaFree(d_v));
+    CUDA_CHECK(cudaFree(d_one_k));
+    CUDA_CHECK(cudaFree(d_one_v));
+    CUDA_CHECK(cudaFree(d_q));
+    CUDA_CHECK(cudaFree(d_out));
+    CUDA_CHECK(cudaFree(d_page_table));
+    CUDA_CHECK(cudaFree(d_seq_lengths));
+    CUDA_CHECK(cudaFree(d_token_batch));
+    CUDA_CHECK(cudaFree(d_token_position));
+    CUDA_CHECK(cudaFree(d_one_batch));
+    CUDA_CHECK(cudaFree(d_one_position));
+    CUDA_CHECK(cudaFree(d_partial_m));
+    CUDA_CHECK(cudaFree(d_partial_l));
+    CUDA_CHECK(cudaFree(d_partial_acc));
+    if (d_l2_scratch != nullptr) CUDA_CHECK(cudaFree(d_l2_scratch));
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    return 0;
+  }
+
   std::vector<__nv_bfloat16> expected(h_q.size());
   std::vector<__nv_bfloat16> actual(h_q.size());
   cpu_decode_reference(expected, h_q, h_k, h_v, seq_len, q_heads,
@@ -539,16 +598,6 @@ int main(int argc, char **argv) {
 
   // Each lambda enqueues exactly the work named by its label. The timing helper
   // wraps these in CUDA events on the same stream and optionally flushes L2.
-  auto prefill_write = [&]() {
-    CUDA_CHECK(gemma4_kv_cache_write_bf16(
-        d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
-        d_token_position, seq_len, layer, d_k, d_v, stream));
-  };
-  auto decode_write = [&]() {
-    CUDA_CHECK(gemma4_kv_cache_write_bf16(
-        d_cache_k, d_cache_v, config, d_page_table, d_one_batch,
-        d_one_position, 1, layer, d_one_k, d_one_v, stream));
-  };
   auto generic_decode_attention = [&]() {
     CUDA_CHECK(gemma4_paged_decode_attention_bf16(
         d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,

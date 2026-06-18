@@ -227,6 +227,7 @@ def load_lib(path):
         ctypes.c_void_p,
     ]
     prefill.restype = ctypes.c_int
+
     return kv_write, decode_sliding, decode_global, prefill
 
 
@@ -296,9 +297,9 @@ def make_decode_inputs(args, device):
     token_batch = torch.arange(args.batch_size, device=device, dtype=torch.int32).repeat_interleave(
         key_count
     )
-    token_positions = torch.arange(first_key, args.seq_len, device=device, dtype=torch.int32).repeat(
-        args.batch_size
-    )
+    token_positions = torch.arange(
+        first_key, args.seq_len, device=device, dtype=torch.int32
+    ).repeat(args.batch_size)
     k_flat = k_window.reshape(args.batch_size * key_count, kv_heads, -1)
     v_flat = v_window.reshape_as(k_flat)
     cache_shape = (
@@ -316,7 +317,9 @@ def make_decode_inputs(args, device):
         "head_dim": head_dim,
         "window_size": window_size,
         "page_table": page_table_cpu.to(device),
-        "seq_lengths": torch.full((args.batch_size,), args.seq_len, device=device, dtype=torch.int32),
+        "seq_lengths": torch.full(
+            (args.batch_size,), args.seq_len, device=device, dtype=torch.int32
+        ),
         "token_batch": token_batch.contiguous(),
         "token_positions": token_positions.contiguous(),
         "q": q.contiguous(),
@@ -389,23 +392,27 @@ def main():
     parser.add_argument("--prefill-seq-len", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--page-size", type=int, default=64)
-    parser.add_argument("--split-size", type=int, default=64)
+    parser.add_argument("--split-size", type=int, default=16)
     parser.add_argument("--mode", choices=["sliding", "global"], default="sliding")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--samples", type=int, default=5)
+    parser.add_argument("--paths", choices=["all", "custom"], default="all")
     parser.add_argument("--cache", choices=["warm", "cold"], default="warm")
     parser.add_argument("--flush-mib", type=int, default=128)
-    parser.add_argument("--sample-delay-s", type=float, default=1.0)
+    parser.add_argument("--sample-delay-s", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--output", default="")
     args = parser.parse_args()
 
-    if args.sample_delay_s < 1.0:
-        raise RuntimeError("--sample-delay-s must be at least 1.0")
-    if args.mode == "sliding" and args.prefill_seq_len <= 1:
+    if args.sample_delay_s < 0.0:
+        raise RuntimeError("--sample-delay-s must be non-negative")
+    if args.paths == "all" and args.mode == "sliding" and args.prefill_seq_len <= 1:
         raise RuntimeError("--prefill-seq-len must be > 1 for the tensor-core section")
-    if args.mode == "sliding" and args.prefill_seq_len > GEMMA4_SLIDING_WINDOW:
+    if (
+        args.paths == "all" and args.mode == "sliding" and
+        args.prefill_seq_len > GEMMA4_SLIDING_WINDOW
+    ):
         raise RuntimeError("--prefill-seq-len must be <= sliding window for this benchmark")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -498,7 +505,7 @@ def main():
 
     q_prefill = k_prefill = v_prefill = None
     custom_prefill_out = torch_prefill_out = None
-    if args.mode == "sliding":
+    if args.mode == "sliding" and args.paths == "all":
         q_prefill, k_prefill, v_prefill = make_prefill_inputs(args, device)
         custom_prefill_out = torch.empty_like(q_prefill)
         torch_prefill_out = torch.empty_like(q_prefill)
@@ -532,7 +539,7 @@ def main():
         torch_decode()
         wait_between_paths()
         custom_decode_direct()
-        if args.mode == "sliding":
+        if args.mode == "sliding" and args.paths == "all":
             torch_prefill()
             wait_between_paths()
             custom_prefill()
@@ -541,7 +548,7 @@ def main():
         correctness = {
             "decode_direct_vs_torch_max_abs": max_abs(decode_out_direct, decode_out_torch),
         }
-        if args.mode == "sliding":
+        if args.mode == "sliding" and args.paths == "all":
             correctness["prefill_custom_vs_torch_max_abs"] = max_abs(
                 custom_prefill_out, torch_prefill_out
             )
@@ -565,8 +572,10 @@ def main():
                 custom_decode_direct, custom_graph_inner_iters
             ),
         }
-        torch_timers = {"decode_torch_timer": torch_decode}
-        if args.mode == "sliding":
+        torch_timers = {}
+        if args.paths == "all":
+            torch_timers["decode_torch_timer"] = torch_decode
+        if args.mode == "sliding" and args.paths == "all":
             custom_graphs["prefill_custom_tensor_core"] = make_cuda_graph(
                 custom_prefill, custom_graph_inner_iters
             )
@@ -601,7 +610,7 @@ def main():
             decode_out_direct.float().sum().item()
             + decode_out_torch.float().sum().item()
         )
-        if args.mode == "sliding":
+        if args.mode == "sliding" and args.paths == "all":
             checksum += float(
                 custom_prefill_out.float().sum().item()
                 + torch_prefill_out.float().sum().item()
@@ -610,17 +619,26 @@ def main():
     result = {
         "contract": {
             "timing": "custom CUDA uses CUDA events; PyTorch uses torch.utils.benchmark.Timer",
-            "execution": "CUDA graph replay for custom CUDA paths; Timer measurements for PyTorch paths",
+            "execution": (
+                "CUDA graph replay for custom CUDA paths; "
+                "Timer measurements for PyTorch paths"
+            ),
             "cache_mode": args.cache,
             "l2_flush_bytes": 0 if flush_buf is None else flush_buf.numel() * 4,
             "sample_delay_s": args.sample_delay_s,
-            "delay_location": "host sleep between initial path checks and before each measured sample",
-            "launch_overhead": "custom CUDA excludes launch overhead by graph replay; PyTorch Timer includes the timed Python statement",
+            "delay_location": (
+                "host sleep between initial path checks and before each measured sample"
+            ),
+            "launch_overhead": (
+                "custom CUDA excludes launch overhead by graph replay; "
+                "PyTorch Timer includes the timed Python statement"
+            ),
             "host_wall_time": "excluded from elapsed timings",
             "warmup": args.warmup,
             "iters_per_sample": args.iters,
             "custom_graph_inner_iters": custom_graph_inner_iters,
             "samples": args.samples,
+            "timed_paths": args.paths,
             "min_effect_for_claim_pct": 5,
         },
         "env": {
@@ -650,16 +668,19 @@ def main():
         "correctness": correctness,
         "checksum": checksum,
         "timings": timings,
-        "speedups": {
-            "decode_direct_vs_torch_median": timings["decode_torch_timer"]["median_ms"]
-            / timings["decode_custom_direct"]["median_ms"],
-        },
+        "speedups": {},
     }
-    if args.mode == "sliding":
-        result["speedups"]["prefill_custom_vs_torch_median"] = (
-            timings["prefill_torch_sdpa_timer"]["median_ms"]
-            / timings["prefill_custom_tensor_core"]["median_ms"]
+    if args.paths == "all":
+        result["speedups"]["decode_direct_vs_torch_median"] = (
+            timings["decode_torch_timer"]["median_ms"]
+            / timings["decode_custom_direct"]["median_ms"]
         )
+    if args.mode == "sliding":
+        if args.paths == "all":
+            result["speedups"]["prefill_custom_vs_torch_median"] = (
+                timings["prefill_torch_sdpa_timer"]["median_ms"]
+                / timings["prefill_custom_tensor_core"]["median_ms"]
+            )
     text = json.dumps(result, indent=2)
     if args.output:
         os.makedirs(os.path.dirname(args.output), exist_ok=True)

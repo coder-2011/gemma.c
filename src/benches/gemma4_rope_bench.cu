@@ -380,6 +380,7 @@ int main(int argc, char **argv) {
   const int max_seq = argc > 4 ? std::atoi(argv[4]) : 1024;
   const int batch_size = argc > 5 ? std::atoi(argv[5]) : 1;
   const int cos_batch_size = argc > 6 ? std::atoi(argv[6]) : 1;
+  const bool run_cudnn_compare = argc > 7 ? std::atoi(argv[7]) != 0 : true;
 
   if (iters <= 0 || warmup < 0 || trials <= 0 || max_seq <= 0 ||
       batch_size <= 0 ||
@@ -387,7 +388,7 @@ int main(int argc, char **argv) {
     std::fprintf(
         stderr,
         "usage: %s [iters=200] [warmup=30] [trials=5] [max_seq=1024] "
-        "[batch=1] [cos_batch=1|batch]\n",
+        "[batch=1] [cos_batch=1|batch] [run_cudnn=1]\n",
         argv[0]);
     return 1;
   }
@@ -410,19 +411,24 @@ int main(int argc, char **argv) {
 
   std::printf("device=%s\n", prop.name);
   std::printf("seed=0x%llx\n", static_cast<unsigned long long>(seed));
-  std::printf("iters=%d,warmup_iters=%d,trials=%d,max_seq=%d,batch=%d,cos_batch=%d\n",
-              iters, warmup, trials, max_seq, batch_size, cos_batch_size);
+  std::printf("iters=%d,warmup_iters=%d,trials=%d,max_seq=%d,batch=%d,"
+              "cos_batch=%d,run_cudnn=%d\n",
+              iters, warmup, trials, max_seq, batch_size, cos_batch_size,
+              run_cudnn_compare ? 1 : 0);
   std::printf("cudnn_op_tensor=%s\n",
 #if GEMMA4_HAS_CUDNN
-              "compiled"
+              run_cudnn_compare ? "compiled" : "skipped"
 #else
               "not_compiled"
 #endif
   );
   std::printf("case,seq,q_heads,kv_heads,head_dim,rotary_dim,"
-              "custom_ms,custom_gib_s,custom_graph_ms,custom_graph_gib_s,"
+              "physical_ms,physical_gib_s,physical_graph_ms,"
+              "physical_graph_gib_s,forward_ms,forward_gib_s,"
+              "forward_graph_ms,forward_graph_gib_s,"
               "cudnn_ms,cudnn_gib_s,cudnn_graph_ms,cudnn_graph_gib_s,"
               "cudnn_q_max_abs,cudnn_k_max_abs\n");
+  std::fflush(stdout);
 
   for (const RopeShape &shape : shapes) {
     for (int seq_len : seq_counts_up_to(max_seq)) {
@@ -473,28 +479,65 @@ int main(int argc, char **argv) {
                                  cudaMemcpyDeviceToDevice, stream));
       CUDA_CHECK(cudaStreamSynchronize(stream));
 
-      auto run_custom = [&]() {
+      auto run_physical = [&]() {
+        CUDA_CHECK(gemma4_rope_bf16(
+            d_q_work, static_cast<int64_t>(shape.q_heads) * shape.head_dim,
+            d_k_work, static_cast<int64_t>(shape.kv_heads) * shape.head_dim,
+            d_cos, shape.rotary_dim / 2, d_sin, shape.rotary_dim / 2,
+            seq_len, batch_size, cos_batch_size, shape.q_heads,
+            shape.kv_heads, shape.head_dim, shape.rotary_dim, stream));
+      };
+
+      run_physical();
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+
+      TimingStats physical_stats =
+          time_ms(run_physical, stream, warmup, iters, trials);
+      float physical_graph_ms = -1.0f;
+      double physical_graph_gib_s = 0.0;
+      try {
+        TimingStats graph_stats =
+            time_ms_graph(run_physical, stream, warmup, iters, trials);
+        physical_graph_ms = graph_stats.best_ms;
+        physical_graph_gib_s = gib_per_second(ideal_bytes,
+                                              physical_graph_ms);
+      } catch (const std::exception &e) {
+        std::fprintf(stderr,
+                     "physical RoPE CUDA graph timing unavailable for %s "
+                     "seq=%d: %s\n",
+                     shape.name, seq_len, e.what());
+      }
+
+      CUDA_CHECK(cudaMemcpyAsync(d_q_work, d_q_in,
+                                 q_elems * sizeof(__nv_bfloat16),
+                                 cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaMemcpyAsync(d_k_work, d_k_in,
+                                 k_elems * sizeof(__nv_bfloat16),
+                                 cudaMemcpyDeviceToDevice, stream));
+      CUDA_CHECK(cudaStreamSynchronize(stream));
+
+      auto run_forward = [&]() {
         CUDA_CHECK(gemma4_rope_forward_bf16(
             d_q_work, d_k_work, d_cos, d_sin, seq_len, batch_size,
             cos_batch_size, shape.q_heads, shape.kv_heads, shape.head_dim,
             shape.rotary_dim, stream));
       };
 
-      run_custom();
+      run_forward();
       CUDA_CHECK(cudaStreamSynchronize(stream));
 
-      TimingStats custom_stats =
-          time_ms(run_custom, stream, warmup, iters, trials);
-      float custom_graph_ms = -1.0f;
-      double custom_graph_gib_s = 0.0;
+      TimingStats forward_stats =
+          time_ms(run_forward, stream, warmup, iters, trials);
+      float forward_graph_ms = -1.0f;
+      double forward_graph_gib_s = 0.0;
       try {
         TimingStats graph_stats =
-            time_ms_graph(run_custom, stream, warmup, iters, trials);
-        custom_graph_ms = graph_stats.best_ms;
-        custom_graph_gib_s = gib_per_second(ideal_bytes, custom_graph_ms);
+            time_ms_graph(run_forward, stream, warmup, iters, trials);
+        forward_graph_ms = graph_stats.best_ms;
+        forward_graph_gib_s = gib_per_second(ideal_bytes, forward_graph_ms);
       } catch (const std::exception &e) {
         std::fprintf(stderr,
-                     "custom RoPE CUDA graph timing unavailable for %s seq=%d: %s\n",
+                     "forward RoPE CUDA graph timing unavailable for %s seq=%d: %s\n",
                      shape.name, seq_len, e.what());
       }
 
@@ -506,6 +549,7 @@ int main(int argc, char **argv) {
       float cudnn_k_max_abs = -1.0f;
 
 #if GEMMA4_HAS_CUDNN
+      if (run_cudnn_compare) {
       try {
         CudnnRope cudnn(batch_size, seq_len, cos_batch_size, shape.q_heads,
                         shape.kv_heads, shape.head_dim, shape.rotary_dim,
@@ -526,7 +570,7 @@ int main(int argc, char **argv) {
         CUDA_CHECK(cudaMemcpyAsync(d_k_cudnn, d_k_in,
                                    k_elems * sizeof(__nv_bfloat16),
                                    cudaMemcpyDeviceToDevice, stream));
-        run_custom();
+        run_forward();
         run_cudnn();
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -556,15 +600,21 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "cuDNN RoPE unavailable for %s seq=%d: %s\n",
                      shape.name, seq_len, e.what());
       }
+      }
 #endif
 
-      std::printf("%s,%d,%d,%d,%d,%d,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6g,%.6g\n",
+      std::printf("%s,%d,%d,%d,%d,%d,%.6f,%.3f,%.6f,%.3f,"
+                  "%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6f,%.3f,%.6g,%.6g\n",
                   shape.name, seq_len, shape.q_heads, shape.kv_heads,
-                  shape.head_dim, shape.rotary_dim, custom_stats.best_ms,
-                  gib_per_second(ideal_bytes, custom_stats.best_ms),
-                  custom_graph_ms, custom_graph_gib_s, cudnn_ms, cudnn_gib_s,
+                  shape.head_dim, shape.rotary_dim, physical_stats.best_ms,
+                  gib_per_second(ideal_bytes, physical_stats.best_ms),
+                  physical_graph_ms, physical_graph_gib_s,
+                  forward_stats.best_ms,
+                  gib_per_second(ideal_bytes, forward_stats.best_ms),
+                  forward_graph_ms, forward_graph_gib_s, cudnn_ms, cudnn_gib_s,
                   cudnn_graph_ms, cudnn_graph_gib_s, cudnn_q_max_abs,
                   cudnn_k_max_abs);
+      std::fflush(stdout);
 
       CUDA_CHECK(cudaFree(d_q_in));
       CUDA_CHECK(cudaFree(d_k_in));

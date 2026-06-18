@@ -13,8 +13,12 @@ import torch
 GEMMA4_NUM_QUERY_HEADS = 32
 GEMMA4_SLIDING_KV_HEADS = 16
 GEMMA4_SLIDING_HEAD_DIM = 256
+GEMMA4_GLOBAL_KV_HEADS = 4
+GEMMA4_GLOBAL_HEAD_DIM = 512
+GEMMA4_GLOBAL_ROTARY_DIM = 128
 GEMMA4_RMS_NORM_EPS = 1.0e-6
 GEMMA4_ROPE_THETA_SLIDING = 10000.0
+GEMMA4_ROPE_THETA_GLOBAL = 1000000.0
 
 
 class Gemma4KvCacheConfig(ctypes.Structure):
@@ -126,42 +130,80 @@ def time_cuda_graph(replay, warmup, iters, samples, flush_buf, enqueue_delay, op
     return summarize(values)
 
 
-def load_custom_lib(path):
+def layer_spec(layer_type):
+    if layer_type == "sliding":
+        return {
+            "kv_heads": GEMMA4_SLIDING_KV_HEADS,
+            "head_dim": GEMMA4_SLIDING_HEAD_DIM,
+            "rotary_dim": GEMMA4_SLIDING_HEAD_DIM,
+            "theta": GEMMA4_ROPE_THETA_SLIDING,
+            "window_size": 1024,
+        }
+    return {
+        "kv_heads": GEMMA4_GLOBAL_KV_HEADS,
+        "head_dim": GEMMA4_GLOBAL_HEAD_DIM,
+        "rotary_dim": GEMMA4_GLOBAL_ROTARY_DIM,
+        "theta": GEMMA4_ROPE_THETA_GLOBAL,
+        "window_size": 0,
+    }
+
+
+def load_custom_lib(path, layer_type):
     lib = ctypes.CDLL(path)
-    fn = lib.gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_bf16
-    fn.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        Gemma4KvCacheConfig,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_int32,
-        ctypes.c_int32,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
+    if layer_type == "sliding":
+        fn = lib.gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_bf16
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            Gemma4KvCacheConfig,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+    else:
+        fn = lib.gemma4_flash_attention_global_decode_prepare_q_paged_kv_bf16
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            Gemma4KvCacheConfig,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
     fn.restype = ctypes.c_int
-    return fn
+    return lib, fn
 
 
 def ptr(tensor):
     return ctypes.c_void_p(tensor.data_ptr())
 
 
-def fill_rope_tables(seq_len, device):
-    half = GEMMA4_SLIDING_HEAD_DIM // 2
+def fill_rope_tables(seq_len, spec, device):
+    half = spec["rotary_dim"] // 2
     row = torch.arange(seq_len, device=device, dtype=torch.float32)[:, None]
     dim = torch.arange(half, device=device, dtype=torch.float32)[None, :]
     freq = torch.pow(
-        torch.tensor(GEMMA4_ROPE_THETA_SLIDING, device=device),
-        -(2.0 * dim) / float(GEMMA4_SLIDING_HEAD_DIM),
+        torch.tensor(spec["theta"], device=device),
+        -(2.0 * dim) / float(spec["head_dim"]),
     )
     angle = row * freq
     return torch.cos(angle).contiguous(), torch.sin(angle).contiguous()
@@ -176,13 +218,16 @@ def rmsnorm(x, weight):
     return y
 
 
-def apply_rope(x, cos, sin, token_position):
-    half = GEMMA4_SLIDING_HEAD_DIM // 2
+def apply_rope(x, cos, sin, token_position, spec):
+    rotary_half = spec["rotary_dim"] // 2
     c = cos.index_select(0, token_position.long())[:, None, :]
     s = sin.index_select(0, token_position.long())[:, None, :]
-    lo = x[..., :half]
-    hi = x[..., half:]
-    return torch.cat((lo * c - hi * s, lo * s + hi * c), dim=-1).to(torch.bfloat16)
+    lo = x[..., :rotary_half]
+    hi = x[..., rotary_half:spec["rotary_dim"]]
+    out = x.clone()
+    out[..., :rotary_half] = lo * c - hi * s
+    out[..., rotary_half:spec["rotary_dim"]] = lo * s + hi * c
+    return out.to(torch.bfloat16)
 
 
 def torch_prep_cache_body(
@@ -201,10 +246,13 @@ def torch_prep_cache_body(
     q_prepared,
     cache_k,
     cache_v,
+    spec,
+    global_layer,
 ):
-    q_out = apply_rope(rmsnorm(q, q_weight), cos, sin, token_position)
-    k_out = apply_rope(rmsnorm(k, k_weight), cos, sin, token_position)
-    v_out = rmsnorm(v, None).to(torch.bfloat16)
+    q_out = apply_rope(rmsnorm(q, q_weight), cos, sin, token_position, spec)
+    k_out = apply_rope(rmsnorm(k, k_weight), cos, sin, token_position, spec)
+    v_source = k if global_layer else v
+    v_out = rmsnorm(v_source, None).to(torch.bfloat16)
     q_prepared.copy_(q_out)
 
     logical_page = torch.div(token_position, page_size, rounding_mode="floor")
@@ -221,25 +269,26 @@ def max_abs(a, b):
 
 def make_inputs(args, device):
     dtype = torch.bfloat16
+    spec = layer_spec(args.layer_type)
     torch.manual_seed(1234)
     q = torch.randn(
         args.batch_size,
         GEMMA4_NUM_QUERY_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
+        spec["head_dim"],
         device=device,
         dtype=dtype,
     )
     k = torch.randn(
         args.batch_size,
-        GEMMA4_SLIDING_KV_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
+        spec["kv_heads"],
+        spec["head_dim"],
         device=device,
         dtype=dtype,
     )
     v = torch.randn_like(k)
-    q_weight = (0.95 + 0.05 * torch.randn(GEMMA4_SLIDING_HEAD_DIM, device=device)).to(dtype)
-    k_weight = (0.95 + 0.05 * torch.randn(GEMMA4_SLIDING_HEAD_DIM, device=device)).to(dtype)
-    cos, sin = fill_rope_tables(args.seq_len, device)
+    q_weight = (0.95 + 0.05 * torch.randn(spec["head_dim"], device=device)).to(dtype)
+    k_weight = (0.95 + 0.05 * torch.randn(spec["head_dim"], device=device)).to(dtype)
+    cos, sin = fill_rope_tables(args.seq_len, spec, device)
 
     pages_per_seq = max(1, (args.seq_len + args.page_size - 1) // args.page_size)
     num_pages = args.batch_size * pages_per_seq
@@ -263,9 +312,9 @@ def make_inputs(args, device):
         num_pages,
         args.page_size,
         pages_per_seq,
-        GEMMA4_SLIDING_KV_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
-        1024,
+        spec["kv_heads"],
+        spec["head_dim"],
+        spec["window_size"],
     )
 
     cache_shape = (
@@ -287,12 +336,14 @@ def make_inputs(args, device):
         "page_table": page_table,
         "config": config,
         "cache_shape": cache_shape,
+        "spec": spec,
     }
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--lib", default="build/libgemma4_flash_attention.so")
+    parser.add_argument("--layer-type", choices=["sliding", "global"], default="sliding")
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--page-size", type=int, default=64)
@@ -300,6 +351,7 @@ def main():
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--samples", type=int, default=30)
     parser.add_argument("--cache", choices=["warm", "cold"], default="cold")
+    parser.add_argument("--paths", choices=["all", "custom"], default="all")
     parser.add_argument("--flush-mib", type=int, default=128)
     parser.add_argument("--sleep-cycles", type=int, default=1_000_000)
     parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=True)
@@ -312,14 +364,15 @@ def main():
         raise RuntimeError(f"missing custom library: {args.lib}")
 
     device = torch.device("cuda")
-    custom_fn = load_custom_lib(args.lib)
+    lib, custom_fn = load_custom_lib(args.lib, args.layer_type)
     tensors = make_inputs(args, device)
     config = tensors["config"]
+    spec = tensors["spec"]
 
     q_prepared_custom = torch.empty(
         args.batch_size,
         GEMMA4_NUM_QUERY_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
+        spec["head_dim"],
         device=device,
         dtype=torch.bfloat16,
     )
@@ -341,7 +394,7 @@ def main():
 
     def custom_prep_cache():
         stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
-        status = custom_fn(
+        common_args = [
             ptr(q_prepared_custom),
             ptr(cache_k_custom),
             ptr(cache_v_custom),
@@ -352,13 +405,17 @@ def main():
             0,
             ptr(tensors["q"]),
             ptr(tensors["k"]),
-            ptr(tensors["v"]),
+        ]
+        if args.layer_type == "sliding":
+            common_args.append(ptr(tensors["v"]))
+        common_args.extend([
             ptr(tensors["q_weight"]),
             ptr(tensors["k_weight"]),
             ptr(tensors["cos"]),
             ptr(tensors["sin"]),
             stream,
-        )
+        ])
+        status = custom_fn(*common_args)
         if status != 0:
             raise RuntimeError(f"custom kernel returned cudaError_t={status}")
 
@@ -379,6 +436,8 @@ def main():
             q_prepared_torch,
             cache_k_torch,
             cache_v_torch,
+            spec,
+            args.layer_type == "global",
         )
 
     with torch.no_grad():
@@ -402,7 +461,9 @@ def main():
 
         graph_inner_iters = 1 if args.cache == "cold" else args.iters
         custom_graph = make_cuda_graph(custom_prep_cache, graph_inner_iters)
-        torch_graph = make_cuda_graph(torch_prep_cache, graph_inner_iters)
+        torch_graph = None
+        if args.paths == "all":
+            torch_graph = make_cuda_graph(torch_prep_cache, graph_inner_iters)
         enqueue_delay, enqueue_delay_description = make_enqueue_delay(
             device, args.sleep_cycles
         )
@@ -419,15 +480,17 @@ def main():
             enqueue_delay,
             graph_inner_iters,
         )
-        torch_stats = time_cuda_graph(
-            torch_graph,
-            args.warmup,
-            args.iters,
-            args.samples,
-            flush_buf,
-            enqueue_delay,
-            graph_inner_iters,
-        )
+        torch_stats = None
+        if args.paths == "all":
+            torch_stats = time_cuda_graph(
+                torch_graph,
+                args.warmup,
+                args.iters,
+                args.samples,
+                flush_buf,
+                enqueue_delay,
+                graph_inner_iters,
+            )
         torch.cuda.synchronize()
         checksum = float(
             q_prepared_custom.float().sum().item()
@@ -441,16 +504,23 @@ def main():
             "execution": "CUDA graph replay; PyTorch work captured after optional torch.compile",
             "cache_mode": args.cache,
             "l2_flush_bytes": 0 if flush_buf is None else flush_buf.numel() * 4,
-            "launch_overhead": "excluded from per-op timing by CUDA graph replay and batched warm replay",
+            "launch_overhead": (
+                "excluded from per-op timing by CUDA graph replay "
+                "and batched warm replay"
+            ),
             "enqueue_delay": f"untimed {enqueue_delay_description} before start event",
             "host_wall_time": "excluded",
             "dtype": "bfloat16",
-            "layout": "raw q=[B,32,256], raw k/v=[B,16,256], cache=[1,pages,page,16,256]",
+            "layout": (
+                "raw q=[B,32,D], raw k/v=[B,KV,D], "
+                "cache=[1,pages,page,KV,D]"
+            ),
             "warmup": args.warmup,
             "iters_per_sample": args.iters,
             "graph_inner_iters": graph_inner_iters,
             "sleep_cycles": args.sleep_cycles,
             "samples": args.samples,
+            "timed_paths": args.paths,
             "min_effect_for_claim_pct": 5,
         },
         "env": {
@@ -462,21 +532,27 @@ def main():
             "torch_compile": torch_compile_mode,
         },
         "shape": {
+            "layer_type": args.layer_type,
             "batch_size": args.batch_size,
             "seq_len": args.seq_len,
             "page_size": args.page_size,
             "pages_per_seq": config.max_pages_per_seq,
             "num_pages": config.num_pages,
             "q_heads": GEMMA4_NUM_QUERY_HEADS,
-            "kv_heads": GEMMA4_SLIDING_KV_HEADS,
-            "head_dim": GEMMA4_SLIDING_HEAD_DIM,
+            "kv_heads": spec["kv_heads"],
+            "head_dim": spec["head_dim"],
+            "rotary_dim": spec["rotary_dim"],
+            "rope_theta": spec["theta"],
         },
         "correctness": correctness,
         "checksum": checksum,
         "custom_cuda_graph_decode_norm_rope_paged_kv_write": custom_stats,
-        "torch_non_eager_decode_norm_rope_paged_kv_write": torch_stats,
-        "speedup_median": torch_stats["median_ms"] / custom_stats["median_ms"],
     }
+    if torch_stats is not None:
+        result["torch_non_eager_decode_norm_rope_paged_kv_write"] = torch_stats
+        result["speedup_median"] = (
+            torch_stats["median_ms"] / custom_stats["median_ms"]
+        )
     text = json.dumps(result, indent=2)
     if args.output:
         os.makedirs(os.path.dirname(args.output), exist_ok=True)
