@@ -422,10 +422,16 @@ int main(int argc, char **argv) {
   int32_t *d_token_position = nullptr;
   int32_t *d_one_batch = nullptr;
   int32_t *d_one_position = nullptr;
+  int32_t *d_work_scratch = nullptr;
   float *d_partial_m = nullptr;
   float *d_partial_l = nullptr;
   float *d_partial_acc = nullptr;
   uint32_t *d_l2_scratch = nullptr;
+  const size_t work_scratch_i32_size =
+      gemma4_flash_attention_sliding_decode_persistent_scratch_i32(
+          batch_size, num_splits);
+  const int32_t work_scratch_i32 =
+      static_cast<int32_t>(work_scratch_i32_size);
 
   // Partial scratch is allocated for `num_splits`, including any extra empty
   // splits requested by --extra-splits.
@@ -446,6 +452,8 @@ int main(int argc, char **argv) {
                         token_position.size() * sizeof(int32_t)));
   CUDA_CHECK(cudaMalloc(&d_one_batch, sizeof(int32_t)));
   CUDA_CHECK(cudaMalloc(&d_one_position, sizeof(int32_t)));
+  CUDA_CHECK(cudaMalloc(&d_work_scratch,
+                        work_scratch_i32_size * sizeof(int32_t)));
   CUDA_CHECK(cudaMalloc(&d_partial_m,
                         gemma4_paged_decode_partial_m_elements(
                             batch_size, q_heads, num_splits) *
@@ -517,6 +525,16 @@ int main(int argc, char **argv) {
                         cudaMemcpyDeviceToHost));
   check_attention_correctness(actual, expected);
 
+  CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
+      d_out, d_partial_m, d_partial_l, d_partial_acc, d_work_scratch,
+      work_scratch_i32, d_q, d_cache_k, d_cache_v, d_page_table,
+      d_seq_lengths, config, layer, batch_size, scale, split_size,
+      num_splits, 0, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
+                        cudaMemcpyDeviceToHost));
+  check_attention_correctness(actual, expected);
+
   // Each lambda enqueues exactly the work named by its label. The timing helper
   // wraps these in CUDA events on the same stream and optionally flushes L2.
   auto prefill_write = [&]() {
@@ -535,6 +553,13 @@ int main(int argc, char **argv) {
         d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
         scale, split_size, num_splits, stream));
   };
+  auto flash_decode_attention_persistent = [&]() {
+    CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
+        d_out, d_partial_m, d_partial_l, d_partial_acc, d_work_scratch,
+        work_scratch_i32, d_q, d_cache_k, d_cache_v, d_page_table,
+        d_seq_lengths, config, layer, batch_size, scale, split_size,
+        num_splits, 0, stream));
+  };
   auto flash_full_decode = [&]() {
     decode_write();
     flash_decode_attention();
@@ -552,6 +577,10 @@ int main(int argc, char **argv) {
               time_cuda_samples(flash_decode_attention, stream, warmup, iters,
                                 samples, cold_cache, d_l2_scratch,
                                 flush_bytes / sizeof(uint32_t)));
+  print_stats("flash_decode_paged_attention_persistent",
+              time_cuda_samples(flash_decode_attention_persistent, stream,
+                                warmup, iters, samples, cold_cache,
+                                d_l2_scratch, flush_bytes / sizeof(uint32_t)));
   print_stats("flash_full_decode_write_plus_attention",
               time_cuda_samples(flash_full_decode, stream, warmup, iters,
                                 samples, cold_cache, d_l2_scratch,
@@ -571,6 +600,7 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaFree(d_token_position));
   CUDA_CHECK(cudaFree(d_one_batch));
   CUDA_CHECK(cudaFree(d_one_position));
+  CUDA_CHECK(cudaFree(d_work_scratch));
   CUDA_CHECK(cudaFree(d_partial_m));
   CUDA_CHECK(cudaFree(d_partial_l));
   CUDA_CHECK(cudaFree(d_partial_acc));
