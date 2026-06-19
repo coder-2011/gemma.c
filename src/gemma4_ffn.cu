@@ -1,4 +1,4 @@
-#include "gemma4_ffn_decode.cuh"
+#include "gemma4_ffn.cuh"
 
 #ifndef GEMMA4_WEIGHT_LOAD_POLICY
 #define GEMMA4_WEIGHT_LOAD_POLICY 0
@@ -8,8 +8,17 @@
 #include "gemma4_matmul_device.cuh"
 #include "gemma4_rmsnorm.cuh"
 
+#include <cutlass/array.h>
+#include <cutlass/epilogue/thread/activation.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/thread/scale_type.h>
 #include <cutlass/gemm/device/gemm.h>
+#include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
+
+#include "device/dual_gemm.h"
+
+#include <math.h>
 
 #ifndef GEMMA4_FFN_DECODE_ACT_TILE
 #define GEMMA4_FFN_DECODE_ACT_TILE 2
@@ -59,8 +68,6 @@ constexpr int kPartialGroups = GEMMA4_FFN_DECODE_PARTIAL_GROUPS;
 constexpr int kAccumBlocksOverride = GEMMA4_FFN_DECODE_ACCUM_BLOCKS;
 constexpr int kSwizzleThreads = 96;
 constexpr int kActualSwizzleBlocksPerRow = 7;
-constexpr int kPrefillGegluThreads = 256;
-constexpr int kPrefillGegluElementsPerThread = 2;
 // Keep most CTAs one tile wide, while one hidden-pack wave folds a second tile.
 constexpr int kDefaultAccumBlocks = kIntermediateTiles - kHiddenPacks;
 constexpr int kAccumBlocks =
@@ -94,12 +101,6 @@ static_assert(kSwizzleThreads > 0 && kSwizzleThreads <= 1024 &&
 static_assert(kActualSwizzleBlocksPerRow > 0 &&
                   kActualSwizzleBlocksPerRow <= kHiddenPacks,
               "FFN swizzle blocks per row must cover at least one pack");
-static_assert(kPrefillGegluThreads > 0 && kPrefillGegluThreads <= 1024 &&
-                  (kPrefillGegluThreads % WARP_SIZE) == 0,
-              "FFN GeGLU threads must be a valid warp-multiple block size");
-static_assert(kPrefillGegluElementsPerThread > 0 &&
-                  kPrefillGegluElementsPerThread <= 8,
-              "FFN GeGLU elements per thread must be in [1, 8]");
 static_assert(kDefaultAccumBlocks > 0,
               "FFN default accumulate grid must be positive");
 static_assert(kAccumBlocks > 0 && kAccumBlocks <= kIntermediateTiles,
@@ -129,6 +130,43 @@ __device__ inline float gelu_tanh(float x) {
   const float inner = kSqrtTwoOverPi * (x + kGeluCubic * x * x2);
   return 0.5f * x * (1.0f + tanhf(inner));
 }
+
+template <typename ElementOutput_,
+          int Count,
+          typename ElementAccumulator_,
+          typename ElementCompute_,
+          cutlass::FloatRoundStyle Round =
+              cutlass::FloatRoundStyle::round_to_nearest>
+class GateGeluTanhUpMul {
+ public:
+  using ElementOutput = ElementOutput_;
+  using ElementAccumulator = ElementAccumulator_;
+  using ElementCompute = ElementCompute_;
+  using FragmentOutput = cutlass::Array<ElementOutput, Count>;
+  using FragmentAccumulator = cutlass::Array<ElementAccumulator, Count>;
+  using FragmentCompute = cutlass::Array<ElementCompute, Count>;
+
+  struct Params {};
+
+  CUTLASS_HOST_DEVICE
+  explicit GateGeluTanhUpMul(Params const &) {}
+
+  CUTLASS_HOST_DEVICE
+  FragmentOutput operator()(FragmentAccumulator const &gate,
+                            FragmentAccumulator const &up) const {
+    cutlass::NumericArrayConverter<ElementCompute, ElementAccumulator, Count,
+                                   Round>
+        to_compute;
+    cutlass::NumericArrayConverter<ElementOutput, ElementCompute, Count,
+                                   Round>
+        to_output;
+    FragmentCompute gate_compute = to_compute(gate);
+    FragmentCompute up_compute = to_compute(up);
+    cutlass::epilogue::thread::GELU_taylor<FragmentCompute> gelu;
+    cutlass::multiplies<FragmentCompute> multiply;
+    return to_output(multiply(gate_compute, gelu(up_compute)));
+  }
+};
 
 __device__ inline void accumulate_scaled_pack(
     float scale,
@@ -577,16 +615,76 @@ cudaError_t launch_cutlass_bf16_gemm(
   return cudaGetLastError();
 }
 
-cudaError_t launch_prefill_gate_up_gemm(
+cudaError_t run_prefill_gate_up_geglu_dual_gemm(
+    floatX *__restrict__ act,
     const floatX *__restrict__ x,
     const floatX *__restrict__ w_gate_up_col_major,
-    floatX *__restrict__ gate_up,
     int rows,
-  cudaStream_t stream) {
-  return launch_cutlass_bf16_gemm<cutlass::layout::ColumnMajor, 128, 128, 64,
-                                  64, 64, 3>(
-      x, w_gate_up_col_major, gate_up, rows, GEMMA4_HIDDEN_SIZE,
-      GEMMA4_PACKED_FFN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
+    cudaStream_t stream) {
+  using Element = cutlass::bfloat16_t;
+  using ThreadblockShape = cutlass::gemm::GemmShape<128, 64, 32>;
+  using WarpShape = cutlass::gemm::GemmShape<64, 32, 32>;
+  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+  using OutputOp0 = cutlass::epilogue::thread::LinearCombination<
+      Element, 8, float, float,
+      cutlass::epilogue::thread::ScaleType::Nothing>;
+  using OutputOp1 = OutputOp0;
+  using OutputOp2 = GateGeluTanhUpMul<Element, 8, Element, float>;
+  using DualGemm = cutlass::gemm::device::DualGemm<
+      Element,
+      cutlass::layout::RowMajor,
+      Element,
+      cutlass::layout::ColumnMajor,
+      cutlass::layout::ColumnMajor,
+      Element,
+      cutlass::layout::RowMajor,
+      float,
+      cutlass::arch::OpClassTensorOp,
+      cutlass::arch::Sm80,
+      ThreadblockShape,
+      WarpShape,
+      InstructionShape,
+      OutputOp0,
+      OutputOp1,
+      OutputOp2,
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
+      3,
+      false,
+      false,
+      false>;
+
+  const Element *w_gate =
+      reinterpret_cast<const Element *>(w_gate_up_col_major);
+  const Element *w_up = w_gate +
+      static_cast<int64_t>(GEMMA4_HIDDEN_SIZE) * GEMMA4_INTERMEDIATE_SIZE;
+  const Element *act_const = reinterpret_cast<const Element *>(act);
+  typename DualGemm::TensorRefD null_ref{};
+
+  typename DualGemm::Arguments args(
+      cutlass::gemm::DualGemmMode::kGemm,
+      {rows, GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE},
+      {reinterpret_cast<const Element *>(x), GEMMA4_HIDDEN_SIZE},
+      {w_gate, GEMMA4_HIDDEN_SIZE},
+      {act_const, GEMMA4_INTERMEDIATE_SIZE},
+      null_ref,
+      {w_up, GEMMA4_HIDDEN_SIZE},
+      {act_const, GEMMA4_INTERMEDIATE_SIZE},
+      null_ref,
+      {reinterpret_cast<Element *>(act), GEMMA4_INTERMEDIATE_SIZE},
+      typename OutputOp0::Params(),
+      typename OutputOp1::Params(),
+      typename OutputOp2::Params());
+
+  DualGemm gemm;
+  cutlass::Status status = gemm.can_implement(args);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorInvalidValue;
+  }
+  status = gemm(args, nullptr, stream);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
 }
 
 cudaError_t launch_prefill_down_gemm(
@@ -607,32 +705,6 @@ cudaError_t launch_prefill_down_gemm(
       GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
 }
 
-__global__ void gemma4_ffn_prefill_geglu_bf16_kernel(
-    floatX *__restrict__ act,
-    const floatX *__restrict__ gate_up,
-    int rows) {
-  const int total = rows * GEMMA4_INTERMEDIATE_SIZE;
-  const int block_start =
-      static_cast<int>(blockIdx.x) * blockDim.x *
-      kPrefillGegluElementsPerThread;
-#pragma unroll
-  for (int item = 0; item < kPrefillGegluElementsPerThread; ++item) {
-    const int idx = block_start + item * blockDim.x + threadIdx.x;
-    if (idx >= total) {
-      continue;
-    }
-
-    const int row = idx / GEMMA4_INTERMEDIATE_SIZE;
-    const int col = idx - row * GEMMA4_INTERMEDIATE_SIZE;
-    const int64_t gate_up_row =
-        static_cast<int64_t>(row) * GEMMA4_PACKED_FFN_SIZE;
-    const float gate = __bfloat162float(gate_up[gate_up_row + col]);
-    const float up = __bfloat162float(
-        gate_up[gate_up_row + GEMMA4_INTERMEDIATE_SIZE + col]);
-    act[idx] = __float2bfloat16_rn(gate * gelu_tanh(up));
-  }
-}
-
 bool ffn_common_args_valid(const Gemma4FfnBf16Args &args) {
   return args.rows >= 0 && args.residual_out != nullptr &&
          args.normed_out != nullptr && args.x != nullptr &&
@@ -646,13 +718,11 @@ bool ffn_prefill_args_valid(const Gemma4FfnBf16Args &args) {
   return ffn_common_args_valid(args) && args.rows > 1 &&
          args.w_gate_up_prefill_col_major != nullptr &&
          args.w_down_prefill_row_major != nullptr &&
-         args.prefill_scratch.gate_up != nullptr &&
          args.prefill_scratch.act != nullptr &&
          args.prefill_scratch.down != nullptr &&
          args.prefill_scratch.capacity_rows >= args.rows &&
          is_aligned_16(args.w_gate_up_prefill_col_major) &&
          is_aligned_16(args.w_down_prefill_row_major) &&
-         is_aligned_16(args.prefill_scratch.gate_up) &&
          is_aligned_16(args.prefill_scratch.act) &&
          is_aligned_16(args.prefill_scratch.down);
 }
@@ -703,22 +773,9 @@ cudaError_t gemma4_ffn_prefill_bf16_impl(const Gemma4FfnBf16Args &args) {
     return cudaErrorInvalidValue;
   }
 
-  cudaError_t status = launch_prefill_gate_up_gemm(
-      args.x, args.w_gate_up_prefill_col_major, args.prefill_scratch.gate_up,
+  cudaError_t status = run_prefill_gate_up_geglu_dual_gemm(
+      args.prefill_scratch.act, args.x, args.w_gate_up_prefill_col_major,
       args.rows, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  const int total = args.rows * GEMMA4_INTERMEDIATE_SIZE;
-  const int work_per_block =
-      kPrefillGegluThreads * kPrefillGegluElementsPerThread;
-  const dim3 geglu_block_dim(kPrefillGegluThreads);
-  const dim3 geglu_grid_dim(div_up(total, work_per_block));
-  gemma4_ffn_prefill_geglu_bf16_kernel<<<geglu_grid_dim, geglu_block_dim, 0,
-                                          args.stream>>>(
-      args.prefill_scratch.act, args.prefill_scratch.gate_up, args.rows);
-  status = cudaGetLastError();
   if (status != cudaSuccess) {
     return status;
   }
@@ -783,7 +840,6 @@ cudaError_t gemma4_ffn_decode_configure_scratch_l2(
 
 size_t gemma4_ffn_prefill_scratch_elements(int rows) {
   constexpr size_t per_row =
-      static_cast<size_t>(GEMMA4_PACKED_FFN_SIZE) +
       static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) +
       static_cast<size_t>(GEMMA4_HIDDEN_SIZE);
   return rows <= 0 ? 0 : static_cast<size_t>(rows) * per_row;
@@ -798,12 +854,10 @@ Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
     return scratch;
   }
 
-  const size_t gate_up_elements =
-      static_cast<size_t>(rows) * GEMMA4_PACKED_FFN_SIZE;
   const size_t act_elements =
       static_cast<size_t>(rows) * GEMMA4_INTERMEDIATE_SIZE;
-  scratch.gate_up = buffer;
-  scratch.act = scratch.gate_up + gate_up_elements;
+  scratch.gate_up = nullptr;
+  scratch.act = buffer;
   scratch.down = scratch.act + act_elements;
   return scratch;
 }

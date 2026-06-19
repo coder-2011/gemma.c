@@ -1,4 +1,4 @@
-#include "gemma4_ffn_decode.cuh"
+#include "gemma4_ffn.cuh"
 #include "gemma4.h"
 
 #include <cuda_bf16.h>

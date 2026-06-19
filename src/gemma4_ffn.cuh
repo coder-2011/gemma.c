@@ -1,5 +1,5 @@
-#ifndef GEMMA4_FFN_DECODE_CUH
-#define GEMMA4_FFN_DECODE_CUH
+#ifndef GEMMA4_FFN_CUH
+#define GEMMA4_FFN_CUH
 
 #include "gemma4.h"
 

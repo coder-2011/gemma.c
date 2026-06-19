@@ -164,48 +164,48 @@ Runtime kernel tuning todos:
     register-buffer stage, identity swizzle on 2026-06-18. Swizzle16 stayed a
     sub-0.1% microbenchmark-only edge, so production keeps identity traversal.
 - [x] Decision: tune `gemma4_ffn_decode_accumulate_bf16_kernel` in
-  `src/gemma4_ffn_decode.cu`. Sweep act tile, intermediate tile, accumulation
+  `src/gemma4_ffn.cu`. Sweep act tile, intermediate tile, accumulation
   block count, swizzle, weight load policy, down preload, and atomic pressure.
   - Accepted no default change on 2026-06-18. Keep `INTERMEDIATE_TILE=2`,
     `ACT_TILE=2`, `ACCUM_BLOCKS=10080`, hidden-pack swizzle on, streaming
     weight loads, and no down preload. Near-miss accum-block counts tied or
     regressed under longer confirmation.
 - [x] Decision: tune `gemma4_ffn_decode_accumulate_partials_bf16_kernel` in
-  `src/gemma4_ffn_decode.cu`. Sweep partial groups and compare against the
+  `src/gemma4_ffn.cu`. Sweep partial groups and compare against the
   atomic accumulator policy across warm/cold cache.
   - Accepted no production use on 2026-06-18. Partial-groups mode was much
     slower than atomic accumulation for all tested group counts because scratch
     clear/finalize traffic grew sharply.
 - [x] Decision: tune `gemma4_ffn_decode_finalize_bf16_kernel` in
-  `src/gemma4_ffn_decode.cu`. Sweep RMS reduction shape, accumulator layout,
+  `src/gemma4_ffn.cu`. Sweep RMS reduction shape, accumulator layout,
   residual load policy, and final store policy.
   - Accepted no default change on 2026-06-18. Added guarded final load/store
     policy knobs, then kept `ldg` final loads, plain residual store, and
     write-back normed store after confirmation. Accumulate/finalize resources
     stayed at zero spills.
 - [x] Decision: tune `swizzle_hidden_packs_kernel` in
-  `src/gemma4_ffn_decode.cu` as an offline transform. Optimize only enough that
+  `src/gemma4_ffn.cu` as an offline transform. Optimize only enough that
   model load/prep time is acceptable; do not trade decode speed for prep speed.
   - Accepted 96 swizzle threads and 7 blocks per row on 2026-06-18. The final
     down-weight swizzle measured `0.678330 ms` best at about `681.7 GB/s`, with zero
     spills. Further geometry/cache-policy sweeps were below the prep benchmark
     noise floor.
 - [x] Decision: tune `swizzle_gate_up_interleaved_kernel` in
-  `src/gemma4_ffn_decode.cu` as an offline transform. Validate layout choices
+  `src/gemma4_ffn.cu` as an offline transform. Validate layout choices
   against decode FFN performance before changing it.
   - Accepted the same swizzle launch defaults as hidden-pack swizzle on
     2026-06-18. The prepared layout did not change, only the offline launch
     shape; gate/up swizzle measured `1.352854 ms` best at about `683.6 GB/s`,
     and decode-path timing remains governed by the already-tuned FFN kernels.
 - [x] Decision: tune `gemma4_ffn_prefill_geglu_bf16_kernel` in
-  `src/gemma4_ffn_decode.cu`. Sweep vectorization, block size, packed BF16
+  `src/gemma4_ffn.cu`. Sweep vectorization, block size, packed BF16
   loads/stores, and fusion with prefill GEMM epilogues.
   - Accepted 256 GeGLU threads and 2 elements per thread on 2026-06-18. Final
     row-range timing improved the large prefill end to `0.190798 ms` at rows
     `1024` and avoided broad regressions across rows `1..1024`; the kernel
     uses 15 registers and zero spills.
 - [x] Decision: tune FFN prefill CUTLASS gate/up and down GEMM configs in
-  `src/gemma4_ffn_decode.cu`. These are library kernels, but the tile choices
+  `src/gemma4_ffn.cu`. These are library kernels, but the tile choices
   are ours; sweep rows across the expected prefill range.
   - Accepted no production tile change on 2026-06-18. Keep gate/up
     `128x128x64` threadblock, `64x64` warp, `3` stages; keep down small-row
@@ -396,7 +396,6 @@ Experimental and benchmark-owned kernels:
   - Target decode first: `x @ Wk` / `x @ Wv` should produce final cache values without a contiguous K/V scratch buffer.
   - The epilogue must preserve Gemma semantics: K gets per-head RMSNorm plus RoPE, V gets scale-free RMSNorm, then both scatter into Layout-A paged cache.
   - Benchmark against the lazier baseline first: cuBLAS/cuBLASLt projection into contiguous raw K/V plus fused norm/RoPE/V-norm paged-cache write.
-
 ## Future Unfused Inference Buildout Notes
 
 These are future model-path buildout notes, not remaining decisions for the current
