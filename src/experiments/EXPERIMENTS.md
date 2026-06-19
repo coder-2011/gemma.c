@@ -12759,37 +12759,6 @@ custom_project_prepare    2.574598  0.005408  -41.25%
 vllm_project_prepare      skipped   -         vLLM unavailable
 ```
 
-Cold-cache follow-up:
-
-```bash
-python3 src/experiments/gemma4_project_prepare_compare.py \
-  --cache cold --flush-mb 64 --warmup 5 --iters 5 --samples 7 \
-  --json src/experiments/results/2026-06-19_project_prepare_compare_cold.json
-```
-
-Contract delta:
-
-- Cache policy: before each measured invocation, the script enqueues a 64 MiB
-  device-buffer write on the same stream, then records the start event after the
-  flush. The flush is ordered before the measurement but excluded from elapsed
-  time. This is a best-effort L2 eviction, not an architectural guarantee.
-- Timing: one CUDA-event window per invocation, then the script averages five
-  invocations into each sample. This avoids timing a Python loop as one large
-  window.
-- Warmup/repeats: `5` warmup iterations, `5` invocations per sample,
-  `7` samples.
-- Clock policy: not locked. JSON snapshot reported `1800 MHz` SM,
-  `7601 MHz` memory, `89.34 W`, `32 C`, and `22%` GPU utilization.
-
-Cold median comparison:
-
-```text
-path                     median ms  IQR ms    vs PyTorch
-pytorch_project_prepare   5.063238  0.784918  baseline
-custom_project_prepare    2.686509  0.055709  -46.94%
-vllm_project_prepare      skipped   -         vLLM unavailable
-```
-
 Conclusion:
 
 - The fused ingress API is correct and removes the full raw QKV HBM
@@ -12801,87 +12770,6 @@ Conclusion:
 - The next performance pass should keep the public API and replace the serial
   per-warp dot-product work with a parallel head-fragment or L2-mailbox design
   that preserves small handoff state without staging the full raw QKV tensor.
-
-## 2026-06-19 - Sliding paged decode vs PyTorch graph baseline
-
-Question:
-
-- Recheck the current direct sliding paged decode path against the Python
-  PyTorch baseline after restoring the faster source state.
-
-Commands:
-
-```bash
-nvidia-smi --query-gpu=name,gpu_bus_id,driver_version,persistence_mode,ecc.mode.current,mig.mode.current,power.limit,power.draw,clocks.sm,clocks.mem,temperature.gpu,pstate,utilization.gpu --format=csv
-
-make -B build/libgemma4_flash_attention.so NVCC=/usr/local/cuda/bin/nvcc
-
-python3 src/experiments/gemma4_paged_decode_torch_bench.py \
-  --seq-len 4096 --prefill-seq-len 64 --page-size 64 --split-size 64 \
-  --warmup 25 --iters 50 --samples 20 --cache warm --sample-delay-s 1.0 \
-  --output src/experiments/results/2026-06-19_paged_decode_torch_graph_warm.json
-
-python3 src/experiments/gemma4_paged_decode_torch_bench.py \
-  --seq-len 4096 --prefill-seq-len 64 --page-size 64 --split-size 64 \
-  --warmup 25 --iters 20 --samples 20 --cache cold --flush-mib 128 \
-  --sample-delay-s 1.0 \
-  --output src/experiments/results/2026-06-19_paged_decode_torch_graph_cold.json
-```
-
-Contract:
-
-- Commit: `4aa7de071c832f1269f3496149c20fd6414b132f`.
-- Hardware: NVIDIA RTX A6000, bus `00000000:0E:00.0`, driver `580.126.16`,
-  persistence enabled, ECC disabled, power limit `300 W`.
-- Idle GPU snapshots before and after the run reported `P8`, `0%` utilization,
-  `36 C`, and low-power clocks (`210 MHz` SM, `405 MHz` memory).
-- Clock policy: not locked.
-- PyTorch: `2.11.0+cu130`, CUDA runtime `13.0`, Python `3.12.13`.
-- Shape: sliding decode, `B=1`, `q_len=1`, `seq_len=4096`, live key count
-  `1024`, `page_size=64`, `split_size=64`, `num_splits=16`, BF16,
-  `q_heads=32`, `kv_heads=16`, `head_dim=256`. Prefill comparison uses
-  `S=64`.
-- Timing: CUDA events on the current PyTorch CUDA stream around CUDA graph
-  replay. CPU launch and host wall time are excluded.
-- Warm cache: repeated graph work, 25 warmups, 50 inner iterations per sample,
-  20 samples.
-- Cold cache: 128 MiB dummy device write before each measured replay, excluded
-  from the event span; 25 warmups, 20 iterations per sample, 20 samples.
-- One second host delay before each measured sample, outside the event window.
-
-Correctness:
-
-```text
-decode direct vs PyTorch max_abs:  0.000244140625
-prefill custom vs PyTorch max_abs: 0.001953125
-```
-
-Median results:
-
-```text
-path                         warm median    cold median
-custom paged decode direct    0.064527 ms    0.073366 ms
-PyTorch decode graph          0.673146 ms    0.680243 ms
-custom prefill tensor-core    0.007468 ms    0.021964 ms
-PyTorch SDPA prefill graph    0.018858 ms    0.030720 ms
-```
-
-Speedups:
-
-```text
-custom decode vs PyTorch graph   10.43x warm   9.27x cold
-custom prefill vs PyTorch SDPA    2.52x warm   1.40x cold
-```
-
-Conclusion:
-
-- The restored direct sliding paged decode path is comfortably ahead of the
-  Python/PyTorch CUDA-graph baseline at this shape.
-- Cold-cache samples were noisier, with custom decode outliers near `0.106 ms`
-  and PyTorch outliers near `0.81 ms`, but the median gap is far larger than
-  the project's `5%` minimum effect threshold.
-- Remaining threats: clocks were not locked, this is one process on one GPU,
-  and the cold-cache mode uses synthetic L2 flushes rather than a serving trace.
 
 ## 2026-06-19 - Global paged decode vs PyTorch graph cold-cache benchmark
 
@@ -12911,15 +12799,15 @@ python3 src/experiments/gemma4_global_decode_torch_bench.py \
   --seq-len 4096 --page-size 64 --split-size 64 \
   --warmup 10 --iters 10 --samples 10 \
   --cache cold --flush-mib 128 --sample-delay-s 1.0 \
-  --json src/experiments/results/2026-06-19_global_decode_torch_graph_cold.json
+  --json src/experiments/results/2026-06-19_global_decode_torch_graph_cold_rebench.json
 ```
 
 Contract:
 
-- Hardware: NVIDIA RTX A6000, bus `00000000:06:00.0`, driver `580.126.16`,
-  persistence enabled, ECC disabled, power limit `300 W`.
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`.
 - Clock policy: not locked. JSON snapshot reported `1800 MHz` SM,
-  `7601 MHz` memory, `84.35 W`, `34 C`, and `P2`.
+  `7601 MHz` memory, `83.32 W`, `36 C`, and `P2`.
 - Shape: global decode, `B=1`, `q_len=1`, `seq_len=4096`, `page_size=64`,
   `split_size=64`, `num_splits=64`, BF16, `q_heads=32`, `kv_heads=4`,
   `head_dim=512`.
@@ -12933,12 +12821,12 @@ Contract:
 - Correctness: custom-vs-PyTorch max absolute diff was
   `0.00000095367431640625`.
 
-Cold-cache results:
+Cold-cache result:
 
 ```text
 path                         median ms  corrected median ms  IQR ms    p95 ms    speedup
-PyTorch global decode graph   0.519816   0.517624             0.003450  0.529428  baseline
-custom global decode          0.421371   0.419179             0.003246  0.462202  1.23x raw / 1.23x corrected
+PyTorch global decode graph   0.519003   0.516677             0.001690  0.525854  baseline
+custom global decode          0.420848   0.418522             0.000126  0.422695  1.23x raw / 1.23x corrected
 ```
 
 Conclusion:
@@ -12948,40 +12836,3 @@ Conclusion:
 - Remaining threats: clocks were not locked, this is one process on one GPU,
   and the cold-cache mode uses a synthetic L2 flush rather than an end-to-end
   serving trace.
-
-Rebench:
-
-```bash
-python3 src/experiments/gemma4_global_decode_torch_bench.py \
-  --seq-len 4096 --page-size 64 --split-size 64 \
-  --warmup 10 --iters 10 --samples 10 \
-  --cache cold --flush-mib 128 --sample-delay-s 1.0 \
-  --json src/experiments/results/2026-06-19_global_decode_torch_graph_cold_rebench.json
-```
-
-Rebench result:
-
-```text
-path                         prior corrected ms  rebench corrected ms  delta
-custom global decode          0.419179            0.418522             -0.16%
-PyTorch global decode graph   0.517624            0.516677             -0.18%
-```
-
-Rebench cold-cache table:
-
-```text
-path                         median ms  corrected median ms  IQR ms    p95 ms    speedup
-PyTorch global decode graph   0.519003   0.516677             0.001690  0.525854  baseline
-custom global decode          0.420848   0.418522             0.000126  0.422695  1.23x raw / 1.23x corrected
-```
-
-Rebench conclusion:
-
-- No performance regression was observed. The custom corrected median improved
-  by `0.16%`, and the tail was lower than the prior run.
-- Correctness remained stable with custom-vs-PyTorch max absolute diff
-  `0.00000095367431640625`.
-- The saved JSON snapshots report different PCI bus IDs across runs
-  (`06:00.0` prior, `09:00.0` rebench), while a post-run live check showed a
-  single visible RTX A6000 at `08:00.0`. Treat the comparison as same SKU, not
-  a controlled same-bus repeat.

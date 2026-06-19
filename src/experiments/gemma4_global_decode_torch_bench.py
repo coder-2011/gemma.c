@@ -19,6 +19,8 @@ GQA = Q_HEADS // KV_HEADS
 
 
 class KvConfig(ctypes.Structure):
+    """ctypes mirror of Gemma4KvCacheConfig."""
+
     _fields_ = [
         ("num_layers", ctypes.c_int32),
         ("num_pages", ctypes.c_int32),
@@ -31,10 +33,14 @@ class KvConfig(ctypes.Structure):
 
 
 def ptr(tensor):
+    """Return a CUDA tensor data pointer for ctypes calls."""
+
     return ctypes.c_void_p(tensor.data_ptr())
 
 
 def percentile(values, pct):
+    """Compute a percentile by linear interpolation over sorted samples."""
+
     if len(values) == 1:
         return values[0]
     values = sorted(values)
@@ -46,6 +52,8 @@ def percentile(values, pct):
 
 
 def summarize(values):
+    """Return raw samples and robust latency statistics in milliseconds."""
+
     values = list(values)
     values_sorted = sorted(values)
     trim = math.floor(len(values_sorted) * 0.1)
@@ -65,10 +73,14 @@ def summarize(values):
 
 
 def run(cmd, cwd=ROOT):
+    """Run a metadata command and return its trimmed text output."""
+
     return subprocess.check_output(cmd, cwd=cwd, text=True, stderr=subprocess.STDOUT).strip()
 
 
 def try_run(cmd, cwd=ROOT):
+    """Run an optional metadata command without failing the benchmark."""
+
     try:
         return run(cmd, cwd)
     except Exception as exc:
@@ -76,6 +88,8 @@ def try_run(cmd, cwd=ROOT):
 
 
 def load_decode_kernel():
+    """Build and load the generic paged decode C ABI entrypoint."""
+
     build_cmd = [
         "make",
         "-B",
@@ -108,6 +122,8 @@ def load_decode_kernel():
 
 
 def make_case(args):
+    """Create one deterministic global paged-decode fixture."""
+
     device = "cuda"
     torch.manual_seed(args.seed)
     pages = math.ceil(args.seq_len / args.page_size)
@@ -169,6 +185,8 @@ def make_case(args):
 
 
 def custom_decode(fn, case, args):
+    """Run the custom global paged decode kernel."""
+
     status = fn(
         ptr(case["out"]),
         ptr(case["partial_m"]),
@@ -192,6 +210,8 @@ def custom_decode(fn, case, args):
 
 
 def pytorch_decode(case, args):
+    """Run a PyTorch GQA reference over the same paged cache layout."""
+
     table = case["page_table"].long()
     page = table[:, case["slots"].long()]
     offset = case["offsets"].view(1, -1)
@@ -209,6 +229,8 @@ def pytorch_decode(case, args):
 
 
 def make_graph(fn):
+    """Capture one invocation of a benchmark candidate into a CUDA graph."""
+
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
@@ -219,14 +241,18 @@ def make_graph(fn):
 
 
 def flush_l2(flush_buf):
+    """Evict useful cache lines with a large same-stream device write."""
+
     if flush_buf is not None:
         flush_buf.zero_()
 
 
-def time_replay(replay, args, flush_buf):
+def time_work(work, args, flush_buf):
+    """Time a graph replay or empty event pair after each L2 flush."""
+
     for _ in range(args.warmup):
         flush_l2(flush_buf)
-        replay()
+        work()
     torch.cuda.synchronize()
 
     samples = []
@@ -238,28 +264,7 @@ def time_replay(replay, args, flush_buf):
         for _ in range(args.iters):
             flush_l2(flush_buf)
             start.record()
-            replay()
-            stop.record()
-            stop.synchronize()
-            total_ms += start.elapsed_time(stop)
-        samples.append(total_ms / args.iters)
-    return summarize(samples)
-
-
-def time_empty(args, flush_buf=None):
-    for _ in range(args.warmup):
-        flush_l2(flush_buf)
-    torch.cuda.synchronize()
-
-    samples = []
-    start = torch.cuda.Event(enable_timing=True)
-    stop = torch.cuda.Event(enable_timing=True)
-    for _ in range(args.samples):
-        time.sleep(args.sample_delay_s)
-        total_ms = 0.0
-        for _ in range(args.iters):
-            flush_l2(flush_buf)
-            start.record()
+            work()
             stop.record()
             stop.synchronize()
             total_ms += start.elapsed_time(stop)
@@ -268,6 +273,8 @@ def time_empty(args, flush_buf=None):
 
 
 def env_snapshot():
+    """Capture enough environment metadata to interpret the run later."""
+
     query = (
         "name,gpu_bus_id,driver_version,persistence_mode,ecc.mode.current,"
         "mig.mode.current,power.limit,power.draw,clocks.sm,clocks.mem,"
@@ -289,12 +296,16 @@ def env_snapshot():
 
 
 def add_corrected(summary, timer_overhead_ms):
+    """Attach a median with empty event-pair overhead subtracted."""
+
     corrected = max(0.0, summary["median_ms"] - timer_overhead_ms)
     summary["timer_overhead_ms"] = timer_overhead_ms
     summary["corrected_median_ms"] = corrected
 
 
 def print_table(timings, raw_speedup, corrected_speedup):
+    """Print the human-readable speedup table."""
+
     print(
         "\n| path | median ms | corrected median ms | IQR ms | "
         "p95 ms | raw speedup | corrected speedup |"
@@ -315,6 +326,8 @@ def print_table(timings, raw_speedup, corrected_speedup):
 
 
 def main():
+    """Parse arguments, validate correctness, run timings, and emit JSON."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seq-len", type=int, default=4096)
@@ -356,10 +369,10 @@ def main():
 
     custom_replay = make_graph(custom)
     pytorch_replay = make_graph(pytorch)
-    overhead = time_empty(args, flush_buf)
+    overhead = time_work(lambda: None, args, flush_buf)
     overhead_ms = overhead["median_ms"]
-    custom_stats = time_replay(custom_replay, args, flush_buf)
-    pytorch_stats = time_replay(pytorch_replay, args, flush_buf)
+    custom_stats = time_work(custom_replay, args, flush_buf)
+    pytorch_stats = time_work(pytorch_replay, args, flush_buf)
     add_corrected(custom_stats, overhead_ms)
     add_corrected(pytorch_stats, overhead_ms)
     raw_speedup = pytorch_stats["median_ms"] / custom_stats["median_ms"]

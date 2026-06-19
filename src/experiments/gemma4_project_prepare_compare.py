@@ -12,7 +12,6 @@ import torch
 H, QH, KVH, D = 5376, 32, 16, 256
 QS, KVS, QKVS = QH * D, KVH * D, (QH + 2 * KVH) * D
 EPS, THETA = 1e-6, 10000.0
-ROOT = Path(__file__).resolve().parents[2]
 
 
 class KvConfig(ctypes.Structure):
@@ -51,10 +50,11 @@ def put_cache(cache_k, cache_v, k, v, table, pos):
 
 
 def load_kernel():
-    so = ROOT / "build/libgemma4_flash_attention.so"
+    root = Path(__file__).resolve().parents[2]
+    so = root / "build/libgemma4_flash_attention.so"
     subprocess.run(
         ["make", "-B", "build/libgemma4_flash_attention.so", "NVCC=/usr/local/cuda/bin/nvcc"],
-        cwd=ROOT,
+        cwd=root,
         check=True,
     )
     fn = ctypes.CDLL(str(so)).gemma4_flash_attention_sliding_decode_project_prepare_paged_kv_bf16
@@ -115,24 +115,18 @@ def custom_case(fn, cfg, t, pos, table, cos, sin):
         raise RuntimeError(f"cudaError_t={err}")
 
 
-def bench(f, warmup, iters, samples, flush=None):
+def bench(f, warmup, iters, samples):
     for _ in range(warmup):
-        if flush is not None:
-            flush.zero_()
         f()
     torch.cuda.synchronize()
     times = []
     for _ in range(samples):
-        sample = []
+        a, b = torch.cuda.Event(True), torch.cuda.Event(True)
+        a.record()
         for _ in range(iters):
-            if flush is not None:
-                flush.zero_()
-            a, b = torch.cuda.Event(True), torch.cuda.Event(True)
-            a.record()
             f()
-            b.record(); b.synchronize()
-            sample.append(a.elapsed_time(b))
-        times.append(statistics.fmean(sample))
+        b.record(); b.synchronize()
+        times.append(a.elapsed_time(b) / iters)
     return times
 
 
@@ -169,6 +163,7 @@ def out(cmd, cwd=None):
 
 
 def env_snapshot():
+    root = Path(__file__).resolve().parents[2]
     query = (
         "name,gpu_bus_id,driver_version,persistence_mode,ecc.mode.current,"
         "mig.mode.current,power.limit,power.draw,clocks.sm,clocks.mem,"
@@ -180,8 +175,8 @@ def env_snapshot():
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
         "device": torch.cuda.get_device_name(),
-        "git_head": out(["git", "rev-parse", "HEAD"], ROOT),
-        "git_status_short": out(["git", "status", "--short"], ROOT),
+        "git_head": out(["git", "rev-parse", "HEAD"], root),
+        "git_status_short": out(["git", "status", "--short"], root),
         "build_command": "make -B build/libgemma4_flash_attention.so NVCC=/usr/local/cuda/bin/nvcc",
     }
 
@@ -207,8 +202,6 @@ def main():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=5)
     p.add_argument("--samples", type=int, default=5)
-    p.add_argument("--cache", choices=["warm", "cold"], default="warm")
-    p.add_argument("--flush-mb", type=int, default=64)
     p.add_argument("--json", default=None)
     args = p.parse_args()
     if not torch.cuda.is_available():
@@ -216,9 +209,6 @@ def main():
 
     fn = load_kernel()
     cfg, pos, table, cos, sin, t = make_case(args.batch, args.seq_len, args.page_size)
-    flush = None
-    if args.cache == "cold":
-        flush = torch.empty(args.flush_mb * 1024 * 1024 // 4, device="cuda", dtype=torch.int32)
     custom = lambda: custom_case(fn, cfg, t, pos, table, cos, sin)
     pt = lambda: pytorch_case(t, pos, table, cos, sin)
 
@@ -233,31 +223,29 @@ def main():
     contract = {
         "measurement": "typical latency for project->prepare stream work",
         "timing": "CUDA events on current stream; CPU enqueue/host wall time excluded",
-        "cache": ("cold-ish L2 flushed before each measured run; flush excluded from timing"
-                  if flush is not None else "warm-L2 repeated buffers; no L2 flush"),
+        "cache": "warm-L2 repeated buffers; no L2 flush",
         "launch_overhead": "CPU launch overhead excluded by CUDA event timing",
         "stability_scope": "single process, single GPU",
         "minimum_effect_size_pct": 5.0,
         "warmup": args.warmup,
         "iters_per_sample": args.iters,
         "sample_count": args.samples,
-        "flush_mb": args.flush_mb if flush is not None else 0,
         "shape": {"batch": args.batch, "seq_len": args.seq_len, "hidden": H, "qkv": QKVS, "dtype": "bf16"},
         "seed": 0,
         "correctness_max_abs": diff,
     }
 
-    pt_ms = bench(pt, args.warmup, args.iters, args.samples, flush)
+    pt_ms = bench(pt, args.warmup, args.iters, args.samples)
     results = {"pytorch_project_prepare": stats(pt_ms)}
     row("pytorch_project_prepare", pt_ms)
-    custom_ms = bench(custom, args.warmup, args.iters, args.samples, flush)
+    custom_ms = bench(custom, args.warmup, args.iters, args.samples)
     results["custom_project_prepare"] = stats(custom_ms)
     row("custom_project_prepare", custom_ms, pt_ms)
 
     try:
         ops = importlib.import_module("vllm._custom_ops")
         xs = bench(lambda: pytorch_case(t, pos, table, cos, sin, ops),
-                   args.warmup, args.iters, args.samples, flush)
+                   args.warmup, args.iters, args.samples)
         results["vllm_rmsnorm_project_prepare"] = stats(xs)
         row("vllm_rmsnorm_project_prepare",
             xs, pt_ms)
@@ -272,7 +260,7 @@ def main():
         "threats": [
             "clocks not locked",
             "single process only",
-            "L2 flush is a best-effort dummy write" if flush is not None else "warm-cache only",
+            "warm-cache only",
             "vLLM unavailable on this machine" if "vllm_project_prepare" in results else "vLLM baseline is operator-level, not server end-to-end",
         ],
     }
