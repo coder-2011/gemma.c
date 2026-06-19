@@ -1,0 +1,7 @@
+mkdir -p build
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -D_GLIBCXX_USE_CXX11_ABI=1 -Xcompiler -fPIC -shared -Isrc -Iexperiments/flash-attention/csrc/cutlass/include src/gemma4_flash_attention.cu src/gemma4_kv_cache.cu src/gemma4.cpp -o build/libgemma4_flash_attention.so
+shape batch=1 seq_len=1024 hidden=5376 qkv=16384 dtype=bf16
+custom_vs_pytorch max_abs=0.031250
+pytorch_project_prepare median_ms=4.382055 trimmed_mean_ms=4.394993 iqr_ms=0.958765 samples_ms=[4.896960067749023, 4.8808448791503904, 4.3820545196533205, 3.922079849243164, 3.466291046142578]
+custom_project_prepare median_ms=2.574598 trimmed_mean_ms=2.573926 iqr_ms=0.005408 samples_ms=[2.557926368713379, 2.570886421203613, 2.5745983123779297, 2.5762943267822265, 2.5818496704101563] delta_vs_pytorch=-41.25%
+vllm_project_prepare skipped: No module named 'vllm'

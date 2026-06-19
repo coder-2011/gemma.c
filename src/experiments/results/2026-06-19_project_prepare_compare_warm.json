@@ -1,0 +1,77 @@
+{
+  "contract": {
+    "measurement": "typical latency for project->prepare stream work",
+    "timing": "CUDA events on current stream; CPU enqueue/host wall time excluded",
+    "cache": "warm-L2 repeated buffers; no L2 flush",
+    "launch_overhead": "CPU launch overhead excluded by CUDA event timing",
+    "stability_scope": "single process, single GPU",
+    "minimum_effect_size_pct": 5.0,
+    "warmup": 3,
+    "iters_per_sample": 5,
+    "sample_count": 5,
+    "shape": {
+      "batch": 1,
+      "seq_len": 1024,
+      "hidden": 5376,
+      "qkv": 16384,
+      "dtype": "bf16"
+    },
+    "seed": 0,
+    "correctness_max_abs": 0.03125
+  },
+  "environment": {
+    "nvidia_smi": "NVIDIA RTX A6000, 00000000:04:00.0, 580.126.16, Enabled, Disabled, [N/A], 300.00, 79.17, 1800, 7601, 31, 7, 49140",
+    "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Wed_Jul_16_07:30:01_PM_PDT_2025\nCuda compilation tools, release 13.0, V13.0.48\nBuild cuda_13.0.r13.0/compiler.36260728_0",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "device": "NVIDIA RTX A6000",
+    "git_head": "48935ba6c1bf60a431989c9e076bb0756166b2a7",
+    "git_status_short": "M Makefile\n M TODO.md\n M build/gemma4_kv_cache.o\n M build/libgemma4_flash_attention.so\n M build/tests/test_kv_cache\n M src/experiments/EXPERIMENTS.md\n M src/experiments/gemma4_kv_cache_bench.cu\n M src/gemma4_embedding_gather.cu\n M src/gemma4_embedding_gather.cuh\n M src/gemma4_flash_attention.cu\n M src/gemma4_flash_attention.cuh\n M src/gemma4_kv_cache.cu\n M tests/test_kv_cache.cu\n?? .codex/\n?? src/experiments/gemma4_project_prepare_compare.py\n?? src/experiments/gemma4_sampling_bench.cu\n?? src/experiments/results/2026-06-19_project_prepare_compare_warm.json\n?? src/experiments/results/2026-06-19_project_prepare_compare_warm.txt\n?? src/experiments/results/2026-06-19_sampling_from_logits_warm.txt\n?? src/experiments/results/2026-06-19_sampling_from_logits_warm_merge_reduce.txt\n?? src/experiments/results/2026-06-19_sampling_ptxas_resource.txt\n?? src/gemma4_sampling.cu\n?? src/gemma4_sampling.cuh\n?? tests/test_sampling.cu",
+    "build_command": "make -B build/libgemma4_flash_attention.so NVCC=/usr/local/cuda/bin/nvcc"
+  },
+  "results": {
+    "pytorch_project_prepare": {
+      "samples_ms": [
+        4.896960067749023,
+        4.8808448791503904,
+        4.3820545196533205,
+        3.922079849243164,
+        3.466291046142578
+      ],
+      "median_ms": 4.3820545196533205,
+      "trimmed_mean_ms": 4.394993082682292,
+      "min_ms": 3.466291046142578,
+      "max_ms": 4.896960067749023,
+      "iqr_ms": 0.9587650299072266,
+      "p95_ms": 4.893737030029297,
+      "p99_ms": 4.896315460205078,
+      "stddev_ms": 0.5545996874945478
+    },
+    "custom_project_prepare": {
+      "samples_ms": [
+        2.557926368713379,
+        2.570886421203613,
+        2.5745983123779297,
+        2.5762943267822265,
+        2.5818496704101563
+      ],
+      "median_ms": 2.5745983123779297,
+      "trimmed_mean_ms": 2.5739263534545898,
+      "min_ms": 2.557926368713379,
+      "max_ms": 2.5818496704101563,
+      "iqr_ms": 0.00540790557861337,
+      "p95_ms": 2.5807386016845704,
+      "p99_ms": 2.581627456665039,
+      "stddev_ms": 0.008012889183796243
+    },
+    "vllm_project_prepare": {
+      "skipped": "No module named 'vllm'"
+    }
+  },
+  "threats": [
+    "clocks not locked",
+    "single process only",
+    "warm-cache only",
+    "vLLM unavailable on this machine"
+  ]
+}

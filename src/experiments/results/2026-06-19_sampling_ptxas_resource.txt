@@ -1,0 +1,11 @@
+ptxas info    : 0 bytes gmem
+ptxas info    : Compiling entry function '_ZN51_GLOBAL__N__d2246aeb_18_gemma4_sampling_cu_b472b0e432final_logits_greedy_fused_kernelEP13__nv_bfloat16PiPKS0_S4_P21Gemma4GreedyCandidatei' for 'sm_86'
+ptxas info    : Function properties for _ZN51_GLOBAL__N__d2246aeb_18_gemma4_sampling_cu_b472b0e432final_logits_greedy_fused_kernelEP13__nv_bfloat16PiPKS0_S4_P21Gemma4GreedyCandidatei
+    0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 60 registers, used 1 barriers, 9216 bytes smem, 396 bytes cmem[0]
+ptxas info    : Compile time = 120.916 ms
+ptxas info    : Compiling entry function '_ZN51_GLOBAL__N__d2246aeb_18_gemma4_sampling_cu_b472b0e425sample_from_logits_kernelEP13__nv_bfloat16PiPKS0_S4_20Gemma4SamplingParams' for 'sm_86'
+ptxas info    : Function properties for _ZN51_GLOBAL__N__d2246aeb_18_gemma4_sampling_cu_b472b0e425sample_from_logits_kernelEP13__nv_bfloat16PiPKS0_S4_20Gemma4SamplingParams
+    512 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info    : Used 34 registers, used 1 barriers, 512 bytes cumulative stack size, 3844 bytes smem, 416 bytes cmem[0], 16 bytes cmem[2]
+ptxas info    : Compile time = 49.954 ms

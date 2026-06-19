@@ -18,6 +18,12 @@
   - Target decode first: `x @ Wk` / `x @ Wv` should produce final cache values without a contiguous K/V scratch buffer.
   - The epilogue must preserve Gemma semantics: K gets per-head RMSNorm plus RoPE, V gets scale-free RMSNorm, then both scatter into Layout-A paged cache.
   - Benchmark against the lazier baseline first: cuBLAS/cuBLASLt projection into contiguous raw K/V plus fused norm/RoPE/V-norm paged-cache write.
+- Later: investigate persistent producer/consumer orchestration to minimize KV-cache and prepared-Q HBM traffic.
+  - Treat the unavoidable paged K/V cache write as the baseline, then look for ways to consume newly written K/V from L2 before it ages out.
+  - Prototype a device-side task queue where projection/prep tasks publish ready KV groups and flash-split tasks consume them immediately.
+  - Track tiny ready flags, task descriptors, and prepared-Q handoff buffers separately from large streaming weight/KV traffic so they can be kept L2-hot.
+  - Explore newest-split-first flash scheduling, L2 persisting windows for prepared Q/partials, and producer-consumer ordering that avoids rereading fresh K/V from HBM when possible.
+  - Keep this as a research path after the simple fused projection-to-prep path is correct and benchmarked.
 
 ## Remaining Unfused Inference Buildout
 

@@ -3,6 +3,136 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-19 - Probabilistic Sampling From Logits
+
+Question:
+
+- Implement and measure a correct baseline for sampling from already-materialized
+  logits, without fusing the final projection into the sampler.
+- Preserve the existing fused greedy endpoint.
+- Keep the tied embedding gather as a reusable device helper so the selected
+  token row can be copied inside the sampling kernel.
+
+Change:
+
+- Added `Gemma4SamplingParams`.
+- Added `gemma4_sample_from_logits_scratch_bytes` and
+  `gemma4_sample_from_logits_decode_bf16`.
+- The new sampler consumes row-major BF16 logits `[B, vocab]`, applies Gemma
+  final softcap, temperature, exact top-k for `1..64`, top-p over the top-k
+  softmax, stateless SplitMix-style deterministic RNG, and copies the selected
+  tied embedding row into `[B, hidden]`.
+- Refactored `src/gemma4_embedding_gather.cu` so its kernel calls the shared
+  `gemma4_embedding_gather::copy_embedding_row_bf16` device helper. The new
+  sampler and the old greedy fused endpoint use the same helper.
+- Initial top-k merge used a serial shared-memory insertion pass and measured
+  about `10.139 ms` median for `B=1, top_k=64`; replaced that merge with an
+  exact block reduction over per-thread sorted candidate lists, reducing the
+  same case to about `8.771 ms`.
+
+Build and correctness:
+
+```bash
+make -B test-sampling test-embedding-gather sampling-bench \
+  NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Correctness status:
+
+- `test-sampling`: passed.
+- `test-embedding-gather`: passed.
+- Benchmark correctness checks: old logits argmax matched fused greedy; all
+  probabilistic variants matched the CPU reference for each measured batch.
+
+Benchmark command:
+
+```bash
+./build/experiments/gemma4_sampling_bench 25 100 9 32 \
+  | tee src/experiments/results/2026-06-19_sampling_from_logits_warm_merge_reduce.txt
+```
+
+Resource check:
+
+```bash
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
+  --ptxas-options=-v -c src/gemma4_sampling.cu \
+  -o /tmp/gemma4_sampling_resource.o 2>&1 \
+  | tee src/experiments/results/2026-06-19_sampling_ptxas_resource.txt
+```
+
+Measurement contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:0F:00.0`, driver `580.126.16`.
+- CUDA driver/runtime reported by benchmark: `13000` / `13000`.
+- Clock policy: not locked. `nvidia-smi` snapshot reported persistence enabled,
+  ECC disabled, power limit `300 W`, SM clock `1800 MHz`, memory clock
+  `8001 MHz`, temperature `27 C`, idle GPU utilization at start.
+- Timing: CUDA events on a nonblocking stream; launch overhead included.
+- Cache: warm-ish repeated-logits benchmark. Logits are reused across timed
+  iterations, so this is not a cold-HBM sampler measurement.
+- Shape: BF16 logits `[B, 262144]`, tied embedding rows `[262144, 5376]`.
+- Warmup: `25`; timed iterations per sample: `100`; samples: `9`.
+- `ncu` was not available on this machine; ptxas resource output was recorded
+  instead.
+
+Median results:
+
+```text
+variant                         B   top_k  top_p   median_us
+final_logits_only               1   -      -       3954.845
+old_logits_argmax_embed         1   1      1.00    4009.821
+fused_greedy_endpoint           1   1      1.00    3969.395
+
+logits_argmax_embed_baseline    1   1      1.00      57.079
+prob_sampler_topk1_topp1        1   1      1.00     258.200
+prob_sampler_topk64_topp095     1   64     0.95    8770.779
+prob_sampler_topk64_topp1       1   64     1.00    8770.848
+
+logits_argmax_embed_baseline    8   1      1.00      56.983
+prob_sampler_topk1_topp1        8   1      1.00     283.112
+prob_sampler_topk64_topp095     8   64     0.95    8802.705
+prob_sampler_topk64_topp1       8   64     1.00    8803.694
+
+logits_argmax_embed_baseline    32  1      1.00      93.834
+prob_sampler_topk1_topp1        32  1      1.00     432.100
+prob_sampler_topk64_topp095     32  64     0.95   11293.972
+prob_sampler_topk64_topp1       32  64     1.00   11293.274
+```
+
+ptxas notes:
+
+```text
+sample_from_logits_kernel:
+  512 bytes stack frame
+  0 bytes spill stores / loads
+  34 registers
+  3844 bytes shared memory
+```
+
+Conclusion:
+
+- Kept the implementation as a correct baseline. The API and deterministic
+  behavior are covered by tests, and the benchmark measures sampler-only cost
+  separately from final projection.
+- The `top_k=1` path is usable as a correctness baseline but still slower than
+  the simpler argmax-only benchmark because it performs softcap, temperature,
+  shared-list merge machinery, RNG/top-p logic, and embedding gather.
+- The `top_k=64` path is intentionally exact but not performance-ready. The
+  per-thread top-64 arrays live in a 512-byte stack frame, so the next tuning
+  pass should replace this with a lower-local-memory top-k design, likely
+  warp-local candidates plus a shared/block merge or a multi-CTA tiled top-k
+  path for `B=1`.
+- Do not treat these numbers as final sampling performance. They are the first
+  correct fused logits-sampler baseline.
+
+Threats to validity:
+
+- Clocks were not locked.
+- Warm-ish repeated logits may understate cache pressure compared with logits
+  produced by a preceding projection under real decode scheduling.
+- CPU launch overhead is included.
+- No Nsight Compute counters were collected because `ncu` was unavailable.
+
 ## 2026-06-18 - FlashAttention cache-hint review and decode metadata loads
 
 Question:
@@ -12432,3 +12562,211 @@ Conclusion:
   block-wide reductions per token; the next cache-adjacent experiment should
   avoid further metadata work only if it does not disturb the coalesced K/V
   read-only load pattern.
+
+## 2026-06-19 - Sliding Decode Persistent Work Queue
+
+Question: can we land the persistent producer/consumer scheduler shape for
+sliding decode attention without changing flash decode numerics?
+
+Change:
+
+- Added an opt-in persistent work-queue decode path,
+  `gemma4_flash_attention_sliding_decode_paged_persistent_bf16`.
+- The first queue generation is split tasks. Each live split task writes the
+  same online-softmax partials as the direct path, then the final live split for
+  each Q row enqueues that row's reduce task.
+- Dummy overprovisioned split tasks do not count toward row readiness. This is
+  required because persistent workers can pop split IDs out of order.
+- All producer lanes issue a device fence before thread 0 publishes a reduce
+  task, because each lane owns one `partial_acc` value and the consumer CTA can
+  start before the producer CTA loops.
+- Added explicit caller-owned `int32_t` scratch sizing through
+  `gemma4_flash_attention_sliding_decode_persistent_scratch_i32`.
+- Added correctness coverage to `test_kv_cache` and a benchmark line for the
+  persistent path in `gemma4_kv_cache_bench`.
+
+Commands:
+
+```bash
+make -B build/tests/test_kv_cache build/experiments/gemma4_kv_cache_bench \
+  NVCC=/usr/local/cuda/bin/nvcc
+
+./build/tests/test_kv_cache
+
+./build/experiments/gemma4_kv_cache_bench 4096 64 64 10 50 7
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`.
+- CUDA/NVCC: CUDA compilation tools `13.0`, `V13.0.48`; benchmark runtime and
+  driver API versions reported as `13000`.
+- Shape: sliding decode, `B=1`, `seq_len=4096`, `page_size=64`,
+  `split_size=64`, sliding key count `1024`, `actual_splits=16`,
+  `num_splits=16`, BF16, `q_heads=32`, `kv_heads=16`, `head_dim=256`.
+- Timing: C++ benchmark, CUDA events on the benchmark stream. Warm cache.
+- Warmup/repeats: `10` warmup iterations, `50` iterations per sample,
+  `7` samples.
+- Cache policy: warm cache, no L2 flush.
+- Clock policy: clocks were not locked. `nvidia-smi` sampled the idle GPU after
+  the run at `210 MHz` SM and `405 MHz` memory, so boost state during timing was
+  not pinned.
+- Nsight Compute: not available in this environment (`ncu` not on `PATH`).
+- Correctness: `test_kv_cache` passed. Benchmark correctness for both direct
+  and persistent paths was `max_abs=0.023438`, `mean_abs=0.000202`.
+
+Median comparison:
+
+```text
+path                                      median ms  vs direct
+flash_decode_paged_attention_direct       0.066292   baseline
+flash_decode_paged_attention_persistent   0.123248   +85.92%
+flash_full_decode_write_plus_attention    0.065050   -1.87%
+```
+
+Conclusion:
+
+- The persistent scheduler is numerically correct across the existing decode
+  edge cases, including overprovisioned splits and staggered batch lengths.
+- As a standalone flash-only path, it is slower because it adds queue/init
+  atomics and a worker grid while still reading prepared Q and cached K/V from
+  HBM.
+- This is still the right scaffold for the next fusion step: projection/prep
+  producer tasks can now hand ready rows to the same worker-owned reduce path,
+  where the expected win comes from removing Q/K/V round trips rather than from
+  replacing the existing two flash launches by itself.
+
+## 2026-06-19 - Single-Kernel Greedy Final-Logit Endpoint
+
+Question: can the decode endpoint be a real single kernel for greedy sampling,
+instead of computing final logits and then launching a separate reducer/gather?
+
+Change:
+
+- Replaced the two-kernel greedy endpoint with one cooperative-grid kernel.
+- Each resident CTA walks a stripe of final vocab-projection tiles, keeps its
+  best local token, and writes one candidate.
+- The cooperative grid syncs once, then block 0 reduces resident-CTA candidates,
+  writes `next_token`, and copies the tied LM-head/embedding row into
+  `next_hidden`.
+- Full `[262144]` logits are still not materialized.
+
+Commands:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc test-sampling
+make NVCC=/usr/local/cuda/bin/nvcc sampling-bench
+./build/experiments/gemma4_sampling_bench 8 50 9
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000.
+- Timing: CUDA events on a nonblocking stream, launch overhead included.
+- Warmup/repeats: `8` warmup iterations, `50` iterations per sample,
+  `9` samples.
+- Cache policy: warm-ish repeated decode buffers, no L2 flush.
+- Clock policy: clocks were not locked.
+- Correctness: `test_sampling` passed. Benchmark matched the old endpoint:
+  `old_token=184509`, `fused_token=184509`.
+
+Median comparison:
+
+```text
+path                       median ms
+final_logits_only           3.955187
+old_logits_argmax_embed     3.997942
+fused_greedy_endpoint       3.974664
+```
+
+Conclusion:
+
+- The greedy endpoint is now actually one kernel for
+  `final logits -> argmax -> tied embedding gather`.
+- It is `23.278 us` faster than the old full-logits plus argmax/gather endpoint.
+- It is `19.477 us` slower than final-logits-only because the cooperative
+  persistent grid adds one grid-wide sync and a final in-kernel reduction.
+- The dominant cost remains the BF16 LM-head stream:
+  `5376 * 262144 * 2 ~= 2.82 GB`.
+
+## 2026-06-19 - Sliding Decode Fused Projection-Prep Ingress
+
+Question: can sliding decode avoid materializing the full raw QKV projection
+tensor before the existing Q/K/V norm+RoPE+cache preparation path?
+
+Change:
+
+- Added `gemma4_flash_attention_sliding_decode_project_prepare_paged_kv_bf16`.
+- The first implementation is intentionally conservative: each warp owns one
+  256-wide Q/K/V head, computes its lane-owned projected values from
+  `x @ Wqkv`, rounds them to the same BF16 raw ingress precision as the
+  existing projection output, then feeds those lane-local raw floats through
+  the refactored prep helpers.
+- Q is written to `d_q_prepared`; K and V are written directly into the
+  existing Layout-A paged cache row. The full `[16384]` raw QKV tensor is not
+  written by the fused path.
+- Existing paged flash decode attention remains unchanged and consumes
+  `d_q_prepared`, `d_cache_k`, and `d_cache_v`.
+- Replaced the temporary C++ benchmark with
+  `src/experiments/gemma4_project_prepare_compare.py`, a minimal Python
+  harness that compares the custom kernel against PyTorch and an optional
+  vLLM custom-op baseline when vLLM is installed.
+- This pass does not use cross-CTA producer/consumer mailboxes. On SM86 this
+  avoids relying on inter-block shared memory or distributed shared memory;
+  the CUDA guide places thread block clusters/DSM in the CC 9.0+ model
+  (CUDA Programming Guide pages 50 and 57).
+
+Commands:
+
+```bash
+make -B test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+
+python3 src/experiments/gemma4_project_prepare_compare.py \
+  --warmup 3 --iters 5 --samples 5 \
+  --json src/experiments/results/2026-06-19_project_prepare_compare_warm.json \
+  | tee src/experiments/results/2026-06-19_project_prepare_compare_warm.txt
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:04:00.0`, driver `580.126.16`,
+  persistence enabled, ECC disabled, power limit `300 W`.
+- CUDA/NVCC: CUDA compilation tools `13.0`, `V13.0.48`; PyTorch `2.11.0+cu130`
+  with CUDA `13.0`.
+- Shape: sliding decode, `B=1`, `seq_len=1024`, `page_size=64`,
+  `split_size=64`, BF16, hidden `5376`, packed QKV `16384`,
+  Q heads `32`, KV heads `16`, head dim `256`.
+- Timing: Python benchmark with CUDA events on the current stream. CPU launch
+  and Python enqueue overhead are not measured by the CUDA events.
+- Warmup/repeats: `3` warmup iterations, `5` iterations per sample,
+  `5` samples.
+- Cache policy: warm-L2 repeated buffers; no L2 flush.
+- Clock policy: clocks were not locked. The JSON snapshot reported
+  `1800 MHz` SM, `7601 MHz` memory, `79.17 W`, `31 C`, and `7%`
+  GPU utilization.
+- Correctness: `test-kv-cache` passed. Python custom-vs-PyTorch max absolute
+  diff across prepared Q and K/V cache was `0.031250`.
+- vLLM baseline: skipped in this environment because `vllm` is not installed.
+- Results were also written as JSON, including raw samples, summary statistics,
+  contract, environment, and threats.
+
+Median comparison:
+
+```text
+path                     median ms  IQR ms    vs PyTorch
+pytorch_project_prepare   4.382055  0.958765  baseline
+custom_project_prepare    2.574598  0.005408  -41.25%
+vllm_project_prepare      skipped   -         vLLM unavailable
+```
+
+Conclusion:
+
+- The fused ingress API is correct and removes the full raw QKV HBM
+  materialization requirement.
+- Against a minimal eager PyTorch baseline, the custom fused kernel is faster
+  for this `B=1`, `seq_len=1024` harness. This does not contradict the earlier
+  C++ baseline result: the existing CTA-reduced custom projection path is a
+  much stronger baseline than eager PyTorch.
+- The next performance pass should keep the public API and replace the serial
+  per-warp dot-product work with a parallel head-fragment or L2-mailbox design
+  that preserves small handoff state without staging the full raw QKV tensor.

@@ -1,0 +1,32 @@
+env=gpu="NVIDIA RTX A6000" global_mem_bytes=50897289216 cuda_driver=13000 cuda_runtime=13000
+contract=sampling_from_materialized_logits timing=cuda_events stream=nonblocking cache=warm-ish launch_overhead=included warmup=25 iters=100 samples=9 max_batch=32 dtype=bf16 vocab=262144 hidden=5376 nvcc_flags="-std=c++17 -O3 -arch=sm_86"
+nvidia_smi_snapshot_begin
+name, pci.bus_id, driver_version, persistence_mode, ecc.mode.current, mig.mode.current, power.limit [W], clocks.current.sm [MHz], clocks.current.memory [MHz], temperature.gpu, power.draw [W], utilization.gpu [%]
+NVIDIA RTX A6000, 00000000:0F:00.0, 580.126.16, Enabled, Disabled, [N/A], 300.00 W, 1800 MHz, 8001 MHz, 27, 29.05 W, 0 %
+nvidia_smi_status=0
+nvidia_smi_snapshot_end
+correctness old_token=184509 fused_token=184509 match=yes
+variant=final_logits_only batch_size=1 top_k=0 top_p=0.000 temp=0.000 min_us=3954.723 median_us=3954.845 mean_us=3954.903 p95_us=3955.189 max_us=3955.230 samples_us=[3955.230,3954.842,3954.912,3954.845,3954.723,3954.735,3954.811,3955.127,3954.899]
+variant=old_logits_argmax_embed batch_size=1 top_k=1 top_p=1.000 temp=1.000 min_us=4009.781 median_us=4009.821 mean_us=4009.956 p95_us=4010.204 max_us=4010.213 samples_us=[4009.821,4009.817,4009.786,4009.815,4009.781,4010.022,4010.191,4010.159,4010.213]
+variant=fused_greedy_endpoint batch_size=1 top_k=1 top_p=1.000 temp=1.000 min_us=3967.696 median_us=3969.395 mean_us=3969.690 p95_us=3972.296 max_us=3972.468 samples_us=[3972.468,3968.954,3970.022,3969.395,3970.001,3968.708,3967.925,3967.696,3972.040]
+variant=logits_argmax_embed_baseline batch_size=1 top_k=1 top_p=1.000 temp=1.000 min_us=56.842 median_us=57.079 mean_us=57.217 p95_us=57.775 max_us=58.066 samples_us=[56.842,57.340,57.274,57.059,57.308,58.066,56.946,57.040,57.079]
+correctness variant=prob_sampler_topk64_topp095 batch_size=1 status=pass
+variant=prob_sampler_topk64_topp095 batch_size=1 top_k=64 top_p=0.950 temp=1.000 min_us=8770.565 median_us=8770.779 mean_us=8770.871 p95_us=8771.340 max_us=8771.408 samples_us=[8770.944,8770.751,8771.408,8770.779,8770.617,8770.675,8771.237,8770.565,8770.869]
+correctness variant=prob_sampler_topk1_topp1 batch_size=1 status=pass
+variant=prob_sampler_topk1_topp1 batch_size=1 top_k=1 top_p=1.000 temp=1.000 min_us=258.105 median_us=258.200 mean_us=258.195 p95_us=258.305 max_us=258.339 samples_us=[258.139,258.105,258.339,258.233,258.213,258.200,258.144,258.129,258.255]
+correctness variant=prob_sampler_topk64_topp1 batch_size=1 status=pass
+variant=prob_sampler_topk64_topp1 batch_size=1 top_k=64 top_p=1.000 temp=1.000 min_us=8770.678 median_us=8770.848 mean_us=8770.893 p95_us=8771.136 max_us=8771.161 samples_us=[8770.825,8770.797,8770.682,8771.161,8770.848,8771.098,8770.678,8771.055,8770.880]
+variant=logits_argmax_embed_baseline batch_size=8 top_k=1 top_p=1.000 temp=1.000 min_us=56.905 median_us=56.983 mean_us=56.974 p95_us=57.066 max_us=57.092 samples_us=[56.905,56.991,57.026,56.933,56.983,57.004,57.092,56.912,56.916]
+correctness variant=prob_sampler_topk64_topp095 batch_size=8 status=pass
+variant=prob_sampler_topk64_topp095 batch_size=8 top_k=64 top_p=0.950 temp=1.000 min_us=8801.909 median_us=8802.705 mean_us=8802.746 p95_us=8803.331 max_us=8803.555 samples_us=[8802.903,8802.385,8803.555,8802.940,8802.632,8801.909,8802.685,8802.705,8802.998]
+correctness variant=prob_sampler_topk1_topp1 batch_size=8 status=pass
+variant=prob_sampler_topk1_topp1 batch_size=8 top_k=1 top_p=1.000 temp=1.000 min_us=283.028 median_us=283.112 mean_us=283.152 p95_us=283.404 max_us=283.528 samples_us=[283.057,283.161,283.115,283.217,283.028,283.112,283.079,283.528,283.068]
+correctness variant=prob_sampler_topk64_topp1 batch_size=8 status=pass
+variant=prob_sampler_topk64_topp1 batch_size=8 top_k=64 top_p=1.000 temp=1.000 min_us=8802.656 median_us=8803.694 mean_us=8803.536 p95_us=8803.855 max_us=8803.868 samples_us=[8803.694,8803.868,8802.656,8803.830,8803.420,8803.579,8803.839,8803.784,8803.147]
+variant=logits_argmax_embed_baseline batch_size=32 top_k=1 top_p=1.000 temp=1.000 min_us=93.673 median_us=93.834 mean_us=93.886 p95_us=94.100 max_us=94.142 samples_us=[93.673,93.791,94.142,93.744,93.834,94.036,94.011,93.773,93.966]
+correctness variant=prob_sampler_topk64_topp095 batch_size=32 status=pass
+variant=prob_sampler_topk64_topp095 batch_size=32 top_k=64 top_p=0.950 temp=1.000 min_us=11289.809 median_us=11293.972 mean_us=11293.178 p95_us=11295.119 max_us=11295.658 samples_us=[11289.809,11293.432,11290.014,11294.131,11295.658,11294.312,11293.972,11294.009,11293.257]
+correctness variant=prob_sampler_topk1_topp1 batch_size=32 status=pass
+variant=prob_sampler_topk1_topp1 batch_size=32 top_k=1 top_p=1.000 temp=1.000 min_us=431.942 median_us=432.100 mean_us=432.093 p95_us=432.192 max_us=432.208 samples_us=[431.942,432.100,432.156,432.168,432.093,432.031,432.124,432.019,432.208]
+correctness variant=prob_sampler_topk64_topp1 batch_size=32 status=pass
+variant=prob_sampler_topk64_topp1 batch_size=32 top_k=64 top_p=1.000 temp=1.000 min_us=11289.644 median_us=11293.274 mean_us=11292.995 p95_us=11295.540 max_us=11295.784 samples_us=[11293.659,11295.176,11293.274,11292.826,11293.562,11295.784,11289.644,11291.940,11291.099]
