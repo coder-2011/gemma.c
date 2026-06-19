@@ -1,0 +1,10 @@
+2026-06-19T03:15:46.575721Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.2 seconds
+Output:
+Failed to write file /tmp/codex_patch_probe.txt
+
+2026-06-19T03:15:50.468106Z ERROR codex_core::tools::router: error=Exit code: 1
+Wall time: 0.2 seconds
+Output:
+Failed to write file /home/ubuntu/gemma.c/codex_patch_probe.txt
+

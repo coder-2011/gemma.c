@@ -1,0 +1,25 @@
+{
+  "cwd": "/home/ubuntu/gemma.c",
+  "model": "latest/default",
+  "reasoningEffort": "high",
+  "approvalPolicy": "codex-exec-default",
+  "sandbox": "workspace-write",
+  "promptPath": "/home/ubuntu/gemma.c/.codex/bg-agent/runs/20260619T031513Z-use-primer-first-then-remove-the-experimental-pe/prompt.md",
+  "stdoutPath": "/home/ubuntu/gemma.c/.codex/bg-agent/runs/20260619T031513Z-use-primer-first-then-remove-the-experimental-pe/stdout.jsonl",
+  "stderrPath": "/home/ubuntu/gemma.c/.codex/bg-agent/runs/20260619T031513Z-use-primer-first-then-remove-the-experimental-pe/stderr.log",
+  "lastMessagePath": "/home/ubuntu/gemma.c/.codex/bg-agent/runs/20260619T031513Z-use-primer-first-then-remove-the-experimental-pe/last_message.md",
+  "command": [
+    "codex",
+    "exec",
+    "--json",
+    "-C",
+    "/home/ubuntu/gemma.c",
+    "-c",
+    "model_reasoning_effort=\"high\"",
+    "-s",
+    "workspace-write",
+    "-o",
+    "/home/ubuntu/gemma.c/.codex/bg-agent/runs/20260619T031513Z-use-primer-first-then-remove-the-experimental-pe/last_message.md",
+    "-"
+  ]
+}
