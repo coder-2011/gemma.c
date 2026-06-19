@@ -25,13 +25,14 @@ TORCH_API_INCLUDE ?= .venv/lib/python3.11/site-packages/torch/include/torch/csrc
 TORCH_LIB ?= .venv/lib/python3.11/site-packages/torch/lib
 PYTHON_INCLUDE ?= /usr/include/python3.11
 
-.PHONY: all cuda-kernels decode-bench embedding-gather-bench rmsnorm-bench rmsnorm-hidden-fused-bench rope-bench ffn-cudnn-bench ffn-decode-load-bench flash-attn-bench kv-cache-bench flash-attn-lib flash-attn-reference-lib tuna-prefill-bench sgemm-prefill-bench sgemm-bf16-prefill-bench test-cuda-utils test-embedding-gather test-rmsnorm test-rope test-ffn-decode test-kv-cache clean
+.PHONY: all cuda-kernels decode-bench embedding-gather-bench sampling-bench rmsnorm-bench rmsnorm-hidden-fused-bench rope-bench ffn-cudnn-bench ffn-decode-load-bench flash-attn-bench kv-cache-bench flash-attn-lib flash-attn-reference-lib tuna-prefill-bench sgemm-prefill-bench sgemm-bf16-prefill-bench test-cuda-utils test-embedding-gather test-sampling test-rmsnorm test-rope test-ffn-decode test-kv-cache clean
 
 all: $(BUILD_DIR)/gemma4.o
 
-cuda-kernels: $(BUILD_DIR)/gemma4_matmul_kernels.o $(BUILD_DIR)/gemma4_rmsnorm.o $(BUILD_DIR)/gemma4_rope.o $(BUILD_DIR)/gemma4_flash_attention.o $(BUILD_DIR)/gemma4_ffn.o $(BUILD_DIR)/gemma4_kv_cache.o
+cuda-kernels: $(BUILD_DIR)/gemma4_matmul_kernels.o $(BUILD_DIR)/gemma4_sampling.o $(BUILD_DIR)/gemma4_rmsnorm.o $(BUILD_DIR)/gemma4_rope.o $(BUILD_DIR)/gemma4_flash_attention.o $(BUILD_DIR)/gemma4_ffn.o $(BUILD_DIR)/gemma4_kv_cache.o
 decode-bench: $(BUILD_DIR)/experiments/gemma4_decode_bench
 embedding-gather-bench: $(BUILD_DIR)/experiments/gemma4_embedding_gather_bench
+sampling-bench: $(BUILD_DIR)/experiments/gemma4_sampling_bench
 rmsnorm-bench: $(BUILD_DIR)/experiments/gemma4_rmsnorm_bench
 rmsnorm-hidden-fused-bench: $(BUILD_DIR)/experiments/gemma4_rmsnorm_hidden_fused_bench
 rope-bench: $(BUILD_DIR)/experiments/gemma4_rope_bench
@@ -47,6 +48,8 @@ sgemm-bf16-prefill-bench: $(BUILD_DIR)/experiments/gemma4_sgemm_bf16_prefill_ben
 test-cuda-utils: $(BUILD_DIR)/tests/cuda_utils/test_cuda_utils
 	./$<
 test-embedding-gather: $(BUILD_DIR)/tests/test_embedding_gather
+	./$<
+test-sampling: $(BUILD_DIR)/tests/test_sampling
 	./$<
 test-rmsnorm: $(BUILD_DIR)/tests/test_rmsnorm
 	./$<
@@ -65,6 +68,9 @@ $(BUILD_DIR)/gemma4.o: src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)
 
 $(BUILD_DIR)/gemma4_matmul_kernels.o: src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -c src/gemma4_matmul_kernels.cu -o $@
+
+$(BUILD_DIR)/gemma4_sampling.o: src/gemma4_sampling.cu src/gemma4_sampling.cuh src/gemma4_embedding_gather.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -c src/gemma4_sampling.cu -o $@
 
 $(BUILD_DIR)/gemma4_rmsnorm.o: src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) -c src/gemma4_rmsnorm.cu -o $@
@@ -102,6 +108,9 @@ $(BUILD_DIR)/experiments/gemma4_decode_bench: src/experiments/gemma4_decode_benc
 $(BUILD_DIR)/experiments/gemma4_embedding_gather_bench: src/experiments/gemma4_embedding_gather_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_embedding_gather.cu src/gemma4_embedding_gather.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/experiments/gemma4_embedding_gather_bench.cu src/gemma4_embedding_gather.cu -o $@
 
+$(BUILD_DIR)/experiments/gemma4_sampling_bench: src/experiments/gemma4_sampling_bench.cu src/gemma4_sampling.cu src/gemma4_sampling.cuh src/gemma4_embedding_gather.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/experiments/gemma4_sampling_bench.cu src/gemma4_sampling.cu -o $@
+
 $(BUILD_DIR)/experiments/gemma4_rmsnorm_bench: src/experiments/gemma4_rmsnorm_bench.cu src/experiments/gemma4_bench_utils.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/experiments
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) -I$(CUDNN_FRONTEND_INCLUDE) src/experiments/gemma4_rmsnorm_bench.cu src/gemma4_rmsnorm.cu $(CUDA_LDFLAGS) $(CUDNN_LDFLAGS) -lnvrtc -lcuda -o $@
 
@@ -135,6 +144,9 @@ $(BUILD_DIR)/experiments/gemma4_sgemm_bf16_prefill_bench: experiments/sgemm.cu/g
 $(BUILD_DIR)/tests/test_embedding_gather: tests/test_embedding_gather.cu src/gemma4_embedding_gather.cu src/gemma4_embedding_gather.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_embedding_gather.cu src/gemma4_embedding_gather.cu -o $@
 
+$(BUILD_DIR)/tests/test_sampling: tests/test_sampling.cu src/gemma4_sampling.cu src/gemma4_sampling.cuh src/gemma4_embedding_gather.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_sampling.cu src/gemma4_sampling.cu -o $@
+
 $(BUILD_DIR)/tests/cuda_utils/test_cuda_utils: tests/cuda_utils/test_cuda_utils.cu src/gemma4_cuda_utils.cuh | $(BUILD_DIR)/tests/cuda_utils
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/cuda_utils/test_cuda_utils.cu -o $@
 
@@ -147,8 +159,8 @@ $(BUILD_DIR)/tests/test_rope: tests/test_rope.cu src/gemma4_rope.cu src/gemma4_r
 $(BUILD_DIR)/tests/test_ffn_decode: tests/test_ffn_decode.cu src/gemma4_ffn.cu src/gemma4_ffn.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
 	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) tests/test_ffn_decode.cu src/gemma4_ffn.cu src/gemma4_rmsnorm.cu -o $@
 
-$(BUILD_DIR)/tests/test_kv_cache: tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/tests
-	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4.cpp -o $@
+$(BUILD_DIR)/tests/test_kv_cache: tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_matmul_device.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/tests
+	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) tests/test_kv_cache.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4_matmul_kernels.cu src/gemma4.cpp $(CUDA_LDFLAGS) -lcublas -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)
