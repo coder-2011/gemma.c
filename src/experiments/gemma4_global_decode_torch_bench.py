@@ -208,14 +208,13 @@ def pytorch_decode(case, args):
     case["ref"].copy_(torch.cat(groups, dim=1).to(torch.bfloat16))
 
 
-def make_graph(fn, inner_iters):
+def make_graph(fn):
     for _ in range(3):
         fn()
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        for _ in range(inner_iters):
-            fn()
+        fn()
     return graph.replay
 
 
@@ -224,7 +223,7 @@ def flush_l2(flush_buf):
         flush_buf.zero_()
 
 
-def time_replay(replay, args, flush_buf=None, ops_per_replay=1):
+def time_replay(replay, args, flush_buf):
     for _ in range(args.warmup):
         flush_l2(flush_buf)
         replay()
@@ -242,7 +241,7 @@ def time_replay(replay, args, flush_buf=None, ops_per_replay=1):
             replay()
             stop.record()
             stop.synchronize()
-            total_ms += start.elapsed_time(stop) / ops_per_replay
+            total_ms += start.elapsed_time(stop)
         samples.append(total_ms / args.iters)
     return summarize(samples)
 
@@ -296,7 +295,10 @@ def add_corrected(summary, timer_overhead_ms):
 
 
 def print_table(timings, raw_speedup, corrected_speedup):
-    print("\n| path | median ms | corrected median ms | IQR ms | p95 ms | raw speedup | corrected speedup |")
+    print(
+        "\n| path | median ms | corrected median ms | IQR ms | "
+        "p95 ms | raw speedup | corrected speedup |"
+    )
     print("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for name, label in [
         ("pytorch_global_decode_graph", "PyTorch global decode graph"),
@@ -321,7 +323,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--samples", type=int, default=10)
-    parser.add_argument("--cache", choices=["cold", "warm"], default="cold")
+    parser.add_argument("--cache", choices=["cold"], default="cold")
     parser.add_argument("--flush-mib", type=int, default=128)
     parser.add_argument("--sample-delay-s", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -336,9 +338,11 @@ def main():
     args.softmax_scale = 1.0 / math.sqrt(HEAD_DIM)
     fn = load_decode_kernel()
     case = make_case(args)
-    flush_buf = None
-    if args.cache == "cold":
-        flush_buf = torch.empty(args.flush_mib * 1024 * 1024 // 4, device="cuda", dtype=torch.int32)
+    flush_buf = torch.empty(
+        args.flush_mib * 1024 * 1024 // 4,
+        device="cuda",
+        dtype=torch.int32,
+    )
 
     custom = lambda: custom_decode(fn, case, args)
     pytorch = lambda: pytorch_decode(case, args)
@@ -350,13 +354,12 @@ def main():
     if max_abs > args.correctness_atol:
         raise RuntimeError(f"correctness failed: max_abs={max_abs}")
 
-    inner_iters = 1 if args.cache == "cold" else args.iters
-    custom_replay = make_graph(custom, inner_iters)
-    pytorch_replay = make_graph(pytorch, inner_iters)
+    custom_replay = make_graph(custom)
+    pytorch_replay = make_graph(pytorch)
     overhead = time_empty(args, flush_buf)
     overhead_ms = overhead["median_ms"]
-    custom_stats = time_replay(custom_replay, args, flush_buf, inner_iters)
-    pytorch_stats = time_replay(pytorch_replay, args, flush_buf, inner_iters)
+    custom_stats = time_replay(custom_replay, args, flush_buf)
+    pytorch_stats = time_replay(pytorch_replay, args, flush_buf)
     add_corrected(custom_stats, overhead_ms)
     add_corrected(pytorch_stats, overhead_ms)
     raw_speedup = pytorch_stats["median_ms"] / custom_stats["median_ms"]
@@ -375,15 +378,18 @@ def main():
             "timing": "CUDA events on current PyTorch CUDA stream",
             "execution": "CUDA graph replay for custom CUDA and PyTorch paths",
             "cache_mode": args.cache,
-            "l2_flush_bytes": args.flush_mib * 1024 * 1024 if args.cache == "cold" else 0,
+            "l2_flush_bytes": args.flush_mib * 1024 * 1024,
             "flush_timing": "flush enqueued before start event and excluded from elapsed time",
             "sample_delay_s": args.sample_delay_s,
             "delay_location": "host sleep before each measured sample, outside event window",
             "launch_overhead": "CPU launch overhead excluded by CUDA graph replay and CUDA events",
-            "timer_overhead": "empty CUDA event-pair median reported and subtracted in corrected medians",
+            "timer_overhead": (
+                "empty CUDA event-pair median reported and subtracted in "
+                "corrected medians"
+            ),
             "warmup": args.warmup,
             "iters_per_sample": args.iters,
-            "graph_inner_iters": inner_iters,
+            "graph_inner_iters": 1,
             "samples": args.samples,
             "min_effect_for_claim_pct": 5,
         },
@@ -413,7 +419,9 @@ def main():
         ],
     }
     if args.json:
-        Path(args.json).write_text(json.dumps(report, indent=2) + "\n")
+        output_path = Path(args.json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":
