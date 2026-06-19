@@ -13206,56 +13206,6 @@ Conclusion:
   cache-write rows, but the decode attention speedups are much larger than the
   `5%` claim threshold.
 
-## 2026-06-18 - FFN PyTorch vs custom CUDA graph benchmark
-
-Purpose:
-
-- Add and run a direct FFN benchmark comparing the generalized
-  `gemma4_ffn_bf16` path against a PyTorch BF16 baseline.
-- Measure both warm and cold-L2 behavior with CUDA events around CUDA graph
-  replay, while alternating path order and recording clock snapshots.
-
-Build and timing commands:
-
-```bash
-make -B ffn-bench-lib NVCC=/usr/local/cuda/bin/nvcc
-
-uv run python src/benches/gemma4_ffn_torch_bench.py \
-  --rows 1 16 --cache both --warmup 5 --iters 10 --samples 10 \
-  --sample-delay-s 0.1 \
-  --output src/benches/results/2026-06-18_ffn_torch_vs_custom_both.json
-```
-
-Measurement contract:
-
-- Timing: CUDA events around CUDA graph replay on PyTorch's current stream.
-- Launch overhead: excluded by graph replay for both custom CUDA and PyTorch.
-- Warm cache: replay the same path once immediately before timing.
-- Cold cache: touch a 256 MiB flush buffer before each timed replay; flush is
-  outside the event span.
-- PyTorch baseline: preallocated BF16 `mm -> tanh GeGLU -> mm -> residual add
-  -> RMSNorm` using out tensors where available.
-- GPU: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC off.
-
-Median results:
-
-```text
-rows  cache  custom median ms  PyTorch median ms  PyTorch/custom  custom p99 ms  PyTorch p99 ms  max abs normed
-   1  warm          0.976261           1.053992           1.080x       1.171875       1.054490        0.015625
-   1  cold          0.987358           1.061798           1.075x       1.048946       1.062933        0.015625
-  16  warm          1.015525           1.035126           1.019x       2.152411       2.139047        0.015625
-  16  cold          1.022310           1.039872           1.017x       1.031736       1.041193        0.015625
-```
-
-Conclusion:
-
-- The custom FFN path was slightly faster than the PyTorch graph baseline in
-  every measured row/cache mode, with the largest win on decode (`rows=1`) and
-  only a small prefill win (`rows=16`).
-- The `rows=16` warm-cache p99 had outliers in both paths, so use median or
-  rerun with locked clocks before claiming a small p99 difference.
-- Correctness matched within BF16-level tolerance (`max_abs_normed=0.015625`).
-
 ## 2026-06-18 - Projection decode GEMV columns-per-block tuning
 
 Purpose:
@@ -13411,7 +13361,7 @@ NORMED_STORE_POLICY          2 (write-back store)
 Build and timing commands:
 
 ```bash
-make -B test-ffn-decode ffn-decode-load-bench ffn-bench-lib \
+make -B test-ffn-decode ffn-decode-load-bench \
   NVCC=/usr/local/cuda/bin/nvcc
 
 /usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
@@ -13424,10 +13374,6 @@ GEMMA4_FFN_LOAD_BENCH_SEED=0x20260618 \
   ./build/benches/gemma4_ffn_decode_load_bench 80 12 5 \
   | tee src/benches/results/2026-06-18_ffn_decode_current_load_baseline.txt
 
-uv run python src/benches/gemma4_ffn_torch_bench.py \
-  --rows 1 16 --cache both --warmup 5 --iters 10 --samples 8 \
-  --sample-delay-s 0.1 --seed 539362840 \
-  --output src/benches/results/2026-06-18_ffn_torch_vs_custom_current_baseline.json
 ```
 
 Measurement contract:
