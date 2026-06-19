@@ -3,22 +3,19 @@
 #include "gemma4.h"
 #include "gemma4_cuda_utils.cuh"
 
-#include <cub/block/block_reduce.cuh>
 #include <cub/thread/thread_load.cuh>
 #include <cub/thread/thread_store.cuh>
-#include <cuda/functional>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 
 #include <algorithm>
 #include <cmath>
 
 namespace {
+namespace cg = cooperative_groups;
 
 constexpr int kKvWriteThreads = 256;
-constexpr int kKvWriteVecThreads = 128;
-
-struct SumOp {
-  __device__ float operator()(float a, float b) const { return a + b; }
-};
+constexpr int kKvWriteVecThreads = WARP_SIZE;
 
 int attention_threads_for_head_dim(int32_t head_dim) {
   return head_dim <= 256 ? 256 : 512;
@@ -28,7 +25,7 @@ bool valid_config(const Gemma4KvCacheConfig &config) {
   if (config.num_layers <= 0 || config.num_pages <= 0 ||
       config.page_size <= 0 || config.max_pages_per_seq <= 0 ||
       config.num_heads <= 0 || config.head_dim <= 0 ||
-      config.head_dim > 512) {
+      config.head_dim > 512 || config.window_size < 0) {
     return false;
   }
   int32_t min_window_pages =
@@ -36,25 +33,22 @@ bool valid_config(const Gemma4KvCacheConfig &config) {
   return config.max_pages_per_seq >= min_window_pages;
 }
 
-template <int BlockThreads, typename Op>
-__device__ inline float block_reduce(float value, Op op) {
-  using BlockReduce = cub::BlockReduce<float, BlockThreads>;
-  __shared__ typename BlockReduce::TempStorage temp_storage;
-  __shared__ float result;
-  float thread0_result = BlockReduce(temp_storage).Reduce(value, op);
-  if (threadIdx.x == 0) result = thread0_result;
-  __syncthreads();
-  return result;
+bool split_coverage_valid(const Gemma4KvCacheConfig &config,
+                          int32_t split_size,
+                          int32_t num_splits) {
+  if (split_size <= 0 || num_splits <= 0) return false;
+  if (config.window_size == 0) return true;
+  return int64_t(split_size) * num_splits >= config.window_size;
 }
 
-template <int BlockThreads>
-__device__ inline float block_sum(float value) {
-  return block_reduce<BlockThreads>(value, SumOp{});
+template <typename Block>
+__device__ inline float block_sum(const Block &block, float value) {
+  return cg::reduce(block, value, cg::plus<float>{});
 }
 
-template <int BlockThreads>
-__device__ inline float block_max(float value) {
-  return block_reduce<BlockThreads>(value, cuda::maximum<>{});
+template <typename Block>
+__device__ inline float block_max(const Block &block, float value) {
+  return cg::reduce(block, value, cg::greater<float>{});
 }
 
 __device__ inline int32_t physical_page_for_position(
@@ -182,25 +176,45 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_split_kernel(
   float l = 0.0f;
   int64_t q_base = (int64_t(batch) * q_heads + q_head) * config.head_dim;
   int64_t partial_acc_base = (int64_t)partial * config.head_dim;
-  float q_value = dim < config.head_dim ? __bfloat162float(loadg(q + q_base + dim)) : 0.0f;
+  int64_t kv_token_stride = int64_t(config.num_heads) * config.head_dim;
+  float q_value =
+      dim < config.head_dim ? __bfloat162float(loadg(q + q_base + dim)) : 0.0f;
 
-  for (int pos = split_begin; pos < split_end; ++pos) {
-    int physical_page = physical_page_for_position(config, page_table, batch, pos);
-    if (physical_page < 0) continue;
-    int page_offset = gemma4_kv_cache_page_offset(config, pos);
-    int64_t kv_base = gemma4_kv_cache_offset(config, layer, physical_page, page_offset, kv_head, 0);
-    float k_value = dim < config.head_dim ? __bfloat162float(loadg(cache_k + kv_base + dim)) : 0.0f;
-    float score = block_sum<BlockThreads>(q_value * k_value) * softmax_scale;
-    float new_m = fmaxf(m, score);
-    float old_scale = __expf(m - new_m);
-    float new_scale = __expf(score - new_m);
+  auto block = cg::tiled_partition<BlockThreads>(cg::this_thread_block());
+  for (int page_begin = split_begin; page_begin < split_end;) {
+    int32_t logical_page = gemma4_kv_cache_logical_page(config, page_begin);
+    int32_t page_offset = page_begin - logical_page * config.page_size;
+    int32_t page_token_count =
+        min(split_end - page_begin, config.page_size - page_offset);
+    int32_t physical_page = cg::invoke_one_broadcast(block, [&] {
+      int32_t slot = logical_page % config.max_pages_per_seq;
+      return __ldg(page_table + batch * config.max_pages_per_seq + slot);
+    });
 
-    if (dim < config.head_dim) {
-      float v_value = __bfloat162float(loadg(cache_v + kv_base + dim));
-      acc = acc * old_scale + v_value * new_scale;
+    if (physical_page >= 0) {
+      int64_t kv_page_base = gemma4_kv_cache_offset(
+          config, layer, physical_page, page_offset, kv_head, 0);
+      for (int page_token = 0; page_token < page_token_count; ++page_token) {
+        int64_t kv_base = kv_page_base + int64_t(page_token) * kv_token_stride;
+        float k_value =
+            dim < config.head_dim
+                ? __bfloat162float(loadg(cache_k + kv_base + dim))
+                : 0.0f;
+        float score = block_sum(block, q_value * k_value) * softmax_scale;
+        float new_m = fmaxf(m, score);
+        float old_scale = __expf(m - new_m);
+        float new_scale = __expf(score - new_m);
+
+        if (dim < config.head_dim) {
+          float v_value = __bfloat162float(loadg(cache_v + kv_base + dim));
+          acc = acc * old_scale + v_value * new_scale;
+        }
+        l = l * old_scale + new_scale;
+        m = new_m;
+      }
     }
-    l = l * old_scale + new_scale;
-    m = new_m;
+
+    page_begin += page_token_count;
   }
 
   if (dim == 0) {
@@ -228,12 +242,13 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_reduce_kernel(
   int row = batch * q_heads + q_head;
   int partial_row = row * num_splits;
   int64_t partial_acc_row = int64_t(row) * num_splits * head_dim;
+  auto block = cg::tiled_partition<BlockThreads>(cg::this_thread_block());
 
   float local_m = -INFINITY;
   for (int split = dim; split < num_splits; split += blockDim.x) {
     local_m = fmaxf(local_m, partial_m[partial_row + split]);
   }
-  float m = block_max<BlockThreads>(local_m);
+  float m = block_max(block, local_m);
   __shared__ float s_m;
   __shared__ float s_l;
   if (dim == 0) {
@@ -249,7 +264,7 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_reduce_kernel(
       local_l += split_l * __expf(split_m - s_m);
     }
   }
-  float l = block_sum<BlockThreads>(local_l);
+  float l = block_sum(block, local_l);
   if (dim == 0) {
     s_l = l;
   }
@@ -495,8 +510,9 @@ cudaError_t gemma4_paged_decode_attention_bf16(
     cudaStream_t stream) {
   if (!valid_config(config) || layer < 0 || layer >= config.num_layers ||
       batch_size <= 0 || q_heads < config.num_heads ||
-      q_heads % config.num_heads != 0 || split_size <= 0 ||
-      num_splits <= 0 || d_out == nullptr ||
+      q_heads % config.num_heads != 0 ||
+      !split_coverage_valid(config, split_size, num_splits) ||
+      d_out == nullptr ||
       d_partial_m == nullptr || d_partial_l == nullptr ||
       d_partial_acc == nullptr || d_q == nullptr || d_cache_k == nullptr ||
       d_cache_v == nullptr || d_page_table == nullptr ||
