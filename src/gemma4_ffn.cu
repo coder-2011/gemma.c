@@ -1,4 +1,4 @@
-#include "gemma4_ffn_decode.cuh"
+#include "gemma4_ffn.cuh"
 
 #ifndef GEMMA4_WEIGHT_LOAD_POLICY
 #define GEMMA4_WEIGHT_LOAD_POLICY 0
@@ -6,6 +6,19 @@
 
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_matmul_device.cuh"
+#include "gemma4_rmsnorm.cuh"
+
+#include <cutlass/array.h>
+#include <cutlass/epilogue/thread/activation.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+#include <cutlass/epilogue/thread/scale_type.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/numeric_conversion.h>
+#include <cutlass/numeric_types.h>
+
+#include "device/dual_gemm.h"
+
+#include <math.h>
 
 #ifndef GEMMA4_FFN_DECODE_ACT_TILE
 #define GEMMA4_FFN_DECODE_ACT_TILE 2
@@ -53,6 +66,8 @@ constexpr int kPreloadDown = GEMMA4_FFN_DECODE_PRELOAD_DOWN;
 constexpr int kReductionPolicy = GEMMA4_FFN_DECODE_REDUCTION_POLICY;
 constexpr int kPartialGroups = GEMMA4_FFN_DECODE_PARTIAL_GROUPS;
 constexpr int kAccumBlocksOverride = GEMMA4_FFN_DECODE_ACCUM_BLOCKS;
+constexpr int kSwizzleThreads = 96;
+constexpr int kActualSwizzleBlocksPerRow = 7;
 // Keep most CTAs one tile wide, while one hidden-pack wave folds a second tile.
 constexpr int kDefaultAccumBlocks = kIntermediateTiles - kHiddenPacks;
 constexpr int kAccumBlocks =
@@ -80,6 +95,12 @@ static_assert(kReductionPolicy == 0 || kReductionPolicy == 1,
               "FFN reduction policy must be 0=atomic or 1=partial groups");
 static_assert(kPartialGroups > 0 && kPartialGroups <= kIntermediateTiles,
               "FFN partial groups must be within the intermediate tile count");
+static_assert(kSwizzleThreads > 0 && kSwizzleThreads <= 1024 &&
+                  (kSwizzleThreads % WARP_SIZE) == 0,
+              "FFN swizzle threads must be a valid warp-multiple block size");
+static_assert(kActualSwizzleBlocksPerRow > 0 &&
+                  kActualSwizzleBlocksPerRow <= kHiddenPacks,
+              "FFN swizzle blocks per row must cover at least one pack");
 static_assert(kDefaultAccumBlocks > 0,
               "FFN default accumulate grid must be positive");
 static_assert(kAccumBlocks > 0 && kAccumBlocks <= kIntermediateTiles,
@@ -109,6 +130,43 @@ __device__ inline float gelu_tanh(float x) {
   const float inner = kSqrtTwoOverPi * (x + kGeluCubic * x * x2);
   return 0.5f * x * (1.0f + tanhf(inner));
 }
+
+template <typename ElementOutput_,
+          int Count,
+          typename ElementAccumulator_,
+          typename ElementCompute_,
+          cutlass::FloatRoundStyle Round =
+              cutlass::FloatRoundStyle::round_to_nearest>
+class GateGeluTanhUpMul {
+ public:
+  using ElementOutput = ElementOutput_;
+  using ElementAccumulator = ElementAccumulator_;
+  using ElementCompute = ElementCompute_;
+  using FragmentOutput = cutlass::Array<ElementOutput, Count>;
+  using FragmentAccumulator = cutlass::Array<ElementAccumulator, Count>;
+  using FragmentCompute = cutlass::Array<ElementCompute, Count>;
+
+  struct Params {};
+
+  CUTLASS_HOST_DEVICE
+  explicit GateGeluTanhUpMul(Params const &) {}
+
+  CUTLASS_HOST_DEVICE
+  FragmentOutput operator()(FragmentAccumulator const &gate,
+                            FragmentAccumulator const &up) const {
+    cutlass::NumericArrayConverter<ElementCompute, ElementAccumulator, Count,
+                                   Round>
+        to_compute;
+    cutlass::NumericArrayConverter<ElementOutput, ElementCompute, Count,
+                                   Round>
+        to_output;
+    FragmentCompute gate_compute = to_compute(gate);
+    FragmentCompute up_compute = to_compute(up);
+    cutlass::epilogue::thread::GELU_taylor<FragmentCompute> gelu;
+    cutlass::multiplies<FragmentCompute> multiply;
+    return to_output(multiply(gate_compute, gelu(up_compute)));
+  }
+};
 
 __device__ inline void accumulate_scaled_pack(
     float scale,
@@ -459,97 +517,217 @@ bool ffn_decode_args_valid(const floatX *residual_out,
          is_aligned_16(w_down_row_major) && is_aligned_128(scratch);
 }
 
-cudaError_t configure_dynamic_shared_memory() {
-  return cudaSuccess;
-}
-
 __global__ void swizzle_hidden_packs_kernel(
     floatX *__restrict__ dst,
     const floatX *__restrict__ src,
     int rows) {
-  const int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int row = static_cast<int>(blockIdx.y);
-  if (pack >= kHiddenPacks) {
+  if (row >= rows) {
     return;
   }
 
-  const int src_col = pack * kBf16Packed128Elements;
-  const int dst_col = hidden_pack_swizzle_index(pack) * kBf16Packed128Elements;
   const int64_t row_offset = static_cast<int64_t>(row) * GEMMA4_HIDDEN_SIZE;
-  const FfnBf16Pack pack_value = load128g(src + row_offset + src_col);
-  store128(dst + row_offset + dst_col, pack_value);
+  const int pack_stride = static_cast<int>(gridDim.x) * blockDim.x;
+  for (int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+       pack < kHiddenPacks; pack += pack_stride) {
+    const int src_col = pack * kBf16Packed128Elements;
+    const int dst_col =
+        hidden_pack_swizzle_index(pack) * kBf16Packed128Elements;
+    const FfnBf16Pack pack_value = load128g(src + row_offset + src_col);
+    store128(dst + row_offset + dst_col, pack_value);
+  }
 }
 
 __global__ void swizzle_gate_up_interleaved_kernel(
     floatX *__restrict__ dst,
     const floatX *__restrict__ src) {
-  const int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int dst_row = static_cast<int>(blockIdx.y);
-  if (pack >= kHiddenPacks) {
+  if (dst_row >= GEMMA4_PACKED_FFN_SIZE) {
     return;
   }
 
   const int src_row =
       (dst_row & 1) == 0 ? dst_row / 2
                          : GEMMA4_INTERMEDIATE_SIZE + dst_row / 2;
-  const int src_col = pack * kBf16Packed128Elements;
-  const int dst_col = hidden_pack_swizzle_index(pack) * kBf16Packed128Elements;
   const int64_t src_row_offset =
       static_cast<int64_t>(src_row) * GEMMA4_HIDDEN_SIZE;
   const int64_t dst_row_offset =
       static_cast<int64_t>(dst_row) * GEMMA4_HIDDEN_SIZE;
-  const FfnBf16Pack pack_value =
-      load128g(src + src_row_offset + src_col);
-  store128(dst + dst_row_offset + dst_col, pack_value);
+  const int pack_stride = static_cast<int>(gridDim.x) * blockDim.x;
+  for (int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+       pack < kHiddenPacks; pack += pack_stride) {
+    const int src_col = pack * kBf16Packed128Elements;
+    const int dst_col =
+        hidden_pack_swizzle_index(pack) * kBf16Packed128Elements;
+    const FfnBf16Pack pack_value =
+        load128g(src + src_row_offset + src_col);
+    store128(dst + dst_row_offset + dst_col, pack_value);
+  }
 }
 
-}  // namespace
-
-cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
-    floatX *__restrict__ w_gate_up_swizzled,
-    const floatX *__restrict__ w_gate_up_col_major,
-    floatX *__restrict__ w_down_swizzled,
-    const floatX *__restrict__ w_down_row_major,
+template <typename LayoutB,
+          int ThreadblockM,
+          int ThreadblockN,
+          int ThreadblockK,
+          int WarpM,
+          int WarpN,
+          int Stages>
+cudaError_t launch_cutlass_bf16_gemm(
+    const floatX *__restrict__ a,
+    const floatX *__restrict__ b,
+    floatX *__restrict__ c,
+    int m,
+    int k,
+    int n,
+    int ldb,
     cudaStream_t stream) {
-  if (w_gate_up_swizzled == nullptr || w_gate_up_col_major == nullptr ||
-      w_down_swizzled == nullptr || w_down_row_major == nullptr ||
-      !is_aligned_16(w_gate_up_swizzled) ||
-      !is_aligned_16(w_gate_up_col_major) ||
-      !is_aligned_16(w_down_swizzled) ||
-      !is_aligned_16(w_down_row_major)) {
+  using Element = cutlass::bfloat16_t;
+  using Gemm = cutlass::gemm::device::Gemm<
+      Element,
+      cutlass::layout::RowMajor,
+      Element,
+      LayoutB,
+      Element,
+      cutlass::layout::RowMajor,
+      float,
+      cutlass::arch::OpClassTensorOp,
+      cutlass::arch::Sm80,
+      cutlass::gemm::GemmShape<ThreadblockM, ThreadblockN, ThreadblockK>,
+      cutlass::gemm::GemmShape<WarpM, WarpN, ThreadblockK>,
+      cutlass::gemm::GemmShape<16, 8, 16>,
+      cutlass::epilogue::thread::LinearCombination<Element, 8, float, float>,
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+      Stages>;
+
+  typename Gemm::Arguments args(
+      {m, n, k},
+      {reinterpret_cast<const Element *>(a), k},
+      {reinterpret_cast<const Element *>(b), ldb},
+      {reinterpret_cast<Element *>(c), n},
+      {reinterpret_cast<Element *>(c), n},
+      {1.0f, 0.0f});
+
+  Gemm gemm;
+  const cutlass::Status status = gemm(args, nullptr, stream);
+  if (status != cutlass::Status::kSuccess) {
     return cudaErrorInvalidValue;
   }
-
-  constexpr int threads = 256;
-  const dim3 block_dim(threads);
-  const dim3 gate_up_grid_dim(div_up(kHiddenPacks, threads),
-                              GEMMA4_PACKED_FFN_SIZE);
-  swizzle_gate_up_interleaved_kernel<<<
-      gate_up_grid_dim, block_dim, 0, stream>>>(
-      w_gate_up_swizzled, w_gate_up_col_major);
-  cudaError_t status = cudaGetLastError();
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  const dim3 down_grid_dim(div_up(kHiddenPacks, threads),
-                           GEMMA4_INTERMEDIATE_SIZE);
-  swizzle_hidden_packs_kernel<<<down_grid_dim, block_dim, 0, stream>>>(
-      w_down_swizzled, w_down_row_major, GEMMA4_INTERMEDIATE_SIZE);
   return cudaGetLastError();
 }
 
-cudaError_t gemma4_ffn_decode_configure_scratch_l2(
-    Gemma4FfnDecodeScratch *scratch,
+cudaError_t run_prefill_gate_up_geglu_dual_gemm(
+    floatX *__restrict__ act,
+    const floatX *__restrict__ x,
+    const floatX *__restrict__ w_gate_up_col_major,
+    int rows,
     cudaStream_t stream) {
-  (void)stream;
-  if (scratch == nullptr || !is_aligned_128(scratch)) {
+  using Element = cutlass::bfloat16_t;
+  using ThreadblockShape = cutlass::gemm::GemmShape<128, 64, 32>;
+  using WarpShape = cutlass::gemm::GemmShape<64, 32, 32>;
+  using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+  using OutputOp0 = cutlass::epilogue::thread::LinearCombination<
+      Element, 8, float, float,
+      cutlass::epilogue::thread::ScaleType::Nothing>;
+  using OutputOp1 = OutputOp0;
+  using OutputOp2 = GateGeluTanhUpMul<Element, 8, Element, float>;
+  using DualGemm = cutlass::gemm::device::DualGemm<
+      Element,
+      cutlass::layout::RowMajor,
+      Element,
+      cutlass::layout::ColumnMajor,
+      cutlass::layout::ColumnMajor,
+      Element,
+      cutlass::layout::RowMajor,
+      float,
+      cutlass::arch::OpClassTensorOp,
+      cutlass::arch::Sm80,
+      ThreadblockShape,
+      WarpShape,
+      InstructionShape,
+      OutputOp0,
+      OutputOp1,
+      OutputOp2,
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
+      3,
+      false,
+      false,
+      false>;
+
+  const Element *w_gate =
+      reinterpret_cast<const Element *>(w_gate_up_col_major);
+  const Element *w_up = w_gate +
+      static_cast<int64_t>(GEMMA4_HIDDEN_SIZE) * GEMMA4_INTERMEDIATE_SIZE;
+  const Element *act_const = reinterpret_cast<const Element *>(act);
+  typename DualGemm::TensorRefD null_ref{};
+
+  typename DualGemm::Arguments args(
+      cutlass::gemm::DualGemmMode::kGemm,
+      {rows, GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE},
+      {reinterpret_cast<const Element *>(x), GEMMA4_HIDDEN_SIZE},
+      {w_gate, GEMMA4_HIDDEN_SIZE},
+      {act_const, GEMMA4_INTERMEDIATE_SIZE},
+      null_ref,
+      {w_up, GEMMA4_HIDDEN_SIZE},
+      {act_const, GEMMA4_INTERMEDIATE_SIZE},
+      null_ref,
+      {reinterpret_cast<Element *>(act), GEMMA4_INTERMEDIATE_SIZE},
+      typename OutputOp0::Params(),
+      typename OutputOp1::Params(),
+      typename OutputOp2::Params());
+
+  DualGemm gemm;
+  cutlass::Status status = gemm.can_implement(args);
+  if (status != cutlass::Status::kSuccess) {
     return cudaErrorInvalidValue;
   }
-  return cudaSuccess;
+  status = gemm(args, nullptr, stream);
+  if (status != cutlass::Status::kSuccess) {
+    return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
 }
 
-cudaError_t gemma4_ffn_decode_fused_bf16(
+cudaError_t launch_prefill_down_gemm(
+    const floatX *__restrict__ act,
+    const floatX *__restrict__ w_down_row_major,
+    floatX *__restrict__ down,
+    int rows,
+    cudaStream_t stream) {
+  if (rows <= 128) {
+    return launch_cutlass_bf16_gemm<cutlass::layout::RowMajor, 64, 128, 64,
+                                    32, 64, 3>(
+        act, w_down_row_major, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+        GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
+  }
+  return launch_cutlass_bf16_gemm<cutlass::layout::RowMajor, 128, 128, 64,
+                                  64, 64, 3>(
+      act, w_down_row_major, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+      GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
+}
+
+bool ffn_common_args_valid(const Gemma4FfnBf16Args &args) {
+  return args.rows >= 0 && args.residual_out != nullptr &&
+         args.normed_out != nullptr && args.x != nullptr &&
+         args.residual != nullptr && args.rms_weight != nullptr &&
+         is_aligned_16(args.residual_out) && is_aligned_16(args.normed_out) &&
+         is_aligned_16(args.x) && is_aligned_16(args.residual) &&
+         is_aligned_16(args.rms_weight);
+}
+
+bool ffn_prefill_args_valid(const Gemma4FfnBf16Args &args) {
+  return ffn_common_args_valid(args) && args.rows > 1 &&
+         args.w_gate_up_prefill_col_major != nullptr &&
+         args.w_down_prefill_row_major != nullptr &&
+         args.prefill_scratch.act != nullptr &&
+         args.prefill_scratch.down != nullptr &&
+         args.prefill_scratch.capacity_rows >= args.rows &&
+         is_aligned_16(args.w_gate_up_prefill_col_major) &&
+         is_aligned_16(args.w_down_prefill_row_major) &&
+         is_aligned_16(args.prefill_scratch.act) &&
+         is_aligned_16(args.prefill_scratch.down);
+}
+
+cudaError_t gemma4_ffn_decode_fused_bf16_impl(
     floatX *__restrict__ residual_out,
     floatX *__restrict__ normed_out,
     const floatX *__restrict__ x,
@@ -566,12 +744,7 @@ cudaError_t gemma4_ffn_decode_fused_bf16(
     return cudaErrorInvalidValue;
   }
 
-  cudaError_t status = configure_dynamic_shared_memory();
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  status = cudaMemsetAsync(scratch, 0, sizeof(*scratch), stream);
+  cudaError_t status = cudaMemsetAsync(scratch, 0, sizeof(*scratch), stream);
   if (status != cudaSuccess) {
     return status;
   }
@@ -593,4 +766,130 @@ cudaError_t gemma4_ffn_decode_fused_bf16(
   gemma4_ffn_decode_finalize_bf16_kernel<<<1, kFfnThreads, 0, stream>>>(
       residual_out, normed_out, residual, rms_weight, scratch, eps);
   return cudaGetLastError();
+}
+
+cudaError_t gemma4_ffn_prefill_bf16_impl(const Gemma4FfnBf16Args &args) {
+  if (!ffn_prefill_args_valid(args)) {
+    return cudaErrorInvalidValue;
+  }
+
+  cudaError_t status = run_prefill_gate_up_geglu_dual_gemm(
+      args.prefill_scratch.act, args.x, args.w_gate_up_prefill_col_major,
+      args.rows, args.stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  status = launch_prefill_down_gemm(
+      args.prefill_scratch.act, args.w_down_prefill_row_major,
+      args.prefill_scratch.down, args.rows, args.stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  return gemma4_residual_add_rmsnorm_bf16(
+      args.residual_out, args.normed_out, args.prefill_scratch.down,
+      args.residual, args.rms_weight, args.rows, GEMMA4_HIDDEN_SIZE,
+      args.eps, args.stream);
+}
+
+}  // namespace
+
+cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
+    floatX *__restrict__ w_gate_up_swizzled,
+    const floatX *__restrict__ w_gate_up_col_major,
+    floatX *__restrict__ w_down_swizzled,
+    const floatX *__restrict__ w_down_row_major,
+    cudaStream_t stream) {
+  if (w_gate_up_swizzled == nullptr || w_gate_up_col_major == nullptr ||
+      w_down_swizzled == nullptr || w_down_row_major == nullptr ||
+      !is_aligned_16(w_gate_up_swizzled) ||
+      !is_aligned_16(w_gate_up_col_major) ||
+      !is_aligned_16(w_down_swizzled) ||
+      !is_aligned_16(w_down_row_major)) {
+    return cudaErrorInvalidValue;
+  }
+
+  const dim3 block_dim(kSwizzleThreads);
+  const dim3 gate_up_grid_dim(kActualSwizzleBlocksPerRow,
+                              GEMMA4_PACKED_FFN_SIZE);
+  swizzle_gate_up_interleaved_kernel<<<
+      gate_up_grid_dim, block_dim, 0, stream>>>(
+      w_gate_up_swizzled, w_gate_up_col_major);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  const dim3 down_grid_dim(kActualSwizzleBlocksPerRow,
+                           GEMMA4_INTERMEDIATE_SIZE);
+  swizzle_hidden_packs_kernel<<<down_grid_dim, block_dim, 0, stream>>>(
+      w_down_swizzled, w_down_row_major, GEMMA4_INTERMEDIATE_SIZE);
+  return cudaGetLastError();
+}
+
+cudaError_t gemma4_ffn_decode_configure_scratch_l2(
+    Gemma4FfnDecodeScratch *scratch,
+    cudaStream_t stream) {
+  (void)stream;
+  if (scratch == nullptr || !is_aligned_128(scratch)) {
+    return cudaErrorInvalidValue;
+  }
+  return cudaSuccess;
+}
+
+size_t gemma4_ffn_prefill_scratch_elements(int rows) {
+  constexpr size_t per_row =
+      static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) +
+      static_cast<size_t>(GEMMA4_HIDDEN_SIZE);
+  return rows <= 0 ? 0 : static_cast<size_t>(rows) * per_row;
+}
+
+Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
+    floatX *buffer,
+    int rows) {
+  Gemma4FfnPrefillScratch scratch = {};
+  scratch.capacity_rows = rows;
+  if (buffer == nullptr || rows <= 0) {
+    return scratch;
+  }
+
+  const size_t act_elements =
+      static_cast<size_t>(rows) * GEMMA4_INTERMEDIATE_SIZE;
+  scratch.gate_up = nullptr;
+  scratch.act = buffer;
+  scratch.down = scratch.act + act_elements;
+  return scratch;
+}
+
+cudaError_t gemma4_ffn_bf16(const Gemma4FfnBf16Args &args) {
+  if (args.rows <= 0) {
+    return args.rows == 0 ? cudaSuccess : cudaErrorInvalidValue;
+  }
+  if (!ffn_common_args_valid(args)) {
+    return cudaErrorInvalidValue;
+  }
+  if (args.rows == 1) {
+    return gemma4_ffn_decode_fused_bf16_impl(
+        args.residual_out, args.normed_out, args.x, args.residual,
+        args.rms_weight, args.w_gate_up_decode, args.w_down_decode,
+        args.decode_scratch, args.eps, args.stream);
+  }
+  return gemma4_ffn_prefill_bf16_impl(args);
+}
+
+cudaError_t gemma4_ffn_decode_fused_bf16(
+    floatX *__restrict__ residual_out,
+    floatX *__restrict__ normed_out,
+    const floatX *__restrict__ x,
+    const floatX *__restrict__ residual,
+    const floatX *__restrict__ rms_weight,
+    const floatX *__restrict__ w_gate_up_col_major,
+    const floatX *__restrict__ w_down_row_major,
+    Gemma4FfnDecodeScratch *__restrict__ scratch,
+    float eps,
+    cudaStream_t stream) {
+  return gemma4_ffn_decode_fused_bf16_impl(
+      residual_out, normed_out, x, residual, rms_weight,
+      w_gate_up_col_major, w_down_row_major, scratch, eps, stream);
 }
