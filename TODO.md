@@ -396,6 +396,7 @@ Experimental and benchmark-owned kernels:
   - Target decode first: `x @ Wk` / `x @ Wv` should produce final cache values without a contiguous K/V scratch buffer.
   - The epilogue must preserve Gemma semantics: K gets per-head RMSNorm plus RoPE, V gets scale-free RMSNorm, then both scatter into Layout-A paged cache.
   - Benchmark against the lazier baseline first: cuBLAS/cuBLASLt projection into contiguous raw K/V plus fused norm/RoPE/V-norm paged-cache write.
+
 ## Future Unfused Inference Buildout Notes
 
 These are future model-path buildout notes, not remaining decisions for the current
