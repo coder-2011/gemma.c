@@ -12770,3 +12770,69 @@ Conclusion:
 - The next performance pass should keep the public API and replace the serial
   per-warp dot-product work with a parallel head-fragment or L2-mailbox design
   that preserves small handoff state without staging the full raw QKV tensor.
+
+## 2026-06-19 - Global paged decode vs PyTorch graph cold-cache benchmark
+
+Question:
+
+- Measure the newly generalized global paged decode attention path against a
+  PyTorch GQA implementation over the same paged cache layout, with cold-cache
+  timing and launch overhead excluded.
+
+Change:
+
+- Added `src/experiments/gemma4_global_decode_torch_bench.py`, a small Python
+  benchmark that imports `gemma4_flash_attention_decode_paged_bf16` from
+  `build/libgemma4_flash_attention.so` via `ctypes`.
+- The custom and PyTorch paths are both captured into CUDA graphs. Timing uses
+  CUDA events on the current PyTorch stream around graph replay.
+- Cold-cache timing writes a 128 MiB device buffer before each measured replay,
+  then records the start event after the flush so the flush is ordered but not
+  included in elapsed time.
+- The script records an empty CUDA event-pair timing and reports both raw and
+  timer-corrected medians.
+
+Command:
+
+```bash
+python3 src/experiments/gemma4_global_decode_torch_bench.py \
+  --seq-len 4096 --page-size 64 --split-size 64 \
+  --warmup 10 --iters 10 --samples 10 \
+  --cache cold --flush-mib 128 --sample-delay-s 1.0 \
+  --json src/experiments/results/2026-06-19_global_decode_torch_graph_cold_rebench.json
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`.
+- Clock policy: not locked. JSON snapshot reported `1800 MHz` SM,
+  `7601 MHz` memory, `83.32 W`, `36 C`, and `P2`.
+- Shape: global decode, `B=1`, `q_len=1`, `seq_len=4096`, `page_size=64`,
+  `split_size=64`, `num_splits=64`, BF16, `q_heads=32`, `kv_heads=4`,
+  `head_dim=512`.
+- Timing: CUDA events on the current PyTorch stream around CUDA graph replay.
+  CPU launch and host wall time are excluded.
+- Cache policy: cold-cache, 128 MiB dummy device write before each measured
+  replay, excluded from the event span.
+- Repeats: 10 warmups, 10 measured replays per sample, 10 samples.
+- Delay: one second host sleep before each measured sample, outside the event
+  window.
+- Correctness: custom-vs-PyTorch max absolute diff was
+  `0.00000095367431640625`.
+
+Cold-cache result:
+
+```text
+path                         median ms  corrected median ms  IQR ms    p95 ms    speedup
+PyTorch global decode graph   0.519003   0.516677             0.001690  0.525854  baseline
+custom global decode          0.420848   0.418522             0.000126  0.422695  1.23x raw / 1.23x corrected
+```
+
+Conclusion:
+
+- The generalized custom global decode path is `1.23x` faster than the
+  graph-captured PyTorch baseline at this cold-cache `S=4096` shape.
+- Remaining threats: clocks were not locked, this is one process on one GPU,
+  and the cold-cache mode uses a synthetic L2 flush rather than an end-to-end
+  serving trace.

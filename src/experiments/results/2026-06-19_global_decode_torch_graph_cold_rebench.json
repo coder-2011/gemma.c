@@ -1,0 +1,128 @@
+{
+  "contract": {
+    "measurement": "single-token global paged decode attention latency",
+    "timing": "CUDA events on current PyTorch CUDA stream",
+    "execution": "CUDA graph replay for custom CUDA and PyTorch paths",
+    "cache_mode": "cold",
+    "l2_flush_bytes": 134217728,
+    "flush_timing": "flush enqueued before start event and excluded from elapsed time",
+    "sample_delay_s": 1.0,
+    "delay_location": "host sleep before each measured sample, outside event window",
+    "launch_overhead": "CPU launch overhead excluded by CUDA graph replay and CUDA events",
+    "timer_overhead": "empty CUDA event-pair median reported and subtracted in corrected medians",
+    "warmup": 10,
+    "iters_per_sample": 10,
+    "graph_inner_iters": 1,
+    "samples": 10,
+    "min_effect_for_claim_pct": 5
+  },
+  "shape": {
+    "batch_size": 1,
+    "seq_len": 4096,
+    "page_size": 64,
+    "split_size": 64,
+    "num_splits": 64,
+    "q_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 512,
+    "dtype": "bf16"
+  },
+  "environment": {
+    "nvidia_smi": "NVIDIA RTX A6000, 00000000:09:00.0, 580.126.16, Enabled, Disabled, [N/A], 300.00, 83.32, 1800, 7601, 36, P2, 0, 49140",
+    "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Wed_Jul_16_07:30:01_PM_PDT_2025\nCuda compilation tools, release 13.0, V13.0.48\nBuild cuda_13.0.r13.0/compiler.36260728_0",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "device": "NVIDIA RTX A6000",
+    "git_head": "4aa7de071c832f1269f3496149c20fd6414b132f",
+    "git_status_short": "M build/libgemma4_flash_attention.so\n M build/tests/test_kv_cache\n M build/tests/test_rope\n M src/experiments/EXPERIMENTS.md\n M src/experiments/gemma4_project_prepare_compare.py\n M src/gemma4_flash_attention.cu\n M src/gemma4_flash_attention.cuh\n M tests/test_kv_cache.cu\n?? praxis/\n?? src/experiments/gemma4_global_decode_torch_bench.py\n?? src/experiments/results/2026-06-19_global_decode_torch_graph_cold.json\n?? src/experiments/results/2026-06-19_paged_decode_torch_graph_cold.json\n?? src/experiments/results/2026-06-19_paged_decode_torch_graph_warm.json\n?? src/experiments/results/2026-06-19_project_prepare_compare_cold.json"
+  },
+  "correctness": {
+    "custom_vs_pytorch_max_abs": 9.5367431640625e-07,
+    "atol": 0.002
+  },
+  "timings": {
+    "timer_empty_event_pair": {
+      "median_ms": 0.0023264000541530546,
+      "mean_ms": 0.0034134400519542397,
+      "trimmed_mean_ms": 0.0028244000568520278,
+      "min_ms": 0.0022720000706613064,
+      "max_ms": 0.009267199994064867,
+      "p95_ms": 0.007182080042548481,
+      "p99_ms": 0.00885017600376159,
+      "stddev_ms": 0.002119014297471313,
+      "iqr_ms": 0.001392799953464419,
+      "samples_ms": [
+        0.004118399997241795,
+        0.0022720000706613064,
+        0.0022944000782445075,
+        0.009267199994064867,
+        0.0022784000495448707,
+        0.0023456000490114093,
+        0.0022720000706613064,
+        0.0023296000668779015,
+        0.004633600101806223,
+        0.002323200041428208
+      ]
+    },
+    "custom_global_decode": {
+      "median_ms": 0.4208479955792427,
+      "mean_ms": 0.42112031906843184,
+      "trimmed_mean_ms": 0.4208099987357855,
+      "min_ms": 0.42055040001869204,
+      "max_ms": 0.42417280077934266,
+      "p95_ms": 0.42269536226987836,
+      "p99_ms": 0.4238773130774498,
+      "stddev_ms": 0.0010239290385428,
+      "iqr_ms": 0.00012560188770305292,
+      "samples_ms": [
+        0.42055040001869204,
+        0.4208703964948654,
+        0.42417280077934266,
+        0.42081920206546786,
+        0.42087039947509763,
+        0.4208896040916443,
+        0.4205951988697052,
+        0.42072959542274474,
+        0.42082559466362,
+        0.42087999880313876
+      ],
+      "timer_overhead_ms": 0.0023264000541530546,
+      "corrected_median_ms": 0.4185215955250896
+    },
+    "pytorch_global_decode_graph": {
+      "median_ms": 0.5190032035112382,
+      "mean_ms": 0.5205552023649216,
+      "trimmed_mean_ms": 0.5199904017150402,
+      "min_ms": 0.5187424063682556,
+      "max_ms": 0.5268864035606384,
+      "p95_ms": 0.5258539220690728,
+      "p99_ms": 0.5266799072623253,
+      "stddev_ms": 0.00271540306796205,
+      "iqr_ms": 0.0016903907060623613,
+      "samples_ms": [
+        0.5187424063682556,
+        0.5194368064403534,
+        0.5210464000701904,
+        0.5189728021621705,
+        0.5189472138881683,
+        0.5189920008182526,
+        0.5189215838909149,
+        0.5190144062042237,
+        0.5268864035606384,
+        0.524592000246048
+      ],
+      "timer_overhead_ms": 0.0023264000541530546,
+      "corrected_median_ms": 0.5166768034570851
+    }
+  },
+  "speedups": {
+    "custom_vs_pytorch_raw_median": 1.233231972025666,
+    "custom_vs_pytorch_corrected_median": 1.2345284185606888
+  },
+  "threats": [
+    "clocks were recorded but not locked",
+    "single process on one GPU only",
+    "synthetic L2 flush is best-effort and not a serving trace",
+    "PyTorch baseline is graph-captured operator code, not an end-to-end server path"
+  ]
+}
