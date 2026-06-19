@@ -8,6 +8,15 @@
 
 #include "gemma4_kv_cache.cuh"
 
+struct Gemma4AttentionProjectionWeights {
+  const __nv_bfloat16 *d_q_col_major;
+  const __nv_bfloat16 *d_k_col_major;
+  const __nv_bfloat16 *d_v_col_major;
+  int32_t q_col_base;
+  int32_t k_col_base;
+  int32_t v_col_base;
+};
+
 extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     __nv_bfloat16 *__restrict__ d_out,
     // Optional. Pass nullptr for inference paths that do not need LSE.
@@ -78,7 +87,42 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_project_prepare_pag
     const float *__restrict__ d_sin,
     cudaStream_t stream);
 
+extern "C" cudaError_t gemma4_flash_attention_decode_project_prepare_paged_kv_bf16(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_cache_k,
+    __nv_bfloat16 *__restrict__ d_cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_token_position,
+    int32_t batch_size,
+    int32_t cache_layer,
+    const __nv_bfloat16 *__restrict__ d_x,
+    Gemma4AttentionProjectionWeights weights,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    cudaStream_t stream);
+
 extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_bf16(
+    __nv_bfloat16 *__restrict__ d_out,
+    float *__restrict__ d_partial_m,
+    float *__restrict__ d_partial_l,
+    float *__restrict__ d_partial_acc,
+    const __nv_bfloat16 *__restrict__ d_q_prepared,
+    const __nv_bfloat16 *__restrict__ d_cache_k,
+    const __nv_bfloat16 *__restrict__ d_cache_v,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_seq_lengths,
+    Gemma4KvCacheConfig cache_config,
+    int32_t cache_layer,
+    int32_t batch_size,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits,
+    cudaStream_t stream);
+
+extern "C" cudaError_t gemma4_flash_attention_decode_paged_bf16(
     __nv_bfloat16 *__restrict__ d_out,
     float *__restrict__ d_partial_m,
     float *__restrict__ d_partial_l,

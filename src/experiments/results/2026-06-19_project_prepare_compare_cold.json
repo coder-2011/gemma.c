@@ -1,0 +1,78 @@
+{
+  "contract": {
+    "measurement": "typical latency for project->prepare stream work",
+    "timing": "CUDA events on current stream; CPU enqueue/host wall time excluded",
+    "cache": "cold-ish L2 flushed before each measured run; flush excluded from timing",
+    "launch_overhead": "CPU launch overhead excluded by CUDA event timing",
+    "stability_scope": "single process, single GPU",
+    "minimum_effect_size_pct": 5.0,
+    "warmup": 5,
+    "iters_per_sample": 5,
+    "sample_count": 7,
+    "flush_mb": 64,
+    "shape": {
+      "batch": 1,
+      "seq_len": 1024,
+      "hidden": 5376,
+      "qkv": 16384,
+      "dtype": "bf16"
+    },
+    "seed": 0,
+    "correctness_max_abs": 0.03125
+  },
+  "environment": {
+    "nvidia_smi": "NVIDIA RTX A6000, 00000000:06:00.0, 580.126.16, Enabled, Disabled, [N/A], 300.00, 89.34, 1800, 7601, 32, 22, 49140",
+    "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Wed_Jul_16_07:30:01_PM_PDT_2025\nCuda compilation tools, release 13.0, V13.0.48\nBuild cuda_13.0.r13.0/compiler.36260728_0",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "device": "NVIDIA RTX A6000",
+    "git_head": "4aa7de071c832f1269f3496149c20fd6414b132f",
+    "git_status_short": "M build/libgemma4_flash_attention.so",
+    "build_command": "make -B build/libgemma4_flash_attention.so NVCC=/usr/local/cuda/bin/nvcc"
+  },
+  "results": {
+    "pytorch_project_prepare": {
+      "samples_ms": [
+        6.602144050598144,
+        5.649081611633301,
+        5.063238334655762,
+        5.791500854492187,
+        4.9928511619567875,
+        4.877894306182862,
+        3.272217559814453
+      ],
+      "median_ms": 5.063238334655762,
+      "trimmed_mean_ms": 5.27491325378418,
+      "min_ms": 3.272217559814453,
+      "max_ms": 6.602144050598144,
+      "iqr_ms": 0.7849184989929192,
+      "stddev_ms": 0.9558845345944931
+    },
+    "custom_project_prepare": {
+      "samples_ms": [
+        2.660300779342651,
+        2.686355209350586,
+        2.7127424240112306,
+        2.6425024032592774,
+        2.686508798599243,
+        2.8561024188995363,
+        2.745331144332886
+      ],
+      "median_ms": 2.686508798599243,
+      "trimmed_mean_ms": 2.6982476711273193,
+      "min_ms": 2.6425024032592774,
+      "max_ms": 2.8561024188995363,
+      "iqr_ms": 0.055708789825439364,
+      "stddev_ms": 0.06620566223289842
+    },
+    "vllm_project_prepare": {
+      "skipped": "No module named 'vllm'"
+    }
+  },
+  "threats": [
+    "clocks not locked",
+    "single process only",
+    "L2 flush is a best-effort dummy write",
+    "vLLM unavailable on this machine"
+  ]
+}
