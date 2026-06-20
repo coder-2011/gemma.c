@@ -3,72 +3,19 @@
 #include "gemma4.h"
 #include "gemma4_cuda_utils.cuh"
 
-#include <cub/thread/thread_load.cuh>
-#include <cub/thread/thread_store.cuh>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cute/tensor.hpp>
 
 #include <algorithm>
 #include <cmath>
 
 namespace {
 namespace cg = cooperative_groups;
-using namespace cute;
 
-constexpr int kKvWriteThreads = 256;
 constexpr int kKvWriteVecThreads = WARP_SIZE;
-
-// Validate the cache geometry before host launchers trust page-table math.
-bool valid_config(const Gemma4KvCacheConfig &config) {
-  if (config.num_layers <= 0 || config.num_pages <= 0 ||
-      config.page_size <= 0 || config.max_pages_per_seq <= 0 ||
-      config.num_heads <= 0 || config.head_dim <= 0 ||
-      config.head_dim > 512 || config.window_size < 0) {
-    return false;
-  }
-  int32_t min_window_pages = 1;
-  if (config.window_size > 0) {
-    min_window_pages = div_up(config.window_size, config.page_size) + 1;
-  }
-  return config.max_pages_per_seq >= min_window_pages;
-}
-
-// Scalar fallback writer for uncommon head widths that are not 128-bit aligned.
-__global__ __launch_bounds__(kKvWriteThreads) void kv_cache_write_kernel(
-    __nv_bfloat16 *__restrict__ cache_k,
-    __nv_bfloat16 *__restrict__ cache_v,
-    Gemma4KvCacheConfig config,
-    const int32_t *__restrict__ page_table,
-    const int32_t *__restrict__ token_batch,
-    const int32_t *__restrict__ token_position,
-    int32_t token_count,
-    int32_t layer,
-    const __nv_bfloat16 *__restrict__ k,
-    const __nv_bfloat16 *__restrict__ v) {
-  int token = blockIdx.x;
-  int head = blockIdx.y;
-  int dim = threadIdx.x;
-  if (token >= token_count || head >= config.num_heads) return;
-
-  int batch = token_batch[token];
-  int position = token_position[token];
-  int logical_page = position / config.page_size;
-  int slot = logical_page % config.max_pages_per_seq;
-  int page_offset = position - logical_page * config.page_size;
-  auto page_table_layout = make_layout(make_shape(token_count, config.max_pages_per_seq), make_stride(config.max_pages_per_seq, 1));
-  int physical_page = __ldg(page_table + page_table_layout(batch, slot));
-  if (physical_page < 0 || physical_page >= config.num_pages) return;
-
-  auto token_layout = make_layout(make_shape(token_count, config.num_heads, config.head_dim), make_stride(int64_t(config.num_heads) * config.head_dim, config.head_dim, 1));
-  auto cache_layout = gemma4_kv_cache_layout(config);
-  int64_t dst = cache_layout(layer, physical_page, page_offset, head, 0);
-
-  for (int d = dim; d < config.head_dim; d += blockDim.x) {
-    int64_t src = token_layout(token, head, d);
-    cache_k[dst + d] = k[src];
-    cache_v[dst + d] = v[src];
-  }
-}
+constexpr int kKvWritePackElements = kBf16Packed128Elements;
+using KvWriteCopyAtom = cute::Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<128>, __nv_bfloat16>;
 
 // Vectorized writer for Gemma K/V heads, copying one 128-bit pack per lane step.
 __global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
@@ -92,39 +39,37 @@ __global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
   int logical_page = position / config.page_size;
   int slot = logical_page % config.max_pages_per_seq;
   int page_offset = position - logical_page * config.page_size;
-  auto page_table_layout = make_layout(
-      make_shape(token_count, config.max_pages_per_seq),
-      make_stride(config.max_pages_per_seq, 1));
-  int physical_page = __ldg(page_table + page_table_layout(batch, slot));
+  auto page_table_layout = cute::make_layout(
+      cute::make_shape(token_count, config.max_pages_per_seq),
+      cute::make_stride(config.max_pages_per_seq, 1));
+  auto block = cg::tiled_partition<kKvWriteVecThreads>(cg::this_thread_block());
+  int physical_page = cg::invoke_one_broadcast(block, [&] {
+    return __ldcg(page_table + page_table_layout(batch, slot));
+  });
   if (physical_page < 0 || physical_page >= config.num_pages) return;
 
   int vecs_per_head = config.head_dim / kBf16Packed128Elements;
-  auto token_vec_layout = make_layout(
-      make_shape(token_count, config.num_heads, vecs_per_head),
-      make_stride(int64_t(config.num_heads) * vecs_per_head,
-                  vecs_per_head, 1));
-  auto cache_vec_layout = make_layout(
-      make_shape(config.num_layers, config.num_pages, config.page_size,
-                 config.num_heads, vecs_per_head),
-      make_stride(int64_t(config.num_pages) * config.page_size *
-                      config.num_heads * vecs_per_head,
-                  int64_t(config.page_size) * config.num_heads *
-                      vecs_per_head,
-                  int64_t(config.num_heads) * vecs_per_head, vecs_per_head,
-                  1));
-  const int4 *src_k = reinterpret_cast<const int4 *>(k);
-  const int4 *src_v = reinterpret_cast<const int4 *>(v);
-  int4 *dst_k = reinterpret_cast<int4 *>(cache_k);
-  int4 *dst_v = reinterpret_cast<int4 *>(cache_v);
+  auto token_vec_layout = cute::make_layout(
+      cute::make_shape(token_count, config.num_heads, vecs_per_head),
+      cute::make_stride(int64_t(config.num_heads) * vecs_per_head,
+                        vecs_per_head, 1));
+  auto cache_vec_layout = cute::make_layout(
+      cute::make_shape(config.num_layers, config.num_pages, config.page_size,
+                       config.num_heads, vecs_per_head),
+      cute::make_stride(int64_t(config.num_pages) * config.page_size * config.num_heads * vecs_per_head,
+                        int64_t(config.page_size) * config.num_heads * vecs_per_head,
+                        int64_t(config.num_heads) * vecs_per_head, vecs_per_head, 1));
 
+  KvWriteCopyAtom copy_atom;
   for (int i = vec; i < vecs_per_head; i += blockDim.x) {
-    int64_t src_vec = token_vec_layout(token, head, i);
-    int64_t dst_vec =
-        cache_vec_layout(layer, physical_page, page_offset, head, i);
-    cub::ThreadStore<cub::STORE_CG>(
-        dst_k + dst_vec, cub::ThreadLoad<cub::LOAD_LDG>(src_k + src_vec));
-    cub::ThreadStore<cub::STORE_CG>(
-        dst_v + dst_vec, cub::ThreadLoad<cub::LOAD_LDG>(src_v + src_vec));
+    int64_t src = token_vec_layout(token, head, i) * kKvWritePackElements;
+    int64_t dst = cache_vec_layout(layer, physical_page, page_offset, head, i) * kKvWritePackElements;
+    auto src_k = cute::make_tensor(cute::make_gmem_ptr(k + src), cute::make_shape(cute::Int<kKvWritePackElements>{}));
+    auto src_v = cute::make_tensor(cute::make_gmem_ptr(v + src), cute::make_shape(cute::Int<kKvWritePackElements>{}));
+    auto dst_k = cute::make_tensor(cute::make_gmem_ptr(cache_k + dst), cute::make_shape(cute::Int<kKvWritePackElements>{}));
+    auto dst_v = cute::make_tensor(cute::make_gmem_ptr(cache_v + dst), cute::make_shape(cute::Int<kKvWritePackElements>{}));
+    cute::copy(copy_atom, src_k, dst_k);
+    cute::copy(copy_atom, src_v, dst_v);
   }
 }
 
@@ -157,19 +102,19 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_split_kernel(
   int key_count = seq_len - first_key;
   int split_begin = first_key + split * split_size;
   int split_end = min(first_key + key_count, split_begin + split_size);
-  auto page_table_layout = make_layout(
-      make_shape(gridDim.x, config.max_pages_per_seq),
-      make_stride(config.max_pages_per_seq, 1));
-  auto q_layout = make_layout(
-      make_shape(gridDim.x, q_heads, config.head_dim),
-      make_stride(int64_t(q_heads) * config.head_dim, config.head_dim, 1));
-  auto partial_layout = make_layout(
-      make_shape(gridDim.x, q_heads, num_splits),
-      make_stride(q_heads * num_splits, num_splits, 1));
-  auto partial_acc_layout = make_layout(
-      make_shape(gridDim.x, q_heads, num_splits, config.head_dim),
-      make_stride(int64_t(q_heads) * num_splits * config.head_dim,
-                  num_splits * config.head_dim, config.head_dim, 1));
+  auto page_table_layout = cute::make_layout(
+      cute::make_shape(gridDim.x, config.max_pages_per_seq),
+      cute::make_stride(config.max_pages_per_seq, 1));
+  auto q_layout = cute::make_layout(
+      cute::make_shape(gridDim.x, q_heads, config.head_dim),
+      cute::make_stride(int64_t(q_heads) * config.head_dim, config.head_dim, 1));
+  auto partial_layout = cute::make_layout(
+      cute::make_shape(gridDim.x, q_heads, num_splits),
+      cute::make_stride(q_heads * num_splits, num_splits, 1));
+  auto partial_acc_layout = cute::make_layout(
+      cute::make_shape(gridDim.x, q_heads, num_splits, config.head_dim),
+      cute::make_stride(int64_t(q_heads) * num_splits * config.head_dim,
+                        num_splits * config.head_dim, config.head_dim, 1));
   int64_t partial = partial_layout(batch, q_head, split);
 
   if (split_begin >= split_end) {
@@ -255,16 +200,16 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_reduce_kernel(
   int batch = blockIdx.x;
   int q_head = blockIdx.y;
   int dim = threadIdx.x;
-  auto partial_layout = make_layout(
-      make_shape(batch_size, q_heads, num_splits),
-      make_stride(q_heads * num_splits, num_splits, 1));
-  auto partial_acc_layout = make_layout(
-      make_shape(batch_size, q_heads, num_splits, head_dim),
-      make_stride(int64_t(q_heads) * num_splits * head_dim,
-                  num_splits * head_dim, head_dim, 1));
-  auto out_layout = make_layout(
-      make_shape(batch_size, q_heads, head_dim),
-      make_stride(int64_t(q_heads) * head_dim, head_dim, 1));
+  auto partial_layout = cute::make_layout(
+      cute::make_shape(batch_size, q_heads, num_splits),
+      cute::make_stride(q_heads * num_splits, num_splits, 1));
+  auto partial_acc_layout = cute::make_layout(
+      cute::make_shape(batch_size, q_heads, num_splits, head_dim),
+      cute::make_stride(int64_t(q_heads) * num_splits * head_dim,
+                        num_splits * head_dim, head_dim, 1));
+  auto out_layout = cute::make_layout(
+      cute::make_shape(batch_size, q_heads, head_dim),
+      cute::make_stride(int64_t(q_heads) * head_dim, head_dim, 1));
   auto block = cg::tiled_partition<BlockThreads>(cg::this_thread_block());
 
   float local_m = -INFINITY;
@@ -413,7 +358,7 @@ int32_t gemma4_kv_cache_ensure_page(
     int32_t batch_size,
     int32_t batch,
     int32_t position) {
-  if (!valid_config(config) || batch < 0 || batch >= batch_size || position < 0) {
+  if (batch < 0 || batch >= batch_size || position < 0) {
     return -1;
   }
 
@@ -422,9 +367,9 @@ int32_t gemma4_kv_cache_ensure_page(
     return -1;
   }
   int32_t slot = logical_page % config.max_pages_per_seq;
-  auto page_table_layout = make_layout(
-      make_shape(batch_size, config.max_pages_per_seq),
-      make_stride(config.max_pages_per_seq, 1));
+  auto page_table_layout = cute::make_layout(
+      cute::make_shape(batch_size, config.max_pages_per_seq),
+      cute::make_stride(config.max_pages_per_seq, 1));
   int64_t index = page_table_layout(batch, slot);
   if (index < 0 || index >= static_cast<int64_t>(page_table.size()) ||
       index >= static_cast<int64_t>(slot_logical_pages.size())) {
@@ -514,7 +459,8 @@ extern "C" cudaError_t gemma4_kv_cache_write_bf16(
     const __nv_bfloat16 *__restrict__ d_v,
     cudaStream_t stream) {
   if (token_count == 0) return cudaSuccess;
-  if (!valid_config(config) || layer < 0 || layer >= config.num_layers ||
+  if (layer < 0 || layer >= config.num_layers ||
+      config.head_dim % kBf16Packed128Elements != 0 ||
       d_cache_k == nullptr || d_cache_v == nullptr || d_page_table == nullptr ||
       d_token_batch == nullptr || d_token_position == nullptr ||
       d_k == nullptr || d_v == nullptr) {
@@ -522,15 +468,9 @@ extern "C" cudaError_t gemma4_kv_cache_write_bf16(
   }
 
   dim3 grid_dim(token_count, config.num_heads);
-  if (config.head_dim % kBf16Packed128Elements == 0) {
-    kv_cache_write_vec_kernel<<<grid_dim, kKvWriteVecThreads, 0, stream>>>(
-        d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
-        d_token_position, token_count, layer, d_k, d_v);
-  } else {
-    kv_cache_write_kernel<<<grid_dim, kKvWriteThreads, 0, stream>>>(
-        d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
-        d_token_position, token_count, layer, d_k, d_v);
-  }
+  kv_cache_write_vec_kernel<<<grid_dim, kKvWriteVecThreads, 0, stream>>>(
+      d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
+      d_token_position, token_count, layer, d_k, d_v);
   return cudaGetLastError();
 }
 
@@ -553,7 +493,7 @@ cudaError_t gemma4_paged_decode_attention_bf16(
     int32_t split_size,
     int32_t num_splits,
     cudaStream_t stream) {
-  if (!valid_config(config) || layer < 0 || layer >= config.num_layers ||
+  if (layer < 0 || layer >= config.num_layers ||
       batch_size <= 0 || q_heads < config.num_heads ||
       q_heads % config.num_heads != 0 ||
       split_size <= 0 || num_splits <= 0 ||

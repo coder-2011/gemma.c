@@ -194,9 +194,9 @@ void run_layout_and_slot_guard_case() {
   }
 }
 
-// Exercise invalid positive physical pages for scalar and vector writers.
-void run_invalid_page_write_case(int head_dim) {
-  Gemma4KvCacheConfig config = {1, 1, 4, 2, 2, head_dim, 0};
+// Exercise invalid positive physical pages for the vector writer.
+void run_invalid_page_write_case() {
+  Gemma4KvCacheConfig config = {1, 1, 4, 2, 2, 16, 0};
   std::vector<int32_t> page_table(config.max_pages_per_seq, -1);
   std::vector<int32_t> token_batch = {0};
   std::vector<int32_t> token_position = {0};
@@ -540,8 +540,7 @@ void run_decode_invalid_args_case() {
 
 int main() {
   run_layout_and_slot_guard_case();
-  run_invalid_page_write_case(16);
-  run_invalid_page_write_case(10);
+  run_invalid_page_write_case();
   run_invalid_page_decode_case();
   run_global_write_decode_case();
   run_sliding_flash_decode_case();
