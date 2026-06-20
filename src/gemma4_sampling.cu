@@ -5,9 +5,7 @@
 #define GEMMA4_WEIGHT_LOAD_POLICY 0
 #endif
 
-#include "gemma4_cuda_utils.cuh"
-#include "gemma4_embedding_gather.cuh"
-#include "gemma4_matmul_device.cuh"
+#include "gemma4_sampling_device.cuh"
 
 #include <cooperative_groups.h>
 #include <math.h>
@@ -15,14 +13,16 @@
 
 namespace {
 
-constexpr int kFinalLogitsThreads = 1024;
+namespace sampling_dev = gemma4_sampling_device;
+
+constexpr int kFinalLogitsThreads = 512;
 constexpr int kFinalLogitsColsPerBlock = 8;
-constexpr int kFinalLogitsMinBlocksPerSm = 1;
+constexpr int kFinalLogitsMinBlocksPerSm = 2;
 constexpr int kFinalLogitsSwizzleTileBlocks = 1;
 constexpr int kCandidateCount = GEMMA4_VOCAB_SIZE / kFinalLogitsColsPerBlock;
 constexpr int kLogitsSamplerThreads = 256;
 constexpr int kMaxTopK = 64;
-constexpr float kNegativeInfinity = -3.4028234663852886e+38F;
+constexpr float kNegativeInfinity = sampling_dev::kNegativeInfinity;
 
 static_assert((GEMMA4_VOCAB_SIZE % kFinalLogitsColsPerBlock) == 0,
               "vocab size must divide final-logits columns per block");
@@ -33,32 +33,20 @@ static_assert((kFinalLogitsThreads & (kFinalLogitsThreads - 1)) == 0,
 static_assert((kLogitsSamplerThreads % WARP_SIZE) == 0,
               "logits sampler thread count must be a warp multiple");
 
-inline bool is_aligned_8(const void *ptr) {
-  return (reinterpret_cast<uintptr_t>(ptr) & 0x7u) == 0;
-}
-
-__device__ inline bool better_candidate(float logit,
-                                        int32_t token_id,
-                                        float best_logit,
-                                        int32_t best_token_id) {
-  return logit > best_logit ||
-         (logit == best_logit && token_id < best_token_id);
-}
-
 __device__ inline void insert_sorted_candidate(float *__restrict__ scores,
                                                int32_t *__restrict__ token_ids,
                                                int top_k,
                                                float score,
                                                int32_t token_id) {
-  if (!better_candidate(score, token_id, scores[top_k - 1],
-                        token_ids[top_k - 1])) {
+  if (!sampling_dev::better_candidate(score, token_id, scores[top_k - 1],
+                                      token_ids[top_k - 1])) {
     return;
   }
 
   int pos = top_k - 1;
   while (pos > 0 &&
-         better_candidate(score, token_id, scores[pos - 1],
-                          token_ids[pos - 1])) {
+         sampling_dev::better_candidate(score, token_id, scores[pos - 1],
+                                        token_ids[pos - 1])) {
     scores[pos] = scores[pos - 1];
     token_ids[pos] = token_ids[pos - 1];
     --pos;
@@ -142,9 +130,9 @@ void sample_from_logits_kernel(
         const float other_score = s_candidate_scores[thread_idx + stride];
         const int32_t other_token_id =
             s_candidate_token_ids[thread_idx + stride];
-        if (better_candidate(other_score, other_token_id,
-                             s_candidate_scores[thread_idx],
-                             s_candidate_token_ids[thread_idx])) {
+        if (sampling_dev::better_candidate(
+                other_score, other_token_id, s_candidate_scores[thread_idx],
+                s_candidate_token_ids[thread_idx])) {
           s_candidate_scores[thread_idx] = other_score;
           s_candidate_token_ids[thread_idx] = other_token_id;
           s_candidate_owners[thread_idx] =
@@ -222,89 +210,25 @@ void final_logits_greedy_fused_kernel(
     int active_candidate_count) {
   namespace cg = cooperative_groups;
 
-  constexpr int warps = kFinalLogitsThreads / WARP_SIZE;
-  __shared__ float warp_sums[kFinalLogitsColsPerBlock][warps];
-  __shared__ float s_logits[kFinalLogitsThreads];
-  __shared__ int32_t s_token_ids[kFinalLogitsThreads];
-
   const int thread_idx = threadIdx.x;
-  float block_best_logit = kNegativeInfinity;
-  int32_t block_best_token_id = GEMMA4_VOCAB_SIZE;
-
-  for (int tile = int(blockIdx.x); tile < kCandidateCount;
-       tile += int(gridDim.x)) {
-    float sums[kFinalLogitsColsPerBlock] = {};
-    gemma4_matmul_device::decode_gemv_cols_device<
-        GEMMA4_HIDDEN_SIZE,
-        GEMMA4_VOCAB_SIZE,
-        kFinalLogitsColsPerBlock,
-        kFinalLogitsThreads,
-        kFinalLogitsSwizzleTileBlocks,
-        false>(
-        d_final_hidden, d_lm_head_col_major, nullptr, tile, warp_sums, sums);
-
-    if (thread_idx == 0) {
-      const int token0 = tile * kFinalLogitsColsPerBlock;
-#pragma unroll
-      for (int col = 0; col < kFinalLogitsColsPerBlock; ++col) {
-        const float logit = __bfloat162float(__float2bfloat16_rn(sums[col]));
-        const int32_t token_id = token0 + col;
-        if (better_candidate(logit, token_id, block_best_logit,
-                             block_best_token_id)) {
-          block_best_logit = logit;
-          block_best_token_id = token_id;
-        }
-      }
-    }
-
-    __syncthreads();
-  }
+  const Gemma4GreedyCandidate candidate =
+      sampling_dev::greedy_lm_head_block_candidate<
+          kFinalLogitsColsPerBlock,
+          kFinalLogitsThreads,
+          kFinalLogitsSwizzleTileBlocks,
+          kCandidateCount>(
+          d_final_hidden, d_lm_head_col_major, int(blockIdx.x),
+          int(gridDim.x), thread_idx);
 
   if (thread_idx == 0) {
-    d_candidates[blockIdx.x] = {block_best_logit, block_best_token_id};
+    d_candidates[blockIdx.x] = candidate;
   }
 
   cg::this_grid().sync();
 
-  if (blockIdx.x != 0) {
-    return;
-  }
-
-  Gemma4GreedyCandidate best = {kNegativeInfinity, GEMMA4_VOCAB_SIZE};
-  for (int candidate_idx = thread_idx; candidate_idx < active_candidate_count;
-       candidate_idx += kFinalLogitsThreads) {
-    const Gemma4GreedyCandidate candidate = d_candidates[candidate_idx];
-    if (better_candidate(candidate.logit, candidate.token_id, best.logit,
-                         best.token_id)) {
-      best = candidate;
-    }
-  }
-
-  s_logits[thread_idx] = best.logit;
-  s_token_ids[thread_idx] = best.token_id;
-  __syncthreads();
-
-  for (int stride = kFinalLogitsThreads / 2; stride > 0; stride >>= 1) {
-    if (thread_idx < stride) {
-      const float other_logit = s_logits[thread_idx + stride];
-      const int32_t other_token_id = s_token_ids[thread_idx + stride];
-      if (better_candidate(other_logit, other_token_id, s_logits[thread_idx],
-                           s_token_ids[thread_idx])) {
-        s_logits[thread_idx] = other_logit;
-        s_token_ids[thread_idx] = other_token_id;
-      }
-    }
-    __syncthreads();
-  }
-
-  const int32_t selected_token_id = s_token_ids[0];
-  if (thread_idx == 0) {
-    *d_next_token = selected_token_id;
-  }
-
-  gemma4_embedding_gather::copy_embedding_row_bf16(
-      d_next_hidden, d_lm_head_col_major, selected_token_id, thread_idx,
-      blockDim.x);
+  sampling_dev::reduce_greedy_and_gather<kFinalLogitsThreads>(
+      d_next_hidden, d_next_token, d_lm_head_col_major, d_candidates,
+      active_candidate_count, int(blockIdx.x), thread_idx);
 }
 
 }  // namespace
@@ -331,7 +255,8 @@ cudaError_t gemma4_greedy_sample_next_decode_bf16(
     return cudaErrorInvalidValue;
   }
   if (!is_aligned_16(d_next_hidden) || !is_aligned_16(d_final_hidden) ||
-      !is_aligned_16(d_lm_head_col_major) || !is_aligned_8(d_scratch)) {
+      !is_aligned_16(d_lm_head_col_major) ||
+      !is_aligned_to<alignof(Gemma4GreedyCandidate)>(d_scratch)) {
     return cudaErrorInvalidValue;
   }
 

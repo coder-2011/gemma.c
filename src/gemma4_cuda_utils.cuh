@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -21,8 +22,17 @@ __host__ __device__ constexpr auto div_up(T n, U d)
   return (n + d - 1) / d;
 }
 
+// Checks that a host-side pointer satisfies a power-of-two alignment.
+template <size_t Alignment>
+inline bool is_aligned_to(const void *ptr) {
+  static_assert(Alignment > 0 && (Alignment & (Alignment - 1)) == 0,
+                "alignment must be a nonzero power of two");
+  return (reinterpret_cast<uintptr_t>(ptr) & (Alignment - 1)) == 0;
+}
+
+// Checks the 16-byte alignment needed by Packed128 loads and stores.
 inline bool is_aligned_16(const void *ptr) {
-  return (reinterpret_cast<uintptr_t>(ptr) & 0xfu) == 0;
+  return is_aligned_to<16>(ptr);
 }
 
 template <typename ElementType>
@@ -220,6 +230,43 @@ __device__ inline float warp_reduce_sum(float value) {
     value += __shfl_xor_sync(0xffffffffu, value, offset);
   }
   return value;
+}
+
+// Reduces one scalar across a CTA when the caller already has lane metadata.
+template <int Threads>
+__device__ inline float gemma4_block_reduce_sum(
+    float value,
+    float *__restrict__ warp_sums,
+    int thread_idx,
+    int lane,
+    int warp) {
+  static_assert((Threads % WARP_SIZE) == 0,
+                "block reduction requires whole warps");
+  constexpr int warps = Threads / WARP_SIZE;
+
+  value = warp_reduce_sum(value);
+  if (lane == 0) {
+    warp_sums[warp] = value;
+  }
+  __syncthreads();
+
+  value = thread_idx < warps ? warp_sums[lane] : 0.0f;
+  if (warp == 0) {
+    value = warp_reduce_sum(value);
+  }
+  return value;
+}
+
+// Reduces one scalar across a CTA using the caller's thread index.
+template <int Threads>
+__device__ inline float gemma4_block_reduce_sum(
+    float value,
+    float *__restrict__ warp_sums,
+    int thread_idx) {
+  const int lane = thread_idx & (WARP_SIZE - 1);
+  const int warp = thread_idx / WARP_SIZE;
+  return gemma4_block_reduce_sum<Threads>(
+      value, warp_sums, thread_idx, lane, warp);
 }
 
 template <int Count>

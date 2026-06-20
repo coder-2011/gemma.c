@@ -24,29 +24,6 @@ constexpr int kResidualAddThreads = 256;
 #define GEMMA4_HIDDEN_PREFILL_MIN_BLOCKS_PER_SM 2
 #endif
 
-template <int Threads>
-__device__ float gemma4_block_reduce_sum(float value,
-                                         float *__restrict__ warp_sums,
-                                         int thread,
-                                         int lane,
-                                         int warp) {
-  static_assert((Threads % WARP_SIZE) == 0,
-                "block reduction requires whole warps");
-  constexpr int warps = Threads / WARP_SIZE;
-
-  value = warp_reduce_sum(value);
-  if (lane == 0) {
-    warp_sums[warp] = value;
-  }
-  __syncthreads();
-
-  value = thread < warps ? warp_sums[lane] : 0.0f;
-  if (warp == 0) {
-    value = warp_reduce_sum(value);
-  }
-  return value;
-}
-
 __device__ void gemma4_async_load_input_pack(RmsnormPack *__restrict__ dst,
                                              const floatX *__restrict__ src) {
   static_assert(sizeof(RmsnormPack) == 16,
@@ -84,8 +61,8 @@ gemma4_rmsnorm_bf16_decode_kernel(floatX *out,
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
 
-  float block_sum =
-      gemma4_block_reduce_sum<Threads>(sum_sq, s_warp_sums, thread, lane, warp);
+  float block_sum = gemma4_block_reduce_sum<Threads>(
+      sum_sq, s_warp_sums, thread, lane, warp);
   if (thread == 0) {
     s_scale = rsqrtf(block_sum / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
   }
@@ -125,8 +102,8 @@ gemma4_residual_add_rmsnorm_bf16_decode_kernel(floatX *residual,
     store128(residual + pack * kFloatXPerPack, values);
   }
 
-  float block_sum =
-      gemma4_block_reduce_sum<Threads>(sum_sq, s_warp_sums, thread, lane, warp);
+  float block_sum = gemma4_block_reduce_sum<Threads>(
+      sum_sq, s_warp_sums, thread, lane, warp);
   if (thread == 0) {
     s_scale = rsqrtf(block_sum / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
   }
@@ -174,8 +151,8 @@ gemma4_residual_add_rmsnorm_bf16_hidden_prefill_kernel(
   gemma4_bf16_pack_accumulate_square(values, sum_sq);
   store128(residual + pack * kFloatXPerPack, values);
 
-  float block_sum =
-      gemma4_block_reduce_sum<Threads>(sum_sq, s_warp_sums, thread, lane, warp);
+  float block_sum = gemma4_block_reduce_sum<Threads>(
+      sum_sq, s_warp_sums, thread, lane, warp);
   if (thread == 0) {
     s_scale = rsqrtf(block_sum / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
   }
