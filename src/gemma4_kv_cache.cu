@@ -13,14 +13,12 @@
 
 namespace {
 namespace cg = cooperative_groups;
+using namespace cute;
 
 constexpr int kKvWriteThreads = 256;
 constexpr int kKvWriteVecThreads = WARP_SIZE;
 
-int attention_threads_for_head_dim(int32_t head_dim) {
-  return head_dim <= 256 ? 256 : 512;
-}
-
+// Validate the cache geometry before host launchers trust page-table math.
 bool valid_config(const Gemma4KvCacheConfig &config) {
   if (config.num_layers <= 0 || config.num_pages <= 0 ||
       config.page_size <= 0 || config.max_pages_per_seq <= 0 ||
@@ -28,38 +26,14 @@ bool valid_config(const Gemma4KvCacheConfig &config) {
       config.head_dim > 512 || config.window_size < 0) {
     return false;
   }
-  int32_t min_window_pages =
-      config.window_size > 0 ? div_up(config.window_size, config.page_size) + 1 : 1;
+  int32_t min_window_pages = 1;
+  if (config.window_size > 0) {
+    min_window_pages = div_up(config.window_size, config.page_size) + 1;
+  }
   return config.max_pages_per_seq >= min_window_pages;
 }
 
-bool split_coverage_valid(const Gemma4KvCacheConfig &config,
-                          int32_t split_size,
-                          int32_t num_splits) {
-  if (split_size <= 0 || num_splits <= 0) return false;
-  if (config.window_size == 0) return true;
-  return int64_t(split_size) * num_splits >= config.window_size;
-}
-
-template <typename Block>
-__device__ inline float block_sum(const Block &block, float value) {
-  return cg::reduce(block, value, cg::plus<float>{});
-}
-
-template <typename Block>
-__device__ inline float block_max(const Block &block, float value) {
-  return cg::reduce(block, value, cg::greater<float>{});
-}
-
-__device__ inline int32_t physical_page_for_position(
-    const Gemma4KvCacheConfig &config,
-    const int32_t *__restrict__ page_table,
-    int32_t batch,
-    int32_t position) {
-  int32_t slot = gemma4_kv_cache_page_slot(config, position);
-  return __ldg(page_table + batch * config.max_pages_per_seq + slot);
-}
-
+// Scalar fallback writer for uncommon head widths that are not 128-bit aligned.
 __global__ __launch_bounds__(kKvWriteThreads) void kv_cache_write_kernel(
     __nv_bfloat16 *__restrict__ cache_k,
     __nv_bfloat16 *__restrict__ cache_v,
@@ -78,19 +52,30 @@ __global__ __launch_bounds__(kKvWriteThreads) void kv_cache_write_kernel(
 
   int batch = token_batch[token];
   int position = token_position[token];
-  int physical_page = physical_page_for_position(config, page_table, batch, position);
-  if (physical_page < 0) return;
+  int logical_page = position / config.page_size;
+  int slot = logical_page % config.max_pages_per_seq;
+  int page_offset = position - logical_page * config.page_size;
+  auto page_table_layout = make_layout(
+      make_shape(token_count, config.max_pages_per_seq),
+      make_stride(config.max_pages_per_seq, 1));
+  int physical_page = __ldg(page_table + page_table_layout(batch, slot));
+  if (physical_page < 0 || physical_page >= config.num_pages) return;
 
-  int page_offset = gemma4_kv_cache_page_offset(config, position);
-  int64_t src = (int64_t(token) * config.num_heads + head) * config.head_dim;
-  int64_t dst = gemma4_kv_cache_offset(config, layer, physical_page, page_offset, head, 0);
+  auto token_layout = make_layout(
+      make_shape(token_count, config.num_heads, config.head_dim),
+      make_stride(int64_t(config.num_heads) * config.head_dim,
+                  config.head_dim, 1));
+  auto cache_layout = gemma4_kv_cache_layout(config);
+  int64_t dst = cache_layout(layer, physical_page, page_offset, head, 0);
 
   for (int d = dim; d < config.head_dim; d += blockDim.x) {
-    cache_k[dst + d] = k[src + d];
-    cache_v[dst + d] = v[src + d];
+    int64_t src = token_layout(token, head, d);
+    cache_k[dst + d] = k[src];
+    cache_v[dst + d] = v[src];
   }
 }
 
+// Vectorized writer for Gemma K/V heads, copying one 128-bit pack per lane step.
 __global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
     __nv_bfloat16 *__restrict__ cache_k,
     __nv_bfloat16 *__restrict__ cache_v,
@@ -109,27 +94,46 @@ __global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
 
   int batch = token_batch[token];
   int position = token_position[token];
-  int physical_page = physical_page_for_position(config, page_table, batch, position);
-  if (physical_page < 0) return;
+  int logical_page = position / config.page_size;
+  int slot = logical_page % config.max_pages_per_seq;
+  int page_offset = position - logical_page * config.page_size;
+  auto page_table_layout = make_layout(
+      make_shape(token_count, config.max_pages_per_seq),
+      make_stride(config.max_pages_per_seq, 1));
+  int physical_page = __ldg(page_table + page_table_layout(batch, slot));
+  if (physical_page < 0 || physical_page >= config.num_pages) return;
 
-  int page_offset = gemma4_kv_cache_page_offset(config, position);
   int vecs_per_head = config.head_dim / kBf16Packed128Elements;
-  int64_t src_vec = (int64_t(token) * config.num_heads + head) * vecs_per_head;
-  int64_t dst_vec = gemma4_kv_cache_offset(config, layer, physical_page, page_offset, head, 0) /
-                    kBf16Packed128Elements;
+  auto token_vec_layout = make_layout(
+      make_shape(token_count, config.num_heads, vecs_per_head),
+      make_stride(int64_t(config.num_heads) * vecs_per_head,
+                  vecs_per_head, 1));
+  auto cache_vec_layout = make_layout(
+      make_shape(config.num_layers, config.num_pages, config.page_size,
+                 config.num_heads, vecs_per_head),
+      make_stride(int64_t(config.num_pages) * config.page_size *
+                      config.num_heads * vecs_per_head,
+                  int64_t(config.page_size) * config.num_heads *
+                      vecs_per_head,
+                  int64_t(config.num_heads) * vecs_per_head, vecs_per_head,
+                  1));
   const int4 *src_k = reinterpret_cast<const int4 *>(k);
   const int4 *src_v = reinterpret_cast<const int4 *>(v);
   int4 *dst_k = reinterpret_cast<int4 *>(cache_k);
   int4 *dst_v = reinterpret_cast<int4 *>(cache_v);
 
   for (int i = vec; i < vecs_per_head; i += blockDim.x) {
-    cub::ThreadStore<cub::STORE_CG>(dst_k + dst_vec + i,
-                                    cub::ThreadLoad<cub::LOAD_LDG>(src_k + src_vec + i));
-    cub::ThreadStore<cub::STORE_CG>(dst_v + dst_vec + i,
-                                    cub::ThreadLoad<cub::LOAD_LDG>(src_v + src_vec + i));
+    int64_t src_vec = token_vec_layout(token, head, i);
+    int64_t dst_vec =
+        cache_vec_layout(layer, physical_page, page_offset, head, i);
+    cub::ThreadStore<cub::STORE_CG>(
+        dst_k + dst_vec, cub::ThreadLoad<cub::LOAD_LDG>(src_k + src_vec));
+    cub::ThreadStore<cub::STORE_CG>(
+        dst_v + dst_vec, cub::ThreadLoad<cub::LOAD_LDG>(src_v + src_vec));
   }
 }
 
+// Compute per-split online-softmax state over the paged K/V cache.
 template <int BlockThreads>
 __global__ __launch_bounds__(BlockThreads) void paged_decode_split_kernel(
     float *__restrict__ partial_m,
@@ -158,7 +162,20 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_split_kernel(
   int key_count = seq_len - first_key;
   int split_begin = first_key + split * split_size;
   int split_end = min(first_key + key_count, split_begin + split_size);
-  int partial = (batch * q_heads + q_head) * num_splits + split;
+  auto page_table_layout = make_layout(
+      make_shape(gridDim.x, config.max_pages_per_seq),
+      make_stride(config.max_pages_per_seq, 1));
+  auto q_layout = make_layout(
+      make_shape(gridDim.x, q_heads, config.head_dim),
+      make_stride(int64_t(q_heads) * config.head_dim, config.head_dim, 1));
+  auto partial_layout = make_layout(
+      make_shape(gridDim.x, q_heads, num_splits),
+      make_stride(q_heads * num_splits, num_splits, 1));
+  auto partial_acc_layout = make_layout(
+      make_shape(gridDim.x, q_heads, num_splits, config.head_dim),
+      make_stride(int64_t(q_heads) * num_splits * config.head_dim,
+                  num_splits * config.head_dim, config.head_dim, 1));
+  int64_t partial = partial_layout(batch, q_head, split);
 
   if (split_begin >= split_end) {
     if (dim == 0) {
@@ -166,7 +183,7 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_split_kernel(
       partial_l[partial] = 0.0f;
     }
     if (dim < config.head_dim) {
-      partial_acc[(int64_t)partial * config.head_dim + dim] = 0.0f;
+      partial_acc[partial_acc_layout(batch, q_head, split, dim)] = 0.0f;
     }
     return;
   }
@@ -174,33 +191,36 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_split_kernel(
   float acc = 0.0f;
   float m = -INFINITY;
   float l = 0.0f;
-  int64_t q_base = (int64_t(batch) * q_heads + q_head) * config.head_dim;
-  int64_t partial_acc_base = (int64_t)partial * config.head_dim;
-  int64_t kv_token_stride = int64_t(config.num_heads) * config.head_dim;
   float q_value =
-      dim < config.head_dim ? __bfloat162float(loadg(q + q_base + dim)) : 0.0f;
+      dim < config.head_dim
+          ? __bfloat162float(loadg(q + q_layout(batch, q_head, dim)))
+          : 0.0f;
 
   auto block = cg::tiled_partition<BlockThreads>(cg::this_thread_block());
+  auto cache_layout = gemma4_kv_cache_layout(config);
+  int64_t kv_token_stride = cache_layout.stride<2>();
   for (int page_begin = split_begin; page_begin < split_end;) {
-    int32_t logical_page = gemma4_kv_cache_logical_page(config, page_begin);
+    int32_t logical_page = page_begin / config.page_size;
     int32_t page_offset = page_begin - logical_page * config.page_size;
     int32_t page_token_count =
         min(split_end - page_begin, config.page_size - page_offset);
     int32_t physical_page = cg::invoke_one_broadcast(block, [&] {
       int32_t slot = logical_page % config.max_pages_per_seq;
-      return __ldg(page_table + batch * config.max_pages_per_seq + slot);
+      return __ldg(page_table + page_table_layout(batch, slot));
     });
 
-    if (physical_page >= 0) {
-      int64_t kv_page_base = gemma4_kv_cache_offset(
-          config, layer, physical_page, page_offset, kv_head, 0);
+    if (physical_page >= 0 && physical_page < config.num_pages) {
+      int64_t kv_page_base =
+          cache_layout(layer, physical_page, page_offset, kv_head, 0);
       for (int page_token = 0; page_token < page_token_count; ++page_token) {
         int64_t kv_base = kv_page_base + int64_t(page_token) * kv_token_stride;
         float k_value =
             dim < config.head_dim
                 ? __bfloat162float(loadg(cache_k + kv_base + dim))
                 : 0.0f;
-        float score = block_sum(block, q_value * k_value) * softmax_scale;
+        float score =
+            cg::reduce(block, q_value * k_value, cg::plus<float>{}) *
+            softmax_scale;
         float new_m = fmaxf(m, score);
         float old_scale = __expf(m - new_m);
         float new_scale = __expf(score - new_m);
@@ -222,10 +242,11 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_split_kernel(
     partial_l[partial] = l;
   }
   if (dim < config.head_dim) {
-    partial_acc[partial_acc_base + dim] = acc;
+    partial_acc[partial_acc_layout(batch, q_head, split, dim)] = acc;
   }
 }
 
+// Combine per-split softmax state into one BF16 attention output row.
 template <int BlockThreads>
 __global__ __launch_bounds__(BlockThreads) void paged_decode_reduce_kernel(
     __nv_bfloat16 *__restrict__ out,
@@ -239,16 +260,23 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_reduce_kernel(
   int batch = blockIdx.x;
   int q_head = blockIdx.y;
   int dim = threadIdx.x;
-  int row = batch * q_heads + q_head;
-  int partial_row = row * num_splits;
-  int64_t partial_acc_row = int64_t(row) * num_splits * head_dim;
+  auto partial_layout = make_layout(
+      make_shape(batch_size, q_heads, num_splits),
+      make_stride(q_heads * num_splits, num_splits, 1));
+  auto partial_acc_layout = make_layout(
+      make_shape(batch_size, q_heads, num_splits, head_dim),
+      make_stride(int64_t(q_heads) * num_splits * head_dim,
+                  num_splits * head_dim, head_dim, 1));
+  auto out_layout = make_layout(
+      make_shape(batch_size, q_heads, head_dim),
+      make_stride(int64_t(q_heads) * head_dim, head_dim, 1));
   auto block = cg::tiled_partition<BlockThreads>(cg::this_thread_block());
 
   float local_m = -INFINITY;
   for (int split = dim; split < num_splits; split += blockDim.x) {
-    local_m = fmaxf(local_m, partial_m[partial_row + split]);
+    local_m = fmaxf(local_m, partial_m[partial_layout(batch, q_head, split)]);
   }
-  float m = block_max(block, local_m);
+  float m = cg::reduce(block, local_m, cg::greater<float>{});
   __shared__ float s_m;
   __shared__ float s_l;
   if (dim == 0) {
@@ -258,13 +286,14 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_reduce_kernel(
 
   float local_l = 0.0f;
   for (int split = dim; split < num_splits; split += blockDim.x) {
-    float split_m = partial_m[partial_row + split];
-    float split_l = partial_l[partial_row + split];
+    int64_t partial = partial_layout(batch, q_head, split);
+    float split_m = partial_m[partial];
+    float split_l = partial_l[partial];
     if (split_l > 0.0f) {
       local_l += split_l * __expf(split_m - s_m);
     }
   }
-  float l = block_sum(block, local_l);
+  float l = cg::reduce(block, local_l, cg::plus<float>{});
   if (dim == 0) {
     s_l = l;
   }
@@ -273,17 +302,20 @@ __global__ __launch_bounds__(BlockThreads) void paged_decode_reduce_kernel(
   for (int d = dim; d < head_dim; d += blockDim.x) {
     float value = 0.0f;
     for (int split = 0; split < num_splits; ++split) {
-      float split_l = partial_l[partial_row + split];
+      int64_t partial = partial_layout(batch, q_head, split);
+      float split_l = partial_l[partial];
       if (split_l > 0.0f) {
-        float split_m = partial_m[partial_row + split];
-        value += partial_acc[partial_acc_row + int64_t(split) * head_dim + d] * __expf(split_m - s_m);
+        float split_m = partial_m[partial];
+        value += partial_acc[partial_acc_layout(batch, q_head, split, d)] *
+                 __expf(split_m - s_m);
       }
     }
-    out[(int64_t)row * head_dim + d] =
+    out[out_layout(batch, q_head, d)] =
         s_l > 0.0f ? __float2bfloat16_rn(value / s_l) : __float2bfloat16_rn(0.0f);
   }
 }
 
+// Launch the generic split/reduce paged decode attention implementation.
 template <int BlockThreads>
 cudaError_t launch_paged_decode_attention(
     __nv_bfloat16 *__restrict__ d_out,
@@ -322,6 +354,7 @@ cudaError_t launch_paged_decode_attention(
 
 }  // namespace
 
+// Allocate one physical cache page from the free-list or monotonic tail.
 int32_t Gemma4KvPageAllocator::allocate() {
   if (!free_pages.empty()) {
     int32_t page = free_pages.back();
@@ -332,17 +365,20 @@ int32_t Gemma4KvPageAllocator::allocate() {
   return next_page++;
 }
 
+// Return one physical page to the free-list.
 void Gemma4KvPageAllocator::release(int32_t page) {
   if (page >= 0 && page < page_count) {
     free_pages.push_back(page);
   }
 }
 
+// Reset allocator state without clearing page contents.
 void Gemma4KvPageAllocator::reset() {
   next_page = 0;
   free_pages.clear();
 }
 
+// Build the cache geometry for either sliding or global Gemma 4 layers.
 Gemma4KvCacheConfig gemma4_kv_cache_make_config(bool global,
                                                 int32_t num_pages,
                                                 int32_t page_size,
@@ -359,6 +395,7 @@ Gemma4KvCacheConfig gemma4_kv_cache_make_config(bool global,
   return config;
 }
 
+// Map a model-layer index into that cache's compact sliding/global layer index.
 int32_t gemma4_kv_cache_layer_index(int32_t model_layer, bool global_cache) {
   if (model_layer < 0 || model_layer >= GEMMA4_NUM_LAYERS) return -1;
   if (gemma4_is_global_layer(model_layer) != global_cache) return -1;
@@ -372,6 +409,7 @@ int32_t gemma4_kv_cache_layer_index(int32_t model_layer, bool global_cache) {
   return cache_layer;
 }
 
+// Ensure one batch/position has a page-table slot and reject stale backwards use.
 int32_t gemma4_kv_cache_ensure_page(
     std::vector<int32_t> &page_table,
     std::vector<int32_t> &slot_logical_pages,
@@ -384,28 +422,32 @@ int32_t gemma4_kv_cache_ensure_page(
     return -1;
   }
 
-  int32_t logical_page = gemma4_kv_cache_logical_page(config, position);
+  int32_t logical_page = position / config.page_size;
   if (config.window_size == 0 && logical_page >= config.max_pages_per_seq) {
     return -1;
   }
   int32_t slot = logical_page % config.max_pages_per_seq;
-  int32_t index = batch * config.max_pages_per_seq + slot;
-  if (index < 0 || index >= static_cast<int32_t>(page_table.size()) ||
-      index >= static_cast<int32_t>(slot_logical_pages.size())) {
+  auto page_table_layout = make_layout(
+      make_shape(batch_size, config.max_pages_per_seq),
+      make_stride(config.max_pages_per_seq, 1));
+  int64_t index = page_table_layout(batch, slot);
+  if (index < 0 || index >= static_cast<int64_t>(page_table.size()) ||
+      index >= static_cast<int64_t>(slot_logical_pages.size())) {
     return -1;
   }
+
+  if (slot_logical_pages[index] > logical_page) return -1;
 
   if (page_table[index] < 0) {
     page_table[index] = allocator.allocate();
   }
   if (page_table[index] < 0) return -1;
 
-  // ponytail: sliding cache reuses the slot page; add physical-page recycling
-  // only if the runtime wants to shrink cache memory below one full window.
   slot_logical_pages[index] = logical_page;
   return page_table[index];
 }
 
+// Ensure a contiguous token range has mapped cache pages.
 int32_t gemma4_kv_cache_ensure_range(
     std::vector<int32_t> &page_table,
     std::vector<int32_t> &slot_logical_pages,
@@ -417,12 +459,14 @@ int32_t gemma4_kv_cache_ensure_range(
     int32_t token_count) {
   for (int32_t i = 0; i < token_count; ++i) {
     int32_t page = gemma4_kv_cache_ensure_page(
-        page_table, slot_logical_pages, allocator, config, batch_size, batch, first_position + i);
+        page_table, slot_logical_pages, allocator, config, batch_size, batch,
+        first_position + i);
     if (page < 0) return -1;
   }
   return 0;
 }
 
+// Append one token position for a batch and advance its sequence length.
 int32_t gemma4_kv_cache_append_position(
     std::vector<int32_t> &page_table,
     std::vector<int32_t> &slot_logical_pages,
@@ -444,19 +488,24 @@ int32_t gemma4_kv_cache_append_position(
   return position;
 }
 
+// Return the element count for per-split softmax max/denominator scratch.
 size_t gemma4_paged_decode_partial_m_elements(int32_t batch_size,
                                               int32_t q_heads,
                                               int32_t num_splits) {
   return size_t(batch_size) * q_heads * num_splits;
 }
 
+// Return the element count for per-split attention accumulator scratch.
 size_t gemma4_paged_decode_partial_acc_elements(int32_t batch_size,
                                                 int32_t q_heads,
                                                 int32_t num_splits,
                                                 int32_t head_dim) {
-  return gemma4_paged_decode_partial_m_elements(batch_size, q_heads, num_splits) * size_t(head_dim);
+  return gemma4_paged_decode_partial_m_elements(batch_size, q_heads,
+                                                num_splits) *
+         size_t(head_dim);
 }
 
+// Write already-prepared BF16 K/V rows into the paged cache.
 extern "C" cudaError_t gemma4_kv_cache_write_bf16(
     __nv_bfloat16 *__restrict__ d_cache_k,
     __nv_bfloat16 *__restrict__ d_cache_v,
@@ -490,6 +539,7 @@ extern "C" cudaError_t gemma4_kv_cache_write_bf16(
   return cudaGetLastError();
 }
 
+// Run the generic paged decode attention reference path.
 cudaError_t gemma4_paged_decode_attention_bf16(
     __nv_bfloat16 *__restrict__ d_out,
     float *__restrict__ d_partial_m,
@@ -511,7 +561,9 @@ cudaError_t gemma4_paged_decode_attention_bf16(
   if (!valid_config(config) || layer < 0 || layer >= config.num_layers ||
       batch_size <= 0 || q_heads < config.num_heads ||
       q_heads % config.num_heads != 0 ||
-      !split_coverage_valid(config, split_size, num_splits) ||
+      split_size <= 0 || num_splits <= 0 ||
+      (config.window_size > 0 &&
+       int64_t(split_size) * num_splits < config.window_size) ||
       d_out == nullptr ||
       d_partial_m == nullptr || d_partial_l == nullptr ||
       d_partial_acc == nullptr || d_q == nullptr || d_cache_k == nullptr ||
@@ -520,8 +572,7 @@ cudaError_t gemma4_paged_decode_attention_bf16(
     return cudaErrorInvalidValue;
   }
 
-  const int threads = attention_threads_for_head_dim(config.head_dim);
-  return threads == 256
+  return config.head_dim <= 256
              ? launch_paged_decode_attention<256>(
                    d_out, d_partial_m, d_partial_l, d_partial_acc, d_q,
                    d_cache_k, d_cache_v, d_page_table, d_seq_lengths, config,

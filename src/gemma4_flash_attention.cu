@@ -1338,13 +1338,17 @@ __device__ __forceinline__ int64_t decode_cache_head_offset(
     int cache_layer,
     int head,
     int lane) {
-  const int slot = gemma4_kv_cache_page_slot(config, position);
+  const int logical_page = position / config.page_size;
+  const int slot = logical_page % config.max_pages_per_seq;
+  auto page_table_layout = make_layout(
+      make_shape(gridDim.x, config.max_pages_per_seq),
+      make_stride(config.max_pages_per_seq, 1));
   const int physical_page = gemma4_warp_uniform_ldg_i32(
-      page_table + batch * config.max_pages_per_seq + slot, lane);
+      page_table + page_table_layout(batch, slot), lane);
   if (physical_page < 0 || physical_page >= config.num_pages) return -1;
-  const int page_offset = gemma4_kv_cache_page_offset(config, position);
-  return gemma4_kv_cache_offset(
-      config, cache_layer, physical_page, page_offset, head, 0);
+  const int page_offset = position - logical_page * config.page_size;
+  auto cache_layout = gemma4_kv_cache_layout(config);
+  return cache_layout(cache_layer, physical_page, page_offset, head, 0);
 }
 
 // Decode prep path: one token per batch. Q is prepared into a compact
@@ -1769,17 +1773,22 @@ void decode_paged_grouped_split_kernel(
   __shared__ typename DecodeBlockReduce::TempStorage
       reduce_storage[Derived::kGqaRatio];
   __shared__ float s_score[Derived::kGqaRatio];
+  auto page_table_layout = make_layout(
+      make_shape(gridDim.x, config.max_pages_per_seq),
+      make_stride(config.max_pages_per_seq, 1));
+  auto cache_layout = gemma4_kv_cache_layout(config);
 
   for (int32_t page_pos = split_begin; page_pos < split_end;) {
     // Resolve one logical page span at a time. This keeps page-table loads
     // read-only, but removes repeated page table, division/modulo, and full
     // cache-offset work for every token inside the same cache page.
-    const int32_t page_offset0 = gemma4_kv_cache_page_offset(config, page_pos);
+    const int32_t logical_page = page_pos / config.page_size;
+    const int32_t page_offset0 = page_pos - logical_page * config.page_size;
     const int32_t span_end =
         min(split_end, page_pos + config.page_size - page_offset0);
-    const int32_t page_slot = gemma4_kv_cache_page_slot(config, page_pos);
+    const int32_t page_slot = logical_page % config.max_pages_per_seq;
     const int32_t physical_page = gemma4_warp_uniform_ldg_i32(
-        page_table + batch * config.max_pages_per_seq + page_slot, lane);
+        page_table + page_table_layout(batch, page_slot), lane);
     if (physical_page < 0 || physical_page >= config.num_pages) {
       page_pos = span_end;
       continue;
@@ -1788,9 +1797,9 @@ void decode_paged_grouped_split_kernel(
     // Cache layout is [layer, page, page_offset, kv_head, dim]. Threads read
     // consecutive BF16 lanes, so K and V stay direct read-only global loads.
     // Advancing one token inside a page is a fixed stride over all KV heads.
-    int64_t kv_base = gemma4_kv_cache_offset(
-        config, layer, physical_page, page_offset0, kv_head, 0);
-    const int64_t kv_token_stride = int64_t(config.num_heads) * config.head_dim;
+    int64_t kv_base =
+        cache_layout(layer, physical_page, page_offset0, kv_head, 0);
+    const int64_t kv_token_stride = cache_layout.stride<2>();
     for (; page_pos < span_end; ++page_pos, kv_base += kv_token_stride) {
       const float k_value = __bfloat162float(loadg(cache_k + kv_base + dim));
       const float v_value = __bfloat162float(loadg(cache_v + kv_base + dim));
@@ -1960,9 +1969,15 @@ __device__ __forceinline__ int32_t sliding_persistent_task_index(
 __device__ __forceinline__ void sliding_persistent_enqueue_reduce(
     int32_t *__restrict__ state,
     int32_t *__restrict__ queue,
+    int32_t queue_capacity,
     int32_t q_row) {
   atomicAdd(state + kSlidingPersistentActiveTasks, 1);
   const int32_t pos = atomicAdd(state + kSlidingPersistentReserveTail, 1);
+  // Duplicate reduce publication is a logic error; fail closed inside scratch.
+  if (pos >= queue_capacity) {
+    atomicSub(state + kSlidingPersistentActiveTasks, 1);
+    return;
+  }
   queue[pos] = sliding_persistent_encode_reduce_task(q_row);
   __threadfence();
   while (atomicCAS(state + kSlidingPersistentPublishTail, pos, pos + 1) != pos) {
@@ -2033,7 +2048,9 @@ void sliding_decode_paged_persistent_worker_kernel(
     int32_t layer,
     float softmax_scale,
     int32_t split_size,
-    int32_t num_splits) {
+    int32_t num_splits,
+    int32_t batch_size,
+    int32_t queue_capacity) {
   using DecodeBlockReduce = cub::BlockReduce<float, kSlidingDecodeThreads>;
   __shared__ typename DecodeBlockReduce::TempStorage reduce_storage_q0;
   __shared__ typename DecodeBlockReduce::TempStorage reduce_storage_q1;
@@ -2047,6 +2064,10 @@ void sliding_decode_paged_persistent_worker_kernel(
 
   const int32_t dim = threadIdx.x;
   const int32_t lane = dim & (kWarpSize - 1);
+  auto page_table_layout = make_layout(
+      make_shape(batch_size, config.max_pages_per_seq),
+      make_stride(config.max_pages_per_seq, 1));
+  auto cache_layout = gemma4_kv_cache_layout(config);
 
   while (true) {
     if (dim == 0) s_task = sliding_persistent_pop_task(state, queue);
@@ -2151,22 +2172,21 @@ void sliding_decode_paged_persistent_worker_kernel(
       float l0 = 0.0f, l1 = 0.0f;
 
       for (int32_t page_pos = split_begin; page_pos < split_end;) {
-        const int32_t page_offset0 =
-            gemma4_kv_cache_page_offset(config, page_pos);
+        const int32_t logical_page = page_pos / config.page_size;
+        const int32_t page_offset0 = page_pos - logical_page * config.page_size;
         const int32_t span_end =
             min(split_end, page_pos + config.page_size - page_offset0);
-        const int32_t page_slot = gemma4_kv_cache_page_slot(config, page_pos);
+        const int32_t page_slot = logical_page % config.max_pages_per_seq;
         const int32_t physical_page = gemma4_warp_uniform_ldg_i32(
-            page_table + batch * config.max_pages_per_seq + page_slot, lane);
+            page_table + page_table_layout(batch, page_slot), lane);
         if (physical_page < 0 || physical_page >= config.num_pages) {
           page_pos = span_end;
           continue;
         }
 
-        int64_t kv_base = gemma4_kv_cache_offset(
-            config, layer, physical_page, page_offset0, kv_head, 0);
-        const int64_t kv_token_stride =
-            int64_t(config.num_heads) * config.head_dim;
+        int64_t kv_base =
+            cache_layout(layer, physical_page, page_offset0, kv_head, 0);
+        const int64_t kv_token_stride = cache_layout.stride<2>();
         for (; page_pos < span_end; ++page_pos, kv_base += kv_token_stride) {
           const float k_value = __bfloat162float(loadg(cache_k + kv_base + dim));
           const float v_value = __bfloat162float(loadg(cache_v + kv_base + dim));
@@ -2207,15 +2227,15 @@ void sliding_decode_paged_persistent_worker_kernel(
       if (live_split) {
         const int32_t done0 = atomicAdd(split_done + row0, 1) + 1;
         if (done0 == actual_splits) {
-          sliding_persistent_enqueue_reduce(state, queue, row0);
+          sliding_persistent_enqueue_reduce(state, queue, queue_capacity, row0);
         }
         const int32_t done1 = atomicAdd(split_done + row1, 1) + 1;
         if (done1 == actual_splits) {
-          sliding_persistent_enqueue_reduce(state, queue, row1);
+          sliding_persistent_enqueue_reduce(state, queue, queue_capacity, row1);
         }
       } else if (zero_length_row) {
-        sliding_persistent_enqueue_reduce(state, queue, row0);
-        sliding_persistent_enqueue_reduce(state, queue, row1);
+        sliding_persistent_enqueue_reduce(state, queue, queue_capacity, row0);
+        sliding_persistent_enqueue_reduce(state, queue, queue_capacity, row1);
       }
       atomicSub(state + kSlidingPersistentActiveTasks, 1);
     }
@@ -2374,6 +2394,14 @@ cudaError_t launch_sliding_decode_paged_persistent(
   const int64_t q_rows = int64_t(batch_size) * GEMMA4_NUM_QUERY_HEADS;
   const int64_t split_tasks =
       int64_t(batch_size) * GEMMA4_SLIDING_KV_HEADS * num_splits;
+  // Queue stores initial split tasks plus at most one reduce task per Q row.
+  const int64_t queue_capacity_i64 = split_tasks + q_rows;
+  if (q_rows > int64_t(std::numeric_limits<int32_t>::max()) ||
+      split_tasks > int64_t(std::numeric_limits<int32_t>::max()) ||
+      queue_capacity_i64 > int64_t(std::numeric_limits<int32_t>::max())) {
+    return cudaErrorInvalidValue;
+  }
+  const int32_t queue_capacity = int32_t(queue_capacity_i64);
   int32_t *state = d_work_scratch;
   int32_t *split_done = state + kSlidingPersistentStateI32;
   int32_t *queue = split_done + q_rows;
@@ -2404,7 +2432,8 @@ cudaError_t launch_sliding_decode_paged_persistent(
   sliding_decode_paged_persistent_worker_kernel<<<persistent_blocks, block_dim, 0, stream>>>(
       d_out, d_partial_m, d_partial_l, d_partial_acc, state, split_done, queue,
       d_q_prepared, d_cache_k, d_cache_v, d_page_table, d_seq_lengths,
-      cache_config, cache_layer, softmax_scale, split_size, num_splits);
+      cache_config, cache_layer, softmax_scale, split_size, num_splits,
+      batch_size, queue_capacity);
   return cudaGetLastError();
 }
 
@@ -2659,9 +2688,8 @@ extern "C" size_t gemma4_flash_attention_sliding_decode_persistent_scratch_i32(
       batch_size, num_splits);
 }
 
-// Persistent-work-queue variant of sliding decode attention. This keeps split
-// production and split reduction inside one resident worker grid, which is the
-// scheduler shape that later projection/prep producer tasks will feed.
+// Persistent-work-queue decode is parked until it has a narrow measured reason.
+// The direct paged decode path above is the active correctness implementation.
 extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
     __nv_bfloat16 *__restrict__ d_out,
     float *__restrict__ d_partial_m,
@@ -2682,11 +2710,27 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_persistent_bf
     int32_t num_splits,
     int32_t persistent_blocks,
     cudaStream_t stream) {
-  return gemma4_flash_attention::launch_sliding_decode_paged_persistent(
-      d_out, d_partial_m, d_partial_l, d_partial_acc, d_work_scratch,
-      work_scratch_i32, d_q_prepared, d_cache_k, d_cache_v, d_page_table,
-      d_seq_lengths, cache_config, cache_layer, batch_size, softmax_scale,
-      split_size, num_splits, persistent_blocks, stream);
+  (void)softmax_scale;
+  (void)persistent_blocks;
+  (void)stream;
+  if (!gemma4_flash_attention::valid_decode_paged_args<
+          gemma4_flash_attention::SlidingAttentionTraits>(
+          d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
+          d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
+          cache_layer, batch_size, split_size, num_splits) ||
+      d_work_scratch == nullptr || work_scratch_i32 <= 0) {
+    return cudaErrorInvalidValue;
+  }
+
+  const size_t required_i32 =
+      gemma4_flash_attention::sliding_decode_persistent_scratch_i32_count(
+          batch_size, num_splits);
+  if (required_i32 == 0 ||
+      required_i32 > size_t(std::numeric_limits<int32_t>::max()) ||
+      size_t(work_scratch_i32) < required_i32) {
+    return cudaErrorInvalidValue;
+  }
+  return cudaErrorNotSupported;
 }
 
 // Expose launch metadata so tests and benchmarks can sanity-check occupancy and

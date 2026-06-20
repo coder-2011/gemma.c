@@ -144,6 +144,7 @@ extern "C" size_t gemma4_flash_attention_sliding_decode_persistent_scratch_i32(
     int32_t batch_size,
     int32_t num_splits);
 
+// Currently returns cudaErrorNotSupported for otherwise-valid calls.
 extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
     __nv_bfloat16 *__restrict__ d_out,
     float *__restrict__ d_partial_m,
