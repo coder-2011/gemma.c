@@ -55,16 +55,11 @@ __global__ __launch_bounds__(kKvWriteThreads) void kv_cache_write_kernel(
   int logical_page = position / config.page_size;
   int slot = logical_page % config.max_pages_per_seq;
   int page_offset = position - logical_page * config.page_size;
-  auto page_table_layout = make_layout(
-      make_shape(token_count, config.max_pages_per_seq),
-      make_stride(config.max_pages_per_seq, 1));
+  auto page_table_layout = make_layout(make_shape(token_count, config.max_pages_per_seq), make_stride(config.max_pages_per_seq, 1));
   int physical_page = __ldg(page_table + page_table_layout(batch, slot));
   if (physical_page < 0 || physical_page >= config.num_pages) return;
 
-  auto token_layout = make_layout(
-      make_shape(token_count, config.num_heads, config.head_dim),
-      make_stride(int64_t(config.num_heads) * config.head_dim,
-                  config.head_dim, 1));
+  auto token_layout = make_layout(make_shape(token_count, config.num_heads, config.head_dim), make_stride(int64_t(config.num_heads) * config.head_dim, config.head_dim, 1));
   auto cache_layout = gemma4_kv_cache_layout(config);
   int64_t dst = cache_layout(layer, physical_page, page_offset, head, 0);
 
