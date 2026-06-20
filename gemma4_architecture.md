@@ -1,927 +1,1079 @@
-# Gemma 4 Architecture: Complete Technical Reference
+# Gemma 4 Architecture: Technical Reference
 
-> **Release:** April 2, 2026 — Google DeepMind  
-> **License:** Apache 2.0  
-> **Status:** No formal research paper published as of May 2026. Primary sources: official model card, HuggingFace model pages, HuggingFace transformers documentation, and community reverse-engineering from config.json files.
+> **Current as of:** June 20, 2026
+> **Primary implementation target for this repository:** dense text inference on RTX A6000-class Ampere GPUs
+> **Current practical target models:** Gemma 4 12B Unified for BF16 bring-up, Gemma 4 31B Dense for quantized single-GPU work, and Gemma 4 26B-A4B for later MoE support.
+> **Out of scope for this document:** E2B and E4B implementation details. They are part of the official Gemma 4 family, but this project is not targeting E-series execution.
 
 ---
 
 ## Table of Contents
 
-1. [Family Overview](#1-family-overview)
-2. [Shared Architectural DNA](#2-shared-architectural-dna)
-3. [Attention Mechanism — Dual-Config Hybrid](#3-attention-mechanism--dual-config-hybrid)
-4. [Positional Encoding — Proportional RoPE (p-RoPE)](#4-positional-encoding--proportional-rope-p-rope)
-5. [Per-Model Architecture Deep Dives](#5-per-model-architecture-deep-dives)
-   - 5.1 [Gemma 4 31B — Dense Server](#51-gemma-4-31b--dense-server)
-   - 5.2 [Gemma 4 26B-A4B — MoE Server](#52-gemma-4-26b-a4b--moe-server)
-   - 5.3 [Gemma 4 E4B — Edge Dense](#53-gemma-4-e4b--edge-dense)
-   - 5.4 [Gemma 4 E2B — On-Device Any-to-Any](#54-gemma-4-e2b--on-device-any-to-any)
-6. [Per-Layer Embeddings (PLE)](#6-per-layer-embeddings-ple)
-7. [Vision Encoder](#7-vision-encoder)
-8. [Audio Encoder (E-Series Only)](#8-audio-encoder-e-series-only)
-9. [MoE Architecture Deep Dive](#9-moe-architecture-deep-dive)
-10. [Tokenizer](#10-tokenizer)
-11. [Full Hyperparameter Tables](#11-full-hyperparameter-tables)
-12. [Parameter Accounting](#12-parameter-accounting)
-13. [Memory & Hardware Requirements](#13-memory--hardware-requirements)
-14. [Benchmark Results](#14-benchmark-results)
-15. [What Changed from Gemma 3](#15-what-changed-from-gemma-3)
-16. [Training Details](#16-training-details)
-17. [Inference & Deployment](#17-inference--deployment)
+1. [Source Status](#1-source-status)
+2. [Family Overview](#2-family-overview)
+3. [Repo-Relevant Model Set](#3-repo-relevant-model-set)
+4. [Shared Text Architecture](#4-shared-text-architecture)
+5. [Hybrid Attention](#5-hybrid-attention)
+6. [RoPE and p-RoPE](#6-rope-and-p-rope)
+7. [Gemma 4 12B Unified](#7-gemma-4-12b-unified)
+8. [Gemma 4 31B Dense](#8-gemma-4-31b-dense)
+9. [Gemma 4 26B-A4B MoE](#9-gemma-4-26b-a4b-moe)
+10. [Unified Multimodal Path in 12B](#10-unified-multimodal-path-in-12b)
+11. [Standard Multimodal Path in 31B and 26B](#11-standard-multimodal-path-in-31b-and-26b)
+12. [Tokenizer and Chat Format](#12-tokenizer-and-chat-format)
+13. [Hyperparameter Tables](#13-hyperparameter-tables)
+14. [Parameter Accounting](#14-parameter-accounting)
+15. [KV Cache and Memory Planning](#15-kv-cache-and-memory-planning)
+16. [A6000 Implications](#16-a6000-implications)
+17. [Benchmark Snapshot](#17-benchmark-snapshot)
+18. [Implementation Notes for this Repo](#18-implementation-notes-for-this-repo)
+19. [Sources](#19-sources)
 
 ---
 
-## 1. Family Overview
+## 1. Source Status
 
-Gemma 4 is the fourth generation of Google DeepMind's open-weight model family, built directly from the same research foundations as the proprietary Gemini 3 models. It is the first Gemma generation where **architecture — not just scale or training data — is the primary axis of differentiation** across variants.
+Gemma 4 changed after this document was first written. The original version predated the June 2026 release of **Gemma 4 12B Unified**, so any architecture notes that say "four models" or omit 12B are stale.
 
-### Model Variants
+This update is based on:
 
-| Model | Architecture | Total Params | Active Params | Context | Modalities |
-|---|---|---|---|---|---|
-| **Gemma 4 E2B** | Dense + PLE | ~5.1B | ~2.3B effective | 128K | Text, Image, Video, Audio |
-| **Gemma 4 E4B** | Dense + PLE | ~8B | ~4.5B effective | 128K | Text, Image, Video, Audio |
-| **Gemma 4 26B-A4B** | MoE | ~26B | ~3.8B active | 256K | Text, Image, Video |
-| **Gemma 4 31B** | Dense | ~31B | ~31B | 256K | Text, Image, Video |
+- Official Google Gemma 4 model overview and model card.
+- Official Google 12B launch post and 12B developer guide.
+- Hugging Face model repositories and downloaded metadata under `/tmp/gemma4_hf_metadata`.
+- Hugging Face Transformers `gemma4` and `gemma4_unified` configuration/modeling code.
+- Exa search results used to cross-check the official pages and locate the 12B-specific docs.
 
-**Naming conventions:**
-- `E` = "Effective" parameters — edge models where PLE tables account for a large portion of total params but only `~2–4.5B` parameters are actively computed per forward pass
-- `A` = "Active" parameters — for the MoE, only `~3.8B` of `26B` total parameters fire per token
-- All four models are **multimodal from the ground up** — not a bolted-on vision tower, but trained jointly from scratch
-- All shipped as both **pre-trained (PT)** and **instruction-tuned (IT)** variants with thinking mode
+The downloaded Hugging Face metadata includes:
 
----
-
-## 2. Shared Architectural DNA
-
-Every Gemma 4 model is a **decoder-only transformer** with the following universally shared properties:
-
-### Core Architecture
-- **Type:** Causal decoder-only transformer (autoregressive)
-- **Normalization:** RMSNorm at pre-attention (`input_layernorm`), post-attention (`post_attention_layernorm`), pre-FFN (`pre_feedforward_layernorm`), post-FFN (`post_feedforward_layernorm`) — 4 norms per block
-- **Activation:** `GELU (tanh approximation)` — `gelu_pytorch_tanh` — used inside GeGLU gated units
-- **FFN type:** GeGLU (Gated Linear Units with GELU): `FFN(x) = (xW_gate ⊙ GELU(xW_up)) · W_down`
-- **Attention type:** Grouped Query Attention (GQA) on all variants, with differing group ratios per model
-- **QK Normalization:** RMSNorm applied to query and key projections before attention computation — stabilizes training at scale
-- **V Normalization:** RMSNorm applied to values (WITHOUT a learned scale parameter) — new in Gemma 4, absent in Gemma 3
-- **Logit soft-capping:** `tanh(x / 30.0) * 30.0` applied to final output logits — bounds to `[-30, 30]`
-- **Weight tying:** Input embedding and output lm_head weights are tied (`tie_word_embeddings=True`)
-- **Attention bias:** None (`attention_bias=False`)
-- **Attention dropout:** 0.0
-- **K=V sharing in global layers:** Full attention layers share K and V projections — V is derived from K before normalization, eliminating the V projection matrix entirely
-- **Final layer always global:** The last decoder layer is always a full (global) attention layer, regardless of the interleaving ratio — guarantees full-context awareness in final representation
-- **Vocabulary size:** 262,144 tokens (up from 262,208 in Gemma 3 — minor boundary rounding)
-- **Attention — K equals V (`attention_k_eq_v`):** `true` — in global layers, K and V start from the same projection, then diverge through separate normalization paths
-- **`initializer_range`:** 0.02
-- **`rms_norm_eps`:** 1e-6
-
-### Hybrid Attention Pattern
-
-All Gemma 4 models alternate between two structurally distinct layer types:
-
-```
-Sliding Layer (local): head_dim=256, more KV heads, RoPE theta=10K, full rotation, window=512 or 1024
-Full Layer (global):   head_dim=512, fewer KV heads, p-RoPE theta=1M, 25% partial rotation, no window
+```text
+/tmp/gemma4_hf_metadata/gemma-4-12B/config.json
+/tmp/gemma4_hf_metadata/gemma-4-12B/README.md
+/tmp/gemma4_hf_metadata/gemma-4-12B/processor_config.json
+/tmp/gemma4_hf_metadata/gemma-4-12B/generation_config.json
+/tmp/gemma4_hf_metadata/gemma-4-12B/tokenizer_config.json
+/tmp/gemma4_hf_metadata/gemma-4-31B-it/config.json
+/tmp/gemma4_hf_metadata/gemma-4-26B-A4B/config.json
+/tmp/gemma4_hf_metadata/modeling_gemma4.py
+/tmp/gemma4_hf_metadata/modeling_gemma4_unified.py
 ```
 
-The pattern ratio is **5:1** (five sliding, one full) for 26B and 31B, and **4:1** (four sliding, one full) for E2B/E4B.
+The model weight file was intentionally not downloaded. The 12B tree contains a roughly 23.9 GB `model.safetensors`; it is not needed for architecture metadata.
 
 ---
 
-## 3. Attention Mechanism — Dual-Config Hybrid
+## 2. Family Overview
 
-This is the most architecturally significant innovation in Gemma 4. Gemma 3 used identical attention geometry across all layers; Gemma 4 makes the geometry fundamentally different depending on layer type.
+Gemma 4 is the fourth generation of Google's open-weight Gemma family. The official current lineup includes five parameter sizes, but this repo is focused on the three non-E-series models:
 
-### Sliding Window (Local) Attention Layers
+| Model | Official architecture bucket | Parameters | Context | Modalities |
+|---|---:|---:|---:|---|
+| Gemma 4 12B Unified | Dense unified, encoder-free multimodal | 11.95B | 256K | Text, Image, Audio |
+| Gemma 4 26B-A4B | Mixture-of-Experts | 25.2B total, 3.8B active | 256K | Text, Image |
+| Gemma 4 31B Dense | Dense | 30.7B text scale | 256K | Text, Image |
 
-- **Window size:** 512 tokens (E2B, E4B) or 1024 tokens (26B, 31B)
-- **`head_dim`:** 256
-- **KV heads:** Model-dependent (see hyperparameter table below)
-- **RoPE:** Standard, `theta=10,000`, all head dimensions rotated (100%)
-- **Masking:** Causal mask + window mask — token can only attend to the last `window` tokens
-- **Purpose:** Efficient local pattern recognition, syntax, short-range dependencies
+The official family also includes E2B and E4B edge models. They are intentionally out of scope here.
 
-### Full / Global Attention Layers
+Naming:
 
-- **Window size:** None — full causal attention over entire sequence
-- **`global_head_dim`:** 512 (double the sliding head_dim)
-- **KV heads:** 4× fewer than sliding layers (see table)
-- **RoPE:** Proportional RoPE (p-RoPE), `theta=1,000,000`, only 25% of dimensions rotated
-- **K=V weight sharing:** V projection matrix is eliminated; K is cloned as V before normalization
-- **`k_norm`:** RMSNorm with learned scale (applied to keys)
-- **`v_norm`:** RMSNorm without learned scale (applied to values derived from K)
-- **Purpose:** Long-range semantic attention, global context, cross-sentence reasoning
-
-### Why Two Head Dims?
-
-The wider `head_dim=512` in global layers compensates for the aggressive KV compression (fewer KV heads). Each global KV head needs higher capacity to represent the full sequence. The narrower `head_dim=256` in sliding layers is fine because each head only covers a 512–1024 token window.
-
-### Information Propagation
-
-Sliding window layers cannot directly attend to tokens outside their window. However, information propagates through the residual stream — tokens from 5,000 positions ago influence today's window because their hidden states were modified by all prior layers. The periodic global layers (every 5th or 6th) break through this indirection by attending directly to the full sequence.
+- **12B Unified** means the model removes the separate multimodal encoders and projects image/audio inputs directly into the language-model embedding space.
+- **31B Dense** means every token runs the full dense transformer stack.
+- **26B-A4B** means about 26B total parameters are loaded, but only about 4B are active for each token because MoE routing selects a sparse subset.
 
 ---
 
-## 4. Positional Encoding — Proportional RoPE (p-RoPE)
+## 3. Repo-Relevant Model Set
 
-### Background
+### Recommended Bring-Up Order
 
-Standard RoPE rotates all head dimensions. In long contexts, the lowest-frequency (slowest-rotating) dimensions eventually complete full rotations, destroying semantic signal. Gemma 3 addressed this with linear frequency scaling (8×) on global layers, but this is suboptimal.
+1. **Gemma 4 12B Unified, text path only**
+   - Same dense text recipe as 31B at smaller dimensions.
+   - BF16 weights fit on one RTX A6000 with meaningful KV room.
+   - Best target for proving the unfused baseline and decode orchestration.
 
-### The p-RoPE Solution
+2. **Gemma 4 31B Dense, quantized weights**
+   - The original project target.
+   - BF16 weights do not fit on one 48 GB A6000.
+   - Q4/weight-only quantization is needed for single-GPU 31B.
 
-Based on the paper *"Round and Round We Go! What makes Rotary Positional Encodings useful?"* (Barbero et al., Oxford & Google DeepMind, 2024, arXiv:2410.06205).
+3. **Gemma 4 26B-A4B, after dense path is stable**
+   - Attractive for speed because only 3.8B parameters are active per token.
+   - Requires MoE routing, expert layout, and sparse expert execution.
+   - Not a small delta from the dense path.
 
-The key insight: **not all RoPE dimensions are equal**:
-- High-frequency dimensions → **positional heads** (robust position tracking)
-- Low-frequency dimensions → **semantic heads** (content meaning, position-invariant at long context)
+### Why 12B Matters for A6000
 
-**p-RoPE** sets the `(1 - p)` lowest-frequency dimensions to zero, making them position-independent (NoPE). With `p=0.25`, only 25% of dimensions carry positional information; 75% become pure semantic channels that never degrade regardless of context length.
+Official memory guidance lists Gemma 4 12B at about **26.7 GB BF16**, **13.4 GB SFP8**, and **6.7 GB Q4_0** before context/KV cache. The RTX A6000 has 48 GB, so 12B BF16 is realistic. By contrast, 31B BF16 is listed at about **69.9 GB** with loading overhead, so it cannot fit on a single A6000 in full precision.
 
-### Gemma 4's Implementation
+12B is not "the same model but fewer layers." It preserves the same important text architecture ideas:
 
-| Layer Type | theta | Partial Factor | Dims Rotated | Behavior |
-|---|---|---|---|---|
-| Sliding (local) | 10,000 | 1.0 (100%) | All head dims | Standard RoPE, fine-grained local positioning |
-| Full (global) | 1,000,000 | 0.25 (25%) | Top 25% of dims | p-RoPE, robust long-range semantic attention |
+- local/global hybrid attention,
+- wider global attention heads,
+- global K=V,
+- p-RoPE on global layers,
+- GeGLU MLPs,
+- RMSNorm,
+- logit soft-capping,
+- tied embeddings,
+- 256K context.
 
-For the 31B with `global_head_dim=512`:
-- 128 dimensions are rotated (positional)
-- 384 dimensions are position-free (semantic NoPE)
-
-This is why Gemma 4 can handle 256K context reliably while Gemma 3 struggled beyond 128K.
-
-### Validation (from p-RoPE paper, lower perplexity = better)
-
-| Encoding | WikiText | Properties |
-|---|---|---|
-| NoPE (no rotation) | 4.8594 | Semantic only, no position |
-| Standard RoPE (theta=10K) | 4.4627 | Baseline |
-| RoPE (theta=500K) | 4.4485 | High theta |
-| **0.25-RoPE (p=0.25)** | **4.4592** | **Gemma 4's setting** |
-| 0.75-RoPE full model | 4.4414 | Best overall |
-
-Gemma 4 uses `0.25-RoPE` on global layers only, giving the best of both: standard RoPE for local layers, p-RoPE for global layers.
+But its dimensions are different enough that this repository's hardcoded 31B constants must become model-config driven before 12B and 31B can share code cleanly.
 
 ---
 
-## 5. Per-Model Architecture Deep Dives
+## 4. Shared Text Architecture
 
-### 5.1 Gemma 4 31B — Dense Server
+The repo-relevant Gemma 4 text models are causal decoder-only transformers.
 
-The flagship model. No sparsity tricks — every layer computes fresh K, V, and FFN.
+Shared text features:
 
-**Core text config:**
+| Feature | Value / behavior |
+|---|---|
+| Transformer type | Decoder-only, autoregressive |
+| Attention pattern | Interleaved sliding-window and full/global attention |
+| Final layer | Always full/global attention |
+| Sliding RoPE | Standard RoPE, `theta=10000` |
+| Global RoPE | Proportional RoPE, `theta=1000000`, `partial_rotary_factor=0.25` |
+| Sliding head dim | 256 |
+| Global head dim | 512 |
+| Attention bias | false |
+| Attention dropout | 0.0 |
+| Q norm | Learned RMSNorm per head |
+| K norm | Learned RMSNorm per head |
+| V norm | RMSNorm without learned scale |
+| MLP | GeGLU with `gelu_pytorch_tanh` |
+| Decoder norms | input, post-attention, pre-FFN, post-FFN RMSNorm |
+| Final norm | RMSNorm |
+| Logit softcap | `tanh(logits / 30.0) * 30.0` |
+| Weight tying | Input embedding and LM head tied |
+| Vocabulary | 262,144 tokens |
+| Default dtype | BF16 |
+| RMSNorm epsilon | `1e-6` |
+| Initializer range | `0.02` |
+
+The text decoder uses four RMSNorms per block:
+
+```text
+x
+  -> input_layernorm
+  -> attention
+  -> post_attention_layernorm
+  -> residual add
+  -> pre_feedforward_layernorm
+  -> GeGLU MLP
+  -> post_feedforward_layernorm
+  -> residual add
+```
+
+Gemma 4's residual/norm order is important for kernel planning. The memory-bound operations are the residual adds, RMSNorms, Q/K/V normalizations, logit softcap, and sampling. GEMMs should stay in cuBLAS/cuBLASLt until correctness and profiling justify replacing them.
+
+---
+
+## 5. Hybrid Attention
+
+Gemma 4 does not use one attention shape everywhere. It alternates local/sliding layers and full/global layers.
+
+### Layer Pattern
+
+For the repo-relevant models:
+
+| Model | Layers | Sliding layers | Global layers | Pattern |
+|---|---:|---:|---:|---|
+| 12B Unified | 48 | 40 | 8 | five sliding, one global |
+| 31B Dense | 60 | 50 | 10 | five sliding, one global |
+| 26B-A4B | 30 | 25 | 5 | five sliding, one global |
+
+The layer list repeats:
+
+```text
+sliding, sliding, sliding, sliding, sliding, full
+```
+
+and ends on a full/global layer.
+
+### Sliding Attention
+
+Sliding attention is local causal attention.
+
+| Property | 12B | 31B | 26B-A4B |
+|---|---:|---:|---:|
+| Window | 1024 | 1024 | 1024 |
+| Head dim | 256 | 256 | 256 |
+| Q heads | 16 | 32 | 16 |
+| KV heads | 8 | 16 | 8 |
+| Q width | 4096 | 8192 | 4096 |
+| K width | 2048 | 4096 | 2048 |
+| V width | 2048 | 4096 | 2048 |
+| GQA ratio | 2 Q heads / KV head | 2 Q heads / KV head | 2 Q heads / KV head |
+
+Sliding attention only needs the most recent 1024 tokens in the decode KV cache for each sliding layer. For long-context memory estimates, do not multiply sliding layers by full context length unless modeling a framework that stores unnecessary history.
+
+### Full / Global Attention
+
+Global attention is full causal attention over the sequence.
+
+| Property | 12B | 31B | 26B-A4B |
+|---|---:|---:|---:|
+| Window | full context | full context | full context |
+| Head dim | 512 | 512 | 512 |
+| Q heads | 16 | 32 | 16 |
+| Global KV heads | 1 | 4 | 2 |
+| Q width | 8192 | 16384 | 8192 |
+| K width | 512 | 2048 | 1024 |
+| V projection | none; V derived from K | none; V derived from K | none; V derived from K |
+| GQA ratio | 16 Q heads / KV head | 8 Q heads / KV head | 8 Q heads / KV head |
+
+The Hugging Face implementation sets `use_alternative_attention = attention_k_eq_v and not is_sliding`. In other words, K=V projection sharing applies to global layers in these configs, not to sliding layers.
+
+### K=V Behavior
+
+In global layers:
+
+```text
+k_raw = x @ W_k
+v_raw = k_raw
+k = RMSNorm(k_raw, learned_scale)
+v = RMSNorm(v_raw, no_learned_scale)
+```
+
+This saves one global V projection matrix and reduces global KV width. It is especially important for the 12B model, where each global layer has only one KV head.
+
+---
+
+## 6. RoPE and p-RoPE
+
+Gemma 4 uses separate RoPE settings for sliding and global layers.
+
+| Layer type | `rope_theta` | `rope_type` | Rotated fraction | Rotated dims |
+|---|---:|---|---:|---:|
+| Sliding | 10,000 | default | 100% | 256 of 256 |
+| Global | 1,000,000 | proportional | 25% | 128 of 512 |
+
+The global attention head is 512 dimensions, but only the first 25% is position-rotated. The remaining 384 dimensions are effectively non-rotary semantic channels. This is the p-RoPE tradeoff: keep enough position signal for long-range ordering while preserving a large position-independent subspace.
+
+Implementation implications:
+
+- RoPE code must accept `rotary_dim` that differs from `head_dim`.
+- Global layers use `rotary_dim = 128`, not 512.
+- Sliding layers use `rotary_dim = 256`.
+- The RoPE cache must be keyed by layer type because theta and rotary dimension differ.
+- Q and K receive RoPE after Q/K RMSNorm.
+- V does not receive RoPE.
+
+For this repo's CUDA kernels, treat rotary application as a separate baseline kernel first, then fuse with Q/K RMSNorm and KV write only after numerical checks pass.
+
+---
+
+## 7. Gemma 4 12B Unified
+
+Gemma 4 12B Unified is the most important new target for this repository. It is dense, fits on an A6000 in BF16, and shares the server-class text design of 31B without requiring quantization for initial bring-up.
+
+### Core Text Config
+
+Source: `google/gemma-4-12B/config.json`.
 
 | Parameter | Value |
+|---|---:|
+| `architectures` | `Gemma4UnifiedForConditionalGeneration` |
+| `model_type` | `gemma4_unified` |
+| `text_config.model_type` | `gemma4_unified_text` |
+| `dtype` | `bfloat16` |
+| `hidden_size` | 3840 |
+| `num_hidden_layers` | 48 |
+| Sliding layers | 40 |
+| Global layers | 8 |
+| `num_attention_heads` | 16 |
+| `num_key_value_heads` | 8 |
+| `num_global_key_value_heads` | 1 |
+| `head_dim` | 256 |
+| `global_head_dim` | 512 |
+| `intermediate_size` | 15360 |
+| `sliding_window` | 1024 |
+| `max_position_embeddings` | 262144 |
+| `vocab_size` | 262144 |
+| `attention_k_eq_v` | true |
+| `hidden_size_per_layer_input` | 0 |
+| `num_kv_shared_layers` | 0 |
+| `use_double_wide_mlp` | false |
+| `final_logit_softcapping` | 30.0 |
+| `tie_word_embeddings` | true |
+
+### Projection Shapes
+
+For text-only inference:
+
+| Operation | Shape |
 |---|---|
+| Sliding Q | `[M, 3840] x [3840, 4096]` |
+| Sliding K | `[M, 3840] x [3840, 2048]` |
+| Sliding V | `[M, 3840] x [3840, 2048]` |
+| Sliding O | `[M, 4096] x [4096, 3840]` |
+| Global Q | `[M, 3840] x [3840, 8192]` |
+| Global K | `[M, 3840] x [3840, 512]` |
+| Global V | no matrix; derived from K |
+| Global O | `[M, 8192] x [8192, 3840]` |
+| FFN gate | `[M, 3840] x [3840, 15360]` |
+| FFN up | `[M, 3840] x [3840, 15360]` |
+| FFN down | `[M, 15360] x [15360, 3840]` |
+| LM head | `[M, 3840] x [3840, 262144]` |
+
+### Per-Block Parameter Counts
+
+Approximate text-only counts:
+
+| Component | Sliding block | Global block | Notes |
+|---|---:|---:|---|
+| Q projection | 15.7M | 31.5M | global head dim is 512 |
+| K projection | 7.9M | 2.0M | one global KV head |
+| V projection | 7.9M | 0 | global K=V |
+| O projection | 15.7M | 31.5M | output width follows Q width |
+| Attention total | 47.2M | 64.9M | excludes norm weights |
+| GeGLU FFN | 176.9M | 176.9M | `3 * 3840 * 15360` |
+| Block total | 224.1M | 241.8M | approximate |
+
+Text parameter estimate:
+
+```text
+Sliding blocks: 40 * 224.1M =  8.97B
+Global blocks:   8 * 241.8M =  1.93B
+Token embedding: 262144 * 3840 = 1.01B
+Text total:                    = 11.91B
+Official listed scale:          11.95B
+```
+
+The small difference is consistent with normalization weights and the lightweight unified multimodal components.
+
+### Why 12B Is Not Just "31B Smaller"
+
+12B keeps the same server-class layer pattern, but changes the compression point:
+
+- It has half as many Q heads as 31B.
+- It has only one global KV head.
+- Its global K/V cache grows at 16 KB per token across all global layers in BF16.
+- Its hidden size is 3840, so all dense GEMMs are meaningfully smaller.
+- It removes the separate vision/audio towers entirely.
+
+For this repo, that means 12B can be used to develop the same baseline kernels at smaller dimensions before scaling to 31B.
+
+---
+
+## 8. Gemma 4 31B Dense
+
+Gemma 4 31B Dense remains the original long-term target for a specialized inference engine. It is the largest dense open Gemma 4 model and has the highest benchmark scores in the family, but it does not fit on a single A6000 in BF16.
+
+### Core Text Config
+
+Source: `google/gemma-4-31B-it/config.json`.
+
+| Parameter | Value |
+|---|---:|
+| `architectures` | `Gemma4ForConditionalGeneration` |
 | `model_type` | `gemma4` |
-| `hidden_size` | 5,376 |
+| `text_config.model_type` | `gemma4_text` |
+| `dtype` | `bfloat16` |
+| `hidden_size` | 5376 |
 | `num_hidden_layers` | 60 |
-| `layer_pattern` | 50 sliding + 10 full (5:1 ratio) |
-| `num_attention_heads` (Q) | 32 |
-| `num_key_value_heads` (sliding) | 16 |
-| `num_key_value_heads` (global) | 4 |
-| `head_dim` (sliding) | 256 |
-| `global_head_dim` (full) | 512 |
-| `intermediate_size` (FFN hidden) | 21,504 |
-| `FFN type` | GeGLU (dense) |
-| `sliding_window` | 1,024 tokens |
-| `context_window` | 256,000 tokens |
-| `vocab_size` | 262,144 |
-| `attention_k_eq_v` | true (global layers) |
+| Sliding layers | 50 |
+| Global layers | 10 |
+| `num_attention_heads` | 32 |
+| `num_key_value_heads` | 16 |
+| `num_global_key_value_heads` | 4 |
+| `head_dim` | 256 |
+| `global_head_dim` | 512 |
+| `intermediate_size` | 21504 |
+| `sliding_window` | 1024 |
+| `max_position_embeddings` | 262144 |
+| `vocab_size` | 262144 |
+| `attention_k_eq_v` | true |
+| `hidden_size_per_layer_input` | 0 |
+| `num_kv_shared_layers` | 0 |
+| `use_double_wide_mlp` | false |
 | `final_logit_softcapping` | 30.0 |
-| `rms_norm_eps` | 1e-6 |
-| `hidden_activation` | gelu_pytorch_tanh |
-| `attention_bias` | false |
-| `attention_dropout` | 0.0 |
-| `dtype` | bfloat16 |
+| `tie_word_embeddings` | true |
 
-**Per-block parameter counts:**
+### Projection Shapes
 
-| Component | Sliding Block | Full Block | Notes |
-|---|---|---|---|
-| Q proj | 44.0M | 88.1M | `5376 × 32 × head_dim` |
-| K proj | 22.0M | 11.0M | `5376 × kv_heads × head_dim` |
-| V proj | 22.0M | **0** | Eliminated in full layers (K=V) |
-| O proj | 44.0M | 88.1M | `q_heads × head_dim × 5376` |
-| **Attention total** | **132.1M** | **187.2M** | |
-| GeGLU FFN | 346.8M | 346.8M | `3 × 5376 × 21504` |
-| **Block total** | **478.9M** | **534.0M** | |
+| Operation | Shape |
+|---|---|
+| Sliding Q | `[M, 5376] x [5376, 8192]` |
+| Sliding K | `[M, 5376] x [5376, 4096]` |
+| Sliding V | `[M, 5376] x [5376, 4096]` |
+| Sliding O | `[M, 8192] x [8192, 5376]` |
+| Global Q | `[M, 5376] x [5376, 16384]` |
+| Global K | `[M, 5376] x [5376, 2048]` |
+| Global V | no matrix; derived from K |
+| Global O | `[M, 16384] x [16384, 5376]` |
+| FFN gate | `[M, 5376] x [5376, 21504]` |
+| FFN up | `[M, 5376] x [5376, 21504]` |
+| FFN down | `[M, 21504] x [21504, 5376]` |
+| LM head | `[M, 5376] x [5376, 262144]` |
 
-**Total:** `50 × 478.9M + 10 × 534.0M + 1.4B embed ≈ 30.7B`
+### Per-Block Parameter Counts
 
-**Vision encoder:** ViT, 27 transformer layers, hidden dim 1152, 550M parameters (shared with 26B)
+| Component | Sliding block | Global block | Notes |
+|---|---:|---:|---|
+| Q projection | 44.0M | 88.1M | global head dim is 512 |
+| K projection | 22.0M | 11.0M | four global KV heads |
+| V projection | 22.0M | 0 | global K=V |
+| O projection | 44.0M | 88.1M | output width follows Q width |
+| Attention total | 132.1M | 187.2M | excludes norm weights |
+| GeGLU FFN | 346.8M | 346.8M | `3 * 5376 * 21504` |
+| Block total | 478.9M | 534.0M | approximate |
+
+Text parameter estimate:
+
+```text
+Sliding blocks: 50 * 478.9M = 23.95B
+Global blocks:  10 * 534.0M =  5.34B
+Token embedding: 262144 * 5376 = 1.41B
+Text total:                    = 30.70B
+```
+
+The model also has a standard Gemma 4 vision tower with about 550M parameters, but the current implementation plan should not block the text path on multimodal support.
 
 ---
 
-### 5.2 Gemma 4 26B-A4B — MoE Server
+## 9. Gemma 4 26B-A4B MoE
 
-The efficiency powerhouse. Achieves 98% of the 31B's Arena score with only ~3.8B active parameters per token — a 7.5× compute reduction.
+Gemma 4 26B-A4B is not a dense model. It has about 25.2B total parameters but activates about 3.8B per token. It is attractive for throughput, but it requires a different FFN execution path.
 
-**Core text config:**
+### Core Text Config
+
+Source: `google/gemma-4-26B-A4B/config.json`.
 
 | Parameter | Value |
-|---|---|
+|---|---:|
+| `architectures` | `Gemma4ForConditionalGeneration` |
 | `model_type` | `gemma4` |
-| `hidden_size` | 2,816 |
+| `text_config.model_type` | `gemma4_text` |
+| `dtype` | `bfloat16` |
+| `hidden_size` | 2816 |
 | `num_hidden_layers` | 30 |
-| `layer_pattern` | 25 sliding + 5 full (5:1 ratio) |
-| `num_attention_heads` (Q) | 16 |
-| `num_key_value_heads` (sliding) | 8 |
-| `num_key_value_heads` (global) | 2 |
-| `head_dim` (sliding) | 256 |
-| `global_head_dim` (full) | 512 |
-| `intermediate_size` (dense FFN hidden) | 2,112 |
-| `FFN type` | MoE (128 experts, top-8) + parallel dense GeGLU |
+| Sliding layers | 25 |
+| Global layers | 5 |
+| `num_attention_heads` | 16 |
+| `num_key_value_heads` | 8 |
+| `num_global_key_value_heads` | 2 |
+| `head_dim` | 256 |
+| `global_head_dim` | 512 |
+| Dense/shared `intermediate_size` | 2112 |
+| Expert `expert_intermediate_size` | 704 |
 | `num_experts` | 128 |
-| `num_experts_per_tok` | 8 |
-| `expert_hidden_size` | 704 |
-| `sliding_window` | 1,024 tokens |
-| `context_window` | 256,000 tokens |
-| `vocab_size` | 262,144 |
+| `top_k_experts` | 8 |
+| `sliding_window` | 1024 |
+| `max_position_embeddings` | 262144 |
+| `vocab_size` | 262144 |
+| `attention_k_eq_v` | true |
 | `enable_moe_block` | true |
-| `attention_k_eq_v` | true (global layers) |
 | `final_logit_softcapping` | 30.0 |
-| `dtype` | bfloat16 |
+| `tie_word_embeddings` | true |
 
-**The unusual MoE design — parallel, not replacement:**
+### Projection Shapes
 
-Most MoE models (DeepSeek, Mixtral, Qwen) **replace** the dense FFN with a MoE layer. Gemma 4's 26B instead runs them **in parallel and sums their outputs**:
-
-```
-FFN_output = (dense_GeGLU(x) + MoE_output(x)) * (1 / sqrt(2))
-```
-
-Where:
-- `dense_GeGLU`: always-on, hidden=2,112, provides stable baseline capacity
-- `MoE_output`: 128 experts, each with hidden=704, top-8 routing per token
-- The `1/sqrt(2)` scaling prevents magnitude explosion from summation
-
-**Expert routing:**
-- Router: learned linear projection `nn.Linear(2816, 128)` + softmax
-- For each token, 128 scores computed → top-8 selected by score
-- Expert outputs weighted by their softmax scores and summed
-- Routing is independent per token, per layer, per forward pass
-
-**Per-block parameter counts:**
-
-| Component | Sliding Block | Full Block | Notes |
-|---|---|---|---|
-| Q proj | 11.5M | 23.1M | `2816 × 16 × head_dim` |
-| K proj | 5.8M | 2.9M | `2816 × kv_heads × head_dim` |
-| V proj | 5.8M | **0** | Eliminated in full layers |
-| O proj | 11.5M | 23.1M | |
-| **Attention total** | **34.6M** | **49.0M** | |
-| Dense GeGLU | 17.8M | 17.8M | `3 × 2816 × 2112` |
-| MoE experts (all 128) | 761.3M | 761.3M | `128 × 3 × 2816 × 704` |
-| MoE active (top-8) | 47.6M | 47.6M | `8 × 5.9M per expert` |
-| Router | 0.4M | 0.4M | `2816 × 128` |
-| **FFN total capacity** | **779.5M** | **779.5M** | |
-| **FFN active/token** | **65.8M** | **65.8M** | dense + top-8 + router |
-| **Block total capacity** | **814.1M** | **828.5M** | |
-| **Block active/token** | **100.4M** | **114.8M** | |
-
-**Total capacity:** `25 × 814M + 5 × 829M + 0.7B embed ≈ 25.2B`  
-**Active per token:** `25 × 100M + 5 × 115M + 0.7B embed ≈ 3.8B`
-
-> Note: All 26B parameters must be loaded into VRAM even though only ~3.8B are active per token — expert weights are all needed for routing decisions.
-
----
-
-### 5.3 Gemma 4 E4B — Edge Dense
-
-The mid-size on-device model. ~8B total parameters, ~4.5B effective. Shares E-series architecture with PLE and KV cache sharing.
-
-**Key specs:**
-
-| Parameter | Value |
+| Operation | Shape |
 |---|---|
-| Total parameters | ~8B |
-| Effective parameters | ~4.5B |
-| Context window | 128,000 tokens |
-| Sliding window | 512 tokens |
-| Layer pattern | 4:1 (sliding:full) |
-| Modalities | Text, Image, Video, Audio |
-| Vision encoder | ViT, 16 layers, d=768, 150M params |
-| Audio encoder | Conformer (USM-style) |
-| PLE | Yes — per-layer embedding system |
-| KV cache sharing | Yes |
+| Sliding Q | `[M, 2816] x [2816, 4096]` |
+| Sliding K | `[M, 2816] x [2816, 2048]` |
+| Sliding V | `[M, 2816] x [2816, 2048]` |
+| Sliding O | `[M, 4096] x [4096, 2816]` |
+| Global Q | `[M, 2816] x [2816, 8192]` |
+| Global K | `[M, 2816] x [2816, 1024]` |
+| Global V | no matrix; derived from K |
+| Global O | `[M, 8192] x [8192, 2816]` |
+| Dense/shared FFN gate/up/down | `2816 <-> 2112` GeGLU |
+| Expert FFN gate/up/down | `2816 <-> 704` GeGLU per expert |
+| Router | `[M, 2816] x [2816, 128]` |
 
-> Note: Full config.json was not publicly released at time of writing. Detailed hyperparameters confirmed to be similar to E2B but scaled up.
+### MoE Structure
 
----
+The model card describes 128 total experts, 8 active experts per token, and one shared path. In config terms:
 
-### 5.4 Gemma 4 E2B — On-Device Any-to-Any
+- `num_experts = 128`
+- `top_k_experts = 8`
+- `expert_intermediate_size = 704`
+- `intermediate_size = 2112`
 
-The most architecturally novel variant. The largest architectural divergence from the server models.
+The practical interpretation for implementation:
 
-**Core text config:**
-
-| Parameter | Value |
-|---|---|
-| `model_type` | `gemma4` |
-| `hidden_size` | 1,536 |
-| `num_hidden_layers` | 35 |
-| `layer_pattern` | 28 sliding + 7 full (4:1 ratio) |
-| `num_attention_heads` (Q) | 8 |
-| `num_key_value_heads` (sliding) | 1 (extreme MQA) |
-| `num_key_value_heads` (global) | 1 |
-| `head_dim` (sliding) | 256 |
-| `global_head_dim` (full) | 512 |
-| `intermediate_size` (standard layers) | 6,144 |
-| `intermediate_size` (KV-shared layers, 2× wide) | 12,288 |
-| `sliding_window` | 512 tokens |
-| `context_window` | 128,000 tokens |
-| `vocab_size` | 262,144 |
-| `num_kv_shared_layers` | 20 (of 35 total) |
-| `hidden_size_per_layer_input` (PLE dim) | 256 |
-| `vocab_size_per_layer_input` (PLE vocab) | 262,144 |
-| `attention_k_eq_v` | false (E2B does not use K=V sharing) |
-| `final_logit_softcapping` | 30.0 |
-| `dtype` | bfloat16 |
-
-**KV Cache Sharing:**
-
-20 of 35 layers reuse KV caches computed by earlier layers of the same type. This dramatically reduces the KV cache memory footprint. Layers with shared KV compensate by using a **2× wider MLP** (`hidden=12,288` instead of `6,144`), maintaining representation capacity.
-
-**Per-block parameter counts (E2B):**
-
-| Component | Sliding (standard) | Full (standard) | Notes |
-|---|---|---|---|
-| Q proj | 3.1M | 6.3M | `1536 × 8 × head_dim` |
-| K proj | 0.4M | 0.8M | `1536 × 1 × head_dim` |
-| V proj | 0.4M | 0.8M | E2B does not use K=V sharing |
-| O proj | 3.1M | 6.3M | |
-| **Attention total** | **7.1M** | **14.2M** | |
-| GeGLU FFN (standard) | 28.3M | 28.3M | `3 × 1536 × 6144` |
-| GeGLU FFN (KV-shared, 2× wide) | 56.6M | 56.6M | `3 × 1536 × 12288` |
-
-**Total breakdown:**
-- 15 standard blocks + 20 double-wide (KV-shared) blocks
-- + 0.4B computed embedding params
-- + ~2.3B per-layer embedding table (PLE)
-- **≈ 5.1B total, ~2.3B effective**
-
----
-
-## 6. Per-Layer Embeddings (PLE)
-
-PLE is the key innovation enabling E-series models to run efficiently on-device. It gives each decoder layer a **unique token-dependent signal** rather than sharing one embedding across all layers.
-
-### Motivation
-
-In standard transformers, all layers process the same input embedding. But different layers specialize differently (early = syntax, late = semantics). PLE lets each layer "re-read" the token with a layer-specific lens, enabling shallower models to encode information that would otherwise require more depth.
-
-### Dual-Signal Architecture
-
-PLE combines two complementary signals per layer:
-
-**1. Token-Identity Component**
-- A single `nn.Embedding` of shape `(vocab_size, num_layers × hidden_size_per_layer_input)`
-- For E2B: shape = `(262144, 35 × 256)` = `(262144, 8960)` — this alone is ~2.3B parameters
-- Lookup is direct (no context from surrounding tokens)
-- Scaled by `√hidden_size_per_layer_input = √256 = 16`
-
-**2. Context-Aware Component**
-- A learned `nn.Linear(hidden_size, num_layers × hidden_size_per_layer_input)` 
-- Projects the main `inputs_embeds` (which include vision/audio soft tokens for multimodal inputs) into per-layer space
-- Scaled by `1/√hidden_size`, then RMSNorm applied
-- This component *sees surrounding context* through the embedding
-
-**Combination:**
-```python
-per_layer_input = (token_identity + context_aware) * (1 / sqrt(2))
-# Reshaped to: (batch, seq_len, num_layers, hidden_size_per_layer_input)
+```text
+dense/shared = GeGLU(x; hidden=2112)
+router_logits = x @ W_router
+selected = top_k(router_logits, 8)
+expert_sum = weighted_sum(GeGLU_expert_i(x; hidden=704) for i in selected)
+ffn_out = combine(dense/shared, expert_sum)
 ```
 
-**Injection into each layer:**
-
-Each decoder layer receives a `256`-dim slice for its specific layer index. This is injected as a **gated third residual block** after attention and FFN:
-
-```
-hidden = hidden + attention_output
-hidden = hidden + ffn_output
-hidden = hidden + gate(per_layer_input[layer_idx])  # PLE residual
-```
-
-### Parameter Accounting
-
-For E2B:
-- Per-layer embedding table: `262144 × 35 × 256 = ~2.34B parameters`
-- Context projection: `1536 × 35 × 256 = ~13.7M parameters`
-- **Total PLE: ~2.35B parameters** (out of ~5.1B total, but not "computed" per token)
-
-This is why "effective parameters" is ~2.3B — the PLE table is looked up (not computed through matrix multiplications) and does not contribute to FLOPs per token in the same way as attention and FFN.
-
----
-
-## 7. Vision Encoder
-
-**All four Gemma 4 models are natively multimodal** — the vision encoder is not a plug-in but was trained jointly with the language model.
-
-### Encoder Sizes
-
-| Model | Vision Encoder | Layers | Hidden Dim | Params |
-|---|---|---|---|---|
-| 31B | ViT | 27 | 1,152 | ~550M |
-| 26B-A4B | ViT | 27 | 1,152 | ~550M |
-| E4B | ViT | 16 | 768 | ~150M |
-| E2B | ViT | 16 | 768 | ~150M |
-
-> Note: Gemma 3 used SigLIP as the vision encoder. Gemma 4 replaces it with a ViT featuring 2D RoPE.
-
-### Key Innovations vs Gemma 3
-
-**2D RoPE for spatial awareness:**
-- Independently rotates half the attention head dimensions for the x-axis and the other half for the y-axis
-- Enables the model to understand spatial relationships: "above," "below," "left of," "right of"
-- Position table stores up to 10,240 positions per axis (handles very large images)
-- Each position is a learned vector of the same dimensions as the patch embedding
-
-**Variable aspect ratio support:**
-- Unlike standard ViT (which resizes to a fixed square), Gemma 4 preserves the original aspect ratio
-- Images are resized so 16×16 pixel patches tile cleanly; minimal padding added where needed
-- Supports configurable token budgets: **70, 140, 280, 560, 1,120 tokens per image**
-- Default: **280 tokens** (vs 256 in Gemma 3)
-
-**Pooling change:**
-- Gemma 3: 4×4 spatial pooling after ViT
-- Gemma 4: **3×3 spatial pooling** — finer spatial granularity, slightly more tokens (280 vs 256)
-
-**Bidirectional attention in vision encoder:**
-- Vision tokens attend to each other bidirectionally (`use_bidirectional_attention="vision"`)
-- Text tokens still use standard causal attention
-- This is set in the model config and handled transparently
-
-### Token Budget System
-
-Users can control image resolution vs. token cost:
-
-| Budget | Tokens | Resolution tradeoff |
-|---|---|---|
-| 70 tokens | Very low | ~7×10 patches — icon-level resolution |
-| 140 tokens | Low | ~10×14 patches |
-| **280 tokens** | **Default** | ~14×20 patches |
-| 560 tokens | High | ~20×28 patches — detailed images |
-| 1,120 tokens | Max | ~28×40 patches — very high detail |
-
-### Special Vision Tokens
-
-```
-boi_token_id: 255999   # begin of image
-eoi_token_id: 258882   # end of image
-image_token_id: 258880 # individual image soft token
-```
-
----
-
-## 8. Audio Encoder (E-Series Only)
-
-E2B and E4B include a native audio encoder, making them **true any-to-any models** (text + image + video + audio in, text out).
-
-### Architecture: USM-style Conformer
-
-| Component | Spec |
-|---|---|
-| Encoder type | Conformer (USM — Universal Speech Model architecture) |
-| Number of layers | 12 |
-| Attention type | Local (chunked) attention — causal |
-| Convolution | Causal Conv1d + depthwise |
-| Subsampling | 2-stage Conv2d, 4× temporal reduction |
-| Output | Projected to text LLM hidden space |
-| Max audio input | Up to 30 seconds |
-| Primary tasks | Speech recognition (ASR), speech translation |
-
-### Special Audio Tokens
-
-```
-boa_token_id: 256000   # begin of audio
-eoa_token_id: 258883   # end of audio
-audio_token_id: 258881 # individual audio soft token
-```
-
-### Benchmark Performance (from model card)
-
-| Task | E2B | E4B |
-|---|---|---|
-| CoVoST-2 (translation) | 33.47 BLEU | 35.54 BLEU |
-| FLEURS (ASR, WER) | 0.09 | 0.08 |
-
----
-
-## 9. MoE Architecture Deep Dive
-
-### Why 128 Experts?
-
-Most prominent MoE models use far fewer experts:
-
-| Model | Total Experts | Active per Token | Sparsity |
-|---|---|---|---|
-| Mixtral 8×7B | 8 | 2 | 25% |
-| DeepSeek-V3 | 256 | 8 | 3.1% |
-| **Gemma 4 26B-A4B** | **128** | **8** | **6.25%** |
-| Qwen MoE | 64 | 8 | 12.5% |
-
-128 experts with top-8 routing = extreme sparsity (6.25% activation). This level of sparsity is normally **fragile** — routing failures or expert collapse are serious risks. Gemma 4 mitigates this with the **always-on dense FFN running in parallel**, which acts as a structural safety net.
-
-### The Parallel Dense + MoE Design
-
-```
-# Per-token, per-MoE-layer forward pass:
-dense_output  = GeGLU_dense(x)          # hidden=2,112, always active
-expert_scores = softmax(x @ router.T)    # shape: (128,)
-top8_indices  = argsort(expert_scores)[-8:]
-moe_output    = sum(expert_scores[i] * expert_i(x) for i in top8_indices)
-layer_output  = (dense_output + moe_output) / sqrt(2)
-```
-
-**Why this matters:**
-- Dense FFN hidden (2,112) is **3× larger than each expert** (704)
-- Even if routing fails for a token (all experts score poorly), the dense FFN provides a reasonable representation
-- The dense path also helps gradient flow through experts during training, stabilizing the 128-expert routing
-
-### Expert Size Rationale
-
-Each expert is intentionally small (`hidden=704`). This forces specialization:
-- With `hidden=2816` main stream and `hidden=704` per expert, each expert handles a narrow niche
-- 128 narrow specialists > 8 generalist experts for capturing diverse knowledge
-- The dense FFN handles the common/universal transformations
-
-### Load Balancing
-
-Google has not published details on the auxiliary loss used for expert load balancing. Common practice (used in DeepSeek, Mixtral, etc.) is an auxiliary load-balancing loss during training that penalizes routing distributions that collapse to a few popular experts.
-
----
-
-## 10. Tokenizer
-
-### Specifications
-
-| Property | Value |
-|---|---|
-| Type | SentencePiece (BPE with byte fallback) |
-| Vocabulary size | 262,144 |
-| Prefix space | None |
-| Normalizer | Replaces spaces with `▁` |
-| `bos_token_id` | 2 |
-| `eos_token_id` | 1 |
-| `pad_token_id` | 0 |
-
-### Special Token IDs
-
-| Token | ID | Purpose |
-|---|---|---|
-| `<pad>` | 0 | Padding |
-| `<eos>` | 1 | End of sequence |
-| `<bos>` | 2 | Beginning of sequence |
-| `<boi>` | 255,999 | Begin of image |
-| `<boa>` | 256,000 | Begin of audio |
-| `<image>` | 258,880 | Image soft token placeholder |
-| `<audio>` | 258,881 | Audio soft token placeholder |
-| `<eoi>` | 258,882 | End of image |
-| `<eoa>` | 258,883 | End of audio |
-
-### Thinking Mode Tokens
-
-Gemma 4 IT models include a native reasoning/thinking mode:
-
-```
-<|think|>   — triggers internal chain-of-thought reasoning
-```
-
-When `<|think|>` appears at the start of the system prompt, the model generates internal reasoning before the final answer. This is toggleable — removing the token disables thinking mode.
-
-### Chat Template
-
-Gemma 4 introduces native support for the **system role** (Gemma 3 did not support this). Standard roles:
-
-```
-system, user, assistant
-```
-
-The `apply_chat_template` processor handles all formatting.
-
----
-
-## 11. Full Hyperparameter Tables
-
-### Architecture Parameters by Model
-
-| Parameter | 31B | 26B-A4B | E2B | Gemma 3 27B (ref) |
-|---|---|---|---|---|
-| **Total params** | ~31B | ~26B | ~5.1B | 27B |
-| **Active params** | 31B | ~3.8B | ~2.3B eff | 27B |
-| **hidden_size** | 5,376 | 2,816 | 1,536 | 5,376 |
-| **num_hidden_layers** | 60 | 30 | 35 | 62 |
-| **layer_pattern** | 5:1 | 5:1 | 4:1 | 5:1 |
-| **Sliding layers** | 50 | 25 | 28 | 52 |
-| **Full layers** | 10 | 5 | 7 | 10 |
-| **num_attention_heads (Q)** | 32 | 16 | 8 | 32 |
-| **num_key_value_heads (sliding)** | 16 | 8 | 1 | 16 |
-| **num_key_value_heads (full/global)** | 4 | 2 | 1 | 16 |
-| **head_dim (sliding)** | 256 | 256 | 256 | 128 |
-| **global_head_dim (full)** | 512 | 512 | 512 | 128 |
-| **intermediate_size** | 21,504 | 2,112 (dense) | 6,144 / 12,288 | 21,504 |
-| **FFN type** | GeGLU | MoE+GeGLU | GeGLU | GeGLU |
-| **num_experts** | — | 128 | — | — |
-| **num_experts_per_tok** | — | 8 | — | — |
-| **expert_hidden_size** | — | 704 | — | — |
-| **sliding_window** | 1,024 | 1,024 | 512 | 1,024 |
-| **context_window** | 256,000 | 256,000 | 128,000 | 128,000 |
-| **vocab_size** | 262,144 | 262,144 | 262,144 | 262,208 |
-| **RoPE theta (sliding)** | 10,000 | 10,000 | 10,000 | 10,000 |
-| **RoPE theta (full)** | 1,000,000 | 1,000,000 | 1,000,000 | 1,000,000 |
-| **partial_rotary_factor (full)** | 0.25 | 0.25 | 0.25 | linear 8× |
-| **QK Norm** | RMSNorm | RMSNorm | RMSNorm | RMSNorm |
-| **V Norm** | RMSNorm (no scale) | RMSNorm (no scale) | RMSNorm (no scale) | none |
-| **K=V sharing (full layers)** | yes | yes | no | no |
-| **KV shared layers** | — | — | 20 of 35 | — |
-| **PLE dim** | — | — | 256 | — |
-| **PLE vocab** | — | — | 262,144 | — |
-| **Logit soft-cap** | 30.0 | 30.0 | 30.0 | none |
-| **Vision encoder** | ViT 27L d=1152 | ViT 27L d=1152 | ViT 16L d=768 | SigLIP 27L d=1152 |
-| **Vision encoder params** | ~550M | ~550M | ~150M | ~400M |
-| **Audio encoder** | — | — | Conformer 12L | — |
-| **Tie word embeddings** | yes | yes | yes | yes |
-| **attention_bias** | false | false | false | false |
-| **rms_norm_eps** | 1e-6 | 1e-6 | 1e-6 | 1e-6 |
-| **initializer_range** | 0.02 | 0.02 | 0.02 | 0.02 |
-| **dtype** | bfloat16 | bfloat16 | bfloat16 | bfloat16 |
-
----
-
-## 12. Parameter Accounting
-
-### Gemma 4 31B (~30.7B actual)
-
-```
-Sliding blocks (50):   50 × 478.9M  = 23.95B
-Full blocks (10):      10 × 534.0M  =  5.34B
-Embedding table:                     ~1.40B
-                               Total = ~30.69B
-```
-
-### Gemma 4 26B-A4B (~25.2B total, ~3.8B active)
-
-```
-Sliding blocks (25):   25 × 814.1M  = 20.35B (capacity)
-Full blocks (5):        5 × 828.5M  =  4.14B (capacity)
-Embedding table:                     ~0.74B
-                       Total capacity = ~25.23B
+This is not a simple replacement of the dense FFN. The shared dense path remains always active, while the sparse experts add conditional capacity.
+
+### Per-Block Parameter Counts
+
+| Component | Sliding block | Global block | Notes |
+|---|---:|---:|---|
+| Attention total | 34.6M | 49.0M | global has wider Q/O, smaller K |
+| Dense/shared GeGLU | 17.8M | 17.8M | `3 * 2816 * 2112` |
+| All experts | 761.3M | 761.3M | `128 * 3 * 2816 * 704` |
+| Active experts/token | 47.6M | 47.6M | `8 * 3 * 2816 * 704` |
+| Router | 0.36M | 0.36M | `2816 * 128` |
+| Capacity/block | 814.1M | 828.5M | loaded parameters |
+| Active/block | 100.4M | 114.8M | per-token compute scale |
+
+Parameter estimate:
+
+```text
+Capacity:
+  Sliding blocks: 25 * 814.1M = 20.35B
+  Global blocks:   5 * 828.5M =  4.14B
+  Token embedding:              0.74B
+  Total capacity:              25.23B
 
 Active per token:
-Sliding (25):          25 × 100.4M  =  2.51B
-Full (5):               5 × 114.8M  =  0.57B
-Embedding:                           ~0.74B
-                       Total active  =  ~3.82B
+  Sliding blocks: 25 * 100.4M = 2.51B
+  Global blocks:   5 * 114.8M = 0.57B
+  Token embedding:             0.74B
+  Active scale:                3.82B
 ```
 
-### Gemma 4 E2B (~5.1B total, ~2.3B effective)
+Implementation consequence: the model's memory footprint behaves like a 25B model, but the FFN compute per token behaves closer to a 4B active model plus routing overhead.
 
+---
+
+## 10. Unified Multimodal Path in 12B
+
+12B Unified is architecturally different from 31B and 26B in the multimodal path. It has no separate vision tower and no separate audio tower.
+
+The Transformers implementation describes the unified model as:
+
+```text
+Vision: raw patches -> LayerNorm -> Dense -> LayerNorm
+        -> factorized XY positional embedding -> LayerNorm
+        -> RMSNorm -> Linear into text hidden space
+
+Audio: raw waveform frames -> RMSNorm -> Linear into text hidden space
 ```
-Standard blocks (15):  ~35.4M × 15  =  0.53B
-Double-wide blocks (20): ~63.7M × 20 =  1.27B
-Computed embedding:                  ~0.40B
-Per-layer embed table (PLE):         ~2.35B  ← lookup only, not computed
-Context projection (PLE):            ~0.014B
-Audio encoder:                       ~0.10B
-Vision encoder (ViT 150M):           ~0.15B
-                       Total         ~4.81B
-                       Effective     ~2.3B (excl. PLE lookup table)
+
+### 12B Vision Embedder
+
+Source: `gemma4_unified` config and modeling code.
+
+| Field | Value |
+|---|---:|
+| `vision_config.model_type` | `gemma4_unified_vision` |
+| `patch_size` | 16 |
+| `pooling_kernel_size` | 3 |
+| `model_patch_size` | 48 |
+| Raw merged patch width | `48 * 48 * 3 = 6912` |
+| `mm_embed_dim` | 3840 |
+| `mm_posemb_size` | 1120 |
+| `num_soft_tokens` | 280 |
+| `output_proj_dims` | 3840 |
+
+The patch embedding core is:
+
+```text
+LayerNorm(6912)
+Linear(6912 -> 3840)
+LayerNorm(3840)
+add factorized positional embedding with shape [1120, 2, 3840]
+LayerNorm(3840)
+RMSNorm(3840, no learned scale in multimodal embedder)
+Linear(3840 -> text_hidden_size)
+```
+
+The main dense patch projection alone is about **26.5M** parameters. The factorized XY positional table is about **8.6M** parameters. This matches the official/developer-guide point that the heavy 27-layer vision encoder is replaced by a lightweight projection-style embedder.
+
+The processor config sets:
+
+| Processor field | Value |
+|---|---:|
+| `image_seq_length` | 280 |
+| `image_processor.max_soft_tokens` | 280 |
+| `video_processor.max_soft_tokens` | 70 |
+| `video_processor.num_frames` | 32 |
+| `do_normalize` for images | false |
+| `do_rescale` for images | true |
+| `rescale_factor` | `1 / 255` |
+
+### 12B Audio Projection
+
+Source: `processor_config.json` and `audio_config`.
+
+| Field | Value |
+|---|---:|
+| `audio_config.model_type` | `gemma4_unified_audio` |
+| `audio_embed_dim` | 640 |
+| `audio_samples_per_token` | 640 |
+| `audio_ms_per_token` | 40 |
+| `audio_seq_length` | 750 |
+| Sampling rate | 16000 Hz |
+| Max audio represented by config | 30 seconds |
+| Projection | RMSNorm + Linear into text hidden space |
+
+At 16 kHz, 640 samples equals 40 ms. With 750 audio tokens, the processor budget is 30 seconds.
+
+### Why Unified Matters
+
+The unified path is not just a deployment trick:
+
+- Multimodal inputs enter the same decoder-only transformer directly.
+- There is no separate vision attention stack to run before the LLM.
+- There is no separate Conformer-style audio encoder to run before the LLM.
+- Fine-tuning can update the multimodal projection and text backbone in one pass.
+- Text-only inference can ignore these modules entirely.
+
+For this repository, the immediate recommendation is still to bring up **text-only 12B** first. The unified multimodal path is small enough to add later, but it is not needed to validate the CUDA text pipeline.
+
+---
+
+## 11. Standard Multimodal Path in 31B and 26B
+
+31B and 26B-A4B use the standard Gemma 4 multimodal path rather than the 12B unified path.
+
+### Vision Tower
+
+Source: `vision_config` in 31B and 26B configs.
+
+| Field | 31B / 26B-A4B |
+|---|---:|
+| `vision_config.model_type` | `gemma4_vision` |
+| Vision hidden size | 1152 |
+| Vision layers | 27 |
+| Vision attention heads | 16 |
+| Vision KV heads | 16 |
+| Vision head dim | 72 |
+| Vision intermediate size | 4304 |
+| Patch size | 16 |
+| Pooling kernel | 3 |
+| Default output length | 280 |
+| Position embedding size | 10240 |
+| RoPE theta | 100 |
+| Standardize | true |
+
+The vision tower uses bidirectional attention over image tokens and 2D RoPE. Text tokens remain causal. This is useful for multimodal inference, but this project should not block the first correct text inference path on it.
+
+### No Audio Tower
+
+The 31B and 26B-A4B configs have `audio_config = null`. They support text and image, not audio.
+
+---
+
+## 12. Tokenizer and Chat Format
+
+### Vocabulary and Token IDs
+
+The shared vocabulary size is 262,144.
+
+| Token / field | ID |
+|---|---:|
+| `<pad>` / `pad_token_id` | 0 |
+| `<eos>` / base `eos_token_id` | 1 |
+| `<bos>` / `bos_token_id` | 2 |
+| `boi_token_id` | 255999 |
+| `boa_token_id` | 256000 |
+| `image_token_id` | 258880 |
+| `audio_token_id` | 258881 |
+| `eoi_token_id` | 258882 |
+| `eoa_token_id` | 258883 |
+| `video_token_id` | 258884 |
+
+Instruction-tuned configs may use multiple EOS IDs in generation config. For example, the downloaded `31B-it` generation config lists `[1, 106, 50]`. The base 12B generation config uses EOS `1` and suppresses `258883` and `258882`.
+
+### Generation Defaults
+
+Official generation config:
+
+| Field | Value |
+|---|---:|
+| `do_sample` | true |
+| `temperature` | 1.0 |
+| `top_k` | 64 |
+| `top_p` | 0.95 |
+| `bos_token_id` | 2 |
+| `pad_token_id` | 0 |
+
+### Chat and Thinking
+
+Gemma 4 instruction-tuned models support standard chat roles, including a native `system` role. Official docs describe a configurable thinking mode controlled through the chat template and thinking tokens. Many libraries hide the raw template details behind `processor.apply_chat_template`.
+
+For this repo's low-level inference path, tokenization/chat templating should remain outside the CUDA core. The CUDA path should accept token IDs and return logits/sampled token IDs.
+
+---
+
+## 13. Hyperparameter Tables
+
+### Text Backbone
+
+| Parameter | 12B Unified | 31B Dense | 26B-A4B |
+|---|---:|---:|---:|
+| Official listed scale | 11.95B | 30.7B | 25.2B total / 3.8B active |
+| `hidden_size` | 3840 | 5376 | 2816 |
+| `num_hidden_layers` | 48 | 60 | 30 |
+| Sliding layers | 40 | 50 | 25 |
+| Global layers | 8 | 10 | 5 |
+| `num_attention_heads` | 16 | 32 | 16 |
+| Sliding KV heads | 8 | 16 | 8 |
+| Global KV heads | 1 | 4 | 2 |
+| Sliding head dim | 256 | 256 | 256 |
+| Global head dim | 512 | 512 | 512 |
+| Sliding Q width | 4096 | 8192 | 4096 |
+| Sliding KV width | 2048 | 4096 | 2048 |
+| Global Q width | 8192 | 16384 | 8192 |
+| Global KV width | 512 | 2048 | 1024 |
+| FFN intermediate | 15360 | 21504 | 2112 shared, 704 expert |
+| MoE experts | none | none | 128 |
+| Active experts/token | none | none | 8 |
+| Sliding window | 1024 | 1024 | 1024 |
+| Max context | 262144 | 262144 | 262144 |
+| Vocabulary | 262144 | 262144 | 262144 |
+| K=V global attention | yes | yes | yes |
+| PLE | no | no | no |
+| KV-shared layers | 0 | 0 | 0 |
+| Default dtype | BF16 | BF16 | BF16 |
+
+### RoPE
+
+| Parameter | Sliding layers | Global layers |
+|---|---:|---:|
+| `rope_theta` | 10000 | 1000000 |
+| `rope_type` | default | proportional |
+| `partial_rotary_factor` | not set / full | 0.25 |
+| Head dim | 256 | 512 |
+| Rotated dims | 256 | 128 |
+
+### Multimodal Support
+
+| Parameter | 12B Unified | 31B Dense | 26B-A4B |
+|---|---|---|---|
+| Text | yes | yes | yes |
+| Image | encoder-free embedder | 27-layer vision tower | 27-layer vision tower |
+| Audio | encoder-free waveform projection | no | no |
+| Video | frames through image path | frames through image path | frames through image path |
+| Vision hidden / embed dim | 3840 embedder | 1152 tower | 1152 tower |
+| Vision output tokens | 280 image, 70/video frame budget | 280 | 280 |
+| Audio budget | 750 tokens / 30 sec | none | none |
+
+---
+
+## 14. Parameter Accounting
+
+These are approximate text-path counts for implementation planning. They intentionally focus on the transformer/LM path, not every tokenizer or processor artifact.
+
+### 12B Unified
+
+```text
+Sliding attention per layer: 47.2M
+Global attention per layer:  64.9M
+Dense FFN per layer:        176.9M
+
+Sliding blocks: 40 * 224.1M =  8.97B
+Global blocks:   8 * 241.8M =  1.93B
+Token embedding:              1.01B
+Text total:                  11.91B
+Official scale:              11.95B
+```
+
+### 31B Dense
+
+```text
+Sliding attention per layer: 132.1M
+Global attention per layer:  187.2M
+Dense FFN per layer:         346.8M
+
+Sliding blocks: 50 * 478.9M = 23.95B
+Global blocks:  10 * 534.0M =  5.34B
+Token embedding:              1.41B
+Text total:                  30.70B
+```
+
+### 26B-A4B
+
+```text
+Sliding attention per layer:       34.6M
+Global attention per layer:        49.0M
+Shared dense FFN per layer:        17.8M
+All experts per layer:            761.3M
+Active experts per token/layer:    47.6M
+Router per layer:                   0.36M
+
+Capacity:
+  Sliding blocks: 25 * 814.1M = 20.35B
+  Global blocks:   5 * 828.5M =  4.14B
+  Token embedding:              0.74B
+  Total capacity:              25.23B
+
+Active:
+  Sliding blocks: 25 * 100.4M =  2.51B
+  Global blocks:   5 * 114.8M =  0.57B
+  Token embedding:              0.74B
+  Active scale:                 3.82B
 ```
 
 ---
 
-## 13. Memory & Hardware Requirements
+## 15. KV Cache and Memory Planning
 
-### Weight Memory by Precision
+### Correct KV Cache Formula
 
-| Precision | 31B | 26B-A4B | E4B | E2B |
-|---|---|---|---|---|
-| BF16 / FP16 | ~62 GB | ~52 GB | ~16 GB | ~10.2 GB |
-| INT8 | ~31 GB | ~26 GB | ~8 GB | ~5.1 GB |
-| INT4 | ~15.5 GB | ~13 GB | ~4 GB | ~2.6 GB |
+For Gemma 4's hybrid attention, an optimized decode cache should treat sliding and global layers differently:
 
-> Note: 26B-A4B requires ALL 26B parameters loaded for routing even though only 3.8B are active per token.
+```text
+sliding_kv_bytes =
+  sliding_layers * 2 * sliding_kv_heads * head_dim * dtype_bytes * min(sequence_length, sliding_window)
 
-### KV Cache Size (FP16, batch=1)
+global_kv_bytes =
+  global_layers * 2 * global_kv_heads * global_head_dim * dtype_bytes * sequence_length
 
-KV formula: `2 × kv_heads × head_dim × 2 bytes × num_layers × seq_len`
+total_kv_bytes = sliding_kv_bytes + global_kv_bytes
+```
 
-For 31B (50 sliding: 16 heads × 256 dim; 10 full: 4 heads × 512 dim):
+Do not use `num_layers * sequence_length` for every layer. Sliding layers only need the local window for steady-state decode. This distinction is central to why Gemma 4 can target 256K context.
 
-| Context | 31B | 26B-A4B | E2B | Gemma 3 27B |
-|---|---|---|---|---|
-| 4K | 3.4 GB | 0.9 GB | 0.07 GB | 1.9 GB |
-| 32K | 27.5 GB | 6.9 GB | 0.6 GB | 15.5 GB |
-| 128K | 110 GB | 27.5 GB | 2.3 GB | 62 GB |
-| 256K | 220 GB | 55 GB | — | — |
+### BF16 KV Cache, Batch 1
 
-The E2B's KV sharing (20 of 35 layers reuse caches) dramatically reduces its footprint — full 128K context fits in ~2.3 GB KV cache.
+Assumes:
 
-### Total VRAM Requirements & GPU Recommendations (batch=1)
+- BF16 K/V cache, 2 bytes per scalar.
+- Sliding cache capped at 1024 tokens.
+- Global cache stores full context.
+- No allocator fragmentation or paging metadata included.
 
-| Scenario | 31B | 26B-A4B | E2B |
-|---|---|---|---|
-| FP16, 4K ctx | 65.4 GB — 1× H100 80GB | 52.9 GB — 1× H100 80GB | 10.3 GB — RTX 4070 12GB |
-| INT4, 4K ctx | 18.9 GB — RTX 4090 24GB | 13.9 GB — RTX 4070 Ti 16GB | 2.7 GB — Any GPU |
-| INT4, 128K ctx | ~125.5 GB — 2× H100 | 40.5 GB — A6000 48GB | 4.9 GB — RTX 4060 8GB |
+| Context | 12B Unified | 31B Dense | 26B-A4B |
+|---:|---:|---:|---:|
+| 4K | 0.38 GiB | 1.09 GiB | 0.27 GiB |
+| 32K | 0.81 GiB | 3.28 GiB | 0.82 GiB |
+| 128K | 2.31 GiB | 10.78 GiB | 2.70 GiB |
+| 256K | 4.31 GiB | 20.78 GiB | 5.20 GiB |
 
-The 26B-A4B MoE's KV cache is 4× smaller than the 31B at equivalent context, making it practical at long context on a single GPU that the 31B cannot fit.
+The old all-layers-full-context estimate is too pessimistic for a specialized implementation. It may still describe a naive framework cache, but it should not guide this repo's memory targets.
 
----
+### Weight Memory
 
-## 14. Benchmark Results
+Official Google memory table includes about 20% loading overhead and excludes KV cache / context memory.
 
-All results are for instruction-tuned variants. Sources: Google DeepMind model card (April 2026), LMArena public leaderboard.
+| Precision | 12B Unified | 31B Dense | 26B-A4B |
+|---|---:|---:|---:|
+| BF16 / 16-bit | 26.7 GB | 69.9 GB | 57.7 GB |
+| SFP8 / 8-bit | 13.4 GB | 34.9 GB | 28.8 GB |
+| Q4_0 / 4-bit | 6.7 GB | 17.5 GB | 14.4 GB |
 
-### Core Reasoning & Knowledge
+Raw text parameter memory without loader overhead is lower:
 
-| Benchmark | 31B | 26B-A4B | E4B | E2B |
-|---|---|---|---|---|
-| **LMArena Score** (text est.) | 1,452 | 1,441 | — | — |
-| **MMLU Pro** | 85.2% | 82.6% | 69.4% | 60.0% |
-| **GPQA Diamond** (graduate science) | 84.3% | 82.3% | 58.6% | 43.4% |
-| **AIME 2026** (math, no tools) | 89.2% | 88.3% | 42.5% | 37.5% |
+| Model | Text scale | Raw BF16 text weights | Raw 8-bit text weights | Raw 4-bit text weights |
+|---|---:|---:|---:|---:|
+| 12B | 11.95B | ~23.9 GB | ~12.0 GB | ~6.0 GB |
+| 31B | 30.7B | ~61.4 GB | ~30.7 GB | ~15.4 GB |
+| 26B-A4B | 25.2B loaded | ~50.4 GB | ~25.2 GB | ~12.6 GB |
 
-### Coding
-
-| Benchmark | 31B | 26B-A4B | E4B | E2B |
-|---|---|---|---|---|
-| **LiveCodeBench v6** | 80.0% | 77.1% | 52.0% | 44.0% |
-| **Codeforces ELO** | 2,150 | 1,718 | 940 | 633 |
-
-### Multimodal
-
-| Benchmark | 31B | 26B-A4B | E4B | E2B |
-|---|---|---|---|---|
-| **MMMU Pro** (vision reasoning) | 76.9% | 73.8% | 52.6% | 44.2% |
-| **MATH-Vision** | — | — | — | — |
-
-### Long Context
-
-| Benchmark | 31B | 26B-A4B | E4B | E2B |
-|---|---|---|---|---|
-| **MRCR v2 8-needle 128K** | 66.4% | 44.1% | 25.4% | 19.1% |
-
-### Agentic / Tool Use
-
-| Benchmark | 31B | 26B-A4B | Gemma 3 27B |
-|---|---|---|---|
-| **τ2-bench Retail** (agentic tool use) | 86.4% | — | 6.6% |
-
-### Audio (E-Series)
-
-| Benchmark | E4B | E2B |
-|---|---|---|
-| **CoVoST-2** (speech translation BLEU) | 35.54 | 33.47 |
-| **FLEURS** (ASR word error rate) | 0.08 | 0.09 |
-
-### Comparison vs Previous Generation
-
-| Benchmark | Gemma 4 31B | Gemma 3 27B | Delta |
-|---|---|---|---|
-| LMArena Text | 1,452 | 1,365 | +87 (+6.4%) |
-| AIME 2026 | 89.2% | 20.8% | +68.4pp |
-| LiveCodeBench v6 | 80.0% | 29.1% | +50.9pp |
-| GPQA Diamond | 84.3% | 42.4% | +41.9pp |
-| τ2-bench Retail | 86.4% | 6.6% | +79.8pp |
+Use official load-memory numbers for practical VRAM planning. Use raw numbers for kernel bandwidth math.
 
 ---
 
-## 15. What Changed from Gemma 3
+## 16. A6000 Implications
 
-### Summary Table
+The target GPU constraint matters:
 
-| Feature | Gemma 3 27B | Gemma 4 31B | Delta |
-|---|---|---|---|
-| **Attention geometry** | Uniform across all layers | Per-type (sliding: head_dim=256, full: head_dim=512) | Major change |
-| **KV heads (full layers)** | 16 | 4 | 4× reduction |
-| **K=V weight sharing** | No | Yes (full layers) | New |
-| **V normalization** | None | RMSNorm (no scale) | New |
-| **RoPE (full layers)** | theta=1M, linear 8× scaling | theta=1M, p-RoPE partial=0.25 | Changed strategy |
-| **Rotated dims (full)** | 128 of 128 (100%) | 128 of 512 (25%) | 3× more semantic dims |
-| **Semantic capacity** | All dims position-coupled | 384 dims pure semantic | Major long-context improvement |
-| **Context window** | 128K | 256K | 2× |
-| **Final layer** | Local in some models (e.g. 4B) | Always global | Enforced |
-| **Logit soft-capping** | None | tanh(x/30)×30 | New |
-| **Vision encoder** | SigLIP 27L, d=1152 | ViT 27L, d=1152, 2D RoPE | Upgraded |
-| **Vision tokens** | 256 (4×4 pooling) | 280 (3×3 pooling) | More detail |
-| **Per-Layer Embeddings** | None | Yes (E-series only) | New |
-| **Audio** | None | Yes (E-series only) | New |
-| **MoE variant** | None | 26B-A4B (128 experts) | New |
-| **License** | Gemma Terms of Use | Apache 2.0 | More permissive |
+- RTX A6000 has 48 GB VRAM.
+- It is Ampere (`sm_86`).
+- It supports BF16/FP16/INT8/INT4 tensor core paths.
+- It does not have native FP8 tensor-core support.
 
----
+### Single-GPU Fit
 
-## 16. Training Details
+Approximate fit on one 48 GB A6000:
 
-Google has not released a full technical paper. The following is known from the model card and blog posts.
+| Model / precision | Weights with overhead | 256K BF16 KV | Total before workspace | Practical? |
+|---|---:|---:|---:|---|
+| 12B BF16 | 26.7 GB | 4.31 GiB | ~31-32 GB | yes |
+| 12B 8-bit | 13.4 GB | 4.31 GiB | ~18 GB | yes |
+| 12B Q4 | 6.7 GB | 4.31 GiB | ~12 GB | yes |
+| 31B BF16 | 69.9 GB | 20.78 GiB | >90 GB | no |
+| 31B 8-bit | 34.9 GB | 20.78 GiB | ~57 GB | no at 256K; maybe short context |
+| 31B Q4 | 17.5 GB | 20.78 GiB | ~39-40 GB | tight but plausible with careful runtime |
+| 26B BF16 | 57.7 GB | 5.20 GiB | >62 GB | no |
+| 26B 8-bit | 28.8 GB | 5.20 GiB | ~34 GB | yes, but MoE path required |
+| 26B Q4 | 14.4 GB | 5.20 GiB | ~20 GB | yes, but MoE path required |
 
-### Training Data
-- **Scale:** Large-scale diverse multilingual corpus
-- **Cutoff:** January 2025
-- **Modalities in training:** Web documents, code, images, audio
-- **Languages:** 140+ languages — balanced representation across European, Asian, African, and Indic language families
-- **Data filtering:** Automated filtering for personal information, quality filtering, safety filtering
+### Recommended Project Path
 
-### Research Lineage
-- Gemma 4 is built from **Gemini 3 research** — same foundational architecture and training innovations as Google's proprietary Gemini 3 models, packaged for open release
-- This is meaningfully different from prior Gemma generations, which were based on earlier Gemini research
+For this repository:
 
-### Post-Training
-- **Instruction tuning:** Supervised fine-tuning on instruction-following data covering all supported modalities
-- **Thinking mode:** Additional training to enable configurable step-by-step reasoning via `<|think|>` token
-- **Function calling:** Structured tool-use training with JSON schema support
-- **Language coverage in IT:** Top 40 languages with human-verified evaluations; remaining 100+ via transfer
-
-### Safety
-- Same rigorous safety evaluations as Gemini proprietary models
-- Partnership with Google DeepMind internal safety and responsible AI teams
-- Range of automated + human evaluations
-- Sensitive data filtering applied during pre-training
+1. Use **12B BF16 text-only** to validate the full unfused inference pipeline on A6000.
+2. Generalize constants so 12B and 31B dimensions are config-selected, not hardcoded.
+3. Add weight-only quantization for 31B.
+4. Treat KV cache quantization as a separate experiment after BF16 KV is correct.
+5. Defer 26B-A4B until dense attention/FFN orchestration is stable.
+6. Do not build an FP8-first path for A6000; use INT8/INT4 or BF16 where Ampere is strong.
 
 ---
 
-## 17. Inference & Deployment
+## 17. Benchmark Snapshot
 
-### Framework Support
+Official 12B model card benchmark table, instruction-tuned variants:
 
-| Framework | Status |
+| Benchmark | 31B | 26B-A4B | 12B Unified | Gemma 3 27B no-think |
+|---|---:|---:|---:|---:|
+| MMLU Pro | 85.2% | 82.6% | 77.2% | 67.6% |
+| AIME 2026 no tools | 89.2% | 88.3% | 77.5% | 20.8% |
+| LiveCodeBench v6 | 80.0% | 77.1% | 72.0% | 29.1% |
+| Codeforces ELO | 2150 | 1718 | 1659 | 110 |
+| GPQA Diamond | 84.3% | 82.3% | 78.8% | 42.4% |
+| Tau2 average over 3 | 76.9% | 68.2% | 69.0% | 16.2% |
+| BigBench Extra Hard | 74.4% | 64.8% | 53.0% | 19.3% |
+| MMMLU | 88.4% | 86.3% | 83.4% | 70.7% |
+| MMMU Pro | 76.9% | 73.8% | 69.1% | 49.7% |
+| OmniDocBench 1.5, lower better | 0.131 | 0.149 | 0.164 | 0.365 |
+| MATH-Vision | 85.6% | 82.4% | 79.7% | 46.0% |
+| MedXPertQA MM | 61.3% | 58.1% | 48.7% | - |
+| CoVoST | - | - | 38.5* | - |
+| FLEURS, lower better | - | - | 0.069* | - |
+| MRCR v2 8-needle 128K | 66.4% | 44.1% | 43.4% | 13.5% |
+
+`*` The 12B audio numbers exclude Chinese, per the model card note.
+
+The benchmark takeaway for this repo is simple:
+
+- 31B is strongest overall but needs quantization on A6000.
+- 26B-A4B is very strong for active compute, but MoE complicates implementation.
+- 12B is the best full-precision local development target and is much stronger than its size suggests.
+
+---
+
+## 18. Implementation Notes for this Repo
+
+### Constants That Must Become Configurable
+
+The current code was written around 31B constants such as hidden size 5376 and attention widths 8192/16384. To support 12B cleanly, these must become model-selected:
+
+| Concept | 12B | 31B |
+|---|---:|---:|
+| Hidden width | 3840 | 5376 |
+| FFN width | 15360 | 21504 |
+| Q heads | 16 | 32 |
+| Sliding KV heads | 8 | 16 |
+| Global KV heads | 1 | 4 |
+| Layers | 48 | 60 |
+| Sliding/global counts | 40/8 | 50/10 |
+| LM head input width | 3840 | 5376 |
+
+The simplest good design is not a general framework. Use a small set of compile-time or launch-time model configs for the repo-relevant models.
+
+### Kernel Inventory Update
+
+For dense text, the baseline kernel order remains:
+
+1. Token embedding gather.
+2. RMSNorm.
+3. Residual add.
+4. Residual add + RMSNorm.
+5. Q/K RMSNorm.
+6. V RMSNorm without learned weight.
+7. RoPE and p-RoPE.
+8. KV-cache write/update with sliding/global policies.
+9. Sliding-window attention.
+10. Global attention.
+11. Attention output pack.
+12. GeGLU tanh activation.
+13. Final logit softcap.
+14. Sampling.
+
+But each kernel should be parameterized over:
+
+- hidden width,
+- number of heads,
+- number of KV heads,
+- head dimension,
+- global head dimension,
+- rotary dimension,
+- layer type,
+- sliding window.
+
+Do not introduce MoE kernels until the dense path works for 12B and 31B.
+
+### GEMM Policy
+
+Keep dense GEMMs in cuBLAS/cuBLASLt for the baseline:
+
+| Model | Dominant dense FFN GEMMs |
 |---|---|
-| HuggingFace Transformers | ✅ Official (`Gemma4ForConditionalGeneration`) |
-| vLLM | ✅ Supported (uses TRITON_ATTN backend due to heterogeneous head dims) |
-| llama.cpp (GGUF) | ✅ Available — tokenizer fix required post-launch |
-| Ollama | ✅ Available |
-| MLX (Apple Silicon) | ✅ Available — ~40% less memory than Ollama |
-| Google AI Studio | ✅ Hosted |
-| Vertex AI | ✅ Hosted |
-| Kaggle | ✅ Available |
-| LiteRT-LM (mobile) | ✅ E2B/E4B on Android/iOS (INT4) |
+| 12B | `[M, 3840] x [3840, 15360]`, `[M, 15360] x [15360, 3840]` |
+| 31B | `[M, 5376] x [5376, 21504]`, `[M, 21504] x [21504, 5376]` |
 
-### vLLM Specific Notes
+Only replace cuBLAS/cuBLASLt after:
 
-```
-INFO: Gemma4 model has heterogeneous head dimensions (head_dim=256, global_head_dim=512).
-Forcing TRITON_ATTN backend to prevent mixed-backend numerical divergence.
-```
+- numerical correctness exists,
+- the unfused path is benchmarked,
+- Nsight Compute shows a specific bottleneck,
+- a custom kernel has a plausible roofline advantage.
 
-vLLM detects the dual head_dim configuration and routes to the Triton attention backend automatically to avoid precision mismatches between the CUDA flash attention implementation (optimized for fixed head_dim) and the heterogeneous Gemma 4 layout.
+### KV Cache Policy
 
-### Recommended Sampling Configuration
+Use two cache policies:
 
-From the official model card:
+```text
+sliding layer:
+  cache length = sliding_window
+  update by ring-buffer / paged-window logic
 
-```python
-generation_config = {
-    "temperature": 1.0,
-    "top_p": 0.95,
-    "top_k": 64,
-}
+global layer:
+  cache length = full sequence
+  append through full context
 ```
 
-### Thinking Mode Usage
+For 12B:
 
-```python
-# Enable thinking mode
-system_prompt = "<|think|>You are a helpful assistant."
-
-# Disable thinking mode  
-system_prompt = "You are a helpful assistant."
+```text
+sliding cache width per layer = 2 * 8 * 256 = 4096 BF16 scalars/token
+global cache width per layer  = 2 * 1 * 512 = 1024 BF16 scalars/token
 ```
 
-### Quantization Notes
+For 31B:
 
-- **INT4 recommended** for local deployment of 26B-A4B and 31B
-- **INT4 + GGUF** community builds available; use tokenizer from latest main branch (bug fix merged post-launch)
-- **Unsloth MLX** builds use ~40% less memory than Ollama at ~15-20% throughput cost for E-series
+```text
+sliding cache width per layer = 2 * 16 * 256 = 8192 BF16 scalars/token
+global cache width per layer  = 2 * 4 * 512 = 4096 BF16 scalars/token
+```
 
-### Hardware Recommendations Summary
+### 12B as the A6000 Baseline
 
-| Model | Minimum GPU | Recommended | Production |
-|---|---|---|---|
-| E2B (INT4) | Any GPU with 3GB VRAM | RTX 3060 8GB | Raspberry Pi 5 viable |
-| E4B (INT4) | RTX 3060 8GB | RTX 3080 10GB | M-series Mac |
-| 26B-A4B (INT4) | RTX 4080 16GB | RTX 4090 24GB | A6000 48GB for long ctx |
-| 31B (INT4) | RTX 4090 24GB | A6000 48GB | H100 80GB for FP16 |
+The most practical near-term objective is:
+
+```text
+Gemma 4 12B text-only BF16
+  -> correct unfused pipeline
+  -> benchmark prefill/decode
+  -> add model-config selection
+  -> port same kernels to 31B Q4/INT8 weight path
+```
+
+This route keeps the implementation close to the original 31B thesis while avoiding the dead end of trying to fit 31B BF16 onto 48 GB.
 
 ---
 
-## Sources
+## 19. Sources
 
-1. **Google DeepMind Gemma 4 model card** — https://ai.google.dev/gemma/docs/core/model_card_4
-2. **HuggingFace Gemma 4 blog** — https://huggingface.co/blog/gemma4
-3. **HuggingFace transformers Gemma4 docs** — https://huggingface.co/docs/transformers/model_doc/gemma4
-4. **google/gemma-4-31B HuggingFace page** — https://huggingface.co/google/gemma-4-31B
-5. **g4.si5.pl — Community architecture reference** (most detailed parameter breakdown)
-6. **Maarten Grootendorst — Visual Guide to Gemma 4** — https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-gemma-4
-7. **WaveSpeed — Architecture breakdown** — https://wavespeed.ai/blog/posts/what-is-google-gemma-4/
-8. **Google DeepMind release blog** — https://blog.google/innovation-and-ai/technology/developers-tools/gemma-4/
-9. **vLLM GitHub Issue #39133** — config.json dump confirming `num_hidden_layers=60`, `num_attention_heads=32`, `num_key_value_heads=16`, `head_dim=256`, `global_head_dim=512`, `sliding_window=1024`, 50 sliding + 10 full layers
-10. **Barbero et al. (2024)** — "Round and Round We Go! What makes Rotary Positional Encodings useful?" — arXiv:2410.06205
+Primary:
 
----
+1. Google AI for Developers, Gemma 4 model overview: https://ai.google.dev/gemma/docs/core
+2. Google AI for Developers, Gemma 4 model card: https://ai.google.dev/gemma/docs/core/model_card_4
+3. Google blog, "Introducing Gemma 4 12B: a unified, encoder-free multimodal model": https://blog.google/innovation-and-ai/technology/developers-tools/introducing-gemma-4-12b/
+4. Google Developers Blog, "Gemma 4 12B: The Developer Guide": https://developers.googleblog.com/gemma-4-12b-the-developer-guide/
+5. Hugging Face, `google/gemma-4-12B`: https://huggingface.co/google/gemma-4-12B
+6. Hugging Face, `google/gemma-4-31B-it`: https://huggingface.co/google/gemma-4-31B-it
+7. Hugging Face, `google/gemma-4-26B-A4B`: https://huggingface.co/google/gemma-4-26B-A4B
+8. Hugging Face Transformers docs, Gemma4 Unified: https://huggingface.co/docs/transformers/model_doc/gemma4_unified
+9. Hugging Face Transformers docs, Gemma4: https://huggingface.co/docs/transformers/model_doc/gemma4
 
-*Document compiled May 2026. No formal Google DeepMind technical paper has been published for Gemma 4 as of this date. All hyperparameter values are sourced from config.json files, official model cards, and HuggingFace transformers implementation.*
+Downloaded metadata and implementation references:
+
+1. `/tmp/gemma4_hf_metadata/gemma-4-12B/config.json`
+2. `/tmp/gemma4_hf_metadata/gemma-4-12B/README.md`
+3. `/tmp/gemma4_hf_metadata/gemma-4-12B/processor_config.json`
+4. `/tmp/gemma4_hf_metadata/gemma-4-31B-it/config.json`
+5. `/tmp/gemma4_hf_metadata/gemma-4-26B-A4B/config.json`
+6. `/tmp/gemma4_hf_metadata/modeling_gemma4.py`
+7. `/tmp/gemma4_hf_metadata/modeling_gemma4_unified.py`
+
+Secondary explanatory sources found via Exa:
+
+1. Maarten Grootendorst, "A Visual Guide to Gemma 4 12B": https://newsletter.maartengrootendorst.com/p/a-visual-guide-to-gemma-4-12b
+2. Hugging Face blog, "Welcome Gemma 4": https://huggingface.co/blog/gemma4
+
+Use official configs over prose if the two disagree. Use the Transformers implementation to resolve execution semantics such as global K=V, KV sharing, p-RoPE, and the 12B unified embedder path.
