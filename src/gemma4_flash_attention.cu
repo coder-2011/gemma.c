@@ -1277,11 +1277,9 @@ __device__ __forceinline__ void project_head_values_bf16(
   }
 }
 
-// Prepare all Q/K/V heads for prefill attention. Each block owns one sequence
-// position, one batch, and a group of heads selected by Traits.
+// Prepare one prefill Q/K/V head group for the caller-provided CTA coordinates.
 template <typename Traits>
-__global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kPrepThreads)
-void gemma4_qkv_norm_rope_kernel(
+__device__ __forceinline__ void phase_qkv_norm_rope(
     __nv_bfloat16 *__restrict__ q_prepared,
     __nv_bfloat16 *__restrict__ k_prepared,
     __nv_bfloat16 *__restrict__ v_prepared,
@@ -1292,17 +1290,19 @@ void gemma4_qkv_norm_rope_kernel(
     const __nv_bfloat16 *__restrict__ k_norm_weight,
     const float *__restrict__ cos,
     const float *__restrict__ sin,
-    int seq_len) {
+    int seq_len,
+    int seq,
+    int head_group,
+    int batch,
+    int thread_idx) {
   using Derived = Gemma4AttentionDerived<Traits>;
   constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
   constexpr int kKvHeads = Traits::kKvHeads;
   constexpr int kHeadDim = Traits::kHeadDim;
 
-  const int seq = blockIdx.x;
-  const int batch = blockIdx.z;
-  const int lane = threadIdx.x & (kWarpSize - 1);
-  const int warp = threadIdx.x / kWarpSize;
-  const int head = blockIdx.y * Derived::kHeadsPerBlock + warp;
+  const int lane = thread_idx & (kWarpSize - 1);
+  const int warp = thread_idx / kWarpSize;
+  const int head = head_group * Derived::kHeadsPerBlock + warp;
   if (head >= kQHeads) return;
   // Cos/sin tables are row-major by position and rotary-pair index.
   const float *cos_row = cos + int64_t(seq) * Derived::kRotaryHalf;
@@ -1326,6 +1326,27 @@ void gemma4_qkv_norm_rope_kernel(
   }
 }
 
+// Wrapper: one CTA prepares one sequence position, batch, and head group.
+template <typename Traits>
+__global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kPrepThreads)
+void gemma4_qkv_norm_rope_kernel(
+    __nv_bfloat16 *__restrict__ q_prepared,
+    __nv_bfloat16 *__restrict__ k_prepared,
+    __nv_bfloat16 *__restrict__ v_prepared,
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
+    const __nv_bfloat16 *__restrict__ q_norm_weight,
+    const __nv_bfloat16 *__restrict__ k_norm_weight,
+    const float *__restrict__ cos,
+    const float *__restrict__ sin,
+    int seq_len) {
+  phase_qkv_norm_rope<Traits>(
+      q_prepared, k_prepared, v_prepared, q, k, v, q_norm_weight,
+      k_norm_weight, cos, sin, seq_len, int(blockIdx.x), int(blockIdx.y),
+      int(blockIdx.z), int(threadIdx.x));
+}
+
 // Convert a decode token position into the Layout-A paged-cache row for one KV
 // head. Page allocation stays on the host/runtime side; this kernel only writes
 // if the page table already maps the requested position.
@@ -1337,11 +1358,12 @@ __device__ __forceinline__ int64_t decode_cache_head_offset(
     int position,
     int cache_layer,
     int head,
-    int lane) {
+    int lane,
+    int batch_count) {
   const int logical_page = position / config.page_size;
   const int slot = logical_page % config.max_pages_per_seq;
   auto page_table_layout = make_layout(
-      make_shape(gridDim.x, config.max_pages_per_seq),
+      make_shape(batch_count, config.max_pages_per_seq),
       make_stride(config.max_pages_per_seq, 1));
   const int physical_page = gemma4_warp_uniform_ldg_i32(
       page_table + page_table_layout(batch, slot), lane);
@@ -1351,12 +1373,9 @@ __device__ __forceinline__ int64_t decode_cache_head_offset(
   return cache_layout(cache_layer, physical_page, page_offset, head, 0);
 }
 
-// Decode prep path: one token per batch. Q is prepared into a compact
-// [batch, 16, head_dim] buffer for paged decode attention, while K/V are
-// normalized, RoPE'd where needed, and written straight to the Layout-A cache.
+// Prepare one decode token's Q and paged K/V cache entry for one KV head.
 template <typename Traits>
-__global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kPrepThreads)
-void gemma4_decode_q_paged_kv_norm_rope_kernel(
+__device__ __forceinline__ void phase_decode_q_paged_kv_norm_rope(
     __nv_bfloat16 *__restrict__ q_prepared,
     __nv_bfloat16 *__restrict__ cache_k,
     __nv_bfloat16 *__restrict__ cache_v,
@@ -1370,16 +1389,18 @@ void gemma4_decode_q_paged_kv_norm_rope_kernel(
     const __nv_bfloat16 *__restrict__ q_norm_weight,
     const __nv_bfloat16 *__restrict__ k_norm_weight,
     const float *__restrict__ cos,
-    const float *__restrict__ sin) {
+    const float *__restrict__ sin,
+    int batch,
+    int kv_head,
+    int thread_idx,
+    int batch_count) {
   using Derived = Gemma4AttentionDerived<Traits>;
   constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
   constexpr int kKvHeads = Traits::kKvHeads;
   constexpr int kHeadDim = Traits::kHeadDim;
 
-  const int batch = blockIdx.x;
-  const int lane = threadIdx.x & (kWarpSize - 1);
-  const int warp = threadIdx.x / kWarpSize;
-  const int kv_head = blockIdx.y;
+  const int lane = thread_idx & (kWarpSize - 1);
+  const int warp = thread_idx / kWarpSize;
 
   const int position =
       gemma4_warp_uniform_ldg_i32(token_position + batch, lane);
@@ -1401,7 +1422,8 @@ void gemma4_decode_q_paged_kv_norm_rope_kernel(
     return;
   }
   const int64_t cache_offset = decode_cache_head_offset<Traits>(
-      cache_config, page_table, batch, position, cache_layer, kv_head, lane);
+      cache_config, page_table, batch, position, cache_layer, kv_head, lane,
+      batch_count);
   if (cache_offset < 0) return;
 
   const int64_t kv_offset = (int64_t(batch) * kKvHeads + kv_head) * kHeadDim;
@@ -1416,11 +1438,34 @@ void gemma4_decode_q_paged_kv_norm_rope_kernel(
   }
 }
 
-// Decode fused ingress: project x into one raw Q/K/V head in registers, then
-// reuse the normal prep semantics without writing full raw projection tensors.
+// Wrapper: one CTA prepares one decode batch row and KV head.
 template <typename Traits>
 __global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kPrepThreads)
-void gemma4_decode_project_prepare_paged_kv_kernel(
+void gemma4_decode_q_paged_kv_norm_rope_kernel(
+    __nv_bfloat16 *__restrict__ q_prepared,
+    __nv_bfloat16 *__restrict__ cache_k,
+    __nv_bfloat16 *__restrict__ cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ page_table,
+    const int32_t *__restrict__ token_position,
+    int cache_layer,
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v,
+    const __nv_bfloat16 *__restrict__ q_norm_weight,
+    const __nv_bfloat16 *__restrict__ k_norm_weight,
+    const float *__restrict__ cos,
+    const float *__restrict__ sin) {
+  phase_decode_q_paged_kv_norm_rope<Traits>(
+      q_prepared, cache_k, cache_v, cache_config, page_table,
+      token_position, cache_layer, q, k, v, q_norm_weight, k_norm_weight,
+      cos, sin, int(blockIdx.x), int(blockIdx.y), int(threadIdx.x),
+      int(gridDim.x));
+}
+
+// Project one decode token into prepared Q and paged K/V cache for one KV head.
+template <typename Traits>
+__device__ __forceinline__ void phase_decode_project_prepare_paged_kv(
     __nv_bfloat16 *__restrict__ q_prepared,
     __nv_bfloat16 *__restrict__ cache_k,
     __nv_bfloat16 *__restrict__ cache_v,
@@ -1433,15 +1478,17 @@ void gemma4_decode_project_prepare_paged_kv_kernel(
     const __nv_bfloat16 *__restrict__ q_norm_weight,
     const __nv_bfloat16 *__restrict__ k_norm_weight,
     const float *__restrict__ cos,
-    const float *__restrict__ sin) {
+    const float *__restrict__ sin,
+    int batch,
+    int kv_head,
+    int thread_idx,
+    int batch_count) {
   using Derived = Gemma4AttentionDerived<Traits>;
   constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
   constexpr int kHeadDim = Traits::kHeadDim;
 
-  const int batch = blockIdx.x;
-  const int lane = threadIdx.x & (kWarpSize - 1);
-  const int warp = threadIdx.x / kWarpSize;
-  const int kv_head = blockIdx.y;
+  const int lane = thread_idx & (kWarpSize - 1);
+  const int warp = thread_idx / kWarpSize;
 
   const int position =
       gemma4_warp_uniform_ldg_i32(token_position + batch, lane);
@@ -1468,7 +1515,8 @@ void gemma4_decode_project_prepare_paged_kv_kernel(
     return;
   }
   const int64_t cache_offset = decode_cache_head_offset<Traits>(
-      cache_config, page_table, batch, position, cache_layer, kv_head, lane);
+      cache_config, page_table, batch, position, cache_layer, kv_head, lane,
+      batch_count);
   if (cache_offset < 0) return;
 
   float values[Derived::kValuesPerLane];
@@ -1487,6 +1535,30 @@ void gemma4_decode_project_prepare_paged_kv_kernel(
         lane, values);
     prep_scale_free_head_values<Traits>(cache_v + cache_offset, values, lane);
   }
+}
+
+// Wrapper: fused decode ingress avoids materializing raw Q/K/V tensors.
+template <typename Traits>
+__global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kPrepThreads)
+void gemma4_decode_project_prepare_paged_kv_kernel(
+    __nv_bfloat16 *__restrict__ q_prepared,
+    __nv_bfloat16 *__restrict__ cache_k,
+    __nv_bfloat16 *__restrict__ cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ page_table,
+    const int32_t *__restrict__ token_position,
+    int cache_layer,
+    const __nv_bfloat16 *__restrict__ x,
+    Gemma4AttentionProjectionWeights weights,
+    const __nv_bfloat16 *__restrict__ q_norm_weight,
+    const __nv_bfloat16 *__restrict__ k_norm_weight,
+    const float *__restrict__ cos,
+    const float *__restrict__ sin) {
+  phase_decode_project_prepare_paged_kv<Traits>(
+      q_prepared, cache_k, cache_v, cache_config, page_table,
+      token_position, cache_layer, x, weights, q_norm_weight,
+      k_norm_weight, cos, sin, int(blockIdx.x), int(blockIdx.y),
+      int(threadIdx.x), int(gridDim.x));
 }
 
 template <typename Traits>
@@ -1692,11 +1764,10 @@ __device__ __forceinline__ void decode_online_update(
   m = new_m;
 }
 
-// CUDA-core decode path for q_len=1. One CTA owns a KV head and all query heads
-// mapped to it, so each K/V cache vector is loaded once per GQA group.
+// Compute one paged-decode split for a caller-selected batch/KV-head/split CTA.
 template <typename Traits>
-__global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kDecodeThreads)
-void decode_paged_grouped_split_kernel(
+__device__ __forceinline__ void phase_decode_paged_grouped_split(
+    __nv_bfloat16 *__restrict__ direct_out,
     float *__restrict__ partial_m,
     float *__restrict__ partial_l,
     float *__restrict__ partial_acc,
@@ -1709,14 +1780,15 @@ void decode_paged_grouped_split_kernel(
     int32_t layer,
     float softmax_scale,
     int32_t split_size,
-    int32_t num_splits) {
+    int32_t num_splits,
+    int32_t batch,
+    int32_t kv_head,
+    int32_t split,
+    int32_t dim,
+    int32_t batch_count) {
   using Derived = Gemma4AttentionDerived<Traits>;
   // CTA mapping: x=batch row, y=KV head, z=split. Within the CTA, one thread
   // owns one head-dim lane, so the block-wide reductions cover the full dot.
-  const int32_t batch = blockIdx.x;
-  const int32_t kv_head = blockIdx.y;
-  const int32_t split = blockIdx.z;
-  const int32_t dim = threadIdx.x;
   const int32_t lane = dim & (kWarpSize - 1);
 
   int32_t q_heads[Derived::kGqaRatio];
@@ -1774,7 +1846,7 @@ void decode_paged_grouped_split_kernel(
       reduce_storage[Derived::kGqaRatio];
   __shared__ float s_score[Derived::kGqaRatio];
   auto page_table_layout = make_layout(
-      make_shape(gridDim.x, config.max_pages_per_seq),
+      make_shape(batch_count, config.max_pages_per_seq),
       make_stride(config.max_pages_per_seq, 1));
   auto cache_layout = gemma4_kv_cache_layout(config);
 
@@ -1821,6 +1893,19 @@ void decode_paged_grouped_split_kernel(
     }
   }
 
+  // A single split already covers the whole live key range, so it can write the
+  // final BF16 attention row directly and avoid the partial scratch/reduce pass.
+  if (direct_out != nullptr) {
+#pragma unroll
+    for (int i = 0; i < Derived::kGqaRatio; ++i) {
+      const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_heads[i];
+      direct_out[int64_t(row) * Traits::kHeadDim + dim] =
+          l[i] > 0.0f ? __float2bfloat16_rn(acc[i] / l[i])
+                      : __float2bfloat16_rn(0.0f);
+    }
+    return;
+  }
+
   if (dim == 0) {
 #pragma unroll
     for (int i = 0; i < Derived::kGqaRatio; ++i) {
@@ -1834,9 +1919,34 @@ void decode_paged_grouped_split_kernel(
   }
 }
 
+// Wrapper: one CTA owns a KV head and all query heads mapped to it.
 template <typename Traits>
 __global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kDecodeThreads)
-void decode_paged_reduce_kernel(
+void decode_paged_grouped_split_kernel(
+    __nv_bfloat16 *__restrict__ direct_out,
+    float *__restrict__ partial_m,
+    float *__restrict__ partial_l,
+    float *__restrict__ partial_acc,
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ cache_k,
+    const __nv_bfloat16 *__restrict__ cache_v,
+    const int32_t *__restrict__ page_table,
+    const int32_t *__restrict__ seq_lengths,
+    Gemma4KvCacheConfig config,
+    int32_t layer,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t num_splits) {
+  phase_decode_paged_grouped_split<Traits>(
+      direct_out, partial_m, partial_l, partial_acc, q, cache_k, cache_v,
+      page_table, seq_lengths, config, layer, softmax_scale, split_size,
+      num_splits, int32_t(blockIdx.x), int32_t(blockIdx.y),
+      int32_t(blockIdx.z), int32_t(threadIdx.x), int32_t(gridDim.x));
+}
+
+// Reduce live paged-decode split partials for one batch/query-head row.
+template <typename Traits>
+__device__ __forceinline__ void phase_decode_paged_reduce(
     __nv_bfloat16 *__restrict__ out,
     const float *__restrict__ partial_m,
     const float *__restrict__ partial_l,
@@ -1844,13 +1954,14 @@ void decode_paged_reduce_kernel(
     const int32_t *__restrict__ seq_lengths,
     Gemma4KvCacheConfig config,
     int32_t split_size,
-    int32_t num_splits) {
+    int32_t num_splits,
+    int32_t batch,
+    int32_t q_head,
+    int32_t dim,
+    int32_t thread_count) {
   using Derived = Gemma4AttentionDerived<Traits>;
   // One CTA reduces all live split partials for one [batch, query head] output
   // row; each thread writes one BF16 head-dim lane.
-  const int32_t batch = blockIdx.x;
-  const int32_t q_head = blockIdx.y;
-  const int32_t dim = threadIdx.x;
   const int32_t lane = dim & (kWarpSize - 1);
   const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_head;
 
@@ -1880,7 +1991,7 @@ void decode_paged_reduce_kernel(
 
   // First pass: find the global max across live splits for numerical stability.
   float local_m = -INFINITY;
-  for (int32_t split = dim; split < reduce_splits; split += blockDim.x) {
+  for (int32_t split = dim; split < reduce_splits; split += thread_count) {
     local_m = fmaxf(local_m, partial_m[partial_row + split]);
   }
 
@@ -1899,7 +2010,7 @@ void decode_paged_reduce_kernel(
   // Second pass: rescale every split denominator into the global-max frame and
   // sum them into the final softmax denominator.
   float local_l = 0.0f;
-  for (int32_t split = dim; split < reduce_splits; split += blockDim.x) {
+  for (int32_t split = dim; split < reduce_splits; split += thread_count) {
     const float split_l = partial_l[partial_row + split];
     if (split_l > 0.0f) {
       local_l += split_l * __expf(partial_m[partial_row + split] - s_m);
@@ -1922,6 +2033,24 @@ void decode_paged_reduce_kernel(
   }
   out[(int64_t(row) * Traits::kHeadDim) + dim] =
       s_l > 0.0f ? __float2bfloat16_rn(value / s_l) : __float2bfloat16_rn(0.0f);
+}
+
+// Wrapper: one CTA reduces one [batch, query head] output row.
+template <typename Traits>
+__global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kDecodeThreads)
+void decode_paged_reduce_kernel(
+    __nv_bfloat16 *__restrict__ out,
+    const float *__restrict__ partial_m,
+    const float *__restrict__ partial_l,
+    const float *__restrict__ partial_acc,
+    const int32_t *__restrict__ seq_lengths,
+    Gemma4KvCacheConfig config,
+    int32_t split_size,
+    int32_t num_splits) {
+  phase_decode_paged_reduce<Traits>(
+      out, partial_m, partial_l, partial_acc, seq_lengths, config, split_size,
+      num_splits, int32_t(blockIdx.x), int32_t(blockIdx.y),
+      int32_t(threadIdx.x), int32_t(blockDim.x));
 }
 
 using SlidingAttentionTraits = Gemma4AttentionTraits<false>;
@@ -2294,11 +2423,13 @@ cudaError_t launch_decode_paged_impl(
   constexpr dim3 block_dim(Derived::kDecodeThreads);
   decode_paged_grouped_split_kernel<Traits>
       <<<split_grid, block_dim, 0, stream>>>(
-      d_partial_m, d_partial_l, d_partial_acc, d_q_prepared, d_cache_k,
-      d_cache_v, d_page_table, d_seq_lengths, cache_config, cache_layer,
-      softmax_scale, split_size, num_splits);
+      num_splits == 1 ? d_out : nullptr, d_partial_m, d_partial_l,
+      d_partial_acc, d_q_prepared, d_cache_k, d_cache_v, d_page_table,
+      d_seq_lengths, cache_config, cache_layer, softmax_scale, split_size,
+      num_splits);
   cudaError_t status = cudaGetLastError();
   if (status != cudaSuccess) return status;
+  if (num_splits == 1) return cudaSuccess;
 
   // Phase 2 reduces live split partials into the final projection-ready BF16
   // attention output.
