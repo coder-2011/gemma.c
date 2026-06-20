@@ -11,6 +11,9 @@
   - Include hidden width `3840` plus Q/K widths `256` and `512`.
   - Confirm the hidden-width-only fused residual+RMSNorm path is skipped for non-hidden widths.
   - Log commands, GPU/clocks, warmup/iteration counts, cache policy, and results in `src/experiments/EXPERIMENTS.md`.
+- Remove the redundant C ABI wrappers across the CUDA path.
+  - Most call sites are C++ now, so keep `extern "C"` only where a real Python/ctypes or shared-library boundary still needs it.
+  - Prefer direct C++ declarations for internal kernel launchers and helper APIs.
 - Fuse token embedding gather with the first matrix multiplication in the language path once the unfused baseline is correct.
   - Avoid materializing the initial `[M, 3840]` hidden buffer when the first projection can consume embedding rows directly.
   - Benchmark against the standalone embedding gather plus cuBLAS/cuBLASLt baseline before keeping the fusion.
@@ -30,6 +33,9 @@
 Build the remaining model-path pieces in this rough order. Keep each kernel
 standalone, numerically tested, benchmarked, and logged in
 `src/experiments/EXPERIMENTS.md` before wiring it into the full path.
+
+0. Write a project-owned tokenizer.
+   - Keep it Gemma-specific, deterministic, and small enough to validate against the checkpoint tokenizer files.
 
 1. Q/K per-head RMSNorm
    - Sliding layers: learned-weight RMSNorm over head dim `256`.
