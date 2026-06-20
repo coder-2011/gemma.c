@@ -1348,7 +1348,7 @@ __device__ __forceinline__ int64_t decode_cache_head_offset(
 }
 
 // Decode prep path: one token per batch. Q is prepared into a compact
-// [batch, 32, head_dim] buffer for paged decode attention, while K/V are
+// [batch, 16, head_dim] buffer for paged decode attention, while K/V are
 // normalized, RoPE'd where needed, and written straight to the Layout-A cache.
 template <typename Traits>
 __global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kPrepThreads)
@@ -2465,7 +2465,7 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
 
 // Gemma sliding prefill helper: Q/K get learned RMSNorm then RoPE; V gets
 // scale-free RMSNorm. The prepared tensors keep the normal FA layout:
-//   Q: [batch, seq, 32, 256], K/V: [batch, seq, 16, 256].
+//   Q: [batch, seq, 16, 256], K/V: [batch, seq, 8, 256].
 extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     __nv_bfloat16 *__restrict__ d_out,
     float *__restrict__ d_softmax_lse,

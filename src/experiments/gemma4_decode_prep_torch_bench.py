@@ -10,8 +10,8 @@ import time
 import torch
 
 
-GEMMA4_NUM_QUERY_HEADS = 32
-GEMMA4_SLIDING_KV_HEADS = 16
+GEMMA4_NUM_QUERY_HEADS = 16
+GEMMA4_SLIDING_KV_HEADS = 8
 GEMMA4_SLIDING_HEAD_DIM = 256
 GEMMA4_RMS_NORM_EPS = 1.0e-6
 GEMMA4_ROPE_THETA_SLIDING = 10000.0
@@ -445,7 +445,7 @@ def main():
             "enqueue_delay": f"untimed {enqueue_delay_description} before start event",
             "host_wall_time": "excluded",
             "dtype": "bfloat16",
-            "layout": "raw q=[B,32,256], raw k/v=[B,16,256], cache=[1,pages,page,16,256]",
+            "layout": "raw q=[B,16,256], raw k/v=[B,8,256], cache=[1,pages,page,8,256]",
             "warmup": args.warmup,
             "iters_per_sample": args.iters,
             "graph_inner_iters": graph_inner_iters,

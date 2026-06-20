@@ -1,6 +1,6 @@
 # gemma.c
 
-`gemma.c` is an experimental inference runtime for Gemma dense models, with an initial focus on running the Gemma 4 31B dense model efficiently on NVIDIA RTX A6000 GPUs.
+`gemma.c` is an experimental inference runtime for Gemma dense models, with an initial focus on running the Gemma 4 12B Unified text path efficiently on NVIDIA RTX A6000 GPUs.
 
 The long-term goal is a highly optimized mega-kernel inference path, w/ minimal imports.
 

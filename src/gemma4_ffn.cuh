@@ -17,7 +17,8 @@
 #endif
 
 #ifndef GEMMA4_FFN_DECODE_PARTIAL_GROUPS
-#define GEMMA4_FFN_DECODE_PARTIAL_GROUPS 1344
+#define GEMMA4_FFN_DECODE_PARTIAL_GROUPS \
+    (2 * GEMMA4_FFN_DECODE_HIDDEN_PACKS)
 #endif
 
 struct alignas(128) Gemma4FfnDecodeScratch {

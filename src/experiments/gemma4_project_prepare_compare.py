@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-H, QH, KVH, D = 5376, 32, 16, 256
+H, QH, KVH, D = 3840, 16, 8, 256
 QS, KVS, QKVS = QH * D, KVH * D, (QH + 2 * KVH) * D
 EPS, THETA = 1e-6, 10000.0
 

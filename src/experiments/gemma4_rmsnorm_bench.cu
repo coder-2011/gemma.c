@@ -247,8 +247,8 @@ int main(int argc, char **argv) {
       width <= 0 || (width % 8) != 0) {
     std::fprintf(stderr,
                  "usage: %s [iters=200] [warmup=30] [trials=5] "
-                 "[max_rows=4096] [width=5376]\n",
-                 argv[0]);
+                 "[max_rows=4096] [width=%d]\n",
+                 argv[0], GEMMA4_HIDDEN_SIZE);
     return 1;
   }
 

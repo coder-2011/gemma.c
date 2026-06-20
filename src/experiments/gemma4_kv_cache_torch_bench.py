@@ -95,8 +95,8 @@ def sdpa(q, k, v, scale):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seq-len", type=int, default=4096)
-    parser.add_argument("--q-heads", type=int, default=32)
-    parser.add_argument("--kv-heads", type=int, default=4)
+    parser.add_argument("--q-heads", type=int, default=16)
+    parser.add_argument("--kv-heads", type=int, default=1)
     parser.add_argument("--head-dim", type=int, default=512)
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--iters", type=int, default=100)

@@ -29,7 +29,7 @@
 #endif
 
 #ifndef GEMMA4_FFN_DECODE_THREADS
-#define GEMMA4_FFN_DECODE_THREADS 672
+#define GEMMA4_FFN_DECODE_THREADS GEMMA4_FFN_DECODE_HIDDEN_PACKS
 #endif
 
 #ifndef GEMMA4_FFN_DECODE_INTERMEDIATE_TILE
@@ -49,7 +49,8 @@
 #endif
 
 #ifndef GEMMA4_FFN_DECODE_PARTIAL_GROUPS
-#define GEMMA4_FFN_DECODE_PARTIAL_GROUPS 1344
+#define GEMMA4_FFN_DECODE_PARTIAL_GROUPS \
+    (2 * GEMMA4_FFN_DECODE_HIDDEN_PACKS)
 #endif
 
 namespace {
@@ -67,7 +68,8 @@ constexpr int kReductionPolicy = GEMMA4_FFN_DECODE_REDUCTION_POLICY;
 constexpr int kPartialGroups = GEMMA4_FFN_DECODE_PARTIAL_GROUPS;
 constexpr int kAccumBlocksOverride = GEMMA4_FFN_DECODE_ACCUM_BLOCKS;
 constexpr int kSwizzleThreads = 96;
-constexpr int kActualSwizzleBlocksPerRow = 7;
+constexpr int kActualSwizzleBlocksPerRow =
+    div_up(kHiddenPacks, kSwizzleThreads);
 // Keep most CTAs one tile wide, while one hidden-pack wave folds a second tile.
 constexpr int kDefaultAccumBlocks = kIntermediateTiles - kHiddenPacks;
 constexpr int kAccumBlocks =

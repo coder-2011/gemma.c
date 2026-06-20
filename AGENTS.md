@@ -7,7 +7,7 @@ frequently when making design, implementation, optimization, or correctness deci
 
 ## Goals
 
-- Target Gemma 4 dense inference, especially the 31B model size.
+- Target Gemma 4 12B Unified dense text inference.
 - Optimize for RTX A6000-class GPUs.
 - Use CUDA 12.x, tracking the latest available CUDA 12 release.
 - Keep the implementation close to the metal, starting from raw math kernels.
@@ -131,8 +131,7 @@ Approximate model memory footprints:
 
 | Model | BF16 (16-bit) | SFP8 (8-bit) | Q4_0 (4-bit) |
 | --- | ---: | ---: | ---: |
-| Gemma 4 E2B | 9.6 GB | 4.6 GB | 3.2 GB |
-| Gemma 4 E4B | 15 GB | 7.5 GB | 5 GB |
+| Gemma 4 12B | 26.7 GB | 13.4 GB | 6.7 GB |
 | Gemma 4 31B | 58.3 GB | 30.4 GB | 17.4 GB |
 | Gemma 4 26B A4B | 48 GB | 25 GB | 15.6 GB |
 
@@ -153,7 +152,7 @@ Approximate model memory footprints:
   inference work in plain `.c` files.
 - Prefer stable filenames such as `gemma4.c`, `gemma4_infer.cu`, and
   `gemma4_kernels.cu`; specialize behavior through config/constants rather than
-  checkpoint-specific filenames like `gemma-4-31B.cu`.
+  checkpoint-specific filenames like `gemma-4-12B.cu`.
 - Keep exploratory CUDA experiments under `src/experiments/`.
 - Track experiment notes, commands, measurements, failures, and follow-up ideas in
   `src/experiments/EXPERIMENTS.md` before promoting an experiment into the main
@@ -218,30 +217,30 @@ __device__ inline void gather_token(
 
 ## Kernel Inventory
 
-The first implementation target is the Gemma 4 31B dense text inference path. Vision
-kernels can come later; do not block the first correct unfused text path on multimodal
-support.
+The first implementation target is the Gemma 4 12B Unified dense text inference path.
+Multimodal kernels can come later; do not block the first correct unfused text path on
+multimodal support.
 
 Write baseline kernels in this order, keeping each kernel separately testable before
 wiring it into the full launcher:
 
 1. Token embedding gather
    - Token IDs to hidden rows.
-   - Shape: token id -> `[5376]`.
+   - Shape: token id -> `[3840]`.
    - Used for prompt/prefill input construction.
 
-2. RMSNorm width 5376
+2. RMSNorm width 3840
    - Learned-weight RMSNorm for language hidden states.
    - Used by `input_layernorm`, `post_attention_layernorm`,
      `pre_feedforward_layernorm`, `post_feedforward_layernorm`, and final
      language-model norm.
    - Baseline first, then fused variants with residual add.
 
-3. Residual add width 5376
+3. Residual add width 3840
    - Baseline standalone residual add.
    - Later fuse with the following RMSNorm wherever possible.
 
-4. Residual add plus RMSNorm width 5376
+4. Residual add plus RMSNorm width 3840
    - Memory-bound fused kernel.
    - Needed after attention projection and after FFN down projection.
    - Account for checkpoint `layer_scalar` once its exact semantics are verified.
@@ -263,32 +262,32 @@ wiring it into the full launcher:
    - Baseline standalone first; later fuse with Q/K norm and KV-cache write.
 
 8. KV-cache write/update
-   - Sliding layers: K/V width `4096`, window `1024`.
-   - Global layers: K/V width `2048`, full context up to `256000`.
+   - Sliding layers: K/V width `2048`, window `1024`.
+   - Global layers: K/V width `512`, full context up to `256000`.
    - Support prefill bulk writes, decode appends, and sliding-window wraparound.
 
 9. Sliding-window attention
    - FlashAttention-style fused attention for local layers.
    - Head dim `256`.
-   - GQA ratio: `32` Q heads / `16` KV heads = `2` Q heads per KV head.
+   - GQA ratio: `16` Q heads / `8` KV heads = `2` Q heads per KV head.
    - Support prefill causal local attention and single-token decode attention.
 
 10. Global attention
    - FlashAttention-style fused attention for full layers.
    - Head dim `512`.
-   - GQA ratio: `32` Q heads / `4` KV heads = `8` Q heads per KV head.
+   - GQA ratio: `16` Q heads / `1` KV head = `16` Q heads per KV head.
    - Support prefill full causal attention and single-token decode over the full KV cache.
 
 11. Attention output pack
    - Pack attention output for the output projection input layout.
-   - Sliding layers produce `[M, 8192]`.
-   - Global layers produce `[M, 16384]`.
+   - Sliding layers produce `[M, 4096]`.
+   - Global layers produce `[M, 8192]`.
    - Prefer having attention kernels write directly in projection-ready layout once the
      baseline is correct.
 
 12. GeGLU tanh activation
    - Apply `gate * GELU_tanh(up)`.
-   - Width `21504`.
+   - Width `15360`.
    - Baseline standalone first; later fuse into FFN output handling.
 
 13. Final logit softcap
@@ -303,23 +302,23 @@ wiring it into the full launcher:
 Dense GEMMs are required operations, but the baseline path should use cuBLAS/cuBLASLt
 before writing custom matmul kernels:
 
-- Sliding Q projection: `[M, 5376] x [5376, 8192]`
-- Sliding K/V projection: `[M, 5376] x [5376, 4096]`
-- Sliding O projection: `[M, 8192] x [8192, 5376]`
-- Global Q projection: `[M, 5376] x [5376, 16384]`
-- Global K projection: `[M, 5376] x [5376, 2048]`
-- Global O projection: `[M, 16384] x [16384, 5376]`
-- FFN gate/up projections: `[M, 5376] x [5376, 21504]`, or packed
-  `[M, 5376] x [5376, 43008]`
-- FFN down projection: `[M, 21504] x [21504, 5376]`
-- Final vocab projection: `[M, 5376] x [5376, 262144]`
+- Sliding Q projection: `[M, 3840] x [3840, 4096]`
+- Sliding K/V projection: `[M, 3840] x [3840, 2048]`
+- Sliding O projection: `[M, 4096] x [4096, 3840]`
+- Global Q projection: `[M, 3840] x [3840, 8192]`
+- Global K projection: `[M, 3840] x [3840, 512]`
+- Global O projection: `[M, 8192] x [8192, 3840]`
+- FFN gate/up projections: `[M, 3840] x [3840, 15360]`, or packed
+  `[M, 3840] x [3840, 30720]`
+- FFN down projection: `[M, 15360] x [15360, 3840]`
+- Final vocab projection: `[M, 3840] x [3840, 262144]`
 
 Only replace cuBLAS/cuBLASLt GEMMs with custom kernels after correctness exists and
 profiling shows a reason. The first custom GEMM candidates are the dominant FFN shapes:
 
-- `[M, 5376] x [5376, 21504]`
-- `[M, 21504] x [21504, 5376]`
-- packed gate/up: `[M, 5376] x [5376, 43008]`
+- `[M, 3840] x [3840, 15360]`
+- `[M, 15360] x [15360, 3840]`
+- packed gate/up: `[M, 3840] x [3840, 30720]`
 
 ## Layer Pipeline Optimization
 

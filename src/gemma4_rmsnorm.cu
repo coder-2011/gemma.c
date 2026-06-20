@@ -12,9 +12,9 @@ namespace {
 
 using RmsnormPack = Bf16Packed128;
 constexpr int kFloatXPerPack = RmsnormPack::size;
-constexpr int kDecodeRmsnormThreads = 704;
-constexpr int kDecodeFusedThreads = 672;
 constexpr int kDecodePacks = GEMMA4_HIDDEN_SIZE / kFloatXPerPack;
+constexpr int kDecodeRmsnormThreads = kDecodePacks;
+constexpr int kDecodeFusedThreads = kDecodePacks;
 constexpr int kHiddenPrefillFusedThreads = kDecodePacks;
 constexpr int kRmsnormRowsPerBlock = 2;
 constexpr int kRmsnormThreads = WARP_SIZE * kRmsnormRowsPerBlock;

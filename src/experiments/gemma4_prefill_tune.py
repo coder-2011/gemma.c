@@ -30,13 +30,13 @@ OPS = [
 ]
 
 OP_WEIGHTS = {
-    "ffn_gate_up": 60,
-    "ffn_down": 60,
-    "sliding_qkv": 50,
-    "sliding_o": 50,
-    "global_q": 10,
-    "global_k": 10,
-    "global_o": 10,
+    "ffn_gate_up": 48,
+    "ffn_down": 48,
+    "sliding_qkv": 40,
+    "sliding_o": 40,
+    "global_q": 8,
+    "global_k": 8,
+    "global_o": 8,
     "final_logits": 1,
 }
 

@@ -12,8 +12,8 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[2]
-Q_HEADS = 32
-KV_HEADS = 4
+Q_HEADS = 16
+KV_HEADS = 1
 HEAD_DIM = 512
 GQA = Q_HEADS // KV_HEADS
 

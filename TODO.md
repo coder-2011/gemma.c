@@ -8,11 +8,11 @@
   - `src/gemma4_rmsnorm.cu` still references fallback kernels removed during cleanup.
   - `make test-rmsnorm` should compile and pass again before RMSNorm-dependent work proceeds.
 - Benchmark the RMSNorm kernels again after the current cleanup/recovery work.
-  - Include hidden width `5376` plus Q/K widths `256` and `512`.
+  - Include hidden width `3840` plus Q/K widths `256` and `512`.
   - Confirm the hidden-width-only fused residual+RMSNorm path is skipped for non-hidden widths.
   - Log commands, GPU/clocks, warmup/iteration counts, cache policy, and results in `src/experiments/EXPERIMENTS.md`.
 - Fuse token embedding gather with the first matrix multiplication in the language path once the unfused baseline is correct.
-  - Avoid materializing the initial `[M, 5376]` hidden buffer when the first projection can consume embedding rows directly.
+  - Avoid materializing the initial `[M, 3840]` hidden buffer when the first projection can consume embedding rows directly.
   - Benchmark against the standalone embedding gather plus cuBLAS/cuBLASLt baseline before keeping the fusion.
 - Write a custom projection GEMM/GEMV path that emits paged K/V directly.
   - Target decode first: `x @ Wk` / `x @ Wv` should produce final cache values without a contiguous K/V scratch buffer.
@@ -37,30 +37,30 @@ standalone, numerically tested, benchmarked, and logged in
    - Weights are shared across heads.
 
 2. KV-cache write/update
-   - Sliding cache: K/V width `4096`, window `1024`, wraparound.
-   - Global cache: K/V width `2048`, full context up to `256000`.
+   - Sliding cache: K/V width `2048`, window `1024`, wraparound.
+   - Global cache: K/V width `512`, full context up to `256000`.
    - Support prefill bulk writes, decode appends, and sliding-window wraparound.
 
 3. Sliding-window attention
    - FlashAttention-style local causal attention.
    - Head dim `256`.
-   - GQA ratio: `32` Q heads / `16` KV heads = `2` Q heads per KV head.
+   - GQA ratio: `16` Q heads / `8` KV heads = `2` Q heads per KV head.
    - Support prefill local causal attention and single-token decode.
 
 4. Global attention
    - FlashAttention-style full causal attention.
    - Head dim `512`.
-   - GQA ratio: `32` Q heads / `4` KV heads = `8` Q heads per KV head.
+   - GQA ratio: `16` Q heads / `1` KV head = `16` Q heads per KV head.
    - Support prefill full causal attention and decode over the full KV cache.
 
 5. Attention output packing
-   - Sliding layers produce projection input width `8192`.
-   - Global layers produce projection input width `16384`.
+   - Sliding layers produce projection input width `4096`.
+   - Global layers produce projection input width `8192`.
    - Prefer having attention kernels write directly in projection-ready layout once correct.
 
 6. GeGLU tanh activation
    - Apply `gate * GELU_tanh(up)`.
-   - Width `21504`.
+   - Width `15360`.
    - Baseline standalone first; later fuse into FFN output handling.
 
 7. Final logit softcap
@@ -89,33 +89,33 @@ standalone, numerically tested, benchmarked, and logged in
   - Preserve the existing CTA-reduction kernel as the baseline and only replace it after correctness and CUDA-event timings clearly improve.
 
 1. FFN gate+up GEMV
-   - Shape: `x[5376] -> gate_up[43008]`
-   - Estimated weight traffic: `~27.7 GB/token` across 60 layers.
+   - Shape: `x[3840] -> gate_up[30720]`
+   - Estimated weight traffic: `~11.3 GB/token` across 48 layers.
    - Biggest fixed-shape decode tuning target.
 
 2. FFN down GEMV
-   - Shape: `ffn_hidden[21504] -> hidden[5376]`
-   - Estimated weight traffic: `~13.9 GB/token`.
+   - Shape: `ffn_hidden[15360] -> hidden[3840]`
+   - Estimated weight traffic: `~5.7 GB/token`.
    - Same every layer, huge, clean.
 
 3. Sliding QKV packed GEMV
-   - Shape: `x[5376] -> qkv[16384]`
-   - Estimated weight traffic: `~8.8 GB/token` across 50 sliding layers.
+   - Shape: `x[3840] -> qkv[8192]`
+   - Estimated weight traffic: `~2.5 GB/token` across 40 sliding layers.
    - Do not optimize sliding Q/K/V separately if we can avoid it.
-   - Pack as `Q 8192 + K 4096 + V 4096 = 16384`.
+   - Pack as `Q 4096 + K 2048 + V 2048 = 8192`.
 
 4. Sliding O GEMV
-   - Shape: `attn_out[8192] -> hidden[5376]`
-   - Estimated weight traffic: `~4.4 GB/token`.
-   - Repeated across 50 sliding layers.
+   - Shape: `attn_out[4096] -> hidden[3840]`
+   - Estimated weight traffic: `~1.3 GB/token`.
+   - Repeated across 40 sliding layers.
 
 5. Final vocab/logits GEMV
-   - Shape: `hidden[5376] -> logits[262144]`
-   - Estimated weight traffic: `~2.8 GB/token`.
+   - Shape: `hidden[3840] -> logits[262144]`
+   - Estimated weight traffic: `~2.0 GB/token`.
    - Huge single kernel.
    - High value if fused with softcap/top-k/argmax, but only runs once per token.
 
 6. Global Q/O GEMVs
-   - Global Q shape: `x[5376] -> q[16384]`
-   - Global O shape: `attn_out[16384] -> hidden[5376]`
-   - Estimated weight traffic: `~1.76 GB/token` each.
+   - Global Q shape: `x[3840] -> q[8192]`
+   - Global O shape: `attn_out[8192] -> hidden[3840]`
+   - Estimated weight traffic: `~0.50 GB/token` each.

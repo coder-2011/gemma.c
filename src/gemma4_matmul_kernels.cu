@@ -1,7 +1,7 @@
 #include "gemma4_matmul_kernels.cuh"
 #include "gemma4.h"
 
-// Gemma 4 31B dense projection kernels.
+// Gemma 4 dense projection kernels.
 
 #ifndef GEMMA4_WEIGHT_LOAD_POLICY
 #define GEMMA4_WEIGHT_LOAD_POLICY 0

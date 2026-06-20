@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LIB = ROOT / "build" / "libgemma4_flash_attention.so"
 DEFAULT_REFERENCE_LIB = ROOT / "build" / "libgemma4_flash_attention_reference.so"
 
-Q_HEADS = 32
-KV_HEADS = 16
+Q_HEADS = 16
+KV_HEADS = 8
 HEAD_DIM = 256
 WINDOW_LEFT = 1024
 ATTR_NAMES = [
