@@ -1,0 +1,214 @@
+{
+  "contract": {
+    "measurement": "steady warm-cache device latency for gemma4_flash_attention_sliding_decode_project_prepare_paged_kv_bf16",
+    "comparison": "HEAD head-group implementation vs working-tree KV-group implementation",
+    "timing": "CUDA events recorded on torch current stream around repeated kernel launches; stop event synchronized before reading elapsed time",
+    "launch_overhead": "CPU enqueue/host wall time excluded by CUDA event timing",
+    "cache_policy": "warm-L2 repeated buffers; no L2 flush, so this is not a cold-cache bandwidth test",
+    "setup_policy": "allocation, random initialization, PyTorch reference, and first-use setup excluded from timed loop",
+    "order_policy": "old/new order randomized per sample after symmetric warmup",
+    "minimum_effect_size_pct": 5.0,
+    "warmup_launches_per_candidate": 25,
+    "iters_per_sample": 200,
+    "sample_count": 21,
+    "correctness_tolerance_max_abs": 0.0625,
+    "dtype": "bf16",
+    "seed": 0
+  },
+  "environment": {
+    "nvidia_smi": "NVIDIA RTX A6000, 00000000:0D:00.0, 580.126.16, Enabled, Disabled, [N/A], 300.00, 33.34, 1800, 8001, 31, 0, 49140",
+    "nvcc": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Wed_Jul_16_07:30:01_PM_PDT_2025\nCuda compilation tools, release 13.0, V13.0.48\nBuild cuda_13.0.r13.0/compiler.36260728_0",
+    "torch": "2.11.0+cu130",
+    "torch_cuda": "13.0",
+    "device": "NVIDIA RTX A6000",
+    "git_head": "4aa7de071c832f1269f3496149c20fd6414b132f",
+    "git_status_short": "M build/libgemma4_flash_attention.so\n M build/tests/test_kv_cache\n M build/tests/test_rope\n M src/gemma4_flash_attention.cu\n?? praxis/",
+    "old_so": "/tmp/libgemma4_flash_attention_old.so",
+    "new_so": "/tmp/libgemma4_flash_attention_new.so",
+    "clock_policy": "not locked; recorded by nvidia-smi snapshot"
+  },
+  "results_by_shape": {
+    "batch1_seq1024": {
+      "shape": {
+        "batch": 1,
+        "seq_len": 1024,
+        "page_size": 64
+      },
+      "correctness": {
+        "old_vs_ref_q": 0.03125,
+        "old_vs_ref_k": 0.03125,
+        "old_vs_ref_v": 0.015625,
+        "new_vs_ref_q": 0.03125,
+        "new_vs_ref_k": 0.03125,
+        "new_vs_ref_v": 0.015625,
+        "new_vs_old_q": 0.0,
+        "new_vs_old_k": 0.0,
+        "new_vs_old_v": 0.0
+      },
+      "results": {
+        "old_head_group": {
+          "samples_ms": [
+            2.394697418212891,
+            2.3901148986816407,
+            2.389029693603516,
+            2.3903544616699217,
+            2.4030250549316405,
+            2.403262939453125,
+            2.40439453125,
+            2.4045257568359375,
+            2.4030914306640625,
+            2.404089050292969,
+            2.4052728271484374,
+            2.4030377197265627,
+            2.403678741455078,
+            2.40326171875,
+            2.4041920471191407,
+            2.4029087829589844,
+            2.403277587890625,
+            2.4024946594238283,
+            2.4031060791015624,
+            2.40383056640625,
+            2.403065032958984
+          ],
+          "median_ms": 2.4031060791015624,
+          "trimmed_mean_ms": 2.401600446199116,
+          "min_ms": 2.389029693603516,
+          "max_ms": 2.4052728271484374,
+          "iqr_ms": 0.0009217834472656783,
+          "p95_ms": 2.4045257568359375,
+          "p99_ms": 2.4051234130859376,
+          "stddev_ms": 0.0050423266143304534
+        },
+        "new_kv_group": {
+          "samples_ms": [
+            1.1948687744140625,
+            1.1957006072998047,
+            1.1952783966064453,
+            1.1967972564697265,
+            1.1971619415283203,
+            1.1970448303222656,
+            1.1964534759521483,
+            1.1967787170410156,
+            1.197508316040039,
+            1.196953125,
+            1.1971116638183594,
+            1.1968596649169922,
+            1.1967190551757811,
+            1.1974591827392578,
+            1.1966490936279297,
+            1.1970006561279296,
+            1.1963699340820313,
+            1.197398910522461,
+            1.1971457672119141,
+            1.197167205810547,
+            1.1983634948730468
+          ],
+          "median_ms": 1.196953125,
+          "trimmed_mean_ms": 1.1968188315943666,
+          "min_ms": 1.1948687744140625,
+          "max_ms": 1.1983634948730468,
+          "iqr_ms": 0.0005128479003906339,
+          "p95_ms": 1.197508316040039,
+          "p99_ms": 1.1981924591064452,
+          "stddev_ms": 0.0007539602176347437
+        }
+      },
+      "delta_new_vs_old_pct": -50.191415376573836,
+      "speedup_old_over_new": 2.0076860395861886
+    },
+    "batch4_seq1024": {
+      "shape": {
+        "batch": 4,
+        "seq_len": 1024,
+        "page_size": 64
+      },
+      "correctness": {
+        "old_vs_ref_q": 0.03125,
+        "old_vs_ref_k": 0.03125,
+        "old_vs_ref_v": 0.03125,
+        "new_vs_ref_q": 0.03125,
+        "new_vs_ref_k": 0.03125,
+        "new_vs_ref_v": 0.03125,
+        "new_vs_old_q": 0.0,
+        "new_vs_old_k": 0.0,
+        "new_vs_old_v": 0.0
+      },
+      "results": {
+        "old_head_group": {
+          "samples_ms": [
+            2.359395751953125,
+            2.358811950683594,
+            2.358839111328125,
+            2.3664659118652343,
+            2.3671891784667967,
+            2.367123718261719,
+            2.3668585205078125,
+            2.366346588134766,
+            2.365437469482422,
+            2.3666070556640624,
+            2.365824890136719,
+            2.366512451171875,
+            2.36677490234375,
+            2.3669889831542967,
+            2.366496276855469,
+            2.365877685546875,
+            2.366593017578125,
+            2.3671249389648437,
+            2.3659132385253905,
+            2.3661500549316408,
+            2.3494140625
+          ],
+          "median_ms": 2.3664659118652343,
+          "trimmed_mean_ms": 2.3652706587942025,
+          "min_ms": 2.3494140625,
+          "max_ms": 2.3671891784667967,
+          "iqr_ms": 0.000950012207030948,
+          "p95_ms": 2.3671249389648437,
+          "p99_ms": 2.367176330566406,
+          "stddev_ms": 0.0043045894086131365
+        },
+        "new_kv_group": {
+          "samples_ms": [
+            1.2068663787841798,
+            1.2069783782958985,
+            1.2070317077636719,
+            1.2097222137451171,
+            1.2109439849853516,
+            1.2116979217529298,
+            1.2107816314697266,
+            1.2108078765869141,
+            1.2102188873291015,
+            1.2105795288085937,
+            1.211240005493164,
+            1.2104608154296874,
+            1.2109744262695312,
+            1.2109358215332031,
+            1.2100030517578124,
+            1.210619659423828,
+            1.2103710174560547,
+            1.2109382629394532,
+            1.210713882446289,
+            1.2101875305175782,
+            1.2062870025634767
+          ],
+          "median_ms": 1.2105795288085937,
+          "trimmed_mean_ms": 1.2100197400544819,
+          "min_ms": 1.2062870025634767,
+          "max_ms": 1.2116979217529298,
+          "iqr_ms": 0.0009327697753906961,
+          "p95_ms": 1.211240005493164,
+          "p99_ms": 1.2116063385009765,
+          "stddev_ms": 0.0015802261130796265
+        }
+      },
+      "delta_new_vs_old_pct": -48.844412981447846,
+      "speedup_old_over_new": 1.9548206917014532
+    }
+  },
+  "threats": [
+    "GPU clocks were not locked, so boost/thermal drift can affect small deltas.",
+    "Warm-cache repeated-buffer timing does not estimate cold-cache HBM behavior.",
+    "This isolates the standalone ingress kernel; megakernel queueing benefits are inferred from ownership shape, not measured here."
+  ],
+  "created_unix_s": 1781911597.2083282
+}

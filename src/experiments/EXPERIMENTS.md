@@ -12836,3 +12836,338 @@ Conclusion:
 - Remaining threats: clocks were not locked, this is one process on one GPU,
   and the cold-cache mode uses a synthetic L2 flush rather than an end-to-end
   serving trace.
+
+## 2026-06-19 - KV-group sliding project-prepare ownership benchmark
+
+Question: how does the KV-group ownership change affect standalone sliding decode
+project-prepare latency versus the previous head-group implementation?
+
+Compared builds:
+
+- Old: `HEAD:src/gemma4_flash_attention.cu` built to
+  `/tmp/libgemma4_flash_attention_old.so`.
+- New: current working-tree `src/gemma4_flash_attention.cu` built to
+  `/tmp/libgemma4_flash_attention_new.so`.
+
+Commands:
+
+```bash
+make test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+make build/libgemma4_flash_attention.so NVCC=/usr/local/cuda/bin/nvcc
+python3 /tmp/bench_gemma4_project_prepare_old_new.py \
+  --warmup 25 --iters 200 --samples 21 \
+  --shapes 1x1024 4x1024 \
+  --json /tmp/gemma4_project_prepare_old_new_warm.json
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:0D:00.0`, driver `580.126.16`,
+  persistence enabled, ECC disabled, power limit `300 W`.
+- CUDA/NVCC: CUDA compilation tools `13.0`, `V13.0.48`; PyTorch
+  `2.11.0+cu130` with CUDA `13.0`.
+- Shape: sliding decode project-prepare, BF16, hidden `5376`, packed QKV
+  `16384`, Q heads `32`, KV heads `16`, head dim `256`, page size `64`,
+  sequence length `1024`.
+- Timing: CUDA events recorded on the current stream around repeated kernel
+  launches. CPU enqueue and host wall time are excluded.
+- Warmup/repeats: `25` warmup launches per candidate, `200` launches per
+  sample, `21` samples. Old/new order was randomized per sample.
+- Cache policy: warm-L2 repeated buffers; no L2 flush.
+- Clock policy: clocks were not locked. The benchmark snapshot reported
+  `1800 MHz` SM, `8001 MHz` memory, `33.34 W`, `31 C`, and `0%` GPU
+  utilization.
+- Correctness: both old and new matched the PyTorch reference with max absolute
+  diff `0.031250`, and new matched old exactly for prepared Q, K cache, and V
+  cache.
+- Profiler: `/usr/local/cuda/bin/ncu` exists, but the Nsight Compute install is
+  incomplete (`nsight-compute directory is not found`), so this run uses CUDA
+  event timing only.
+- Raw JSON with samples, environment, and threats:
+  `src/experiments/results/2026-06-19_project_prepare_kv_group_old_new_warm.json`.
+
+Median comparison:
+
+```text
+shape          old head-group  new KV-group  delta new-vs-old  speedup  IQR old   IQR new
+B=1 S=1024       2.403106 ms    1.196953 ms          -50.19%    2.008x  0.000922  0.000513
+B=4 S=1024       2.366466 ms    1.210580 ms          -48.84%    1.955x  0.000950  0.000933
+```
+
+Conclusion:
+
+- For this standalone sliding project-prepare path, KV-group ownership is about
+  `2x` faster than the previous head-group launch shape on warm-cache CUDA-event
+  timing.
+- This benchmark only isolates ingress project-prepare latency. It does not
+  measure the future megakernel queueing benefit directly, but it confirms the
+  ownership change did not introduce a standalone latency regression.
+
+## 2026-06-19 - Lazy-RMS FFN Decode Consumer Smoke Benchmark
+
+Question: does applying the FFN input RMSNorm in registers from residual state
+change standalone decode FFN latency versus the existing materialized-input FFN
+decode path?
+
+Change:
+
+- Added `lazy_graph`, `lazy_warm_minus_clear`, `cold_lazy`, and
+  `lazy_cold_minus_flush_clear` rows to
+  `src/experiments/gemma4_ffn_decode_load_bench.cu`.
+- The benchmark reuses the existing FFN decode harness and buffers; it does not
+  add a new benchmark program.
+
+Commands:
+
+```bash
+make test-ffn-decode NVCC=/usr/local/cuda/bin/nvcc
+make ffn-decode-load-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_ffn_decode_load_bench 30 8 5
+for i in 1 2 3 4 5; do ./build/experiments/gemma4_ffn_decode_load_bench 50 10 5; done
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:06:00.0`, driver `580.126.16`,
+  persistence enabled, ECC disabled, power limit `300 W`.
+- Timing: CUDA events on a nonblocking stream. Warm rows use CUDA graph replay
+  with capture/instantiate outside timing. Cold rows flush 256 MiB before each
+  measured call and subtract the measured flush+scratch-clear overhead.
+- Warmup/repeats: primary repeated run used `10` warmups, `50` iterations per
+  timed sample, `5` samples per process, and `5` process-level repeats.
+- Cache policy: warm graph rows use repeated buffers; cold rows use the
+  benchmark's 256 MiB device flush.
+- Clock policy: clocks were not locked. `nvidia-smi` snapshots before and after
+  the run showed idle clocks at `210 MHz` SM and `405 MHz` memory.
+- Correctness: `test-ffn-decode` passed, including lazy-RMS output comparison
+  against the materialized-input FFN path.
+
+Process-level median of best corrected rows:
+
+```text
+path                         median ms
+materialized warm-minus-clear  0.974781
+lazy-RMS warm-minus-clear      0.975068
+materialized cold corrected    0.976433
+lazy-RMS cold corrected        0.976769
+```
+
+Conclusion:
+
+- The lazy-RMS consumer is effectively performance-neutral in this standalone
+  FFN decode benchmark: about `0.0003 ms` slower, roughly `0.03%`.
+- This does not yet measure the intended O-producer mailbox win. It only shows
+  that the FFN consumer side can absorb input RMSNorm in registers without a
+  meaningful standalone latency penalty.
+
+## 2026-06-19 - Sliding O-to-FFN Lazy-RMS Chain Slice Benchmark
+
+Question: does the first local chain slice,
+`sliding O projection -> residual/RMS bookkeeping -> FFN`, improve when the
+post-attention normed hidden vector is not materialized?
+
+Change:
+
+- Extended `src/experiments/gemma4_ffn_decode_load_bench.cu` with two chain
+  rows:
+  - `chain_baseline`: sliding O projection, residual+RMSNorm, materialized-input
+    FFN decode.
+  - `chain_lazy`: sliding O projection, residual+sumsq/scale producer, lazy-RMS
+    FFN decode.
+- The residual+sumsq producer is benchmark-local and writes the scalar scale,
+  but the current lazy FFN public API still consumes a fixed representative host
+  scale. This measures the dataflow cost of skipping the normed hidden
+  materialization, not full numerical equivalence of the chain.
+
+Commands:
+
+```bash
+make test-ffn-decode NVCC=/usr/local/cuda/bin/nvcc
+make ffn-decode-load-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_ffn_decode_load_bench 30 8 5
+for i in 1 2 3 4 5; do ./build/experiments/gemma4_ffn_decode_load_bench 50 10 5; done
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:06:00.0`, driver `580.126.16`,
+  persistence enabled, ECC disabled, power limit `300 W`.
+- Shape: sliding O projection `8192 -> 5376`, hidden `5376`, FFN
+  gate/up `5376 -> 43008`, FFN down `21504 -> 5376`, BF16.
+- Timing: CUDA events on a nonblocking stream. Warm rows use CUDA graph replay
+  with capture/instantiate outside timing. Cold rows flush 256 MiB before each
+  measured call and subtract measured flush+scratch-clear overhead.
+- Warmup/repeats: repeated run used `10` warmups, `50` iterations per timed
+  sample, `5` samples per process, and `5` process-level repeats.
+- Cache policy: warm graph rows use repeated buffers; cold rows use the
+  benchmark's 256 MiB device flush.
+- Clock policy: clocks were not locked. Pre-run `nvidia-smi` snapshot showed
+  idle clocks at `210 MHz` SM and `405 MHz` memory.
+- Correctness: `test-ffn-decode` passed. The chain benchmark is a timing slice;
+  full chain output equivalence is not claimed because the lazy path consumes a
+  fixed representative scale.
+
+Process-level median of best corrected rows:
+
+```text
+path                 median ms
+chain baseline warm   1.102913
+chain lazy warm       1.102406
+chain baseline cold   1.106110
+chain lazy cold       1.105274
+```
+
+Conclusion:
+
+- The chain slice is slightly faster with the lazy-RMS consumer:
+  `-0.000507 ms` warm (`-0.046%`) and `-0.000836 ms` cold (`-0.076%`).
+- This is still a tiny local win, not the final mailbox overlap win. The next
+  measurement should replace the fixed host scale with a device-consumed scale
+  or move both producer and consumer into one persistent mailbox kernel.
+
+## 2026-06-19 - Device-Scale Lazy-RMS Chain Rebench
+
+Question: after replacing the fixed host scale with the scale produced on
+device by the residual+sumsq producer, does the local chain slice still show a
+benefit?
+
+Change:
+
+- Added `gemma4_ffn_decode_lazy_rms_device_scale_bf16()`, a decode FFN entry
+  point that reads the input RMS scale from device memory.
+- Updated `chain_lazy` in `gemma4_ffn_decode_load_bench.cu` to consume
+  `d_post_attn_scale` produced by the benchmark-local residual+sumsq kernel.
+- Kept the old host-scale lazy entry point for standalone consumer checks.
+
+Commands:
+
+```bash
+make test-ffn-decode NVCC=/usr/local/cuda/bin/nvcc
+make ffn-decode-load-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_ffn_decode_load_bench 5 2 1
+for i in 1 2 3 4 5; do \
+  GEMMA4_FFN_LOAD_BENCH_SEED=0x51a3f00d \
+  ./build/experiments/gemma4_ffn_decode_load_bench 50 10 5; \
+done
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:06:00.0`, driver `580.126.16`,
+  persistence enabled, ECC disabled, power limit `300 W`.
+- Compiler: `/usr/local/cuda/bin/nvcc`, `Build cuda_13.0.r13.0`.
+- Shape: sliding O projection `8192 -> 5376`, hidden `5376`, FFN
+  gate/up `5376 -> 43008`, FFN down `21504 -> 5376`, BF16.
+- Timing: CUDA events on a nonblocking stream. Warm rows use CUDA graph replay
+  with capture/instantiate outside timing. Cold rows flush 256 MiB before each
+  measured call and subtract measured flush+scratch-clear overhead.
+- Warmup/repeats: `10` warmups, `50` iterations per timed sample, `5` samples
+  per process, `5` process-level repeats.
+- Cache policy: warm graph rows reuse buffers; cold rows use the benchmark's
+  256 MiB device flush.
+- Clock policy: clocks were not locked. Post-run `nvidia-smi` snapshot showed
+  idle clocks at `210 MHz` SM and `405 MHz` memory.
+- Correctness: `test-ffn-decode` passed, including device-scale lazy-RMS FFN
+  parity against the materialized-input FFN path. The corrected chain now reads
+  the same RMS scale value computed by its residual+sumsq producer instead of a
+  fixed representative scale.
+
+Process-level median of best corrected rows:
+
+```text
+path                         median ms  lazy delta
+materialized warm-minus-clear  0.974877  +0.000157 ms (+0.016%)
+lazy-RMS warm-minus-clear      0.975034
+materialized cold corrected    0.976597  +0.000223 ms (+0.023%)
+lazy-RMS cold corrected        0.976820
+
+chain baseline warm            1.103075  -0.000475 ms (-0.043%)
+chain lazy warm                1.102600
+chain baseline cold            1.106050  -0.000720 ms (-0.065%)
+chain lazy cold                1.105330
+```
+
+Conclusion:
+
+- The corrected chain comparison is numerically comparable in the sense that
+  `chain_lazy` consumes the device-produced RMS scale for the same
+  post-attention residual state instead of the old fixed placeholder.
+- Standalone lazy-RMS FFN remains neutral/slightly slower by about `0.02%`.
+- The local O-to-FFN chain still shows a tiny speedup, about `0.04%` warm and
+  `0.07%` cold. This is too small to celebrate, but it is no longer an invalid
+  fixed-scale comparison.
+
+## 2026-06-20 - Fused Sliding-O Projection Residual/RMS Producer
+
+Question: what happens when the local chain removes the projection-delta buffer
+for real, by fusing sliding O projection with the following residual add and
+RMS bookkeeping?
+
+Change:
+
+- Added `gemma4_sliding_o_projection_residual_rmsnorm_decode()`.
+- Removed the lazy-RMS FFN consumer APIs and benchmark rows from the active code
+  path.
+- Replaced benchmark `chain_lazy` with `chain_fused_o`:
+  - baseline: `O projection -> residual_add_rmsnorm -> FFN decode`.
+  - fused: `O projection + residual + partial_sumsq -> RMS finalize -> FFN
+    decode`.
+- The kept implementation uses two kernels for the fused O/RMS producer:
+  - projection CTAs write `post_attn_residual` and one sumsq partial each.
+  - one finalize CTA reduces partials and writes `post_attn_normed`.
+- A single-kernel last-block counter variant was tested and rejected before
+  keeping this version; its fences/atomics outweighed the removed buffer pass.
+
+Commands:
+
+```bash
+make test-ffn-decode NVCC=/usr/local/cuda/bin/nvcc
+make test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+make ffn-decode-load-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_ffn_decode_load_bench 5 2 1
+for i in 1 2 3 4 5; do \
+  GEMMA4_FFN_LOAD_BENCH_SEED=0x51a3f00d \
+  ./build/experiments/gemma4_ffn_decode_load_bench 50 10 5; \
+done
+```
+
+Contract:
+
+- Hardware snapshot after run: NVIDIA RTX A6000, bus `00000000:04:00.0`,
+  driver `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Compiler: `/usr/local/cuda/bin/nvcc`, `Build cuda_13.0.r13.0`.
+- Shape: sliding O projection `8192 -> 5376`, hidden `5376`, FFN
+  gate/up `5376 -> 43008`, FFN down `21504 -> 5376`, BF16.
+- Timing: CUDA events on a nonblocking stream. Warm rows use CUDA graph replay
+  with capture/instantiate outside timing. Cold rows flush 256 MiB before each
+  measured call and subtract measured flush+scratch-clear overhead.
+- Warmup/repeats: `10` warmups, `50` iterations per timed sample, `5` samples
+  per process, `5` process-level repeats.
+- Cache policy: warm graph rows reuse buffers; cold rows use the benchmark's
+  256 MiB device flush.
+- Clock policy: clocks were not locked. Post-run snapshot showed idle clocks at
+  `210 MHz` SM and `405 MHz` memory.
+- Correctness: `test-ffn-decode` passed. `test-kv-cache` passed with
+  `fused sliding O normed max_abs=0 max_rel=0` against the baseline
+  `projection_decode -> residual_add_rmsnorm` path.
+
+Process-level median of best corrected rows:
+
+```text
+path                 median ms  fused delta
+chain baseline warm   1.102835  +0.000073 ms (+0.0066%)
+chain fused-O warm    1.102908
+chain baseline cold   1.106008  -0.000087 ms (-0.0079%)
+chain fused-O cold    1.105921
+```
+
+Conclusion:
+
+- The fused benchmark path removed `d_o_delta`, but the measured result was
+  effectively neutral: very slightly slower warm-cache and very slightly faster
+  cold-cache.
+- The fused-O API, benchmark rows, and parity test were removed from active code
+  after this result.
+- This confirms the projection-delta pass is too small relative to the FFN
+  weight stream to move end-to-end decode meaningfully by itself. The next
+  material target remains reducing or amortizing FFN weight bytes.
