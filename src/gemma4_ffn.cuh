@@ -32,8 +32,9 @@ struct alignas(128) Gemma4FfnDecodeScratch {
 };
 
 struct Gemma4FfnPrefillScratch {
-  __nv_bfloat16 *gate_up = nullptr;
   __nv_bfloat16 *act = nullptr;
+  // Reused as swizzled hidden input before gate/up and swizzled down output
+  // before residual add + RMSNorm.
   __nv_bfloat16 *down = nullptr;
   int capacity_rows = 0;
 };
@@ -45,8 +46,6 @@ struct Gemma4FfnBf16Args {
   const __nv_bfloat16 *residual = nullptr;
   const __nv_bfloat16 *rms_weight = nullptr;
 
-  const __nv_bfloat16 *w_gate_up_prefill_col_major = nullptr;
-  const __nv_bfloat16 *w_down_prefill_row_major = nullptr;
   Gemma4FfnPrefillScratch prefill_scratch = {};
 
   const __nv_bfloat16 *w_gate_up_decode = nullptr;

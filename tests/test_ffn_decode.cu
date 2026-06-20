@@ -234,6 +234,93 @@ void run_sparse_case() {
   compare_bf16(actual_normed, expected_normed, 0.03125f,
                "fused FFN normed");
 
+  constexpr int prefill_rows = 3;
+  std::vector<__nv_bfloat16> x_prefill(
+      static_cast<size_t>(prefill_rows) * GEMMA4_HIDDEN_SIZE);
+  std::vector<__nv_bfloat16> residual_prefill(x_prefill.size());
+  std::vector<__nv_bfloat16> actual_prefill_residual(x_prefill.size());
+  std::vector<__nv_bfloat16> actual_prefill_normed(x_prefill.size());
+  std::vector<__nv_bfloat16> expected_prefill_residual(x_prefill.size());
+  std::vector<__nv_bfloat16> expected_prefill_normed(x_prefill.size());
+
+  for (int row = 0; row < prefill_rows; ++row) {
+    for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
+      const int offset = row * GEMMA4_HIDDEN_SIZE + col;
+      x_prefill[offset] = make_x_value(offset + row * 31);
+      residual_prefill[offset] = make_residual_value(offset + row * 43);
+    }
+  }
+
+  for (int row = 0; row < prefill_rows; ++row) {
+    std::fill(ffn_out.begin(), ffn_out.end(), 0.0f);
+    for (int tile = 0; tile < tiles; ++tile) {
+      const int x_index = (tile * 97 + 13) % GEMMA4_HIDDEN_SIZE;
+      const __nv_bfloat16 gate_weight =
+          __float2bfloat16(0.35f + static_cast<float>(tile % 5) * 0.03125f);
+      const __nv_bfloat16 up_weight =
+          __float2bfloat16(-0.25f + static_cast<float>(tile % 7) * 0.0234375f);
+      const float xv = bf16_to_float(
+          x_prefill[row * GEMMA4_HIDDEN_SIZE + x_index]);
+      const float gate = xv * bf16_to_float(gate_weight);
+      const float up = xv * bf16_to_float(up_weight);
+      const float act = gate * gelu_tanh_reference(up);
+      for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
+        ffn_out[col] = fmaf(act, bf16_to_float(make_down_value(tile, col)),
+                            ffn_out[col]);
+      }
+    }
+
+    sum_sq = 0.0;
+    for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
+      const int offset = row * GEMMA4_HIDDEN_SIZE + col;
+      const float value =
+          ffn_out[col] + bf16_to_float(residual_prefill[offset]);
+      residual_float[col] = value;
+      expected_prefill_residual[offset] = __float2bfloat16_rn(value);
+      sum_sq += static_cast<double>(value) * value;
+    }
+    const float row_scale =
+        1.0f / std::sqrt(static_cast<float>(sum_sq / GEMMA4_HIDDEN_SIZE) +
+                         GEMMA4_RMS_NORM_EPS);
+    for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
+      const int offset = row * GEMMA4_HIDDEN_SIZE + col;
+      const float value =
+          residual_float[col] * row_scale * bf16_to_float(gamma[col]);
+      expected_prefill_normed[offset] = __float2bfloat16_rn(value);
+    }
+  }
+
+  DeviceBuffer<__nv_bfloat16> d_x_prefill(x_prefill.size());
+  DeviceBuffer<__nv_bfloat16> d_residual_prefill(residual_prefill.size());
+  DeviceBuffer<__nv_bfloat16> d_prefill_residual_out(x_prefill.size());
+  DeviceBuffer<__nv_bfloat16> d_prefill_normed_out(x_prefill.size());
+  DeviceBuffer<__nv_bfloat16> d_prefill_scratch(
+      gemma4_ffn_prefill_scratch_elements(prefill_rows));
+  d_x_prefill.copy_from(x_prefill);
+  d_residual_prefill.copy_from(residual_prefill);
+
+  Gemma4FfnBf16Args prefill_args = {};
+  prefill_args.residual_out = d_prefill_residual_out.get();
+  prefill_args.normed_out = d_prefill_normed_out.get();
+  prefill_args.x = d_x_prefill.get();
+  prefill_args.residual = d_residual_prefill.get();
+  prefill_args.rms_weight = d_gamma.get();
+  prefill_args.w_gate_up_decode = d_gate_up.get();
+  prefill_args.w_down_decode = d_down.get();
+  prefill_args.prefill_scratch =
+      gemma4_ffn_prefill_scratch_from_buffer(
+          d_prefill_scratch.get(), prefill_rows);
+  prefill_args.rows = prefill_rows;
+  prefill_args.eps = GEMMA4_RMS_NORM_EPS;
+  CHECK_CUDA(gemma4_ffn_bf16(prefill_args));
+  d_prefill_residual_out.copy_to(actual_prefill_residual);
+  d_prefill_normed_out.copy_to(actual_prefill_normed);
+
+  compare_bf16(actual_prefill_residual, expected_prefill_residual, 0.03125f,
+               "prefill FFN residual");
+  compare_bf16(actual_prefill_normed, expected_prefill_normed, 0.03125f,
+               "prefill FFN normed");
+
   DeviceBuffer<unsigned char> d_scratch_bytes(
       sizeof(Gemma4FfnDecodeScratch) + 128);
   auto *misaligned_scratch = reinterpret_cast<Gemma4FfnDecodeScratch *>(

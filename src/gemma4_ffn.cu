@@ -216,6 +216,60 @@ __global__ void swizzle_hidden_packs_kernel(
   }
 }
 
+// Adds a swizzled down-projection row to the natural residual row, then writes
+// the post-FFN residual and next RMS-normalized hidden state in natural order.
+__global__ __launch_bounds__(kFfnThreads, 1) void
+residual_add_rmsnorm_from_swizzled_down_kernel(
+    floatX *__restrict__ residual_out,
+    floatX *__restrict__ normed_out,
+    const floatX *__restrict__ down_swizzled,
+    const floatX *__restrict__ residual,
+    const floatX *__restrict__ rms_weight,
+    float eps) {
+  __shared__ float s_rms_warp_sums[kFfnWarps];
+  __shared__ float s_scale;
+
+  const int row = static_cast<int>(blockIdx.x);
+  const int hidden_pack = static_cast<int>(threadIdx.x);
+  const int natural_col = hidden_pack * kBf16Packed128Elements;
+  const int swizzled_col =
+      hidden_pack_swizzle_index(hidden_pack) * kBf16Packed128Elements;
+  const int64_t row_offset = static_cast<int64_t>(row) * GEMMA4_HIDDEN_SIZE;
+
+  const FfnBf16Pack down_pack =
+      load128g(down_swizzled + row_offset + swizzled_col);
+  float values[kBf16Packed128Elements] = {};
+  const __nv_bfloat162 *down_pairs = gemma4_bf16_pack_pairs(down_pack);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    const float2 down = __bfloat1622float2(down_pairs[p]);
+    values[2 * p] = down.x;
+    values[2 * p + 1] = down.y;
+  }
+
+  float sum_sq = 0.0f;
+  const FfnBf16Pack residual_pack =
+      load128g(residual + row_offset + natural_col);
+  FfnBf16Pack residual_out_pack;
+  ffn_dev::add_residual_store_pack(
+      residual_pack, values, residual_out_pack, sum_sq);
+  store128(residual_out + row_offset + natural_col, residual_out_pack);
+
+  const float total =
+      gemma4_block_reduce_sum<kFfnThreads>(
+          sum_sq, s_rms_warp_sums, threadIdx.x);
+  if (threadIdx.x == 0) {
+    s_scale = rsqrtf(total / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
+  }
+  __syncthreads();
+
+  const FfnBf16Pack gamma_pack =
+      load128g(rms_weight + natural_col);
+  const FfnBf16Pack normed_pack =
+      ffn_dev::rmsnorm_store_pack(values, gamma_pack, s_scale);
+  store128wb(normed_out + row_offset + natural_col, normed_pack);
+}
+
 __global__ void swizzle_gate_up_interleaved_kernel(
     floatX *__restrict__ dst,
     const floatX *__restrict__ src) {
@@ -293,10 +347,10 @@ cudaError_t launch_cutlass_bf16_gemm(
   return cudaGetLastError();
 }
 
-cudaError_t run_prefill_gate_up_geglu_dual_gemm(
+cudaError_t run_prefill_gate_up_geglu_decode_layout_dual_gemm(
     floatX *__restrict__ act,
-    const floatX *__restrict__ x,
-    const floatX *__restrict__ w_gate_up_col_major,
+    const floatX *__restrict__ x_swizzled,
+    const floatX *__restrict__ w_gate_up_decode,
     int rows,
     cudaStream_t stream) {
   using Element = cutlass::bfloat16_t;
@@ -332,20 +386,21 @@ cudaError_t run_prefill_gate_up_geglu_dual_gemm(
       false>;
 
   const Element *w_gate =
-      reinterpret_cast<const Element *>(w_gate_up_col_major);
-  const Element *w_up = w_gate +
-      static_cast<int64_t>(GEMMA4_HIDDEN_SIZE) * GEMMA4_INTERMEDIATE_SIZE;
+      reinterpret_cast<const Element *>(w_gate_up_decode);
+  const Element *w_up = w_gate + GEMMA4_HIDDEN_SIZE;
   const Element *act_const = reinterpret_cast<const Element *>(act);
   typename DualGemm::TensorRefD null_ref{};
 
+  // Decode layout interleaves gate/up rows, so adjacent output columns are
+  // separated by two hidden rows instead of one.
   typename DualGemm::Arguments args(
       cutlass::gemm::DualGemmMode::kGemm,
       {rows, GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE},
-      {reinterpret_cast<const Element *>(x), GEMMA4_HIDDEN_SIZE},
-      {w_gate, GEMMA4_HIDDEN_SIZE},
+      {reinterpret_cast<const Element *>(x_swizzled), GEMMA4_HIDDEN_SIZE},
+      {w_gate, 2 * GEMMA4_HIDDEN_SIZE},
       {act_const, GEMMA4_INTERMEDIATE_SIZE},
       null_ref,
-      {w_up, GEMMA4_HIDDEN_SIZE},
+      {w_up, 2 * GEMMA4_HIDDEN_SIZE},
       {act_const, GEMMA4_INTERMEDIATE_SIZE},
       null_ref,
       {reinterpret_cast<Element *>(act), GEMMA4_INTERMEDIATE_SIZE},
@@ -392,15 +447,15 @@ bool ffn_common_args_valid(const Gemma4FfnBf16Args &args) {
          is_aligned_16(args.rms_weight);
 }
 
-bool ffn_prefill_args_valid(const Gemma4FfnBf16Args &args) {
+bool ffn_prefill_decode_layout_args_valid(const Gemma4FfnBf16Args &args) {
   return ffn_common_args_valid(args) && args.rows > 1 &&
-         args.w_gate_up_prefill_col_major != nullptr &&
-         args.w_down_prefill_row_major != nullptr &&
+         args.w_gate_up_decode != nullptr &&
+         args.w_down_decode != nullptr &&
          args.prefill_scratch.act != nullptr &&
          args.prefill_scratch.down != nullptr &&
          args.prefill_scratch.capacity_rows >= args.rows &&
-         is_aligned_16(args.w_gate_up_prefill_col_major) &&
-         is_aligned_16(args.w_down_prefill_row_major) &&
+         is_aligned_16(args.w_gate_up_decode) &&
+         is_aligned_16(args.w_down_decode) &&
          is_aligned_16(args.prefill_scratch.act) &&
          is_aligned_16(args.prefill_scratch.down);
 }
@@ -447,28 +502,38 @@ cudaError_t gemma4_ffn_decode_fused_bf16_impl(
 }
 
 cudaError_t gemma4_ffn_prefill_bf16_impl(const Gemma4FfnBf16Args &args) {
-  if (!ffn_prefill_args_valid(args)) {
+  if (!ffn_prefill_decode_layout_args_valid(args)) {
     return cudaErrorInvalidValue;
   }
 
-  cudaError_t status = run_prefill_gate_up_geglu_dual_gemm(
-      args.prefill_scratch.act, args.x, args.w_gate_up_prefill_col_major,
-      args.rows, args.stream);
+  const dim3 block_dim(kSwizzleThreads);
+  const dim3 swizzle_grid_dim(kActualSwizzleBlocksPerRow, args.rows);
+  swizzle_hidden_packs_kernel<<<swizzle_grid_dim, block_dim, 0, args.stream>>>(
+      args.prefill_scratch.down, args.x, args.rows);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  status = run_prefill_gate_up_geglu_decode_layout_dual_gemm(
+      args.prefill_scratch.act, args.prefill_scratch.down,
+      args.w_gate_up_decode, args.rows, args.stream);
   if (status != cudaSuccess) {
     return status;
   }
 
   status = launch_prefill_down_gemm(
-      args.prefill_scratch.act, args.w_down_prefill_row_major,
+      args.prefill_scratch.act, args.w_down_decode,
       args.prefill_scratch.down, args.rows, args.stream);
   if (status != cudaSuccess) {
     return status;
   }
 
-  return gemma4_residual_add_rmsnorm_bf16(
+  residual_add_rmsnorm_from_swizzled_down_kernel<<<
+      args.rows, kFfnThreads, 0, args.stream>>>(
       args.residual_out, args.normed_out, args.prefill_scratch.down,
-      args.residual, args.rms_weight, args.rows, GEMMA4_HIDDEN_SIZE,
-      args.eps, args.stream);
+      args.residual, args.rms_weight, args.eps);
+  return cudaGetLastError();
 }
 
 }  // namespace
@@ -534,7 +599,6 @@ Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
 
   const size_t act_elements =
       static_cast<size_t>(rows) * GEMMA4_INTERMEDIATE_SIZE;
-  scratch.gate_up = nullptr;
   scratch.act = buffer;
   scratch.down = scratch.act + act_elements;
   return scratch;
