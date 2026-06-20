@@ -525,15 +525,23 @@ int main(int argc, char **argv) {
                         cudaMemcpyDeviceToHost));
   check_attention_correctness(actual, expected);
 
-  CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
+  bool persistent_supported = true;
+  cudaError_t persistent_status =
+      gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
       d_out, d_partial_m, d_partial_l, d_partial_acc, d_work_scratch,
       work_scratch_i32, d_q, d_cache_k, d_cache_v, d_page_table,
       d_seq_lengths, config, layer, batch_size, scale, split_size,
-      num_splits, 0, stream));
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-  CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
-                        cudaMemcpyDeviceToHost));
-  check_attention_correctness(actual, expected);
+      num_splits, 0, stream);
+  if (persistent_status == cudaErrorNotSupported) {
+    persistent_supported = false;
+    CUDA_CHECK(cudaGetLastError());
+  } else {
+    CUDA_CHECK(persistent_status);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
+                          cudaMemcpyDeviceToHost));
+    check_attention_correctness(actual, expected);
+  }
 
   // Each lambda enqueues exactly the work named by its label. The timing helper
   // wraps these in CUDA events on the same stream and optionally flushes L2.
@@ -577,10 +585,15 @@ int main(int argc, char **argv) {
               time_cuda_samples(flash_decode_attention, stream, warmup, iters,
                                 samples, cold_cache, d_l2_scratch,
                                 flush_bytes / sizeof(uint32_t)));
-  print_stats("flash_decode_paged_attention_persistent",
-              time_cuda_samples(flash_decode_attention_persistent, stream,
-                                warmup, iters, samples, cold_cache,
-                                d_l2_scratch, flush_bytes / sizeof(uint32_t)));
+  if (persistent_supported) {
+    print_stats("flash_decode_paged_attention_persistent",
+                time_cuda_samples(flash_decode_attention_persistent, stream,
+                                  warmup, iters, samples, cold_cache,
+                                  d_l2_scratch,
+                                  flush_bytes / sizeof(uint32_t)));
+  } else {
+    std::printf("flash_decode_paged_attention_persistent skipped=not_supported\n");
+  }
   print_stats("flash_full_decode_write_plus_attention",
               time_cuda_samples(flash_full_decode, stream, warmup, iters,
                                 samples, cold_cache, d_l2_scratch,

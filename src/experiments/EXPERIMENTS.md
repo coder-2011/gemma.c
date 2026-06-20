@@ -3,6 +3,107 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-20 - Flash-Attention Kernel Wrapper Refactor Check
+
+Question:
+
+- Refactor the active flash-attn CUDA globals so they are thin wrappers around
+  device phase helpers, without changing the math, launch shapes, cache layout,
+  or fused attention behavior.
+- Confirm correctness and latency stayed effectively unchanged.
+
+Change:
+
+- Extracted phase helpers from the prefill Q/K/V prep, decode Q/K/V prep,
+  fused decode project+prep, paged decode split, and paged decode reduce
+  kernels in `src/gemma4_flash_attention.cu`.
+- Left `gemma4_flash_fwd_bf16_kernel` on the existing wrapper path around
+  `gemma4_compute_attn_1rowblock`, since the real FlashAttention work was
+  already below the global wrapper.
+- Did not touch the unsupported sliding persistent decode path.
+
+Build:
+
+```bash
+make -B flash-attn-bench NVCC=/usr/local/cuda/bin/nvcc
+make -B kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+make -B flash-attn-lib NVCC=/usr/local/cuda/bin/nvcc
+make -B build/gemma4_flash_attention.o NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Environment snapshot:
+
+- GPU: NVIDIA RTX A6000, bus `00000000:06:00.0`.
+- Driver: `580.126.16`; persistence enabled; ECC disabled; MIG disabled.
+- Power limit: `300 W`; initial clocks `210 MHz` SM / `405 MHz` memory.
+- Clock policy: not locked.
+
+Correctness:
+
+```text
+flash-attn-bench:
+  correctness seq=64 max_abs=0.0078125 mean_abs=0.000258471 max_rel=0.00775194
+  no_lse_correctness max_abs=0.0078125 mean_abs=0.000258471 max_rel=0.00775194
+  norm_rope_prep_correctness q_max_abs=0.00195312 k_max_abs=0 v_max_abs=0.000976562
+
+sliding paged decode torch graph:
+  decode_direct_vs_torch_max_abs=0.000244140625
+  prefill_custom_vs_torch_max_abs=0.000244140625
+
+global paged decode torch graph:
+  custom_vs_pytorch max_abs=0.00012207
+```
+
+Benchmark commands:
+
+```bash
+./build/experiments/gemma4_flash_attention_bench 1024 200 50 5 1 64 warm 64
+
+python3 src/experiments/gemma4_paged_decode_torch_bench.py \
+  --lib build/libgemma4_flash_attention.so --seq-len 1024 \
+  --prefill-seq-len 64 --batch-size 1 --page-size 64 --split-size 64 \
+  --warmup 10 --iters 20 --samples 5 --cache warm --sample-delay-s 1.0
+
+python3 src/experiments/gemma4_global_decode_torch_bench.py \
+  --seq-len 1024 --batch-size 1 --page-size 64 --split-size 64 \
+  --warmup 5 --iters 5 --samples 5 --cache cold
+```
+
+Measurement contract:
+
+- `flash-attn-bench`: CUDA events on the benchmark stream, warm cache,
+  launch overhead included, 50 warmups, 200 timed iterations, 5 samples.
+- Sliding paged decode torch graph: CUDA graph replay, warm cache, launch
+  overhead excluded, 10 warmups, 20 inner iterations, 5 samples.
+- Global paged decode torch graph: CUDA graph replay, cold cache, launch
+  overhead excluded, 5 warmups, 5 iterations, 5 samples.
+
+Baseline vs refactor, same `flash-attn-bench` command:
+
+```text
+path                         baseline median ms   refactor median ms
+norm_rope_plus_fa            0.186738             0.186861
+decode_norm_rope_paged_kv    0.023846             0.020419
+```
+
+Post-refactor decode attention timing:
+
+```text
+sliding decode_custom_direct warm median   0.059155 ms
+global custom_global_decode cold median    0.278880 ms
+```
+
+Conclusion:
+
+- Numerical results match the pre-refactor bench exactly for the covered
+  prefill/prep checks, and paged decode split/reduce passes both sliding and
+  global PyTorch references.
+- Prefill timing is unchanged within noise. Decode prep measured faster than
+  the earlier single baseline run, but that path is noisy at this size, so this
+  is not claimed as a performance win.
+- `kv-cache-bench` rebuilt and confirmed direct decode correctness before
+  stopping at the pre-existing unsupported persistent decode entrypoint.
+
 ## 2026-06-19 - Probabilistic Sampling From Logits
 
 Question:
