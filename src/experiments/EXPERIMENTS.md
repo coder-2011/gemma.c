@@ -13171,3 +13171,62 @@ Conclusion:
 - This confirms the projection-delta pass is too small relative to the FFN
   weight stream to move end-to-end decode meaningfully by itself. The next
   material target remains reducing or amortizing FFN weight bytes.
+
+## 2026-06-20 - 12B Decode Thread-Count Sanity Pass
+
+Question: after retargeting the constants to Gemma 4 12B, are any decode GEMV
+thread counts obviously mismatched to the new dimensions?
+
+Change:
+
+- Changed FFN-down decode from `1024` to `960` threads. The 12B FFN-down
+  reduction has `15360 / 8 = 1920` BF16 vector packs, so this gives every
+  thread exactly two packs instead of leaving the tail imbalanced.
+- Kept final logits at `1024` threads. A `512`-thread trial was not an obvious
+  win in the short benchmark and it also affects the fused sampler reduction.
+
+Commands:
+
+```bash
+make NVCC=/usr/local/cuda/bin/nvcc decode-bench test-sampling test-kv-cache
+GEMMA4_DECODE_BENCH_SEED=0x12b \
+  ./build/experiments/gemma4_decode_bench ffn_down 20 5 2
+GEMMA4_DECODE_BENCH_SEED=0x12b \
+  ./build/experiments/gemma4_decode_bench final_logits 5 2 1
+./build/tests/test_kv_cache
+make NVCC=/usr/local/cuda/bin/nvcc test-kv-cache
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`.
+- Compiler: `/usr/local/cuda/bin/nvcc`, CUDA compilation tools `13.0`,
+  `Build cuda_13.0.r13.0`.
+- Shape: Gemma 4 12B FFN down `15360 -> 3840`, final logits
+  `3840 -> 262144`, BF16.
+- Timing: decode bench CUDA-event timings with `5` warmup iterations, `20`
+  timed iterations, and `2` trials for FFN down. The final-logits spot check
+  used `2` warmups, `5` timed iterations, and `1` trial.
+- Cache policy: benchmark default warm-buffer behavior.
+- Clock policy: clocks were not locked; post-run idle snapshot was `210 MHz`
+  SM and `405 MHz` memory.
+- Correctness: `test-sampling` passed. The first full make run hit a transient
+  sliding persistent attention mismatch in `test-kv-cache`; rerunning
+  `./build/tests/test_kv_cache` and then `make test-kv-cache` passed.
+
+Result:
+
+```text
+path                old best ms  new best ms  correctness
+FFN down custom       0.169640     0.169432   swizzle16 max_abs=0
+```
+
+Conclusion:
+
+- The `960`-thread FFN-down launch is the only keeper from this pass. It better
+  matches the 12B pack count and measured neutral/slightly faster in the short
+  run.
+- No final-logits launch change was kept; the current `1024` threads remain a
+  reasonable baseline until a more serious sampler/logits benchmark says
+  otherwise.
