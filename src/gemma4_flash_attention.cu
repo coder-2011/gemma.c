@@ -2,7 +2,7 @@
 //
 // This file is a Gemma-specific inline specialization of the FlashAttention-2
 // SM80 forward path. It keeps only the active BF16 forward kernels used by
-// Gemma 4 31B text attention: local sliding and global layers. The
+// Gemma 4 text attention: local sliding and global layers. The
 // implementation is limited to fixed-shape model paths and omits the upstream
 // generic feature matrix.
 //
@@ -176,6 +176,10 @@ struct Gemma4AttentionDerived {
   static constexpr int kRotaryHalf = Traits::kRotaryDim / 2;
   static constexpr int kRotaryPairsPerLane = kRotaryHalf / kWarpSize;
   static constexpr int kGqaRatio = GEMMA4_NUM_QUERY_HEADS / Traits::kKvHeads;
+  static constexpr int kDecodeKvWarps = Traits::kHasVProjection ? 2 : 1;
+  static constexpr int kDecodeKWarp =
+      kGqaRatio < kHeadsPerBlock ? kGqaRatio : 0;
+  static constexpr int kDecodeVWarp = kDecodeKWarp + 1;
 
   static_assert((Traits::kHeadDim % kWarpSize) == 0);
   static_assert((Traits::kRotaryDim % 2) == 0);
@@ -183,6 +187,8 @@ struct Gemma4AttentionDerived {
   static_assert((GEMMA4_NUM_QUERY_HEADS % Traits::kKvHeads) == 0);
   static_assert((GEMMA4_NUM_QUERY_HEADS % kHeadsPerBlock) == 0);
   static_assert((Traits::kHeadDim % kBf16Packed128Elements) == 0);
+  static_assert(kHeadsPerBlock >= kGqaRatio);
+  static_assert(!Traits::kHasVProjection || kDecodeVWarp < kHeadsPerBlock);
 };
 
 // Return the maximum value across the 4 lanes that jointly own one score row.
@@ -1369,8 +1375,7 @@ void gemma4_decode_q_paged_kv_norm_rope_kernel(
   const int batch = blockIdx.x;
   const int lane = threadIdx.x & (kWarpSize - 1);
   const int warp = threadIdx.x / kWarpSize;
-  const int head = blockIdx.y * Derived::kHeadsPerBlock + warp;
-  if (head >= kQHeads) return;
+  const int kv_head = blockIdx.y;
 
   const int position =
       gemma4_warp_uniform_ldg_i32(token_position + batch, lane);
@@ -1378,23 +1383,32 @@ void gemma4_decode_q_paged_kv_norm_rope_kernel(
   const float *cos_row = cos + int64_t(position) * Derived::kRotaryHalf;
   const float *sin_row = sin + int64_t(position) * Derived::kRotaryHalf;
 
-  const int64_t q_offset = (int64_t(batch) * kQHeads + head) * kHeadDim;
-  prep_weighted_rope_head<Traits>(q_prepared + q_offset, q + q_offset,
-                                  q_norm_weight, cos_row, sin_row, lane);
+  if (warp < Derived::kGqaRatio) {
+    const int q_head = kv_head * Derived::kGqaRatio + warp;
+    const int64_t q_offset = (int64_t(batch) * kQHeads + q_head) * kHeadDim;
+    prep_weighted_rope_head<Traits>(q_prepared + q_offset, q + q_offset,
+                                    q_norm_weight, cos_row, sin_row, lane);
+    if (warp != Derived::kDecodeKWarp) return;
+  }
 
-  // Only KV heads have cache rows; the remaining query-head warps are done.
-  if (head >= kKvHeads) return;
+  // One decode producer owns one KV head and that head's GQA query group.
+  if (warp != Derived::kDecodeKWarp &&
+      (!Traits::kHasVProjection || warp != Derived::kDecodeVWarp)) {
+    return;
+  }
   const int64_t cache_offset = decode_cache_head_offset<Traits>(
-      cache_config, page_table, batch, position, cache_layer, head, lane);
+      cache_config, page_table, batch, position, cache_layer, kv_head, lane);
   if (cache_offset < 0) return;
 
-  const int64_t kv_offset = (int64_t(batch) * kKvHeads + head) * kHeadDim;
-  prep_weighted_rope_head<Traits>(cache_k + cache_offset, k + kv_offset,
-                                  k_norm_weight, cos_row, sin_row, lane);
-  if constexpr (Traits::kHasVProjection) {
+  const int64_t kv_offset = (int64_t(batch) * kKvHeads + kv_head) * kHeadDim;
+  if (warp == Derived::kDecodeKWarp) {
+    prep_weighted_rope_head<Traits>(cache_k + cache_offset, k + kv_offset,
+                                    k_norm_weight, cos_row, sin_row, lane);
+    if constexpr (!Traits::kHasVProjection) {
+      prep_scale_free_head<Traits>(cache_v + cache_offset, k + kv_offset, lane);
+    }
+  } else if constexpr (Traits::kHasVProjection) {
     prep_scale_free_head<Traits>(cache_v + cache_offset, v + kv_offset, lane);
-  } else {
-    prep_scale_free_head<Traits>(cache_v + cache_offset, k + kv_offset, lane);
   }
 }
 
@@ -1418,14 +1432,12 @@ void gemma4_decode_project_prepare_paged_kv_kernel(
     const float *__restrict__ sin) {
   using Derived = Gemma4AttentionDerived<Traits>;
   constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
-  constexpr int kKvHeads = Traits::kKvHeads;
   constexpr int kHeadDim = Traits::kHeadDim;
 
   const int batch = blockIdx.x;
   const int lane = threadIdx.x & (kWarpSize - 1);
   const int warp = threadIdx.x / kWarpSize;
-  const int head = blockIdx.y * Derived::kHeadsPerBlock + warp;
-  if (head >= kQHeads) return;
+  const int kv_head = blockIdx.y;
 
   const int position =
       gemma4_warp_uniform_ldg_i32(token_position + batch, lane);
@@ -1434,34 +1446,42 @@ void gemma4_decode_project_prepare_paged_kv_kernel(
   const float *sin_row = sin + int64_t(position) * Derived::kRotaryHalf;
   const __nv_bfloat16 *x_row = x + int64_t(batch) * GEMMA4_HIDDEN_SIZE;
 
-  float q_values[Derived::kValuesPerLane];
-  project_head_values_bf16<Traits>(
-      x_row, weights.d_q_col_major, weights.q_col_base + head * kHeadDim,
-      lane, q_values);
-  const int64_t q_offset = (int64_t(batch) * kQHeads + head) * kHeadDim;
-  prep_weighted_rope_head_values<Traits>(
-      q_prepared + q_offset, q_values, q_norm_weight, cos_row, sin_row, lane);
+  if (warp < Derived::kGqaRatio) {
+    const int q_head = kv_head * Derived::kGqaRatio + warp;
+    float q_values[Derived::kValuesPerLane];
+    project_head_values_bf16<Traits>(
+        x_row, weights.d_q_col_major, weights.q_col_base + q_head * kHeadDim,
+        lane, q_values);
+    const int64_t q_offset = (int64_t(batch) * kQHeads + q_head) * kHeadDim;
+    prep_weighted_rope_head_values<Traits>(
+        q_prepared + q_offset, q_values, q_norm_weight, cos_row, sin_row, lane);
+    if (warp != Derived::kDecodeKWarp) return;
+  }
 
-  if (head >= kKvHeads) return;
+  // One decode producer owns one KV head and that head's GQA query group.
+  if (warp != Derived::kDecodeKWarp &&
+      (!Traits::kHasVProjection || warp != Derived::kDecodeVWarp)) {
+    return;
+  }
   const int64_t cache_offset = decode_cache_head_offset<Traits>(
-      cache_config, page_table, batch, position, cache_layer, head, lane);
+      cache_config, page_table, batch, position, cache_layer, kv_head, lane);
   if (cache_offset < 0) return;
 
-  float k_values[Derived::kValuesPerLane];
-  project_head_values_bf16<Traits>(
-      x_row, weights.d_k_col_major, weights.k_col_base + head * kHeadDim,
-      lane, k_values);
-  prep_weighted_rope_head_values<Traits>(
-      cache_k + cache_offset, k_values, k_norm_weight, cos_row, sin_row, lane);
-
-  if constexpr (Traits::kHasVProjection) {
-    float v_values[Derived::kValuesPerLane];
+  float values[Derived::kValuesPerLane];
+  if (warp == Derived::kDecodeKWarp) {
     project_head_values_bf16<Traits>(
-        x_row, weights.d_v_col_major, weights.v_col_base + head * kHeadDim,
-        lane, v_values);
-    prep_scale_free_head_values<Traits>(cache_v + cache_offset, v_values, lane);
-  } else {
-    prep_scale_free_head_values<Traits>(cache_v + cache_offset, k_values, lane);
+        x_row, weights.d_k_col_major, weights.k_col_base + kv_head * kHeadDim,
+        lane, values);
+    prep_weighted_rope_head_values<Traits>(
+        cache_k + cache_offset, values, k_norm_weight, cos_row, sin_row, lane);
+    if constexpr (!Traits::kHasVProjection) {
+      prep_scale_free_head_values<Traits>(cache_v + cache_offset, values, lane);
+    }
+  } else if constexpr (Traits::kHasVProjection) {
+    project_head_values_bf16<Traits>(
+        x_row, weights.d_v_col_major, weights.v_col_base + kv_head * kHeadDim,
+        lane, values);
+    prep_scale_free_head_values<Traits>(cache_v + cache_offset, values, lane);
   }
 }
 
@@ -1563,10 +1583,8 @@ cudaError_t prepare_decode_q_paged_kv_norm_rope(
     return cudaErrorInvalidValue;
   }
 
-  constexpr int kHeadGroups =
-      (GEMMA4_NUM_QUERY_HEADS + Derived::kHeadsPerBlock - 1) /
-      Derived::kHeadsPerBlock;
-  const dim3 grid_dim(batch_size, kHeadGroups);
+  // grid.y = KV head. Each producer owns that KV head's GQA query group.
+  const dim3 grid_dim(batch_size, Traits::kKvHeads);
   constexpr dim3 block_dim(Derived::kPrepThreads);
   gemma4_decode_q_paged_kv_norm_rope_kernel<Traits>
       <<<grid_dim, block_dim, 0, stream>>>(
@@ -1607,10 +1625,8 @@ cudaError_t project_prepare_decode_paged_kv_impl(
     return cudaErrorInvalidValue;
   }
 
-  constexpr int kHeadGroups =
-      (GEMMA4_NUM_QUERY_HEADS + Derived::kHeadsPerBlock - 1) /
-      Derived::kHeadsPerBlock;
-  const dim3 grid_dim(batch_size, kHeadGroups);
+  // grid.y = KV head. Each producer owns that KV head's GQA query group.
+  const dim3 grid_dim(batch_size, Traits::kKvHeads);
   constexpr dim3 block_dim(Derived::kPrepThreads);
   gemma4_decode_project_prepare_paged_kv_kernel<Traits>
       <<<grid_dim, block_dim, 0, stream>>>(
