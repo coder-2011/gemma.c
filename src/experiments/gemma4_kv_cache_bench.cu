@@ -35,7 +35,7 @@ struct SampleStats {
 struct BenchOptions {
   int seq_len = 4096;
   int page_size = 64;
-  int split_size = 64;
+  int split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
   int warmup = 25;
   int iters = 100;
   int samples = 15;

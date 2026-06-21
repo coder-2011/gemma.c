@@ -15,6 +15,7 @@ GEMMA4_NUM_QUERY_HEADS = 16
 GEMMA4_SLIDING_KV_HEADS = 8
 GEMMA4_SLIDING_HEAD_DIM = 256
 GEMMA4_SLIDING_WINDOW = 1024
+GEMMA4_SLIDING_DECODE_SPLIT_SIZE = 20
 
 
 class Gemma4KvCacheConfig(ctypes.Structure):
@@ -327,7 +328,7 @@ def main():
     parser.add_argument("--prefill-seq-len", type=int, default=64)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--page-size", type=int, default=64)
-    parser.add_argument("--split-size", type=int, default=64)
+    parser.add_argument("--split-size", type=int, default=GEMMA4_SLIDING_DECODE_SPLIT_SIZE)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--samples", type=int, default=5)

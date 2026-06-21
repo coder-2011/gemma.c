@@ -27,6 +27,10 @@
   - Track tiny ready flags, task descriptors, and prepared-Q handoff buffers separately from large streaming weight/KV traffic so they can be kept L2-hot.
   - Explore newest-split-first flash scheduling, L2 persisting windows for prepared Q/partials, and producer-consumer ordering that avoids rereading fresh K/V from HBM when possible.
   - Keep this as a research path after the simple fused projection-to-prep path is correct and benchmarked.
+- Later: investigate a persistent projection/FFN worker before trying to fuse FlashAttention.
+  - Use one fixed weight layout and let the persistent task scheduler choose prefill-sized GEMM tiles or decode-sized GEMV tiles per work item.
+  - Keep prefill and decode projection tasks adjacent by layer/projection where possible so recently streamed weight tiles can get partial L2 reuse.
+  - Start with weight-stream-heavy tasks such as FFN gate/up, FFN down, QKV/Q/K projection, O projection, and final LM-head projection; FlashAttention mostly streams KV cache, not layer weights.
 
 ## Remaining Unfused Inference Buildout
 

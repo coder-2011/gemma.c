@@ -3,6 +3,497 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-20 - Fused LM-Head Gumbel Sampling Smoke
+
+Question:
+
+- Can the final logits decode path sample from the full vocabulary without
+  materializing `[1, vocab]` logits in HBM?
+
+Change:
+
+- Added a decode-only fused full-vocab Gumbel-Max sampler that reuses the
+  existing final LM-head GEMV tile shape.
+- Each CTA computes its strided vocab tiles, applies final softcap and
+  temperature, adds deterministic per-token Gumbel noise, and writes one
+  candidate. The cooperative reduction then selects one token and gathers its
+  tied embedding row.
+- This first pass intentionally does not implement top-k/top-p. The old
+  materialized top-k/top-p path was removed in the follow-up cleanup; add a
+  fused truncated sampler separately if that distribution is needed again.
+
+Commands:
+
+```bash
+make test-sampling NVCC=/usr/local/cuda/bin/nvcc
+make sampling-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_sampling_bench 5 10 5
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 -Isrc -Xptxas=-v \
+  -c src/gemma4_sampling.cu -o /tmp/gemma4_sampling_resource.o
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, 48 GB.
+- Timing: CUDA events on a nonblocking stream.
+- Warmup/iterations/samples: 5 warmup, 10 timed iterations, 5 samples.
+- Cache policy: warm-ish repeated buffers.
+- Clock policy: clocks not locked.
+- Correctness: `make test-sampling` compares the fused Gumbel token against a
+  CPU reference over all 262144 token IDs for sparse LM-head fixtures.
+
+Results:
+
+```text
+fused_lm_head_gumbel_full_vocab:
+  median_us=2964.803 min_us=2956.403 max_us=2972.752
+
+ptxas final_logits_gumbel_fused_kernel:
+  registers=64 smem=9216B stack=0 spills=0
+```
+
+Conclusion:
+
+- The fused path is correct on the focused tests and avoids writing full logits.
+- The smoke benchmark includes the full LM-head GEMV weight stream, so it is not
+  directly comparable to the existing materialized-logits sampler rows in the
+  same bench, which start after logits already exist.
+- Next useful comparison is an apples-to-apples baseline:
+  materialized final LM-head GEMV plus a materialized full-vocab Gumbel-Max
+  sampler.
+
+## 2026-06-20 - Fused vs Materialized LM-Head Gumbel Benchmark
+
+Question:
+
+- How much faster is the fused full-vocab Gumbel sampler than a materialized
+  final-logits path?
+
+Change:
+
+- Added a benchmark-local baseline:
+  `final logits GEMV -> write [1, vocab] BF16 logits -> full-vocab Gumbel-Max
+  sampler -> gather tied embedding row`.
+- The benchmark checks that fused and materialized paths select the same token
+  before timing.
+
+Commands:
+
+```bash
+nvidia-smi --query-gpu=name,gpu_bus_id,driver_version,persistence_mode,ecc.mode.current,mig.mode.current,power.limit,clocks.sm,clocks.mem,temperature.gpu,power.draw,utilization.gpu --format=csv
+/usr/local/cuda/bin/nvcc --version
+make sampling-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_sampling_bench 25 50 15
+./build/experiments/gemma4_sampling_bench 25 50 15
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, 48 GB.
+- Driver: `580.126.16`.
+- CUDA/NVCC: CUDA `13.0`, NVCC `13.0.48`.
+- Timing: CUDA events on a nonblocking stream.
+- Warmup/iterations/samples: 25 warmup, 50 timed iterations, 15 samples.
+- Cache policy: warm-ish repeated buffers.
+- Clock policy: clocks not locked. Persistence mode was enabled.
+- Correctness: fused/materialized token IDs matched before timed runs.
+
+Results:
+
+```text
+run 1:
+  fused median_us=2867.341 mean_us=2868.309
+  materialized median_us=2972.001 mean_us=2972.224
+  delta median_us=104.660
+  fused speedup=1.0365x, latency reduction=3.52%
+
+run 2:
+  fused median_us=2870.649 mean_us=2870.228
+  materialized median_us=2972.137 mean_us=2972.007
+  delta median_us=101.488
+  fused speedup=1.0354x, latency reduction=3.42%
+
+average of run medians:
+  fused median_us=2868.995
+  materialized median_us=2972.069
+  delta median_us=103.074
+  fused speedup=1.0359x, latency reduction=3.47%
+```
+
+Conclusion:
+
+- The fused path is about `1.036x` faster on this A6000 warm-cache decode
+  microbenchmark, saving about `103 us/token` in the final LM-head sampling
+  tail.
+- This is a modest but repeatable win. It mainly removes the logits HBM
+  write/read and the separate sampler launch, while the unavoidable LM-head
+  weight stream still dominates the runtime.
+
+## 2026-06-20 - Sliding Decode Split-Size Retune to 20
+
+Question:
+
+- After rejecting the combined score reducer, retest whether the retained
+  split/reduce kernel wants a smaller split size than the previously selected
+  `32`.
+- Use the same full-window sliding decode shape: `seq_len=1024`,
+  `page_size=64`, BF16, `batch_size=1`, `q_heads=16`, `kv_heads=8`,
+  `head_dim=256`.
+
+Change:
+
+- Changed `GEMMA4_SLIDING_DECODE_SPLIT_SIZE` from `32` to `20`.
+- Updated the Python sliding decode comparison default to the same value.
+- No flash-attn kernel body change was kept.
+
+Commands:
+
+```bash
+/usr/local/cuda/bin/ncu --version
+/usr/local/cuda/bin/nvcc -std=c++17 -O3 -arch=sm_86 \
+  --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math \
+  -D_GLIBCXX_USE_CXX11_ABI=1 -Isrc \
+  -Iexperiments/flash-attention/csrc/cutlass/include -Xptxas=-v \
+  -c src/gemma4_flash_attention.cu \
+  -o /tmp/gemma4_flash_attention_resource.o
+./build/experiments/gemma4_kv_cache_bench 1024 64 24 50 200 20 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 24 20 30 10 --cache cold
+./build/experiments/gemma4_kv_cache_bench 1024 64 20 50 200 20 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 28 50 200 20 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 22 50 200 20 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 20 20 30 10 --cache cold
+./build/experiments/gemma4_kv_cache_bench 1024 64 18 50 200 20 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 16 50 200 20 --cache warm
+make kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_kv_cache_bench 1024 64
+```
+
+Profiler/resource notes:
+
+- `/usr/local/cuda/bin/ncu` exists as a launcher, but Nsight Compute is not
+  installed under the expected CUDA/Opt directories, so hardware counters were
+  not available.
+- ptxas resource output for the retained decode kernels:
+  - sliding split: `38` registers, `96` B shared memory, no spills.
+  - sliding reduce: `26` registers, `96` B shared memory, no spills.
+  - global split: `64` registers, `1408` B shared memory, no spills.
+  - global reduce: `28` registers, `176` B shared memory, no spills.
+
+Results:
+
+```text
+split_size  actual_splits  cache  median_ms  correctness
+32          32             warm   0.036211   max_abs=0
+32          32             cold   0.041970   max_abs=0
+24          43             warm   0.031740   max_abs=0
+24          43             cold   0.038083   max_abs=0
+20          52             warm   0.031529   max_abs=0
+20          52             cold   0.035987   max_abs=0
+28          37             warm   0.033374   max_abs=0
+22          47             warm   0.031456   max_abs=0, noisy tail
+18          57             warm   0.032329   max_abs=0, bimodal
+16          64             warm   0.037753   max_abs=0
+
+default constant check after edit:
+  split_size=20 actual_splits=52 warm median_ms=0.033236 max_abs=0
+```
+
+Conclusion:
+
+- The best retained policy from this sweep is `split_size=20`.
+- It improves direct attention median versus `32` by about `13%` warm-cache and
+  about `14%` cold-cache in this harness.
+- `16` has already turned over, and `18`/`22` are noisier without a meaningful
+  median win. `20` is the cleaner default among the faster small-split choices.
+- The tradeoff is larger partial scratch: `52` live splits instead of `32` for
+  a 1024-token sliding window. For batch-1 sliding decode, `partial_acc` rises
+  from about `512 KiB` to about `832 KiB`, which is acceptable for this
+  throughput win.
+
+## 2026-06-20 - Decode Split Combined Score Reduction Rejected
+
+Question:
+
+- The decode split kernel computes one QK dot-product score per GQA head for
+  every key. The existing code uses one CUB block reduction per score.
+- Test whether reducing all GQA scores together with one custom warp/block
+  reduction lowers overhead in the sliding decode hot path.
+
+Tested change:
+
+- Temporarily replaced the per-score CUB reductions in
+  `phase_decode_paged_grouped_split` with a combined shuffle/shared-memory
+  reduction over `Derived::kGqaRatio` scores.
+- This source change was reverted after measurement.
+
+Commands:
+
+```bash
+make test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+make kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_kv_cache_bench 1024 64 32 50 200 20 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 32 20 30 10 --cache cold
+make kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_kv_cache_bench 1024 64 32 50 200 20 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 32 20 30 10 --cache cold
+```
+
+Results:
+
+```text
+temporary combined score reduction:
+  test-kv-cache: passed
+  warm median_ms=0.038612 max_abs=0
+  cold median_ms=0.045520 max_abs=0
+
+retained CUB score reductions after revert:
+  warm median_ms=0.036211 max_abs=0
+  cold median_ms=0.041970 max_abs=0
+```
+
+Conclusion:
+
+- The custom combined score reducer was correct but slower in both warm and
+  cold cache runs, so it was rejected.
+- The current CUB score reductions should stay until profiling identifies a
+  more specific issue. The next flash-attn work should not chase this path.
+
+## 2026-06-20 - Sliding Decode Split-Size Policy
+
+Question:
+
+- The flash decode kernel body already has the right split/reduce structure for
+  short-context direct output and full-window sliding decode.
+- The remaining policy question is how much key-range parallelism to expose for
+  the 1024-token sliding window before partial scratch/reduce overhead wins.
+
+Change:
+
+- Changed the default sliding decode split size from `64` to `32` in:
+  - `src/gemma4.h`
+  - `src/experiments/gemma4_kv_cache_bench.cu`
+  - `src/experiments/gemma4_paged_decode_torch_bench.py`
+- The flash-attn kernel body was not changed. Production callers should use
+  `split_size=32` and allocate `ceil(window_size / 32)` split scratch for
+  sliding decode unless a later end-to-end benchmark says otherwise.
+
+Commands:
+
+```bash
+make kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_kv_cache_bench 1024 64 32 50 200 20 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 64 50 200 20 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 32 20 30 10 --cache cold
+./build/experiments/gemma4_kv_cache_bench 1024 64 64 20 30 10 --cache cold
+./build/experiments/gemma4_kv_cache_bench 1024 64 16 20 100 10 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 1024 20 100 10 --cache warm
+./build/experiments/gemma4_kv_cache_bench 1024 64 24 20 100 10 --cache warm
+./build/experiments/gemma4_kv_cache_bench
+./build/experiments/gemma4_kv_cache_bench 1024 64
+python3 -m py_compile src/experiments/gemma4_paged_decode_torch_bench.py
+make kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_kv_cache_bench
+./build/experiments/gemma4_kv_cache_bench 1024 64
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, CUDA driver/runtime `13000` / `13000`.
+- Timing: CUDA events on the benchmark stream.
+- Cache: warm and cold C++ `kv-cache-bench` runs. Cold runs flushed 64 MiB.
+- Clock policy: clocks were not locked.
+
+Results:
+
+```text
+seq=1024 page=64 warm:
+  split_size=32 actual_splits=32 median_ms=0.036417 max_abs=0
+  split_size=64 actual_splits=16 median_ms=0.055714 max_abs=0
+
+seq=1024 page=64 cold:
+  split_size=32 actual_splits=32 median_ms=0.042239 max_abs=0
+  split_size=64 actual_splits=16 median_ms=0.062973 max_abs=0
+
+additional warm probes:
+  split_size=16   actual_splits=64 median_ms=0.046912 max_abs=0
+  split_size=24   actual_splits=43 median_ms=0.035147 max_abs=0
+  split_size=1024 actual_splits=1  median_ms=0.754711 max_abs=0
+
+default C++ harness after the edit:
+  ./build/experiments/gemma4_kv_cache_bench
+    split_size=32, seq_len=4096, key_count=1024, median_ms=0.036184
+  ./build/experiments/gemma4_kv_cache_bench 1024 64
+    split_size=32, correctness max_abs=0
+
+constant-wired verification after moving the policy to gemma4.h:
+  ./build/experiments/gemma4_kv_cache_bench
+    split_size=32, median_ms=0.037165
+  ./build/experiments/gemma4_kv_cache_bench 1024 64
+    split_size=32, correctness max_abs=0, median_ms=0.038498
+```
+
+Conclusion:
+
+- The original `64`-token split policy was under-parallelizing full-window
+  sliding decode on A6000. Moving to `32` gives about `35%` lower warm median
+  and about `33%` lower cold median in the focused benchmark.
+- A single 1024-token split is not viable despite avoiding partial scratch; it
+  removes split-level parallelism and measured about `0.755 ms`.
+- The `24`-token probe was slightly faster than `32` in one short warm run, but
+  the margin was below the project's `5%` claim threshold and the split crosses
+  page boundaries. `32` is the cleaner default.
+
+## 2026-06-20 - Small-Split Paged Decode Reduce Fast Path
+
+Question:
+
+- The normal sliding decode path with `seq_len=1024`, `split_size=64` launches
+  `16` split CTAs, writes partial softmax state/accumulators to global memory,
+  then launches the reducer.
+- Test whether the reducer itself is a material source of overhead by replacing
+  the generic two-CUB-reduction scalar combine path with a small-split branch
+  for `reduce_splits <= 32`.
+
+Tested change:
+
+- Added a small-split branch inside `phase_decode_paged_reduce` in
+  `src/gemma4_flash_attention.cu`.
+- One thread computes the row max and row denominator across live splits; the
+  head-dimension threads then combine the per-dimension partial accumulators.
+- The existing generic reducer remains the fallback for larger split counts.
+- This source change was not kept after measurement.
+
+Commands:
+
+```bash
+make build/libgemma4_flash_attention.so NVCC=/usr/local/cuda/bin/nvcc
+make kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+make test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+./build/experiments/gemma4_kv_cache_bench 1024 64 64 20 100 10 --cache warm
+./build/experiments/gemma4_kv_cache_bench 64 64 1024 20 100 10 --cache warm
+python3 src/experiments/gemma4_global_decode_torch_bench.py \
+  --seq-len 64 --batch-size 1 --page-size 64 --split-size 1024 \
+  --warmup 3 --iters 3 --samples 3 --cache cold
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, CUDA driver/runtime `13000` / `13000`.
+- Timing: CUDA events on the benchmark stream.
+- Cache: warm for C++ `kv-cache-bench`; cold for the global PyTorch graph
+  harness because that harness only exposes cold mode.
+- Warmup/timing: C++ runs used `20` warmups, `100` iterations per sample, `10`
+  samples. Global Python run used `3` warmups, `3` iterations, `3` samples.
+
+Results:
+
+```text
+test-kv-cache: passed
+
+sliding seq=1024 split=64 actual_splits=16:
+  correctness max_abs=0 mean_abs=0
+  flash_decode_paged_attention_direct median_ms=0.059416
+  prior median from single-split direct-output pass=0.059571
+
+sliding seq=64 split=1024 actual_splits=1:
+  correctness max_abs=0 mean_abs=0
+  flash_decode_paged_attention_direct median_ms=0.039984
+
+global seq=64 split=1024:
+  custom_vs_pytorch max_abs=0.00048828
+  custom global decode median_ms=0.310805
+```
+
+Conclusion:
+
+- The small-split reducer branch was correct and neutral/slightly faster in this
+  short run, but the effect was below the project's `5%` claim threshold, so
+  the source change was reverted.
+- This confirms the reducer scalar work is not the main inefficiency. The real
+  issue is still the multi-split design for full-window sliding decode: it
+  writes `partial_m`, `partial_l`, and `partial_acc` to HBM, then reads them
+  back in a second kernel.
+- The next meaningful flash-attn optimization should avoid the partial
+  accumulator round trip for the common full-window sliding decode case, rather
+  than further tuning this reducer.
+
+## 2026-06-20 - Single-Split Paged Decode Direct Output
+
+Question:
+
+- Remove unnecessary paged decode split/reduce work when a decode row has only
+  one launched split.
+- Keep the existing multi-split path unchanged for normal sliding-window decode.
+
+Change:
+
+- Added an optional `direct_out` sink to `phase_decode_paged_grouped_split` in
+  `src/gemma4_flash_attention.cu`.
+- `launch_decode_paged_impl` now passes `d_out` and skips
+  `decode_paged_reduce_kernel` when `num_splits == 1`.
+- Updated `gemma4_kv_cache_bench` to skip the parked persistent decode variant
+  when it returns `cudaErrorNotSupported`, so direct decode timing still runs.
+
+Build and correctness:
+
+```bash
+make build/libgemma4_flash_attention.so NVCC=/usr/local/cuda/bin/nvcc
+make kv-cache-bench NVCC=/usr/local/cuda/bin/nvcc
+make test-kv-cache NVCC=/usr/local/cuda/bin/nvcc
+```
+
+Correctness status:
+
+- `test-kv-cache`: passed.
+- Sliding single-split decode against CPU reference:
+  `max_abs=0.000000 mean_abs=0.000000`.
+- Sliding multi-split decode against CPU reference:
+  `max_abs=0.000000 mean_abs=0.000000`.
+- Global single-split decode against PyTorch:
+  `custom_vs_pytorch max_abs=0.00048828`.
+
+Benchmark contract:
+
+- Hardware: NVIDIA RTX A6000, CUDA driver/runtime `13000` / `13000`.
+- Timing: CUDA events on the benchmark stream.
+- Cache: warm for C++ `kv-cache-bench`; cold for the global PyTorch graph
+  harness because that harness only exposes cold mode.
+- Warmup/timing: C++ runs used `20` warmups, `100` iterations per sample, `10`
+  samples. Global Python run used `3` warmups, `3` iterations, `3` samples.
+
+Benchmark commands:
+
+```bash
+./build/experiments/gemma4_kv_cache_bench 64 64 1024 20 100 10 --cache warm
+./build/experiments/gemma4_kv_cache_bench 64 64 1024 20 100 10 --cache warm --extra-splits 1
+./build/experiments/gemma4_kv_cache_bench 1024 64 64 20 100 10 --cache warm
+
+python3 src/experiments/gemma4_global_decode_torch_bench.py \
+  --seq-len 64 --batch-size 1 --page-size 64 --split-size 1024 \
+  --warmup 3 --iters 3 --samples 3 --cache cold
+```
+
+Results:
+
+```text
+case                                      median_ms
+sliding single split, direct output       0.040159
+sliding one live split, forced reduce     0.043414
+sliding 1024-token, 16-split fallback     0.059571
+global 64-token, single split, cold       0.310869
+```
+
+Conclusion:
+
+- The single-split direct-output path removes the reduce launch and partial
+  scratch round-trip for short-context decode and measured about `7.5%` faster
+  than the forced split/reduce comparison in this run.
+- The normal 16-split sliding fallback still passes correctness and remains in
+  the expected performance range.
+- This does not solve full-window decode inefficiency. The next larger flash
+  attention step is a measured single-kernel split+reduce design or a
+  sliding/global-specific split schedule that reduces partial-scratch traffic.
+
 ## 2026-06-20 - Flash-Attention Kernel Wrapper Refactor Check
 
 Question:

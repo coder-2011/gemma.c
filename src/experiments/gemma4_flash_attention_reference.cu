@@ -64,7 +64,7 @@ void set_reference_params(
     int q_heads,
     int kv_heads,
     int head_dim,
-    int window_left,
+    int reference_window_left,
     float softmax_scale) {
   params = {};
   params.q_ptr = const_cast<__nv_bfloat16 *>(d_q);
@@ -106,7 +106,7 @@ void set_reference_params(
   params.p_dropout_in_uint8_t = 255;
   params.rp_dropout = 1.0f;
   params.scale_softmax_rp_dropout = softmax_scale;
-  params.window_size_left = window_left;
+  params.window_size_left = reference_window_left;
   params.window_size_right = 0;
   params.page_block_size = 1;
   params.is_bf16 = true;
@@ -191,22 +191,23 @@ extern "C" cudaError_t gemma4_flash_attention_reference_sliding_fwd_bf16(
     int batch_size,
     int seqlen_q,
     int seqlen_k,
-    int window_left,
+    int window_size,
     float softmax_scale,
     cudaStream_t stream) {
   if (d_out == nullptr || d_softmax_lse == nullptr || d_q == nullptr ||
       d_k == nullptr || d_v == nullptr) {
     return cudaErrorInvalidValue;
   }
-  if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0 || window_left < 0) {
+  if (batch_size <= 0 || seqlen_q <= 0 || seqlen_k <= 0 || window_size <= 0) {
     return cudaErrorInvalidValue;
   }
 
   flash::Flash_fwd_params params;
+  const int reference_window_left = window_size - 1;
   gemma4_flash_attention_reference_detail::set_reference_params(
       params, d_out, d_softmax_lse, d_q, d_k, d_v, batch_size, seqlen_q,
       seqlen_k, GEMMA4_NUM_QUERY_HEADS, GEMMA4_SLIDING_KV_HEADS,
-      GEMMA4_SLIDING_HEAD_DIM, window_left, softmax_scale);
+      GEMMA4_SLIDING_HEAD_DIM, reference_window_left, softmax_scale);
   flash::run_mha_fwd_<
       gemma4_flash_attention_reference_detail::ReferenceElement,
       GEMMA4_SLIDING_HEAD_DIM,

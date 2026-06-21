@@ -26,6 +26,17 @@ class KvConfig(ctypes.Structure):
     ]
 
 
+class ProjectionWeights(ctypes.Structure):
+    _fields_ = [
+        ("d_q_col_major", ctypes.c_void_p),
+        ("d_k_col_major", ctypes.c_void_p),
+        ("d_v_col_major", ctypes.c_void_p),
+        ("q_col_base", ctypes.c_int32),
+        ("k_col_base", ctypes.c_int32),
+        ("v_col_base", ctypes.c_int32),
+    ]
+
+
 def addr(t):
     return ctypes.c_void_p(t.data_ptr())
 
@@ -57,11 +68,12 @@ def load_kernel():
         cwd=root,
         check=True,
     )
-    fn = ctypes.CDLL(str(so)).gemma4_flash_attention_sliding_decode_project_prepare_paged_kv_bf16
+    fn = ctypes.CDLL(str(so)).gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16
     fn.restype = ctypes.c_int
     fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, KvConfig,
                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
-                   ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                   ctypes.c_void_p, ctypes.c_void_p, ProjectionWeights,
+                   ctypes.c_void_p, ctypes.c_void_p,
                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     return fn
 
@@ -78,6 +90,7 @@ def make_case(batch, seq, page_size):
     cache_shape = (1, cfg.num_pages, page_size, KVH, D)
     return cfg, pos, table, phase.cos(), phase.sin(), {
         "x": torch.randn(batch, H, device=device, dtype=torch.bfloat16),
+        "inw": torch.randn(H, device=device, dtype=torch.bfloat16) * 0.01 + 1,
         "w": (torch.randn(QKVS, H, device=device, dtype=torch.bfloat16) / H**0.5).contiguous(),
         "qw": torch.randn(D, device=device, dtype=torch.bfloat16) * 0.01 + 1,
         "kw": torch.randn(D, device=device, dtype=torch.bfloat16) * 0.01 + 1,
@@ -91,7 +104,7 @@ def make_case(batch, seq, page_size):
 
 
 def pytorch_case(t, pos, table, cos, sin, vllm_ops=None):
-    qkv = t["x"] @ t["w"].t()
+    qkv = rms(t["x"], t["inw"]) @ t["w"].t()
     q = qkv[:, :QS].reshape(-1, QH, D)
     k = qkv[:, QS:QS + KVS].reshape(-1, KVH, D)
     v = qkv[:, QS + KVS:].reshape(-1, KVH, D)
@@ -107,9 +120,11 @@ def pytorch_case(t, pos, table, cos, sin, vllm_ops=None):
 
 
 def custom_case(fn, cfg, t, pos, table, cos, sin):
+    weights = ProjectionWeights(t["w"].data_ptr(), t["w"].data_ptr(),
+                                t["w"].data_ptr(), 0, QS, QS + KVS)
     err = fn(addr(t["q"]), addr(t["ck"]), addr(t["cv"]), cfg, addr(table), addr(pos),
-             t["x"].shape[0], 0, addr(t["x"]), addr(t["w"]), addr(t["qw"]),
-             addr(t["kw"]), addr(cos), addr(sin),
+             t["x"].shape[0], 0, addr(t["x"]), addr(t["inw"]), weights,
+             addr(t["qw"]), addr(t["kw"]), addr(cos), addr(sin),
              ctypes.c_void_p(torch.cuda.current_stream().cuda_stream))
     if err:
         raise RuntimeError(f"cudaError_t={err}")
