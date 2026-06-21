@@ -660,6 +660,7 @@ void run_global_prefill_norm_rope_case() {
   constexpr int q_count = rows * GEMMA4_GLOBAL_Q_PROJ_SIZE;
   constexpr int kv_count = rows * GEMMA4_GLOBAL_K_PROJ_SIZE;
   constexpr int rotary_half = GEMMA4_GLOBAL_HEAD_DIM / 8;
+  constexpr int max_position = 4;
 
   std::vector<__nv_bfloat16> q(q_count, __float2bfloat16_rn(0.0f));
   std::vector<__nv_bfloat16> k(kv_count);
@@ -669,8 +670,13 @@ void run_global_prefill_norm_rope_case() {
 
   std::vector<__nv_bfloat16> norm_weight(
       GEMMA4_GLOBAL_HEAD_DIM, __float2bfloat16_rn(1.0f));
-  std::vector<float> cos(seq_len * rotary_half, 1.0f);
+  std::vector<int32_t> token_position = {2, 4};
+  std::vector<float> cos((max_position + 1) * rotary_half, 1.0f);
   std::vector<float> sin(cos.size(), 0.0f);
+  cos[token_position[0] * rotary_half] = 0.0f;
+  sin[token_position[0] * rotary_half] = 1.0f;
+  cos[token_position[1] * rotary_half] = 0.0f;
+  sin[token_position[1] * rotary_half] = -1.0f;
 
   DeviceBuffer<__nv_bfloat16> d_q(q.size());
   DeviceBuffer<__nv_bfloat16> d_k(k.size());
@@ -681,19 +687,21 @@ void run_global_prefill_norm_rope_case() {
   DeviceBuffer<__nv_bfloat16> d_norm_weight(norm_weight.size());
   DeviceBuffer<float> d_cos(cos.size());
   DeviceBuffer<float> d_sin(sin.size());
+  DeviceBuffer<int32_t> d_token_position(token_position.size());
 
   copy_to_device(d_q, q);
   copy_to_device(d_k, k);
   copy_to_device(d_norm_weight, norm_weight);
   copy_to_device(d_cos, cos);
   copy_to_device(d_sin, sin);
+  copy_to_device(d_token_position, token_position);
 
   const float scale = 1.0f / std::sqrt(float(GEMMA4_GLOBAL_HEAD_DIM));
   CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
       d_out.get(), nullptr, d_q_prepared.get(), d_k_prepared.get(),
       d_v_prepared.get(), d_q.get(), d_k.get(), d_norm_weight.get(),
-      d_norm_weight.get(), d_cos.get(), d_sin.get(), nullptr, batch_size, seq_len,
-      seq_len, scale, 0));
+      d_norm_weight.get(), d_cos.get(), d_sin.get(), d_token_position.get(),
+      batch_size, seq_len, seq_len, scale, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
   std::vector<__nv_bfloat16> expected_v(kv_count);
@@ -713,6 +721,34 @@ void run_global_prefill_norm_rope_case() {
   }
   compare_bf16(copy_to_host(d_v_prepared), expected_v, 0.00390625f,
                "global prefill K-derived V");
+
+  std::vector<__nv_bfloat16> k_prepared = copy_to_host(d_k_prepared);
+  for (int row = 0; row < rows; ++row) {
+    float sum_sq = 0.0f;
+    for (int d = 0; d < GEMMA4_GLOBAL_HEAD_DIM; ++d) {
+      const float value = bf16_to_float(k[row * GEMMA4_GLOBAL_HEAD_DIM + d]);
+      sum_sq += value * value;
+    }
+    const float inv_rms =
+        1.0f / std::sqrt(sum_sq / GEMMA4_GLOBAL_HEAD_DIM + GEMMA4_RMS_NORM_EPS);
+    const int position = token_position[row];
+    const float c = cos[position * rotary_half];
+    const float s = sin[position * rotary_half];
+    const float lo = bf16_to_float(k[row * GEMMA4_GLOBAL_HEAD_DIM]) * inv_rms;
+    const float hi =
+        bf16_to_float(k[row * GEMMA4_GLOBAL_HEAD_DIM + rotary_half]) * inv_rms;
+    const float expected_lo = bf16_to_float(__float2bfloat16_rn(lo * c - hi * s));
+    const float expected_hi = bf16_to_float(__float2bfloat16_rn(lo * s + hi * c));
+    const float actual_lo = bf16_to_float(k_prepared[row * GEMMA4_GLOBAL_HEAD_DIM]);
+    const float actual_hi =
+        bf16_to_float(k_prepared[row * GEMMA4_GLOBAL_HEAD_DIM + rotary_half]);
+    if (std::fabs(actual_lo - expected_lo) > 0.00390625f ||
+        std::fabs(actual_hi - expected_hi) > 0.00390625f) {
+      std::fprintf(stderr, "global prefill K RoPE used wrong position at row %d\n",
+                   row);
+      std::exit(1);
+    }
+  }
 
   std::vector<__nv_bfloat16> expected_out(q_count);
   std::vector<__nv_bfloat16> v_prepared = copy_to_host(d_v_prepared);
