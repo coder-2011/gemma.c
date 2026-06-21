@@ -69,7 +69,7 @@ standalone, numerically tested, benchmarked, and logged in
    - Prefer having attention kernels write directly in projection-ready layout once correct.
 
 6. GeGLU tanh activation
-   - Apply `gate * GELU_tanh(up)`.
+   - Apply `GELU_tanh(gate) * up`.
    - Width `15360`.
    - Baseline standalone first; later fuse into FFN output handling.
 
