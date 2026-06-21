@@ -26,6 +26,13 @@ __nv_bfloat16 make_value(int token, int channel) {
   return __float2bfloat16(value);
 }
 
+// Mirrors the model-input scaling in the embedding gather helper.
+uint16_t scaled_embedding_bits(__nv_bfloat16 value) {
+  const __nv_bfloat16 scaled =
+      __float2bfloat16_rn(__bfloat162float(value) * GEMMA4_EMBEDDING_SCALE);
+  return *reinterpret_cast<const uint16_t *>(&scaled);
+}
+
 void run_case(int vocab_size, const std::vector<int32_t> &token_ids) {
   int num_tokens = static_cast<int>(token_ids.size());
   constexpr int hidden_size = GEMMA4_HIDDEN_SIZE;
@@ -64,7 +71,8 @@ void run_case(int vocab_size, const std::vector<int32_t> &token_ids) {
     int32_t token_id = token_ids[token_idx];
     for (int c = 0; c < hidden_size; ++c) {
       uint16_t actual = out_bits[static_cast<size_t>(token_idx) * hidden_size + c];
-      uint16_t expected = embedding_bits[static_cast<size_t>(token_id) * hidden_size + c];
+      uint16_t expected = scaled_embedding_bits(
+          embeddings[static_cast<size_t>(token_id) * hidden_size + c]);
       if (actual != expected) {
         std::fprintf(stderr,
                      "mismatch token_idx=%d token_id=%d channel=%d "

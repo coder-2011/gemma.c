@@ -32,8 +32,9 @@ struct alignas(128) Gemma4FfnDecodeScratch {
 };
 
 struct Gemma4FfnPrefillScratch {
-  __nv_bfloat16 *gate_up = nullptr;
   __nv_bfloat16 *act = nullptr;
+  // Reused as swizzled hidden input before gate/up and swizzled down output
+  // before post-FFN RMSNorm + residual add.
   __nv_bfloat16 *down = nullptr;
   int capacity_rows = 0;
 };
@@ -45,8 +46,6 @@ struct Gemma4FfnBf16Args {
   const __nv_bfloat16 *residual = nullptr;
   const __nv_bfloat16 *rms_weight = nullptr;
 
-  const __nv_bfloat16 *w_gate_up_prefill_col_major = nullptr;
-  const __nv_bfloat16 *w_down_prefill_row_major = nullptr;
   Gemma4FfnPrefillScratch prefill_scratch = {};
 
   const __nv_bfloat16 *w_gate_up_decode = nullptr;
@@ -69,6 +68,16 @@ Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
     int rows);
 
 cudaError_t gemma4_ffn_bf16(const Gemma4FfnBf16Args &args);
+
+// Runs prefill GeGLU FFN only and writes the natural-order down-projection row.
+cudaError_t gemma4_ffn_prefill_mlp_bf16(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
+    const __nv_bfloat16 *__restrict__ w_down_decode,
+    Gemma4FfnPrefillScratch scratch,
+    int rows,
+    cudaStream_t stream);
 
 cudaError_t gemma4_ffn_decode_fused_bf16(
     __nv_bfloat16 *__restrict__ residual_out,

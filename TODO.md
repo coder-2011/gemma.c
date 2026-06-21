@@ -11,6 +11,9 @@
   - Include hidden width `3840` plus Q/K widths `256` and `512`.
   - Confirm the hidden-width-only fused residual+RMSNorm path is skipped for non-hidden widths.
   - Log commands, GPU/clocks, warmup/iteration counts, cache policy, and results in `src/experiments/EXPERIMENTS.md`.
+- Remove the redundant C ABI wrappers across the CUDA path.
+  - Most call sites are C++ now, so keep `extern "C"` only where a real Python/ctypes or shared-library boundary still needs it.
+  - Prefer direct C++ declarations for internal kernel launchers and helper APIs.
 - Fuse token embedding gather with the first matrix multiplication in the language path once the unfused baseline is correct.
   - Avoid materializing the initial `[M, 3840]` hidden buffer when the first projection can consume embedding rows directly.
   - Benchmark against the standalone embedding gather plus cuBLAS/cuBLASLt baseline before keeping the fusion.
@@ -24,12 +27,19 @@
   - Track tiny ready flags, task descriptors, and prepared-Q handoff buffers separately from large streaming weight/KV traffic so they can be kept L2-hot.
   - Explore newest-split-first flash scheduling, L2 persisting windows for prepared Q/partials, and producer-consumer ordering that avoids rereading fresh K/V from HBM when possible.
   - Keep this as a research path after the simple fused projection-to-prep path is correct and benchmarked.
+- Later: investigate a persistent projection/FFN worker before trying to fuse FlashAttention.
+  - Use one fixed weight layout and let the persistent task scheduler choose prefill-sized GEMM tiles or decode-sized GEMV tiles per work item.
+  - Keep prefill and decode projection tasks adjacent by layer/projection where possible so recently streamed weight tiles can get partial L2 reuse.
+  - Start with weight-stream-heavy tasks such as FFN gate/up, FFN down, QKV/Q/K projection, O projection, and final LM-head projection; FlashAttention mostly streams KV cache, not layer weights.
 
 ## Remaining Unfused Inference Buildout
 
 Build the remaining model-path pieces in this rough order. Keep each kernel
 standalone, numerically tested, benchmarked, and logged in
 `src/experiments/EXPERIMENTS.md` before wiring it into the full path.
+
+0. Write a project-owned tokenizer.
+   - Keep it Gemma-specific, deterministic, and small enough to validate against the checkpoint tokenizer files.
 
 1. Q/K per-head RMSNorm
    - Sliding layers: learned-weight RMSNorm over head dim `256`.
@@ -59,7 +69,7 @@ standalone, numerically tested, benchmarked, and logged in
    - Prefer having attention kernels write directly in projection-ready layout once correct.
 
 6. GeGLU tanh activation
-   - Apply `gate * GELU_tanh(up)`.
+   - Apply `GELU_tanh(gate) * up`.
    - Width `15360`.
    - Baseline standalone first; later fuse into FFN output handling.
 

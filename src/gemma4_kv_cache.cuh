@@ -3,6 +3,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <cute/layout.hpp>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -31,34 +32,20 @@ struct Gemma4KvPageAllocator {
   void reset();
 };
 
-__host__ __device__ inline int64_t gemma4_kv_cache_offset(
-    const Gemma4KvCacheConfig &config,
-    int32_t layer,
-    int32_t physical_page,
-    int32_t page_offset,
-    int32_t head,
-    int32_t dim) {
-  return (((((int64_t)layer * config.num_pages + physical_page) * config.page_size + page_offset) *
-           config.num_heads + head) * config.head_dim + dim);
-}
-
-__host__ __device__ inline int32_t gemma4_kv_cache_logical_page(
-    const Gemma4KvCacheConfig &config,
-    int32_t position) {
-  return position / config.page_size;
-}
-
-__host__ __device__ inline int32_t gemma4_kv_cache_page_offset(
-    const Gemma4KvCacheConfig &config,
-    int32_t position) {
-  return position % config.page_size;
-}
-
-__host__ __device__ inline int32_t gemma4_kv_cache_page_slot(
-    const Gemma4KvCacheConfig &config,
-    int32_t position) {
-  int32_t logical_page = gemma4_kv_cache_logical_page(config, position);
-  return logical_page % config.max_pages_per_seq;
+// Return the flat Layout-A cache mapping: [layer, page, page_offset, head, dim].
+__host__ __device__ inline auto gemma4_kv_cache_layout(
+    const Gemma4KvCacheConfig &config) {
+  using namespace cute;
+  int64_t dim_stride = 1;
+  int64_t head_stride = config.head_dim;
+  int64_t page_offset_stride = int64_t(config.num_heads) * head_stride;
+  int64_t page_stride = int64_t(config.page_size) * page_offset_stride;
+  int64_t layer_stride = int64_t(config.num_pages) * page_stride;
+  return make_layout(
+      make_shape(config.num_layers, config.num_pages, config.page_size,
+                 config.num_heads, config.head_dim),
+      make_stride(layer_stride, page_stride, page_offset_stride, head_stride,
+                  dim_stride));
 }
 
 Gemma4KvCacheConfig gemma4_kv_cache_make_config(bool global,

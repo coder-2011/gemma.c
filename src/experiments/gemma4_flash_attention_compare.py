@@ -19,7 +19,9 @@ DEFAULT_REFERENCE_LIB = ROOT / "build" / "libgemma4_flash_attention_reference.so
 Q_HEADS = 16
 KV_HEADS = 8
 HEAD_DIM = 256
-WINDOW_LEFT = 1024
+WINDOW_SIZE = 1024
+# Upstream FlashAttention uses left-token window size, unlike Gemma's total live-key API.
+REFERENCE_WINDOW_LEFT = WINDOW_SIZE - 1
 ATTR_NAMES = [
     "sharedSizeBytes",
     "constSizeBytes",
@@ -108,7 +110,7 @@ def call_custom(
         ctypes.c_int(q.shape[0]),
         ctypes.c_int(q.shape[1]),
         ctypes.c_int(k.shape[1]),
-        ctypes.c_int(WINDOW_LEFT),
+        ctypes.c_int(WINDOW_SIZE),
         ctypes.c_float(1.0 / math.sqrt(HEAD_DIM)),
         ctypes.c_void_p(stream.cuda_stream),
     )
@@ -134,7 +136,7 @@ def call_reference(
         ctypes.c_int(q.shape[0]),
         ctypes.c_int(q.shape[1]),
         ctypes.c_int(k.shape[1]),
-        ctypes.c_int(WINDOW_LEFT),
+        ctypes.c_int(WINDOW_SIZE),
         ctypes.c_float(1.0 / math.sqrt(HEAD_DIM)),
         ctypes.c_void_p(stream.cuda_stream),
     )
@@ -183,7 +185,7 @@ def stats(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
 def approx_tflops(batch: int, seq_len: int, ms: float) -> float:
     keys = 0
     for row in range(seq_len):
-        keys += row - max(0, row - WINDOW_LEFT) + 1
+        keys += row - max(0, row - WINDOW_SIZE + 1) + 1
     flops = batch * Q_HEADS * keys * (4 * HEAD_DIM)
     return flops / (ms * 1.0e-3) / 1.0e12
 
@@ -292,7 +294,7 @@ def main() -> None:
         dropout_p=0.0,
         softmax_scale=1.0 / math.sqrt(HEAD_DIM),
         causal=False,
-        window_size=(WINDOW_LEFT, 0),
+        window_size=(REFERENCE_WINDOW_LEFT, 0),
         alibi_slopes=None,
         deterministic=False,
     )
@@ -308,7 +310,7 @@ def main() -> None:
             dropout_p=0.0,
             softmax_scale=1.0 / math.sqrt(HEAD_DIM),
             causal=False,
-            window_size=(WINDOW_LEFT, 0),
+            window_size=(REFERENCE_WINDOW_LEFT, 0),
             alibi_slopes=None,
             deterministic=False,
         ),

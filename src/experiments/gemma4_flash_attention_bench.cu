@@ -316,14 +316,14 @@ std::vector<__nv_bfloat16> reference_sliding_attention(
     const std::vector<__nv_bfloat16> &v,
     int batch_size,
     int seq_len,
-    int window_left,
+    int window_size,
     float softmax_scale) {
   std::vector<__nv_bfloat16> out(q_elements(batch_size, seq_len));
   std::vector<float> scores(seq_len);
 
   for (int b = 0; b < batch_size; ++b) {
     for (int row = 0; row < seq_len; ++row) {
-      const int col_begin = std::max(0, row - window_left);
+      const int col_begin = std::max(0, row - window_size + 1);
       const int col_end = row + 1;
       for (int qh = 0; qh < kQHeads; ++qh) {
         const int kvh = qh / kGqaRatio;
@@ -379,7 +379,7 @@ DiffStats diff_stats_host(const std::vector<__nv_bfloat16> &lhs,
   return stats;
 }
 
-void run_correctness(int batch_size, int seq_len, int window_left,
+void run_correctness(int batch_size, int seq_len, int window_size,
                      cudaStream_t stream) {
   const float scale = 1.0f / std::sqrt(float(kHeadDim));
   std::vector<__nv_bfloat16> h_q(q_elements(batch_size, seq_len));
@@ -449,7 +449,7 @@ void run_correctness(int batch_size, int seq_len, int window_left,
   CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
       d_out, d_lse, d_q_prepared, d_k_prepared, d_v_prepared,
       d_q, d_k, d_v, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin,
-      batch_size, seq_len, seq_len, window_left, scale, stream));
+      nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   std::vector<__nv_bfloat16> h_out(h_q.size());
@@ -469,7 +469,7 @@ void run_correctness(int batch_size, int seq_len, int window_left,
                         cudaMemcpyDeviceToHost));
   std::vector<__nv_bfloat16> h_ref =
       reference_sliding_attention(h_q_prepared, h_k_prepared, h_v_prepared,
-                                  batch_size, seq_len, window_left, scale);
+                                  batch_size, seq_len, window_size, scale);
   const DiffStats q_diff = diff_stats_host(h_q_gpu, h_q_prepared);
   const DiffStats k_diff = diff_stats_host(h_k_gpu, h_k_prepared);
   const DiffStats v_diff = diff_stats_host(h_v_gpu, h_v_prepared);
@@ -478,7 +478,7 @@ void run_correctness(int batch_size, int seq_len, int window_left,
   CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
       d_out, nullptr, d_q_prepared, d_k_prepared, d_v_prepared,
       d_q, d_k, d_v, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin,
-      batch_size, seq_len, seq_len, window_left, scale, stream));
+      nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
   std::vector<__nv_bfloat16> h_out_no_lse(h_q.size());
   CUDA_CHECK(cudaMemcpy(h_out_no_lse.data(), d_out,
@@ -511,15 +511,15 @@ void run_correctness(int batch_size, int seq_len, int window_left,
   CUDA_CHECK(cudaFree(d_q));
 }
 
-double sliding_attention_flops(int batch_size, int seq_len, int window_left) {
+double sliding_attention_flops(int batch_size, int seq_len, int window_size) {
   double key_count = 0.0;
   for (int row = 0; row < seq_len; ++row) {
-    key_count += double(row - std::max(0, row - window_left) + 1);
+    key_count += double(row - std::max(0, row - window_size + 1) + 1);
   }
   return double(batch_size) * kQHeads * key_count * double(4 * kHeadDim);
 }
 
-void run_benchmark(int batch_size, int seq_len, int window_left, int warmup,
+void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
                    int iters, int samples, const std::string &cache_mode,
                    int64_t flush_bytes, cudaStream_t stream) {
   if (cache_mode != "warm" && cache_mode != "cold") {
@@ -660,12 +660,12 @@ void run_benchmark(int batch_size, int seq_len, int window_left, int warmup,
     CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
         d_out, nullptr, d_q_prepared, d_k_prepared, d_v_prepared,
         d_q, d_k, d_v, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin,
-        batch_size, seq_len, seq_len, window_left, scale, stream));
+        nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   };
   const SampleStats norm_rope_timing =
       time_cuda_samples(launch_norm_rope_fa, stream, warmup, iters, samples,
                         cold_cache, d_l2_scratch, l2_flush_words);
-  const double tflops = sliding_attention_flops(batch_size, seq_len, window_left) /
+  const double tflops = sliding_attention_flops(batch_size, seq_len, window_size) /
                         (double(norm_rope_timing.median_ms) * 1.0e-3) / 1.0e12;
 
   auto launch_decode_prep_cache = [&]() {
@@ -681,7 +681,7 @@ void run_benchmark(int batch_size, int seq_len, int window_left, int warmup,
 
   std::cout << "benchmark batch=" << batch_size
             << " seq=" << seq_len
-            << " window_left=" << window_left
+            << " window_size=" << window_size
             << " warmup=" << warmup
             << " iters=" << iters
             << " samples=" << samples
@@ -732,14 +732,14 @@ int main(int argc, char **argv) {
     const int check_seq = parse_arg(argv, argc, 6, 64);
     const std::string cache_mode = parse_string_arg(argv, argc, 7, "warm");
     const int flush_mib = parse_arg(argv, argc, 8, 64);
-    const int window_left = GEMMA4_SLIDING_WINDOW;
+    const int window_size = GEMMA4_SLIDING_WINDOW;
 
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
     if (check_seq > 0) {
-      run_correctness(batch_size, check_seq, window_left, stream);
+      run_correctness(batch_size, check_seq, window_size, stream);
     }
-    run_benchmark(batch_size, seq_len, window_left, warmup, iters, samples,
+    run_benchmark(batch_size, seq_len, window_size, warmup, iters, samples,
                   cache_mode, int64_t(flush_mib) * 1024 * 1024, stream);
     CUDA_CHECK(cudaStreamDestroy(stream));
     return 0;
