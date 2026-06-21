@@ -264,9 +264,9 @@ struct CudnnGeGlu : public CudnnGraphBase {
     auto up = graph.matmul(x, w_up, matmul_attrs("up_matmul"));
     up->set_data_type(fe::DataType_t::BFLOAT16);
     auto gelu = graph.pointwise(
-        up, pointwise_attrs("gelu", fe::PointwiseMode_t::GELU_APPROX_TANH_FWD));
+        gate, pointwise_attrs("gelu", fe::PointwiseMode_t::GELU_APPROX_TANH_FWD));
     gelu->set_data_type(fe::DataType_t::BFLOAT16);
-    act = graph.pointwise(gate, gelu,
+    act = graph.pointwise(gelu, up,
                           pointwise_attrs("gate_mul", fe::PointwiseMode_t::MUL));
     act->set_output(true).set_data_type(fe::DataType_t::BFLOAT16);
 
@@ -337,9 +337,9 @@ struct CudnnFullFfn : public CudnnGraphBase {
     auto up = graph.matmul(x, w_up, matmul_attrs("up_matmul"));
     up->set_data_type(fe::DataType_t::BFLOAT16);
     auto gelu = graph.pointwise(
-        up, pointwise_attrs("gelu", fe::PointwiseMode_t::GELU_APPROX_TANH_FWD));
+        gate, pointwise_attrs("gelu", fe::PointwiseMode_t::GELU_APPROX_TANH_FWD));
     gelu->set_data_type(fe::DataType_t::BFLOAT16);
-    auto act = graph.pointwise(gate, gelu,
+    auto act = graph.pointwise(gelu, up,
                                pointwise_attrs("gate_mul", fe::PointwiseMode_t::MUL));
     act->set_data_type(fe::DataType_t::BFLOAT16);
     out = graph.matmul(act, w_down, matmul_attrs("down_matmul"));
