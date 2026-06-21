@@ -1329,6 +1329,7 @@ __device__ __forceinline__ void phase_qkv_norm_rope(
     const __nv_bfloat16 *__restrict__ k_norm_weight,
     const float *__restrict__ cos,
     const float *__restrict__ sin,
+    const int32_t *__restrict__ token_position,
     int seq_len,
     int seq,
     int head_group,
@@ -1343,11 +1344,16 @@ __device__ __forceinline__ void phase_qkv_norm_rope(
   const int warp = thread_idx / kWarpSize;
   const int head = head_group * Derived::kHeadsPerBlock + warp;
   if (head >= kQHeads) return;
-  // Cos/sin tables are row-major by position and rotary-pair index.
-  const float *cos_row = cos + int64_t(seq) * Derived::kRotaryHalf;
-  const float *sin_row = sin + int64_t(seq) * Derived::kRotaryHalf;
-
   const int64_t row = int64_t(batch) * seq_len + seq;
+  const int position =
+      token_position == nullptr ? seq
+                                : gemma4_warp_uniform_ldg_i32(
+                                      token_position + row, lane);
+  if (position < 0) return;
+  // Cos/sin tables are row-major by position and rotary-pair index.
+  const float *cos_row = cos + int64_t(position) * Derived::kRotaryHalf;
+  const float *sin_row = sin + int64_t(position) * Derived::kRotaryHalf;
+
   const int64_t q_offset = (int64_t(row) * kQHeads + head) * kHeadDim;
   prep_weighted_rope_head<Traits>(q_prepared + q_offset, q + q_offset,
                                   q_norm_weight, cos_row, sin_row, lane);
@@ -1379,11 +1385,12 @@ void gemma4_qkv_norm_rope_kernel(
     const __nv_bfloat16 *__restrict__ k_norm_weight,
     const float *__restrict__ cos,
     const float *__restrict__ sin,
+    const int32_t *__restrict__ token_position,
     int seq_len) {
   phase_qkv_norm_rope<Traits>(
       q_prepared, k_prepared, v_prepared, q, k, v, q_norm_weight,
-      k_norm_weight, cos, sin, seq_len, int(blockIdx.x), int(blockIdx.y),
-      int(blockIdx.z), int(threadIdx.x));
+      k_norm_weight, cos, sin, token_position, seq_len, int(blockIdx.x),
+      int(blockIdx.y), int(blockIdx.z), int(threadIdx.x));
 }
 
 // Convert a decode token position into the Layout-A paged-cache row for one KV
@@ -1642,6 +1649,7 @@ cudaError_t prepare_qkv_norm_rope(
     const __nv_bfloat16 *__restrict__ d_k_norm_weight,
     const float *__restrict__ d_cos,
     const float *__restrict__ d_sin,
+    const int32_t *__restrict__ d_token_position,
     int batch_size,
     int seq_len,
     cudaStream_t stream) {
@@ -1662,7 +1670,8 @@ cudaError_t prepare_qkv_norm_rope(
   constexpr dim3 block_dim(Derived::kPrepThreads);
   gemma4_qkv_norm_rope_kernel<Traits><<<grid_dim, block_dim, 0, stream>>>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
-      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, seq_len);
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, d_token_position,
+      seq_len);
   return cudaGetLastError();
 }
 
@@ -2835,6 +2844,7 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     const __nv_bfloat16 *__restrict__ d_k_norm_weight,
     const float *__restrict__ d_cos,
     const float *__restrict__ d_sin,
+    const int32_t *__restrict__ d_token_position,
     int batch_size,
     int seqlen_q,
     int seqlen_k,
@@ -2860,8 +2870,8 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
   cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
       gemma4_flash_attention::SlidingAttentionTraits>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
-      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seqlen_q,
-      stream);
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, d_token_position,
+      batch_size, seqlen_q, stream);
   if (status != cudaSuccess) return status;
 
   gemma4_flash_attention::Gemma4FlashFwdParams params =
@@ -2885,6 +2895,7 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
     const __nv_bfloat16 *__restrict__ d_k_norm_weight,
     const float *__restrict__ d_cos,
     const float *__restrict__ d_sin,
+    const int32_t *__restrict__ d_token_position,
     int batch_size,
     int seqlen_q,
     int seqlen_k,
@@ -2901,8 +2912,8 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
   cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
       gemma4_flash_attention::Gemma4AttentionTraits<true>>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, nullptr,
-      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, batch_size, seqlen_q,
-      stream);
+      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, d_token_position,
+      batch_size, seqlen_q, stream);
   if (status != cudaSuccess) return status;
 
   gemma4_flash_attention::Gemma4FlashFwdParams params =
