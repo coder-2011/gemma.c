@@ -370,7 +370,7 @@ __device__ inline void accumulate_intermediate_tile(
     if (threadIdx.x == 0) {
 #pragma unroll
       for (int t = 0; t < kActTile; ++t) {
-        s_act[t] = gate[t] * gelu_tanh(up[t]);
+        s_act[t] = gelu_tanh(gate[t]) * up[t];
       }
     }
     __syncthreads();

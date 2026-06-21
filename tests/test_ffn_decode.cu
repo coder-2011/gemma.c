@@ -196,7 +196,7 @@ void run_sparse_case() {
     const float xv = bf16_to_float(x[x_index]);
     const float gate = xv * bf16_to_float(gate_weight);
     const float up = xv * bf16_to_float(up_weight);
-    const float act = gate * gelu_tanh_reference(up);
+    const float act = gelu_tanh_reference(gate) * up;
     for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
       ffn_out[col] = fmaf(act, bf16_to_float(down_row[col]), ffn_out[col]);
     }
@@ -263,7 +263,7 @@ void run_sparse_case() {
           x_prefill[row * GEMMA4_HIDDEN_SIZE + x_index]);
       const float gate = xv * bf16_to_float(gate_weight);
       const float up = xv * bf16_to_float(up_weight);
-      const float act = gate * gelu_tanh_reference(up);
+      const float act = gelu_tanh_reference(gate) * up;
       for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
         ffn_out[col] = fmaf(act, bf16_to_float(make_down_value(tile, col)),
                             ffn_out[col]);

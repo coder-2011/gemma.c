@@ -79,7 +79,7 @@ class GateGeluTanhUpMul {
     FragmentCompute up_compute = to_compute(up);
     cutlass::epilogue::thread::GELU_taylor<FragmentCompute> gelu;
     cutlass::multiplies<FragmentCompute> multiply;
-    return to_output(multiply(gate_compute, gelu(up_compute)));
+    return to_output(multiply(gelu(gate_compute), up_compute));
   }
 };
 
