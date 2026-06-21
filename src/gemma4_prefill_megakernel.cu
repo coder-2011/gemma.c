@@ -229,15 +229,15 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
         scratch.attention_out, nullptr, scratch.q_prepared,
         scratch.k_prepared, scratch.v_prepared, scratch.q, scratch.k,
         scratch.v, weights->q_norm_weight, weights->k_norm_weight, args.cos,
-        args.sin, args.batch_size, args.seq_len, args.seq_len,
+        args.sin, args.token_position, args.batch_size, args.seq_len, args.seq_len,
         shape.window_size, args.softmax_scale, args.stream);
   } else {
     status = gemma4_flash_attention_global_fwd_bf16_norm_rope(
         scratch.attention_out, nullptr, scratch.q_prepared,
         scratch.k_prepared, scratch.v_prepared, scratch.q, scratch.k,
         weights->q_norm_weight, weights->k_norm_weight, args.cos, args.sin,
-        args.batch_size, args.seq_len, args.seq_len, args.softmax_scale,
-        args.stream);
+        args.token_position, args.batch_size, args.seq_len, args.seq_len,
+        args.softmax_scale, args.stream);
   }
   if (status != cudaSuccess) {
     return status;

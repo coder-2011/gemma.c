@@ -449,7 +449,7 @@ void run_correctness(int batch_size, int seq_len, int window_size,
   CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
       d_out, d_lse, d_q_prepared, d_k_prepared, d_v_prepared,
       d_q, d_k, d_v, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin,
-      batch_size, seq_len, seq_len, window_size, scale, stream));
+      nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   std::vector<__nv_bfloat16> h_out(h_q.size());
@@ -478,7 +478,7 @@ void run_correctness(int batch_size, int seq_len, int window_size,
   CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
       d_out, nullptr, d_q_prepared, d_k_prepared, d_v_prepared,
       d_q, d_k, d_v, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin,
-      batch_size, seq_len, seq_len, window_size, scale, stream));
+      nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
   std::vector<__nv_bfloat16> h_out_no_lse(h_q.size());
   CUDA_CHECK(cudaMemcpy(h_out_no_lse.data(), d_out,
@@ -660,7 +660,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
     CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
         d_out, nullptr, d_q_prepared, d_k_prepared, d_v_prepared,
         d_q, d_k, d_v, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin,
-        batch_size, seq_len, seq_len, window_size, scale, stream));
+        nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   };
   const SampleStats norm_rope_timing =
       time_cuda_samples(launch_norm_rope_fa, stream, warmup, iters, samples,

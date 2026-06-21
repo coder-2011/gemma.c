@@ -692,7 +692,7 @@ void run_global_prefill_norm_rope_case() {
   CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
       d_out.get(), nullptr, d_q_prepared.get(), d_k_prepared.get(),
       d_v_prepared.get(), d_q.get(), d_k.get(), d_norm_weight.get(),
-      d_norm_weight.get(), d_cos.get(), d_sin.get(), batch_size, seq_len,
+      d_norm_weight.get(), d_cos.get(), d_sin.get(), nullptr, batch_size, seq_len,
       seq_len, scale, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
