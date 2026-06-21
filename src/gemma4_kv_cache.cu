@@ -459,7 +459,10 @@ extern "C" cudaError_t gemma4_kv_cache_write_bf16(
     const __nv_bfloat16 *__restrict__ d_v,
     cudaStream_t stream) {
   if (token_count == 0) return cudaSuccess;
-  if (layer < 0 || layer >= config.num_layers ||
+  if (token_count < 0 || layer < 0 || layer >= config.num_layers ||
+      config.num_layers <= 0 || config.num_pages <= 0 ||
+      config.page_size <= 0 || config.max_pages_per_seq <= 0 ||
+      config.num_heads <= 0 || config.head_dim <= 0 ||
       config.head_dim % kBf16Packed128Elements != 0 ||
       d_cache_k == nullptr || d_cache_v == nullptr || d_page_table == nullptr ||
       d_token_batch == nullptr || d_token_position == nullptr ||

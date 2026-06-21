@@ -145,19 +145,19 @@ struct LayerBuffers {
         ffn_down(static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) *
                  GEMMA4_HIDDEN_SIZE) {}
 
-  // Initializes norms/scalar to one and projections to deterministic test values.
+  // Initializes weights to make the runner output a scaled hidden tensor.
   void initialize() const {
     std::vector<__nv_bfloat16> hidden_ones(
         GEMMA4_HIDDEN_SIZE, __float2bfloat16_rn(1.0f));
     std::vector<__nv_bfloat16> head_ones(
         head_dim, __float2bfloat16_rn(1.0f));
-    std::vector<__nv_bfloat16> scalar_one(1, __float2bfloat16_rn(1.0f));
+    std::vector<__nv_bfloat16> scalar(1, __float2bfloat16_rn(0.5f));
 
     input_norm.copy_from(hidden_ones);
     post_attention_norm.copy_from(hidden_ones);
     pre_feedforward_norm.copy_from(hidden_ones);
     post_feedforward_norm.copy_from(hidden_ones);
-    layer_scalar.copy_from(scalar_one);
+    layer_scalar.copy_from(scalar);
     q_norm.copy_from(head_ones);
     k_norm.copy_from(head_ones);
 
@@ -228,7 +228,7 @@ bool has_nonzero(const std::vector<__nv_bfloat16> &values) {
   return false;
 }
 
-// Runs one sliding or global prefill layer and checks it preserves identity.
+// Runs one sliding or global prefill layer and checks scalar/output/cache wiring.
 void run_prefill_layer_case(bool global) {
   constexpr int batch_size = 1;
   constexpr int seq_len = 2;
@@ -289,8 +289,7 @@ void run_prefill_layer_case(bool global) {
   args.seq_len = seq_len;
   args.cos = d_cos.get();
   args.sin = d_sin.get();
-  args.softmax_scale =
-      1.0f / std::sqrt(static_cast<float>(layer.head_dim));
+  args.softmax_scale = 1.0f;
   args.cache_k = d_cache_k.get();
   args.cache_v = d_cache_v.get();
   args.cache_config = cache_config;
@@ -302,9 +301,14 @@ void run_prefill_layer_case(bool global) {
   CHECK_CUDA(gemma4_prefill_megakernel_layer_bf16(args, scratch));
   CHECK_CUDA(cudaDeviceSynchronize());
 
-  compare_bf16(d_out.copy_to_host(), hidden, 0.0f,
-               global ? "global prefill identity"
-                      : "sliding prefill identity");
+  std::vector<__nv_bfloat16> expected = hidden;
+  for (size_t i = 0; i < expected.size(); ++i) {
+    expected[i] = __float2bfloat16_rn(bf16_to_float(expected[i]) * 0.5f);
+  }
+
+  compare_bf16(d_out.copy_to_host(), expected, 0.0f,
+               global ? "global prefill scaled output"
+                      : "sliding prefill scaled output");
 
   if (!has_nonzero(d_cache_k.copy_to_host()) ||
       !has_nonzero(d_cache_v.copy_to_host())) {

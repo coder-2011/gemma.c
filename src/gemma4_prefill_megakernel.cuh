@@ -11,6 +11,8 @@
 #include <stdint.h>
 
 typedef struct {
+  int32_t capacity_rows = 0;
+  bool global = false;
   __nv_bfloat16 *hidden_work = nullptr;
   __nv_bfloat16 *hidden_delta = nullptr;
   __nv_bfloat16 *post_attention_residual = nullptr;
@@ -34,7 +36,7 @@ typedef struct {
   int32_t seq_len = 0;
   const float *cos = nullptr;
   const float *sin = nullptr;
-  float softmax_scale = 0.0f;
+  float softmax_scale = 1.0f;
 
   __nv_bfloat16 *cache_k = nullptr;
   __nv_bfloat16 *cache_v = nullptr;

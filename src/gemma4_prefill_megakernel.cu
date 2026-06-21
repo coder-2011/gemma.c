@@ -95,6 +95,9 @@ gemma4_prefill_megakernel_layer_scratch_from_buffer(
     return scratch;
   }
 
+  scratch.capacity_rows = rows;
+  scratch.global = global;
+
   const PrefillAttentionShape shape = prefill_attention_shape(global);
   __nv_bfloat16 *ptr = buffer;
   const auto hidden_layout =
@@ -160,11 +163,39 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
   const PrefillAttentionShape shape = prefill_attention_shape(global);
   const int32_t rows = static_cast<int32_t>(rows64);
   if (args.out == nullptr || args.hidden == nullptr ||
-      args.weights == nullptr || args.cos == nullptr || args.sin == nullptr) {
+      args.weights == nullptr || args.cos == nullptr || args.sin == nullptr ||
+      args.softmax_scale <= 0.0f || !is_aligned_16(args.out)) {
     return cudaErrorInvalidValue;
   }
 
   const Gemma4TextLayerWeightsDevice *weights = args.weights;
+  if (weights->layer_scalar == nullptr ||
+      scratch.capacity_rows < rows || scratch.global != global) {
+    return cudaErrorInvalidValue;
+  }
+
+  const int32_t expected_cache_layers =
+      global ? GEMMA4_GLOBAL_LAYER_COUNT : GEMMA4_SLIDING_LAYER_COUNT;
+  const int32_t expected_cache_heads =
+      global ? GEMMA4_GLOBAL_KV_HEADS : GEMMA4_SLIDING_KV_HEADS;
+  const int32_t expected_cache_head_dim =
+      global ? GEMMA4_GLOBAL_HEAD_DIM : GEMMA4_SLIDING_HEAD_DIM;
+  const int32_t expected_cache_window = global ? 0 : GEMMA4_SLIDING_WINDOW;
+  if (args.cache_config.num_layers != expected_cache_layers ||
+      args.cache_config.num_pages <= 0 || args.cache_config.page_size <= 0 ||
+      args.cache_config.max_pages_per_seq <= 0 ||
+      args.cache_config.num_heads != expected_cache_heads ||
+      args.cache_config.head_dim != expected_cache_head_dim ||
+      args.cache_config.window_size != expected_cache_window) {
+    return cudaErrorInvalidValue;
+  }
+
+  const int32_t cache_layer =
+      gemma4_kv_cache_layer_index(args.layer_index, global);
+  if (cache_layer < 0) {
+    return cudaErrorInvalidValue;
+  }
+
   cudaError_t status = gemma4_rmsnorm_bf16(
       scratch.hidden_work, args.hidden, weights->input_norm_weight, rows,
       GEMMA4_HIDDEN_SIZE, args.eps, args.stream);
@@ -212,12 +243,30 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
     return status;
   }
 
-  status = gemma4_kv_cache_write_bf16(
-      args.cache_k, args.cache_v, args.cache_config, args.page_table,
-      args.token_batch, args.token_position, rows, args.cache_layer,
-      scratch.k_prepared, scratch.v_prepared, args.stream);
-  if (status != cudaSuccess) {
-    return status;
+  if (global || args.seq_len <= GEMMA4_SLIDING_WINDOW) {
+    status = gemma4_kv_cache_write_bf16(
+        args.cache_k, args.cache_v, args.cache_config, args.page_table,
+        args.token_batch, args.token_position, rows, cache_layer,
+        scratch.k_prepared, scratch.v_prepared, args.stream);
+    if (status != cudaSuccess) {
+      return status;
+    }
+  } else {
+    // Sliding layers keep only the live tail of each batch in the ring cache.
+    const int32_t first_live_seq = args.seq_len - GEMMA4_SLIDING_WINDOW;
+    for (int32_t batch = 0; batch < args.batch_size; ++batch) {
+      const int32_t row_offset = batch * args.seq_len + first_live_seq;
+      const int64_t source_offset = int64_t(row_offset) * shape.kv_width;
+      status = gemma4_kv_cache_write_bf16(
+          args.cache_k, args.cache_v, args.cache_config, args.page_table,
+          args.token_batch + row_offset, args.token_position + row_offset,
+          GEMMA4_SLIDING_WINDOW, cache_layer,
+          scratch.k_prepared + source_offset, scratch.v_prepared + source_offset,
+          args.stream);
+      if (status != cudaSuccess) {
+        return status;
+      }
+    }
   }
 
   status = gemma4_prefill_gemm_bf16(
