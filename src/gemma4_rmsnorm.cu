@@ -31,6 +31,18 @@ __device__ void gemma4_async_load_input_pack(RmsnormPack *__restrict__ dst,
   __pipeline_memcpy_async(dst, src, sizeof(RmsnormPack));
 }
 
+// Adds one 128-bit BF16 pack for the standalone residual-add wrapper.
+__device__ inline void gemma4_residual_add_pack_bf16(
+    floatX *__restrict__ out,
+    const floatX *__restrict__ inp1,
+    const floatX *__restrict__ inp2,
+    int pack) {
+  RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
+  RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
+  RmsnormPack result = gemma4_bf16_pack_add(a, b);
+  store128(out + pack * kFloatXPerPack, result);
+}
+
 // -----------------------------------------------------------------------------
 // CUDA kernels
 
@@ -333,10 +345,7 @@ gemma4_residual_add_bf16_kernel(
     return;
   }
 
-  RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
-  RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
-  RmsnormPack result = gemma4_bf16_pack_add(a, b);
-  store128(out + pack * kFloatXPerPack, result);
+  gemma4_residual_add_pack_bf16(out, inp1, inp2, pack);
 }
 
 // -----------------------------------------------------------------------------

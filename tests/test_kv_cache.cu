@@ -722,26 +722,30 @@ void run_global_prefill_norm_rope_case() {
   compare_bf16(copy_to_host(d_v_prepared), expected_v, 0.00390625f,
                "global prefill K-derived V");
 
+  // Check RoPE uses absolute token positions instead of local prefill rows.
   std::vector<__nv_bfloat16> k_prepared = copy_to_host(d_k_prepared);
   for (int row = 0; row < rows; ++row) {
+    const int64_t row_base = int64_t(row) * GEMMA4_GLOBAL_HEAD_DIM;
     float sum_sq = 0.0f;
     for (int d = 0; d < GEMMA4_GLOBAL_HEAD_DIM; ++d) {
-      const float value = bf16_to_float(k[row * GEMMA4_GLOBAL_HEAD_DIM + d]);
+      const float value = bf16_to_float(k[row_base + d]);
       sum_sq += value * value;
     }
     const float inv_rms =
-        1.0f / std::sqrt(sum_sq / GEMMA4_GLOBAL_HEAD_DIM + GEMMA4_RMS_NORM_EPS);
+        1.0f / std::sqrt(
+            sum_sq / GEMMA4_GLOBAL_HEAD_DIM + GEMMA4_RMS_NORM_EPS);
     const int position = token_position[row];
     const float c = cos[position * rotary_half];
     const float s = sin[position * rotary_half];
-    const float lo = bf16_to_float(k[row * GEMMA4_GLOBAL_HEAD_DIM]) * inv_rms;
-    const float hi =
-        bf16_to_float(k[row * GEMMA4_GLOBAL_HEAD_DIM + rotary_half]) * inv_rms;
-    const float expected_lo = bf16_to_float(__float2bfloat16_rn(lo * c - hi * s));
-    const float expected_hi = bf16_to_float(__float2bfloat16_rn(lo * s + hi * c));
-    const float actual_lo = bf16_to_float(k_prepared[row * GEMMA4_GLOBAL_HEAD_DIM]);
+    const float lo = bf16_to_float(k[row_base]) * inv_rms;
+    const float hi = bf16_to_float(k[row_base + rotary_half]) * inv_rms;
+    const float expected_lo =
+        bf16_to_float(__float2bfloat16_rn(lo * c - hi * s));
+    const float expected_hi =
+        bf16_to_float(__float2bfloat16_rn(lo * s + hi * c));
+    const float actual_lo = bf16_to_float(k_prepared[row_base]);
     const float actual_hi =
-        bf16_to_float(k_prepared[row * GEMMA4_GLOBAL_HEAD_DIM + rotary_half]);
+        bf16_to_float(k_prepared[row_base + rotary_half]);
     if (std::fabs(actual_lo - expected_lo) > 0.00390625f ||
         std::fabs(actual_hi - expected_hi) > 0.00390625f) {
       std::fprintf(stderr, "global prefill K RoPE used wrong position at row %d\n",

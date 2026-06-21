@@ -22,6 +22,18 @@ struct PrefillAttentionShape {
   int32_t window_size;
 };
 
+// Scales one 128-bit BF16 pack for the local scale benchmark wrapper.
+__device__ inline void scale_hidden_pack_bf16(
+    floatX *__restrict__ out,
+    const floatX *__restrict__ in,
+    float scale,
+    int pack) {
+  const int offset = pack * kBf16Packed128Elements;
+  Bf16Packed128 values = load128g(in + offset);
+  Bf16Packed128 result = gemma4_bf16_pack_apply_scale(values, scale);
+  store128(out + offset, result);
+}
+
 // Returns the fixed Gemma 4 attention dimensions for the selected layer type.
 PrefillAttentionShape prefill_attention_shape(bool global) {
   if (global) {
@@ -48,10 +60,7 @@ __global__ __launch_bounds__(kScaleThreads) void scale_hidden_bf16_kernel(
   }
 
   const float scale = __bfloat162float(__ldg(layer_scalar));
-  const int offset = pack * kBf16Packed128Elements;
-  Bf16Packed128 values = load128g(in + offset);
-  Bf16Packed128 result = gemma4_bf16_pack_apply_scale(values, scale);
-  store128(out + offset, result);
+  scale_hidden_pack_bf16(out, in, scale, pack);
 }
 
 }  // namespace

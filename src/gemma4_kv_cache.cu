@@ -17,8 +17,8 @@ constexpr int kKvWriteVecThreads = WARP_SIZE;
 constexpr int kKvWritePackElements = kBf16Packed128Elements;
 using KvWriteCopyAtom = cute::Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<128>, __nv_bfloat16>;
 
-// Vectorized writer for Gemma K/V heads, copying one 128-bit pack per lane step.
-__global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
+// Copies the K/V packs assigned to one token/head for the kernel wrapper.
+__device__ inline void kv_cache_write_vec_device(
     __nv_bfloat16 *__restrict__ cache_k,
     __nv_bfloat16 *__restrict__ cache_v,
     Gemma4KvCacheConfig config,
@@ -28,10 +28,11 @@ __global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
     int32_t token_count,
     int32_t layer,
     const __nv_bfloat16 *__restrict__ k,
-    const __nv_bfloat16 *__restrict__ v) {
-  int token = blockIdx.x;
-  int head = blockIdx.y;
-  int vec = threadIdx.x;
+    const __nv_bfloat16 *__restrict__ v,
+    int32_t token,
+    int32_t head,
+    int32_t vec,
+    int32_t vec_stride) {
   if (token >= token_count || head >= config.num_heads) return;
 
   int batch = token_batch[token];
@@ -61,7 +62,7 @@ __global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
                         int64_t(config.num_heads) * vecs_per_head, vecs_per_head, 1));
 
   KvWriteCopyAtom copy_atom;
-  for (int i = vec; i < vecs_per_head; i += blockDim.x) {
+  for (int i = vec; i < vecs_per_head; i += vec_stride) {
     int64_t src = token_vec_layout(token, head, i) * kKvWritePackElements;
     int64_t dst = cache_vec_layout(layer, physical_page, page_offset, head, i) * kKvWritePackElements;
     auto src_k = cute::make_tensor(cute::make_gmem_ptr(k + src), cute::make_shape(cute::Int<kKvWritePackElements>{}));
@@ -71,6 +72,23 @@ __global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
     cute::copy(copy_atom, src_k, dst_k);
     cute::copy(copy_atom, src_v, dst_v);
   }
+}
+
+// Vectorized writer for Gemma K/V heads, copying one 128-bit pack per lane step.
+__global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
+    __nv_bfloat16 *__restrict__ cache_k,
+    __nv_bfloat16 *__restrict__ cache_v,
+    Gemma4KvCacheConfig config,
+    const int32_t *__restrict__ page_table,
+    const int32_t *__restrict__ token_batch,
+    const int32_t *__restrict__ token_position,
+    int32_t token_count,
+    int32_t layer,
+    const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v) {
+  kv_cache_write_vec_device(cache_k, cache_v, config, page_table, token_batch,
+                            token_position, token_count, layer, k, v,
+                            blockIdx.x, blockIdx.y, threadIdx.x, blockDim.x);
 }
 
 // Compute per-split online-softmax state over the paged K/V cache.
