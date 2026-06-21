@@ -112,6 +112,52 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
   }
 }
 
+// Materialize one CPU RMSNorm row for parity against fused decode ingress.
+std::vector<__nv_bfloat16> reference_hidden_rmsnorm(
+    const std::vector<__nv_bfloat16> &x,
+    const std::vector<__nv_bfloat16> &weight) {
+  float sum_sq = 0.0f;
+  for (int i = 0; i < GEMMA4_HIDDEN_SIZE; ++i) {
+    float value = bf16_to_float(x[i]);
+    sum_sq += value * value;
+  }
+
+  float scale =
+      1.0f / std::sqrt(sum_sq / float(GEMMA4_HIDDEN_SIZE) +
+                       GEMMA4_RMS_NORM_EPS);
+  std::vector<__nv_bfloat16> out(GEMMA4_HIDDEN_SIZE);
+  for (int i = 0; i < GEMMA4_HIDDEN_SIZE; ++i) {
+    float value = bf16_to_float(x[i]);
+    float gamma = bf16_to_float(weight[i]);
+    out[i] = __float2bfloat16_rn(value * scale * gamma);
+  }
+  return out;
+}
+
+// Reproduce the one-term BF16 projection rounding used by the CUDA path.
+float reference_project_scalar(__nv_bfloat16 x, float weight) {
+  __nv_bfloat16 bf16_weight = __float2bfloat16_rn(weight);
+  float product = bf16_to_float(x) * bf16_to_float(bf16_weight);
+  return bf16_to_float(__float2bfloat16_rn(product));
+}
+
+// Reproduce per-head RMSNorm for a sparse head with only dim 0 nonzero.
+__nv_bfloat16 reference_head_rms_scalar(float value, int head_dim) {
+  float scale =
+      1.0f / std::sqrt((value * value) / float(head_dim) +
+                       GEMMA4_RMS_NORM_EPS);
+  return __float2bfloat16_rn(value * scale);
+}
+
+// Write one BF16 value into a large zeroed device matrix.
+void write_device_bf16(const DeviceBuffer<__nv_bfloat16> &dst,
+                       int64_t index,
+                       float value) {
+  __nv_bfloat16 bf16 = __float2bfloat16_rn(value);
+  CHECK_CUDA(cudaMemcpy(dst.get() + index, &bf16, sizeof(bf16),
+                        cudaMemcpyHostToDevice));
+}
+
 // Compute a small CPU reference for paged decode attention.
 void reference_decode_attention(std::vector<__nv_bfloat16> &out,
                                 const std::vector<__nv_bfloat16> &q,
@@ -490,6 +536,206 @@ void run_sliding_flash_decode_case() {
                "sliding flash decode");
 }
 
+// Check the folded decode ingress against a sparse CPU reference.
+void run_norm_project_prepare_case(bool global) {
+  constexpr int batch_size = 1;
+  constexpr int cache_layer = 0;
+  const int head_dim =
+      global ? GEMMA4_GLOBAL_HEAD_DIM : GEMMA4_SLIDING_HEAD_DIM;
+  const int kv_heads =
+      global ? GEMMA4_GLOBAL_KV_HEADS : GEMMA4_SLIDING_KV_HEADS;
+  const int q_cols = GEMMA4_NUM_QUERY_HEADS * head_dim;
+  const int kv_cols = kv_heads * head_dim;
+  const int rotary_half = global ? GEMMA4_GLOBAL_HEAD_DIM / 8 : head_dim / 2;
+  Gemma4KvCacheConfig config = {
+      1,
+      1,
+      1,
+      1,
+      kv_heads,
+      head_dim,
+      global ? 0 : 1,
+  };
+
+  std::vector<__nv_bfloat16> x(GEMMA4_HIDDEN_SIZE,
+                               __float2bfloat16_rn(0.0f));
+  std::vector<__nv_bfloat16> input_norm_weight(
+      GEMMA4_HIDDEN_SIZE, __float2bfloat16_rn(1.0f));
+  std::vector<__nv_bfloat16> head_norm_weight(
+      head_dim, __float2bfloat16_rn(1.0f));
+  std::vector<float> cos(rotary_half, 1.0f);
+  std::vector<float> sin(rotary_half, 0.0f);
+  std::vector<int32_t> page_table = {0};
+  std::vector<int32_t> token_position = {0};
+  x[0] = __float2bfloat16_rn(1.0f);
+  input_norm_weight[0] = __float2bfloat16_rn(1.25f);
+
+  std::vector<__nv_bfloat16> normed_x =
+      reference_hidden_rmsnorm(x, input_norm_weight);
+  const size_t q_weight_count =
+      static_cast<size_t>(q_cols) * GEMMA4_HIDDEN_SIZE;
+  const size_t kv_weight_count =
+      static_cast<size_t>(kv_cols) * GEMMA4_HIDDEN_SIZE;
+  const int64_t cache_count = cache_elements(config);
+
+  DeviceBuffer<__nv_bfloat16> d_x(x.size());
+  DeviceBuffer<__nv_bfloat16> d_input_norm_weight(input_norm_weight.size());
+  DeviceBuffer<__nv_bfloat16> d_q_norm(head_norm_weight.size());
+  DeviceBuffer<__nv_bfloat16> d_k_norm(head_norm_weight.size());
+  DeviceBuffer<float> d_cos(cos.size());
+  DeviceBuffer<float> d_sin(sin.size());
+  DeviceBuffer<int32_t> d_page_table(page_table.size());
+  DeviceBuffer<int32_t> d_token_position(token_position.size());
+  DeviceBuffer<__nv_bfloat16> d_w_q(q_weight_count);
+  DeviceBuffer<__nv_bfloat16> d_w_k(kv_weight_count);
+  DeviceBuffer<__nv_bfloat16> d_w_v(global ? 1 : kv_weight_count);
+  DeviceBuffer<__nv_bfloat16> d_q(q_cols);
+  DeviceBuffer<__nv_bfloat16> d_cache_k(cache_count);
+  DeviceBuffer<__nv_bfloat16> d_cache_v(cache_count);
+
+  copy_to_device(d_x, x);
+  copy_to_device(d_input_norm_weight, input_norm_weight);
+  copy_to_device(d_q_norm, head_norm_weight);
+  copy_to_device(d_k_norm, head_norm_weight);
+  copy_to_device(d_cos, cos);
+  copy_to_device(d_sin, sin);
+  copy_to_device(d_page_table, page_table);
+  copy_to_device(d_token_position, token_position);
+  CHECK_CUDA(cudaMemset(d_w_q.get(), 0,
+                        q_weight_count * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_w_k.get(), 0,
+                        kv_weight_count * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_w_v.get(), 0,
+                        d_w_v.count * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_q.get(), 0, q_cols * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_cache_k.get(), 0,
+                        cache_count * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_cache_v.get(), 0,
+                        cache_count * sizeof(__nv_bfloat16)));
+
+  write_device_bf16(d_w_q, 0, 0.5f);
+  write_device_bf16(d_w_k, 0, -0.25f);
+  if (!global) write_device_bf16(d_w_v, 0, 0.75f);
+
+  const __nv_bfloat16 *d_v_weight = global ? nullptr : d_w_v.get();
+  Gemma4AttentionProjectionWeights weights = {
+      d_w_q.get(),
+      d_w_k.get(),
+      d_v_weight,
+      0,
+      0,
+      0,
+  };
+
+  CHECK_CUDA(gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16(
+      d_q.get(), d_cache_k.get(), d_cache_v.get(), config,
+      d_page_table.get(), d_token_position.get(), batch_size, cache_layer,
+      d_x.get(), d_input_norm_weight.get(), weights, d_q_norm.get(),
+      d_k_norm.get(), d_cos.get(), d_sin.get(), 0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  float q_value = reference_project_scalar(normed_x[0], 0.5f);
+  float k_value = reference_project_scalar(normed_x[0], -0.25f);
+  float v_value = global ? k_value : reference_project_scalar(normed_x[0], 0.75f);
+  std::vector<__nv_bfloat16> expected_q(q_cols, __float2bfloat16_rn(0.0f));
+  std::vector<__nv_bfloat16> expected_k(cache_count, __float2bfloat16_rn(0.0f));
+  std::vector<__nv_bfloat16> expected_v(cache_count, __float2bfloat16_rn(0.0f));
+  expected_q[0] = reference_head_rms_scalar(q_value, head_dim);
+  expected_k[0] = reference_head_rms_scalar(k_value, head_dim);
+  expected_v[0] = reference_head_rms_scalar(v_value, head_dim);
+
+  compare_bf16(copy_to_host(d_q), expected_q, 0.125f,
+               global ? "global norm-project Q" : "sliding norm-project Q");
+  compare_bf16(copy_to_host(d_cache_k), expected_k, 0.125f,
+               global ? "global norm-project K" : "sliding norm-project K");
+  compare_bf16(copy_to_host(d_cache_v), expected_v, 0.125f,
+               global ? "global norm-project V" : "sliding norm-project V");
+}
+
+// Check global prefill prepares K-derived V and runs full causal attention.
+void run_global_prefill_norm_rope_case() {
+  constexpr int batch_size = 1;
+  constexpr int seq_len = 2;
+  constexpr int rows = batch_size * seq_len;
+  constexpr int q_count = rows * GEMMA4_GLOBAL_Q_PROJ_SIZE;
+  constexpr int kv_count = rows * GEMMA4_GLOBAL_K_PROJ_SIZE;
+  constexpr int rotary_half = GEMMA4_GLOBAL_HEAD_DIM / 8;
+
+  std::vector<__nv_bfloat16> q(q_count, __float2bfloat16_rn(0.0f));
+  std::vector<__nv_bfloat16> k(kv_count);
+  for (int i = 0; i < kv_count; ++i) {
+    k[i] = make_value(110000 + i);
+  }
+
+  std::vector<__nv_bfloat16> norm_weight(
+      GEMMA4_GLOBAL_HEAD_DIM, __float2bfloat16_rn(1.0f));
+  std::vector<float> cos(seq_len * rotary_half, 1.0f);
+  std::vector<float> sin(cos.size(), 0.0f);
+
+  DeviceBuffer<__nv_bfloat16> d_q(q.size());
+  DeviceBuffer<__nv_bfloat16> d_k(k.size());
+  DeviceBuffer<__nv_bfloat16> d_q_prepared(q.size());
+  DeviceBuffer<__nv_bfloat16> d_k_prepared(k.size());
+  DeviceBuffer<__nv_bfloat16> d_v_prepared(k.size());
+  DeviceBuffer<__nv_bfloat16> d_out(q.size());
+  DeviceBuffer<__nv_bfloat16> d_norm_weight(norm_weight.size());
+  DeviceBuffer<float> d_cos(cos.size());
+  DeviceBuffer<float> d_sin(sin.size());
+
+  copy_to_device(d_q, q);
+  copy_to_device(d_k, k);
+  copy_to_device(d_norm_weight, norm_weight);
+  copy_to_device(d_cos, cos);
+  copy_to_device(d_sin, sin);
+
+  const float scale = 1.0f / std::sqrt(float(GEMMA4_GLOBAL_HEAD_DIM));
+  CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
+      d_out.get(), nullptr, d_q_prepared.get(), d_k_prepared.get(),
+      d_v_prepared.get(), d_q.get(), d_k.get(), d_norm_weight.get(),
+      d_norm_weight.get(), d_cos.get(), d_sin.get(), batch_size, seq_len,
+      seq_len, scale, 0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  std::vector<__nv_bfloat16> expected_v(kv_count);
+  for (int row = 0; row < rows; ++row) {
+    float sum_sq = 0.0f;
+    for (int d = 0; d < GEMMA4_GLOBAL_HEAD_DIM; ++d) {
+      float value = bf16_to_float(k[row * GEMMA4_GLOBAL_HEAD_DIM + d]);
+      sum_sq += value * value;
+    }
+    float inv_rms = 1.0f / std::sqrt(sum_sq / GEMMA4_GLOBAL_HEAD_DIM +
+                                     GEMMA4_RMS_NORM_EPS);
+    for (int d = 0; d < GEMMA4_GLOBAL_HEAD_DIM; ++d) {
+      float value = bf16_to_float(k[row * GEMMA4_GLOBAL_HEAD_DIM + d]);
+      expected_v[row * GEMMA4_GLOBAL_HEAD_DIM + d] =
+          __float2bfloat16_rn(value * inv_rms);
+    }
+  }
+  compare_bf16(copy_to_host(d_v_prepared), expected_v, 0.00390625f,
+               "global prefill K-derived V");
+
+  std::vector<__nv_bfloat16> expected_out(q_count);
+  std::vector<__nv_bfloat16> v_prepared = copy_to_host(d_v_prepared);
+  for (int qh = 0; qh < GEMMA4_NUM_QUERY_HEADS; ++qh) {
+    for (int d = 0; d < GEMMA4_GLOBAL_HEAD_DIM; ++d) {
+      float v0 = bf16_to_float(v_prepared[token_offset(
+          0, 0, 0, d, seq_len, GEMMA4_GLOBAL_KV_HEADS,
+          GEMMA4_GLOBAL_HEAD_DIM)]);
+      float v1 = bf16_to_float(v_prepared[token_offset(
+          0, 1, 0, d, seq_len, GEMMA4_GLOBAL_KV_HEADS,
+          GEMMA4_GLOBAL_HEAD_DIM)]);
+      expected_out[token_offset(
+          0, 0, qh, d, seq_len, GEMMA4_NUM_QUERY_HEADS,
+          GEMMA4_GLOBAL_HEAD_DIM)] = __float2bfloat16_rn(v0);
+      expected_out[token_offset(
+          0, 1, qh, d, seq_len, GEMMA4_NUM_QUERY_HEADS,
+          GEMMA4_GLOBAL_HEAD_DIM)] = __float2bfloat16_rn(0.5f * (v0 + v1));
+    }
+  }
+  compare_bf16(copy_to_host(d_out), expected_out, 0.03125f,
+               "global prefill attention");
+}
+
 // Validate argument guards for sliding decode and parked persistent decode.
 void run_decode_invalid_args_case() {
   DeviceBuffer<__nv_bfloat16> d_bf16(1);
@@ -524,6 +770,26 @@ void run_decode_invalid_args_case() {
     std::exit(1);
   }
 
+  Gemma4KvCacheConfig global_config = {
+      1,
+      3,
+      2,
+      3,
+      GEMMA4_GLOBAL_KV_HEADS,
+      GEMMA4_GLOBAL_HEAD_DIM,
+      0,
+  };
+  DeviceBuffer<__nv_bfloat16> d_global_q(
+      GEMMA4_NUM_QUERY_HEADS * GEMMA4_GLOBAL_HEAD_DIM);
+  status = gemma4_flash_attention_decode_paged_bf16(
+      d_global_q.get(), d_float.get(), d_float.get(), d_float.get(),
+      d_global_q.get(), d_bf16.get(), d_bf16.get(), d_i32.get(), d_i32.get(),
+      global_config, 0, 1, 0.25f, 2, 2, 0);
+  if (status != cudaErrorInvalidValue) {
+    std::fprintf(stderr, "expected invalid global split coverage\n");
+    std::exit(1);
+  }
+
   int32_t scratch_i32 = static_cast<int32_t>(
       gemma4_flash_attention_sliding_decode_persistent_scratch_i32(1, 16));
   status = gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
@@ -544,6 +810,9 @@ int main() {
   run_invalid_page_decode_case();
   run_global_write_decode_case();
   run_sliding_flash_decode_case();
+  run_norm_project_prepare_case(false);
+  run_norm_project_prepare_case(true);
+  run_global_prefill_norm_rope_case();
   run_decode_invalid_args_case();
   std::puts("kv cache tests passed");
   return 0;

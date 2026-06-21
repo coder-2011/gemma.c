@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +22,11 @@ void check_cuda(cudaError_t status, const char *expr, const char *file, int line
 }
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+
+// Converts BF16 to float for small host-side assertions.
+float bf16_to_float(__nv_bfloat16 value) {
+  return __bfloat162float(value);
+}
 
 // Minimal RAII wrapper for device buffers owned by this test.
 template <typename T>
@@ -111,6 +117,13 @@ void install_target_row(DeviceBuffer<__nv_bfloat16> &d_lm_head,
                         cudaMemcpyHostToDevice));
 }
 
+// Writes one BF16 value into a device array.
+void write_device_bf16(__nv_bfloat16 *dst, size_t index, float value) {
+  const __nv_bfloat16 bf16 = __float2bfloat16_rn(value);
+  CHECK_CUDA(cudaMemcpy(dst + index, &bf16, sizeof(bf16),
+                        cudaMemcpyHostToDevice));
+}
+
 // Runs one cooperative FFN-tail step and returns the selected token id.
 int32_t run_ffn_tail_once(
     DeviceBuffer<__nv_bfloat16> &d_residual_out,
@@ -133,8 +146,8 @@ int32_t run_ffn_tail_once(
   args.ffn_x = d_x.get();
   args.ffn_residual = d_residual.get();
   args.ffn_norm_weight = d_gamma.get();
-  args.ffn_gate_up_col_major = d_gate_up.get();
-  args.ffn_down_row_major = d_down.get();
+  args.ffn_gate_up_decode = d_gate_up.get();
+  args.ffn_down_decode = d_down.get();
   args.final_norm_weight = d_final_norm.get();
   args.lm_head_col_major = d_lm_head.get();
   args.eps = GEMMA4_RMS_NORM_EPS;
@@ -203,11 +216,169 @@ void run_ffn_tail_zero_weight_case() {
   compare_hidden_bits(actual_next_hidden, residual, "ffn tail next hidden");
 }
 
+// Verifies the optional FlashAttention phase runs inside the megakernel tail.
+void run_flash_attention_flag_case() {
+  constexpr int kTargetToken = 6789;
+  constexpr int kRotaryHalf = GEMMA4_SLIDING_HEAD_DIM / 2;
+  const size_t lm_head_elems =
+      static_cast<size_t>(GEMMA4_VOCAB_SIZE) * GEMMA4_HIDDEN_SIZE;
+  const size_t gate_up_elems =
+      static_cast<size_t>(GEMMA4_PACKED_FFN_SIZE) * GEMMA4_HIDDEN_SIZE;
+  const size_t down_elems =
+      static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) * GEMMA4_HIDDEN_SIZE;
+  const size_t q_weight_elems =
+      static_cast<size_t>(GEMMA4_SLIDING_Q_PROJ_SIZE) * GEMMA4_HIDDEN_SIZE;
+  const size_t kv_weight_elems =
+      static_cast<size_t>(GEMMA4_SLIDING_KV_PROJ_SIZE) * GEMMA4_HIDDEN_SIZE;
+  Gemma4KvCacheConfig cache_config = {
+      1,
+      1,
+      1,
+      1,
+      GEMMA4_SLIDING_KV_HEADS,
+      GEMMA4_SLIDING_HEAD_DIM,
+      1,
+  };
+
+  const std::vector<__nv_bfloat16> x = make_hidden(0.5f);
+  const std::vector<__nv_bfloat16> residual = make_hidden(1.0f);
+  const std::vector<__nv_bfloat16> norm_weight = make_norm_weight();
+  const std::vector<__nv_bfloat16> head_weight(
+      GEMMA4_SLIDING_HEAD_DIM, __float2bfloat16_rn(1.0f));
+  const std::vector<float> cos(kRotaryHalf, 1.0f);
+  const std::vector<float> sin(kRotaryHalf, 0.0f);
+  const std::vector<int32_t> page_table = {0};
+  const std::vector<int32_t> token_position = {0};
+  const std::vector<int32_t> seq_lengths = {1};
+
+  DeviceBuffer<__nv_bfloat16> d_x(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_residual(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_gamma(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_residual_out(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_normed_out(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_next_hidden(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_gate_up(gate_up_elems);
+  DeviceBuffer<__nv_bfloat16> d_down(down_elems);
+  DeviceBuffer<__nv_bfloat16> d_final_norm(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_lm_head(lm_head_elems);
+  DeviceBuffer<int32_t> d_next_token(1);
+  DeviceBuffer<unsigned char> d_scratch(
+      gemma4_decode_megakernel_ffn_tail_scratch_bytes());
+
+  DeviceBuffer<__nv_bfloat16> d_attention_x(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_input_norm(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_q_norm(GEMMA4_SLIDING_HEAD_DIM);
+  DeviceBuffer<__nv_bfloat16> d_k_norm(GEMMA4_SLIDING_HEAD_DIM);
+  DeviceBuffer<__nv_bfloat16> d_w_q(q_weight_elems);
+  DeviceBuffer<__nv_bfloat16> d_w_k(kv_weight_elems);
+  DeviceBuffer<__nv_bfloat16> d_w_v(kv_weight_elems);
+  DeviceBuffer<__nv_bfloat16> d_attention_q(GEMMA4_SLIDING_Q_PROJ_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_attention_out(
+      GEMMA4_SLIDING_ATTENTION_OUT_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_cache_k(
+      GEMMA4_SLIDING_KV_HEADS * GEMMA4_SLIDING_HEAD_DIM);
+  DeviceBuffer<__nv_bfloat16> d_cache_v(
+      GEMMA4_SLIDING_KV_HEADS * GEMMA4_SLIDING_HEAD_DIM);
+  DeviceBuffer<float> d_partial_m(GEMMA4_NUM_QUERY_HEADS);
+  DeviceBuffer<float> d_partial_l(GEMMA4_NUM_QUERY_HEADS);
+  DeviceBuffer<float> d_partial_acc(
+      GEMMA4_NUM_QUERY_HEADS * GEMMA4_SLIDING_HEAD_DIM);
+  DeviceBuffer<float> d_cos(cos.size());
+  DeviceBuffer<float> d_sin(sin.size());
+  DeviceBuffer<int32_t> d_page_table(page_table.size());
+  DeviceBuffer<int32_t> d_token_position(token_position.size());
+  DeviceBuffer<int32_t> d_seq_lengths(seq_lengths.size());
+
+  d_x.copy_from(x);
+  d_residual.copy_from(residual);
+  d_gamma.copy_from(norm_weight);
+  d_final_norm.copy_from(norm_weight);
+  d_attention_x.copy_from(x);
+  d_input_norm.copy_from(norm_weight);
+  d_q_norm.copy_from(head_weight);
+  d_k_norm.copy_from(head_weight);
+  d_cos.copy_from(cos);
+  d_sin.copy_from(sin);
+  d_page_table.copy_from(page_table);
+  d_token_position.copy_from(token_position);
+  d_seq_lengths.copy_from(seq_lengths);
+
+  CHECK_CUDA(cudaMemset(d_gate_up.get(), 0,
+                        gate_up_elems * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_down.get(), 0,
+                        down_elems * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_w_q.get(), 0,
+                        q_weight_elems * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_w_k.get(), 0,
+                        kv_weight_elems * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_w_v.get(), 0,
+                        kv_weight_elems * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_attention_out.get(), 0,
+                        GEMMA4_SLIDING_ATTENTION_OUT_SIZE *
+                            sizeof(__nv_bfloat16)));
+  write_device_bf16(d_w_q.get(), 0, 1.0f);
+  write_device_bf16(d_w_k.get(), 0, 1.0f);
+  write_device_bf16(d_w_v.get(), 0, 1.0f);
+
+  install_target_row(d_lm_head, kTargetToken, residual);
+
+  Gemma4DecodeMegakernelFfnTailArgs args = {};
+  args.residual_out = d_residual_out.get();
+  args.normed_out = d_normed_out.get();
+  args.next_hidden = d_next_hidden.get();
+  args.next_token = d_next_token.get();
+  args.ffn_x = d_x.get();
+  args.ffn_residual = d_residual.get();
+  args.ffn_norm_weight = d_gamma.get();
+  args.ffn_gate_up_decode = d_gate_up.get();
+  args.ffn_down_decode = d_down.get();
+  args.final_norm_weight = d_final_norm.get();
+  args.lm_head_col_major = d_lm_head.get();
+  args.flags = GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION;
+  args.attention_q = d_attention_q.get();
+  args.attention_out = d_attention_out.get();
+  args.attention_partial_m = d_partial_m.get();
+  args.attention_partial_l = d_partial_l.get();
+  args.attention_partial_acc = d_partial_acc.get();
+  args.attention_cache_k = d_cache_k.get();
+  args.attention_cache_v = d_cache_v.get();
+  args.attention_cache_config = cache_config;
+  args.attention_page_table = d_page_table.get();
+  args.attention_token_position = d_token_position.get();
+  args.attention_seq_lengths = d_seq_lengths.get();
+  args.attention_cache_layer = 0;
+  args.attention_split_size = 1;
+  args.attention_num_splits = 1;
+  args.attention_softmax_scale =
+      1.0f / std::sqrt(float(GEMMA4_SLIDING_HEAD_DIM));
+  args.attention_x = d_attention_x.get();
+  args.attention_input_norm_weight = d_input_norm.get();
+  args.attention_weights = {d_w_q.get(), d_w_k.get(), d_w_v.get(), 0, 0, 0};
+  args.attention_q_norm_weight = d_q_norm.get();
+  args.attention_k_norm_weight = d_k_norm.get();
+  args.attention_cos = d_cos.get();
+  args.attention_sin = d_sin.get();
+  args.eps = GEMMA4_RMS_NORM_EPS;
+
+  CHECK_CUDA(gemma4_decode_megakernel_ffn_tail_bf16(
+      args, d_scratch.get(), gemma4_decode_megakernel_ffn_tail_scratch_bytes(),
+      0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  std::vector<__nv_bfloat16> attention_out(GEMMA4_SLIDING_ATTENTION_OUT_SIZE);
+  d_attention_out.copy_to(attention_out);
+  if (bf16_to_float(attention_out[0]) <= 0.0f) {
+    std::fprintf(stderr, "flash attention flag did not produce attention\n");
+    std::exit(1);
+  }
+}
+
 }  // namespace
 
 // Runs the focused decode megakernel regression suite.
 int main() {
   run_ffn_tail_zero_weight_case();
+  run_flash_attention_flag_case();
   std::printf("decode megakernel tests passed\n");
   return 0;
 }

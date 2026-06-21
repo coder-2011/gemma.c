@@ -17,6 +17,7 @@ struct Gemma4AttentionProjectionWeights {
   int32_t v_col_base;
 };
 
+// Sliding prefill APIs take total live causal keys, including the current key.
 extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     __nv_bfloat16 *__restrict__ d_out,
     // Optional. Pass nullptr for inference paths that do not need LSE.
@@ -27,7 +28,7 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     int batch_size,
     int seqlen_q,
     int seqlen_k,
-    int window_left,
+    int window_size,
     float softmax_scale,
     cudaStream_t stream);
 
@@ -48,7 +49,26 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     int batch_size,
     int seqlen_q,
     int seqlen_k,
-    int window_left,
+    int window_size,
+    float softmax_scale,
+    cudaStream_t stream);
+
+extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
+    __nv_bfloat16 *__restrict__ d_out,
+    // Optional. Pass nullptr for inference paths that do not need LSE.
+    float *__restrict__ d_softmax_lse,
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_k_prepared,
+    __nv_bfloat16 *__restrict__ d_v_prepared,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    int batch_size,
+    int seqlen_q,
+    int seqlen_k,
     float softmax_scale,
     cudaStream_t stream);
 
@@ -70,7 +90,7 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_
     const float *__restrict__ d_sin,
     cudaStream_t stream);
 
-extern "C" cudaError_t gemma4_flash_attention_sliding_decode_project_prepare_paged_kv_bf16(
+extern "C" cudaError_t gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16(
     __nv_bfloat16 *__restrict__ d_q_prepared,
     __nv_bfloat16 *__restrict__ d_cache_k,
     __nv_bfloat16 *__restrict__ d_cache_v,
@@ -80,23 +100,7 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_project_prepare_pag
     int32_t batch_size,
     int32_t cache_layer,
     const __nv_bfloat16 *__restrict__ d_x,
-    const __nv_bfloat16 *__restrict__ d_w_qkv_col_major,
-    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
-    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
-    const float *__restrict__ d_cos,
-    const float *__restrict__ d_sin,
-    cudaStream_t stream);
-
-extern "C" cudaError_t gemma4_flash_attention_decode_project_prepare_paged_kv_bf16(
-    __nv_bfloat16 *__restrict__ d_q_prepared,
-    __nv_bfloat16 *__restrict__ d_cache_k,
-    __nv_bfloat16 *__restrict__ d_cache_v,
-    Gemma4KvCacheConfig cache_config,
-    const int32_t *__restrict__ d_page_table,
-    const int32_t *__restrict__ d_token_position,
-    int32_t batch_size,
-    int32_t cache_layer,
-    const __nv_bfloat16 *__restrict__ d_x,
+    const __nv_bfloat16 *__restrict__ d_input_norm_weight,
     Gemma4AttentionProjectionWeights weights,
     const __nv_bfloat16 *__restrict__ d_q_norm_weight,
     const __nv_bfloat16 *__restrict__ d_k_norm_weight,

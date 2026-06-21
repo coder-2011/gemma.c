@@ -16,6 +16,7 @@ __device__ inline void rmsnorm_hidden_row_bf16(
     const __nv_bfloat16 *__restrict__ in,
     const __nv_bfloat16 *__restrict__ weight,
     float eps,
+    Bf16Packed128 *__restrict__ cached_input,
     float *__restrict__ warp_sums,
     float &scale,
     int thread_idx) {
@@ -27,6 +28,8 @@ __device__ inline void rmsnorm_hidden_row_bf16(
   for (int pack = thread_idx; pack < packs; pack += Threads) {
     const int offset = pack * kBf16Packed128Elements;
     const Bf16Packed128 values = load128g(in + offset);
+    // Keep the row pack on-chip for the post-reduction normalization pass.
+    cached_input[pack] = values;
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
 
@@ -39,7 +42,7 @@ __device__ inline void rmsnorm_hidden_row_bf16(
 
   for (int pack = thread_idx; pack < packs; pack += Threads) {
     const int offset = pack * kBf16Packed128Elements;
-    const Bf16Packed128 values = load128g(in + offset);
+    const Bf16Packed128 values = cached_input[pack];
     const Bf16Packed128 gamma = load128g(weight + offset);
     const Bf16Packed128 result =
         gemma4_bf16_pack_apply_rmsnorm(values, gamma, scale);

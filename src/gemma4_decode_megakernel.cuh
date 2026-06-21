@@ -1,10 +1,14 @@
 #ifndef GEMMA4_DECODE_MEGAKERNEL_CUH
 #define GEMMA4_DECODE_MEGAKERNEL_CUH
 
+#include "gemma4_flash_attention.cuh"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#define GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION 1u
 
 typedef struct {
   __nv_bfloat16 *state = nullptr;
@@ -22,10 +26,35 @@ typedef struct {
   const __nv_bfloat16 *ffn_x = nullptr;
   const __nv_bfloat16 *ffn_residual = nullptr;
   const __nv_bfloat16 *ffn_norm_weight = nullptr;
-  const __nv_bfloat16 *ffn_gate_up_col_major = nullptr;
-  const __nv_bfloat16 *ffn_down_row_major = nullptr;
+  const __nv_bfloat16 *ffn_gate_up_decode = nullptr;
+  const __nv_bfloat16 *ffn_down_decode = nullptr;
   const __nv_bfloat16 *final_norm_weight = nullptr;
   const __nv_bfloat16 *lm_head_col_major = nullptr;
+  uint32_t flags = 0;
+
+  __nv_bfloat16 *attention_q = nullptr;
+  __nv_bfloat16 *attention_out = nullptr;
+  float *attention_partial_m = nullptr;
+  float *attention_partial_l = nullptr;
+  float *attention_partial_acc = nullptr;
+  __nv_bfloat16 *attention_cache_k = nullptr;
+  __nv_bfloat16 *attention_cache_v = nullptr;
+  Gemma4KvCacheConfig attention_cache_config = {};
+  const int32_t *attention_page_table = nullptr;
+  const int32_t *attention_token_position = nullptr;
+  const int32_t *attention_seq_lengths = nullptr;
+  int32_t attention_cache_layer = 0;
+  int32_t attention_split_size = 0;
+  int32_t attention_num_splits = 0;
+  float attention_softmax_scale = 0.0f;
+  const __nv_bfloat16 *attention_x = nullptr;
+  const __nv_bfloat16 *attention_input_norm_weight = nullptr;
+  Gemma4AttentionProjectionWeights attention_weights = {};
+  const __nv_bfloat16 *attention_q_norm_weight = nullptr;
+  const __nv_bfloat16 *attention_k_norm_weight = nullptr;
+  const float *attention_cos = nullptr;
+  const float *attention_sin = nullptr;
+
   float eps = 1.0e-6f;
 } Gemma4DecodeMegakernelFfnTailArgs;
 
@@ -41,8 +70,8 @@ cudaError_t gemma4_decode_megakernel_spine_bf16(
     size_t scratch_bytes,
     cudaStream_t stream);
 
-// Runs one cooperative FFN phase followed by the final sampling tail. This
-// phase does not include attention.
+// Runs one cooperative FFN phase followed by the final sampling tail. When
+// requested by flags, FlashAttention runs before the FFN phase.
 cudaError_t gemma4_decode_megakernel_ffn_tail_bf16(
     const Gemma4DecodeMegakernelFfnTailArgs &args,
     void *__restrict__ scratch,

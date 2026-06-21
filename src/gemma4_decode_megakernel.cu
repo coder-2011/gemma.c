@@ -4,6 +4,12 @@
 
 #include <cooperative_groups.h>
 
+cudaError_t gemma4_decode_megakernel_ffn_tail_flash_attention_bf16(
+    const Gemma4DecodeMegakernelFfnTailArgs &args,
+    void *__restrict__ scratch,
+    size_t scratch_bytes,
+    cudaStream_t stream);
+
 namespace {
 
 namespace phase = gemma4_decode_megakernel_phases;
@@ -105,6 +111,10 @@ cudaError_t gemma4_decode_megakernel_ffn_tail_bf16(
     void *__restrict__ scratch,
     size_t scratch_bytes,
     cudaStream_t stream) {
+  if (phase::ffn_tail_uses_flash_attention(args)) {
+    return gemma4_decode_megakernel_ffn_tail_flash_attention_bf16(
+        args, scratch, scratch_bytes, stream);
+  }
   return phase::launch_ffn_tail(
       args, scratch, scratch_bytes, stream,
       decode_megakernel_ffn_tail_kernel);

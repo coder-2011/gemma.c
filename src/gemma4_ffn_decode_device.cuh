@@ -3,7 +3,6 @@
 
 #include "gemma4_ffn.cuh"
 #include "gemma4_cuda_utils.cuh"
-#include "gemma4_matmul_device.cuh"
 
 #include <math.h>
 
@@ -72,6 +71,41 @@ static_assert(kAccumBlocks > 0 && kAccumBlocks <= kIntermediateTiles,
               "FFN accumulate grid must be within the intermediate tile count");
 
 using FfnBf16Pack = Bf16Packed128;
+
+template <int ColsPerBlock, int Threads>
+__device__ inline void reduce_cols_pair(
+    int thread_idx,
+    float (&a_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&b_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&a_sums)[ColsPerBlock],
+    float (&b_sums)[ColsPerBlock]) {
+  constexpr int warps = Threads / WARP_SIZE;
+  const int lane = thread_idx & (WARP_SIZE - 1);
+  const int warp = thread_idx / WARP_SIZE;
+
+  warp_reduce_sum_to_lane0(a_sums);
+  warp_reduce_sum_to_lane0(b_sums);
+
+  if (lane == 0) {
+#pragma unroll
+    for (int col = 0; col < ColsPerBlock; ++col) {
+      a_warp_sums[col][warp] = a_sums[col];
+      b_warp_sums[col][warp] = b_sums[col];
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int col = 0; col < ColsPerBlock; ++col) {
+    a_sums[col] = thread_idx < warps ? a_warp_sums[col][lane] : 0.0f;
+    b_sums[col] = thread_idx < warps ? b_warp_sums[col][lane] : 0.0f;
+  }
+
+  if (warp == 0) {
+    warp_reduce_sum_to_lane0(a_sums);
+    warp_reduce_sum_to_lane0(b_sums);
+  }
+}
 
 // Checks the 128-byte alignment required by Gemma4FfnDecodeScratch.
 inline bool is_aligned_128(const void *ptr) {
@@ -307,7 +341,7 @@ __device__ inline void dot_gate_up_reduce(
   dot_gate_up_pack<GuardHiddenPack>(
       x, w_gate_up_col_major, gate_col0, threadIdx.x, gate, up);
 
-  gemma4_matmul_device::reduce_cols_pair<kActTile, Threads>(
+  reduce_cols_pair<kActTile, Threads>(
       threadIdx.x, gate_warp_sums, up_warp_sums, gate, up);
 }
 

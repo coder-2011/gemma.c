@@ -69,6 +69,16 @@ Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
 
 cudaError_t gemma4_ffn_bf16(const Gemma4FfnBf16Args &args);
 
+// Runs prefill GeGLU FFN only and writes the natural-order down-projection row.
+cudaError_t gemma4_ffn_prefill_mlp_bf16(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
+    const __nv_bfloat16 *__restrict__ w_down_decode,
+    Gemma4FfnPrefillScratch scratch,
+    int rows,
+    cudaStream_t stream);
+
 cudaError_t gemma4_ffn_decode_fused_bf16(
     __nv_bfloat16 *__restrict__ residual_out,
     __nv_bfloat16 *__restrict__ normed_out,

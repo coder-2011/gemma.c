@@ -6,7 +6,6 @@
 
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_ffn_decode_device.cuh"
-#include "gemma4_matmul_device.cuh"
 #include "gemma4_rmsnorm.cuh"
 
 #include <cutlass/array.h>
@@ -37,16 +36,9 @@ constexpr int kSwizzleThreads = 96;
 constexpr int kActualSwizzleBlocksPerRow =
     div_up(kHiddenPacks, kSwizzleThreads);
 constexpr int kAccumBlocks = ffn_dev::kAccumBlocks;
-static_assert(kFfnThreads == kHiddenPacks,
-              "FFN decode maps one CTA thread to one hidden bf16 pack");
-static_assert((kFfnThreads % WARP_SIZE) == 0,
-              "FFN decode thread count must be a whole number of warps");
-static_assert(kSwizzleThreads > 0 && kSwizzleThreads <= 1024 &&
-                  (kSwizzleThreads % WARP_SIZE) == 0,
-              "FFN swizzle threads must be a valid warp-multiple block size");
-static_assert(kActualSwizzleBlocksPerRow > 0 &&
-                  kActualSwizzleBlocksPerRow <= kHiddenPacks,
-              "FFN swizzle blocks per row must cover at least one pack");
+
+static_assert((kFfnThreads % WARP_SIZE) == 0, "FFN decode thread count must be a whole number of warps");
+static_assert(kSwizzleThreads > 0 && kSwizzleThreads <= 1024 && (kSwizzleThreads % WARP_SIZE) == 0, "FFN swizzle threads must be a valid warp-multiple block size");
 
 using FfnBf16Pack = ffn_dev::FfnBf16Pack;
 using ffn_dev::atomic_add_accum_pack;
@@ -59,7 +51,7 @@ template <typename ElementOutput_,
           typename ElementAccumulator_,
           typename ElementCompute_,
           cutlass::FloatRoundStyle Round =
-              cutlass::FloatRoundStyle::round_to_nearest>
+          cutlass::FloatRoundStyle::round_to_nearest>
 class GateGeluTanhUpMul {
  public:
   using ElementOutput = ElementOutput_;
@@ -270,6 +262,25 @@ residual_add_rmsnorm_from_swizzled_down_kernel(
   store128wb(normed_out + row_offset + natural_col, normed_pack);
 }
 
+// Reorders the swizzled hidden packs produced by the prefill down GEMM back to
+// the natural hidden layout expected by the standalone post-FFN RMSNorm.
+__global__ __launch_bounds__(kFfnThreads, 1) void
+unswizzle_hidden_packs_kernel(
+    floatX *__restrict__ dst,
+    const floatX *__restrict__ src) {
+  const int row = static_cast<int>(blockIdx.x);
+  const int64_t row_offset = static_cast<int64_t>(row) * GEMMA4_HIDDEN_SIZE;
+
+  for (int hidden_pack = static_cast<int>(threadIdx.x);
+       hidden_pack < kHiddenPacks; hidden_pack += blockDim.x) {
+    const int natural_col = hidden_pack * kBf16Packed128Elements;
+    const int swizzled_col =
+        hidden_pack_swizzle_index(hidden_pack) * kBf16Packed128Elements;
+    const FfnBf16Pack pack = load128g(src + row_offset + swizzled_col);
+    store128(dst + row_offset + natural_col, pack);
+  }
+}
+
 __global__ void swizzle_gate_up_interleaved_kernel(
     floatX *__restrict__ dst,
     const floatX *__restrict__ src) {
@@ -460,6 +471,23 @@ bool ffn_prefill_decode_layout_args_valid(const Gemma4FfnBf16Args &args) {
          is_aligned_16(args.prefill_scratch.down);
 }
 
+// Checks the standalone prefill MLP path without requiring residual/norm args.
+bool ffn_prefill_mlp_args_valid(
+    const floatX *__restrict__ out,
+    const floatX *__restrict__ x,
+    const floatX *__restrict__ w_gate_up_decode,
+    const floatX *__restrict__ w_down_decode,
+    Gemma4FfnPrefillScratch scratch,
+    int rows) {
+  return rows >= 0 && out != nullptr && x != nullptr &&
+         w_gate_up_decode != nullptr && w_down_decode != nullptr &&
+         scratch.act != nullptr && scratch.down != nullptr &&
+         scratch.capacity_rows >= rows && is_aligned_16(out) &&
+         is_aligned_16(x) && is_aligned_16(w_gate_up_decode) &&
+         is_aligned_16(w_down_decode) && is_aligned_16(scratch.act) &&
+         is_aligned_16(scratch.down);
+}
+
 cudaError_t gemma4_ffn_decode_fused_bf16_impl(
     floatX *__restrict__ residual_out,
     floatX *__restrict__ normed_out,
@@ -533,6 +561,49 @@ cudaError_t gemma4_ffn_prefill_bf16_impl(const Gemma4FfnBf16Args &args) {
       args.rows, kFfnThreads, 0, args.stream>>>(
       args.residual_out, args.normed_out, args.prefill_scratch.down,
       args.residual, args.rms_weight, args.eps);
+  return cudaGetLastError();
+}
+
+// Runs the prefill GeGLU MLP and leaves the down-projection in natural order.
+cudaError_t gemma4_ffn_prefill_mlp_bf16_impl(
+    floatX *__restrict__ out,
+    const floatX *__restrict__ x,
+    const floatX *__restrict__ w_gate_up_decode,
+    const floatX *__restrict__ w_down_decode,
+    Gemma4FfnPrefillScratch scratch,
+    int rows,
+    cudaStream_t stream) {
+  if (rows == 0) {
+    return cudaSuccess;
+  }
+  if (!ffn_prefill_mlp_args_valid(
+          out, x, w_gate_up_decode, w_down_decode, scratch, rows)) {
+    return cudaErrorInvalidValue;
+  }
+
+  const dim3 block_dim(kSwizzleThreads);
+  const dim3 swizzle_grid_dim(kActualSwizzleBlocksPerRow, rows);
+  swizzle_hidden_packs_kernel<<<swizzle_grid_dim, block_dim, 0, stream>>>(
+      scratch.down, x, rows);
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  status = run_prefill_gate_up_geglu_decode_layout_dual_gemm(
+      scratch.act, scratch.down, w_gate_up_decode, rows, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  status = launch_prefill_down_gemm(
+      scratch.act, w_down_decode, scratch.down, rows, stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  unswizzle_hidden_packs_kernel<<<rows, kFfnThreads, 0, stream>>>(
+      out, scratch.down);
   return cudaGetLastError();
 }
 
@@ -618,6 +689,18 @@ cudaError_t gemma4_ffn_bf16(const Gemma4FfnBf16Args &args) {
         args.decode_scratch, args.eps, args.stream);
   }
   return gemma4_ffn_prefill_bf16_impl(args);
+}
+
+cudaError_t gemma4_ffn_prefill_mlp_bf16(
+    floatX *__restrict__ out,
+    const floatX *__restrict__ x,
+    const floatX *__restrict__ w_gate_up_decode,
+    const floatX *__restrict__ w_down_decode,
+    Gemma4FfnPrefillScratch scratch,
+    int rows,
+    cudaStream_t stream) {
+  return gemma4_ffn_prefill_mlp_bf16_impl(
+      out, x, w_gate_up_decode, w_down_decode, scratch, rows, stream);
 }
 
 cudaError_t gemma4_ffn_decode_fused_bf16(

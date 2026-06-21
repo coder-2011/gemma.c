@@ -4,8 +4,6 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <stdint.h>
-
 #include "gemma4_cuda_utils.cuh"
 
 #ifndef GEMMA4_ROPE_QK_LOAD_CS
@@ -129,41 +127,5 @@ __device__ __forceinline__ void rotate_head_bf16(
 }
 
 }  // namespace gemma4_rope
-
-// In-place RoPE for physical [batch, seq, heads, head_dim] Q/K buffers.
-// cos_row_stride/sin_row_stride may be compact rotary_dim / 2 or full head_dim.
-cudaError_t gemma4_rope_bf16(__nv_bfloat16 *__restrict__ q,
-                             int64_t q_row_stride,
-                             __nv_bfloat16 *__restrict__ k,
-                             int64_t k_row_stride,
-                             const float *__restrict__ cos,
-                             int64_t cos_row_stride,
-                             const float *__restrict__ sin,
-                             int64_t sin_row_stride,
-                             int seq_len,
-                             int batch_size,
-                             int cos_batch_size,
-                             int q_heads,
-                             int kv_heads,
-                             int head_dim,
-                             int rotary_dim,
-                             cudaStream_t stream);
-
-// In-place RoPE matching the Python forward signature layout:
-// q: [batch, q_heads, seq, head_dim]
-// k: [batch, kv_heads, seq, head_dim]
-// cos/sin: [1 or batch, seq, rotary_dim / 2]
-cudaError_t gemma4_rope_forward_bf16(__nv_bfloat16 *__restrict__ q,
-                                     __nv_bfloat16 *__restrict__ k,
-                                     const float *__restrict__ cos,
-                                     const float *__restrict__ sin,
-                                     int seq_len,
-                                     int batch_size,
-                                     int cos_batch_size,
-                                     int q_heads,
-                                     int kv_heads,
-                                     int head_dim,
-                                     int rotary_dim,
-                                     cudaStream_t stream);
 
 #endif

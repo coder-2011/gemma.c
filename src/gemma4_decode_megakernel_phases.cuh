@@ -103,26 +103,100 @@ inline bool valid_args(const Gemma4DecodeMegakernelSpineArgs &args) {
          is_aligned_16(args.lm_head_col_major);
 }
 
+// Returns true when the caller requested the optional FlashAttention phase.
+inline bool ffn_tail_uses_flash_attention(
+    const Gemma4DecodeMegakernelFfnTailArgs &args) {
+  return (args.flags & GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION) != 0;
+}
+
+// Validates the optional FlashAttention phase arguments.
+inline bool valid_flash_attention_args(
+    const Gemma4DecodeMegakernelFfnTailArgs &args) {
+  if (!ffn_tail_uses_flash_attention(args)) {
+    return true;
+  }
+
+  const Gemma4KvCacheConfig &config = args.attention_cache_config;
+  const bool sliding = config.head_dim == GEMMA4_SLIDING_HEAD_DIM &&
+                       config.num_heads == GEMMA4_SLIDING_KV_HEADS &&
+                       config.window_size > 0;
+  const bool global = config.head_dim == GEMMA4_GLOBAL_HEAD_DIM &&
+                      config.num_heads == GEMMA4_GLOBAL_KV_HEADS &&
+                      config.window_size == 0;
+  const int64_t required_keys =
+      global ? int64_t(config.max_pages_per_seq) * config.page_size
+             : config.window_size;
+  const int64_t split_capacity =
+      int64_t(args.attention_split_size) * args.attention_num_splits;
+  const bool needs_v_weight = sliding;
+
+  return (sliding || global) &&
+         args.attention_cache_layer >= 0 &&
+         args.attention_cache_layer < config.num_layers &&
+         config.num_layers > 0 && config.num_pages > 0 &&
+         config.page_size > 0 && config.max_pages_per_seq > 0 &&
+         args.attention_split_size > 0 &&
+         args.attention_num_splits > 0 &&
+         split_capacity >= required_keys &&
+         args.attention_softmax_scale > 0.0f &&
+         args.attention_q != nullptr &&
+         args.attention_out != nullptr &&
+         args.attention_partial_m != nullptr &&
+         args.attention_partial_l != nullptr &&
+         args.attention_partial_acc != nullptr &&
+         args.attention_cache_k != nullptr &&
+         args.attention_cache_v != nullptr &&
+         args.attention_page_table != nullptr &&
+         args.attention_token_position != nullptr &&
+         args.attention_seq_lengths != nullptr &&
+         args.attention_x != nullptr &&
+         args.attention_input_norm_weight != nullptr &&
+         args.attention_weights.d_q_col_major != nullptr &&
+         args.attention_weights.d_k_col_major != nullptr &&
+         (!needs_v_weight ||
+          args.attention_weights.d_v_col_major != nullptr) &&
+         args.attention_q_norm_weight != nullptr &&
+         args.attention_k_norm_weight != nullptr &&
+         args.attention_cos != nullptr &&
+         args.attention_sin != nullptr &&
+         is_aligned_16(args.attention_q) &&
+         is_aligned_16(args.attention_out) &&
+         is_aligned_16(args.attention_cache_k) &&
+         is_aligned_16(args.attention_cache_v) &&
+         is_aligned_16(args.attention_x) &&
+         is_aligned_16(args.attention_input_norm_weight) &&
+         is_aligned_16(args.attention_weights.d_q_col_major) &&
+         is_aligned_16(args.attention_weights.d_k_col_major) &&
+         (!needs_v_weight ||
+          is_aligned_16(args.attention_weights.d_v_col_major)) &&
+         is_aligned_16(args.attention_q_norm_weight) &&
+         is_aligned_16(args.attention_k_norm_weight);
+}
+
 // Validates the public FFN-tail launcher arguments before cooperative launch.
 inline bool valid_args(const Gemma4DecodeMegakernelFfnTailArgs &args) {
+  constexpr uint32_t known_flags =
+      GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION;
   return args.residual_out != nullptr && args.normed_out != nullptr &&
          args.next_hidden != nullptr && args.next_token != nullptr &&
          args.ffn_x != nullptr && args.ffn_residual != nullptr &&
          args.ffn_norm_weight != nullptr &&
-         args.ffn_gate_up_col_major != nullptr &&
-         args.ffn_down_row_major != nullptr &&
+         args.ffn_gate_up_decode != nullptr &&
+         args.ffn_down_decode != nullptr &&
          args.final_norm_weight != nullptr &&
          args.lm_head_col_major != nullptr && args.eps > 0.0f &&
+         (args.flags & ~known_flags) == 0 &&
          is_aligned_16(args.residual_out) &&
          is_aligned_16(args.normed_out) &&
          is_aligned_16(args.next_hidden) &&
          is_aligned_16(args.ffn_x) &&
          is_aligned_16(args.ffn_residual) &&
          is_aligned_16(args.ffn_norm_weight) &&
-         is_aligned_16(args.ffn_gate_up_col_major) &&
-         is_aligned_16(args.ffn_down_row_major) &&
+         is_aligned_16(args.ffn_gate_up_decode) &&
+         is_aligned_16(args.ffn_down_decode) &&
          is_aligned_16(args.final_norm_weight) &&
-         is_aligned_16(args.lm_head_col_major);
+         is_aligned_16(args.lm_head_col_major) &&
+         valid_flash_attention_args(args);
 }
 
 // Clears FFN accumulation scratch across the resident cooperative grid.
@@ -152,7 +226,7 @@ __device__ inline void phase_ffn_accumulate(
   for (int tile = int(blockIdx.x); tile < kFfnIntermediateTiles;
        tile += int(gridDim.x)) {
     ffn_dev::accumulate_intermediate_tile<kMegaThreads, true>(
-        args.ffn_x, args.ffn_gate_up_col_major, args.ffn_down_row_major,
+        args.ffn_x, args.ffn_gate_up_decode, args.ffn_down_decode,
         tile * kFfnIntermediateTile, swizzled_hidden_col, active_hidden_pack,
         partial, s_matmul_warp_sums, s_act);
   }
@@ -186,6 +260,7 @@ __device__ inline void phase_final_rmsnorm_hidden(
     const __nv_bfloat16 *__restrict__ final_norm_weight) {
   __shared__ float warp_sums[kMegaWarps];
   __shared__ float scale;
+  __shared__ Bf16Packed128 cached_input[kFfnHiddenPacks];
 
   if (blockIdx.x != 0) {
     return;
@@ -193,7 +268,7 @@ __device__ inline void phase_final_rmsnorm_hidden(
 
   rmsnorm_dev::rmsnorm_hidden_row_bf16<kMegaThreads>(
       normed_hidden, state, final_norm_weight, GEMMA4_RMS_NORM_EPS,
-      warp_sums, scale, int(threadIdx.x));
+      cached_input, warp_sums, scale, int(threadIdx.x));
 }
 
 // Computes this CTA's final greedy LM-head candidate.
