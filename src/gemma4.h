@@ -31,6 +31,8 @@
 #define GEMMA4_PARTIAL_ROTARY_FACTOR_GLOBAL 0.25f
 #define GEMMA4_RMS_NORM_EPS 1.0e-6f
 #define GEMMA4_FINAL_LOGIT_SOFTCAPPING 30.0f
+// HF casts sqrt(hidden_size) to BF16 before scaling token embeddings.
+#define GEMMA4_EMBEDDING_SCALE 62.0f
 
 #define GEMMA4_PACKED_FFN_SIZE (2 * GEMMA4_INTERMEDIATE_SIZE)
 #define GEMMA4_SLIDING_Q_PROJ_SIZE \

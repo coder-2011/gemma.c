@@ -34,7 +34,7 @@ struct alignas(128) Gemma4FfnDecodeScratch {
 struct Gemma4FfnPrefillScratch {
   __nv_bfloat16 *act = nullptr;
   // Reused as swizzled hidden input before gate/up and swizzled down output
-  // before residual add + RMSNorm.
+  // before post-FFN RMSNorm + residual add.
   __nv_bfloat16 *down = nullptr;
   int capacity_rows = 0;
 };

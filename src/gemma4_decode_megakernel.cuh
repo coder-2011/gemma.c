@@ -23,11 +23,12 @@ typedef struct {
   __nv_bfloat16 *normed_out = nullptr;
   __nv_bfloat16 *next_hidden = nullptr;
   int32_t *next_token = nullptr;
-  const __nv_bfloat16 *ffn_x = nullptr;
-  const __nv_bfloat16 *ffn_residual = nullptr;
+  __nv_bfloat16 *ffn_x = nullptr;
+  __nv_bfloat16 *ffn_residual = nullptr;
   const __nv_bfloat16 *ffn_norm_weight = nullptr;
   const __nv_bfloat16 *ffn_gate_up_decode = nullptr;
   const __nv_bfloat16 *ffn_down_decode = nullptr;
+  const __nv_bfloat16 *layer_scalar = nullptr;
   const __nv_bfloat16 *final_norm_weight = nullptr;
   const __nv_bfloat16 *lm_head_col_major = nullptr;
   uint32_t flags = 0;
@@ -50,6 +51,9 @@ typedef struct {
   const __nv_bfloat16 *attention_x = nullptr;
   const __nv_bfloat16 *attention_input_norm_weight = nullptr;
   Gemma4AttentionProjectionWeights attention_weights = {};
+  const __nv_bfloat16 *attention_o_proj_col_major = nullptr;
+  const __nv_bfloat16 *attention_post_norm_weight = nullptr;
+  const __nv_bfloat16 *attention_pre_ffn_norm_weight = nullptr;
   const __nv_bfloat16 *attention_q_norm_weight = nullptr;
   const __nv_bfloat16 *attention_k_norm_weight = nullptr;
   const float *attention_cos = nullptr;

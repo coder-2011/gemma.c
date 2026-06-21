@@ -155,6 +155,9 @@ inline bool valid_flash_attention_args(
          args.attention_weights.d_k_col_major != nullptr &&
          (!needs_v_weight ||
           args.attention_weights.d_v_col_major != nullptr) &&
+         args.attention_o_proj_col_major != nullptr &&
+         args.attention_post_norm_weight != nullptr &&
+         args.attention_pre_ffn_norm_weight != nullptr &&
          args.attention_q_norm_weight != nullptr &&
          args.attention_k_norm_weight != nullptr &&
          args.attention_cos != nullptr &&
@@ -169,6 +172,9 @@ inline bool valid_flash_attention_args(
          is_aligned_16(args.attention_weights.d_k_col_major) &&
          (!needs_v_weight ||
           is_aligned_16(args.attention_weights.d_v_col_major)) &&
+         is_aligned_16(args.attention_o_proj_col_major) &&
+         is_aligned_16(args.attention_post_norm_weight) &&
+         is_aligned_16(args.attention_pre_ffn_norm_weight) &&
          is_aligned_16(args.attention_q_norm_weight) &&
          is_aligned_16(args.attention_k_norm_weight);
 }
@@ -183,6 +189,7 @@ inline bool valid_args(const Gemma4DecodeMegakernelFfnTailArgs &args) {
          args.ffn_norm_weight != nullptr &&
          args.ffn_gate_up_decode != nullptr &&
          args.ffn_down_decode != nullptr &&
+         args.layer_scalar != nullptr &&
          args.final_norm_weight != nullptr &&
          args.lm_head_col_major != nullptr && args.eps > 0.0f &&
          (args.flags & ~known_flags) == 0 &&
@@ -236,8 +243,100 @@ __device__ inline void phase_ffn_accumulate(
   }
 }
 
-// Finalizes the FFN accumulation into residual_out and normed_out.
-__device__ inline void phase_ffn_finalize_residual_rmsnorm(
+// Projects attention output to hidden width inside the resident decode grid.
+template <int AttentionWidth>
+__device__ inline void phase_attention_o_projection(
+    const Gemma4DecodeMegakernelFfnTailArgs &args) {
+  constexpr int kColsPerBlock = 8;
+  constexpr int kHiddenBlocks = GEMMA4_HIDDEN_SIZE / kColsPerBlock;
+  static_assert((GEMMA4_HIDDEN_SIZE % kColsPerBlock) == 0,
+                "hidden width must divide O projection tile columns");
+  static_assert((AttentionWidth % kBf16Packed128Elements) == 0,
+                "attention width must divide bf16 pack width");
+
+  __shared__ float s_warp_sums[kColsPerBlock][kMegaWarps];
+
+  for (int col_block = int(blockIdx.x); col_block < kHiddenBlocks;
+       col_block += int(gridDim.x)) {
+    float sums[kColsPerBlock] = {};
+    const int col0 = col_block * kColsPerBlock;
+    constexpr int packs = AttentionWidth / kBf16Packed128Elements;
+
+    for (int pack = int(threadIdx.x); pack < packs; pack += kMegaThreads) {
+      const int element = pack * kBf16Packed128Elements;
+      const Bf16Packed128 x_pack = load128g(args.attention_out + element);
+#pragma unroll
+      for (int col = 0; col < kColsPerBlock; ++col) {
+        const __nv_bfloat16 *weight =
+            args.attention_o_proj_col_major +
+            int64_t(col0 + col) * AttentionWidth + element;
+        const Bf16Packed128 w_pack = load128weight(weight);
+        gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
+      }
+    }
+
+    warp_reduce_sum_to_lane0(sums);
+    const int lane = int(threadIdx.x) & (WARP_SIZE - 1);
+    const int warp = int(threadIdx.x) / WARP_SIZE;
+    if (lane == 0) {
+#pragma unroll
+      for (int col = 0; col < kColsPerBlock; ++col) {
+        s_warp_sums[col][warp] = sums[col];
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int col = 0; col < kColsPerBlock; ++col) {
+      sums[col] = threadIdx.x < kMegaWarps ? s_warp_sums[col][lane] : 0.0f;
+    }
+    if (warp == 0) {
+      warp_reduce_sum_to_lane0(sums);
+    }
+    if (threadIdx.x == 0) {
+      Bf16Packed128 out_pack;
+#pragma unroll
+      for (int col = 0; col < kColsPerBlock; ++col) {
+        out_pack[col] = __float2bfloat16_rn(sums[col]);
+      }
+      store128(args.residual_out + col0, out_pack);
+    }
+  }
+}
+
+// Builds the post-attention residual and pre-FFN normed row for one token.
+__device__ inline void phase_attention_to_ffn(
+    const Gemma4DecodeMegakernelFfnTailArgs &args) {
+  if (blockIdx.x != 0) {
+    return;
+  }
+
+  __shared__ Bf16Packed128 cached_input[kFfnHiddenPacks];
+  __shared__ float warp_sums[kMegaWarps];
+  __shared__ float scale;
+
+  rmsnorm_dev::rmsnorm_hidden_row_bf16<kMegaThreads>(
+      args.normed_out, args.residual_out, args.attention_post_norm_weight,
+      args.eps, cached_input, warp_sums, scale, int(threadIdx.x));
+  __syncthreads();
+
+  for (int pack = int(threadIdx.x); pack < kFfnHiddenPacks;
+       pack += kMegaThreads) {
+    const int offset = pack * kBf16Packed128Elements;
+    const Bf16Packed128 residual = load128g(args.attention_x + offset);
+    const Bf16Packed128 delta = load128g(args.normed_out + offset);
+    const Bf16Packed128 sum = gemma4_bf16_pack_add(residual, delta);
+    store128(args.ffn_residual + offset, sum);
+  }
+  __syncthreads();
+
+  rmsnorm_dev::rmsnorm_hidden_row_bf16<kMegaThreads>(
+      args.ffn_x, args.ffn_residual, args.attention_pre_ffn_norm_weight,
+      args.eps, cached_input, warp_sums, scale, int(threadIdx.x));
+}
+
+// Finalizes FFN as post-FFN RMSNorm followed by residual add.
+__device__ inline void phase_ffn_finalize_rmsnorm_residual(
     const Gemma4DecodeMegakernelFfnTailArgs &args,
     const Gemma4FfnDecodeScratch *__restrict__ scratch) {
   if (blockIdx.x != 0) {
@@ -247,10 +346,25 @@ __device__ inline void phase_ffn_finalize_residual_rmsnorm(
   __shared__ float s_rms_warp_sums[kMegaWarps];
   __shared__ float s_scale;
 
-  ffn_dev::finalize_residual_rmsnorm<kMegaThreads, true, false>(
+  ffn_dev::finalize_rmsnorm_residual<kMegaThreads, true, false>(
       args.residual_out, args.normed_out, args.ffn_residual,
       args.ffn_norm_weight, scratch, args.eps, s_rms_warp_sums, s_scale,
       int(threadIdx.x));
+}
+
+// Applies the checkpoint layer scalar to the completed post-FFN residual row.
+__device__ inline void phase_scale_layer_hidden(
+    __nv_bfloat16 *__restrict__ hidden,
+    const __nv_bfloat16 *__restrict__ layer_scalar) {
+  const float scale = __bfloat162float(__ldg(layer_scalar));
+  const int linear_idx = int(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int stride = int(gridDim.x) * blockDim.x;
+  for (int pack = linear_idx; pack < kFfnHiddenPacks; pack += stride) {
+    const int offset = pack * kBf16Packed128Elements;
+    const Bf16Packed128 values = load128g(hidden + offset);
+    const Bf16Packed128 scaled = gemma4_bf16_pack_apply_scale(values, scale);
+    store128(hidden + offset, scaled);
+  }
 }
 
 // Computes final RMSNorm in block 0 into the normalized hidden scratch row.

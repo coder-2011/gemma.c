@@ -2213,13 +2213,23 @@ void decode_megakernel_flash_attention_ffn_tail_kernel(
   phase_megakernel_flash_attention<Traits>(args, grid);
   grid.sync();
 
+  mega_phase::phase_attention_o_projection<
+      GEMMA4_NUM_QUERY_HEADS * Traits::kHeadDim>(args);
+  grid.sync();
+
+  mega_phase::phase_attention_to_ffn(args);
+  grid.sync();
+
   mega_phase::phase_ffn_zero_accum(ffn_scratch);
   grid.sync();
 
   mega_phase::phase_ffn_accumulate(args, ffn_scratch);
   grid.sync();
 
-  mega_phase::phase_ffn_finalize_residual_rmsnorm(args, ffn_scratch);
+  mega_phase::phase_ffn_finalize_rmsnorm_residual(args, ffn_scratch);
+  grid.sync();
+
+  mega_phase::phase_scale_layer_hidden(args.residual_out, args.layer_scalar);
   grid.sync();
 
   phase_megakernel_final_spine(

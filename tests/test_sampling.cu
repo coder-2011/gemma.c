@@ -134,6 +134,17 @@ std::vector<__nv_bfloat16> make_target_row() {
   return row;
 }
 
+// Mirrors the scaled embedding row returned as the next decode input.
+std::vector<__nv_bfloat16> scaled_embedding_row(
+    const std::vector<__nv_bfloat16> &row) {
+  std::vector<__nv_bfloat16> scaled(row.size());
+  for (size_t i = 0; i < row.size(); ++i) {
+    scaled[i] =
+        __float2bfloat16_rn(__bfloat162float(row[i]) * GEMMA4_EMBEDDING_SCALE);
+  }
+  return scaled;
+}
+
 void compare_hidden_bits(const std::vector<__nv_bfloat16> &actual,
                          const std::vector<__nv_bfloat16> &expected,
                          const char *label) {
@@ -201,7 +212,7 @@ void run_greedy_cases() {
                         target_row.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
   run_case(d_lm_head, d_hidden, d_next_hidden, d_next_token, d_scratch,
-           target_row, kTargetToken, "single target");
+           scaled_embedding_row(target_row), kTargetToken, "single target");
 }
 
 void run_invalid_args_case() {
@@ -264,7 +275,7 @@ void run_gumbel_case(DeviceBuffer<__nv_bfloat16> &d_lm_head,
 
   std::vector<__nv_bfloat16> expected_row(GEMMA4_HIDDEN_SIZE);
   if (actual_token == hot_token_id) {
-    expected_row = hot_row;
+    expected_row = scaled_embedding_row(hot_row);
   }
   std::vector<__nv_bfloat16> actual_hidden(GEMMA4_HIDDEN_SIZE);
   d_next_hidden.copy_to(actual_hidden);

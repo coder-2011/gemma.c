@@ -163,7 +163,7 @@ gemma4_ffn_decode_finalize_bf16_kernel(
   __shared__ float s_rms_warp_sums[kFfnWarps];
   __shared__ float s_scale;
 
-  ffn_dev::finalize_residual_rmsnorm<
+  ffn_dev::finalize_rmsnorm_residual<
       kFfnThreads, false, kReductionPolicy == 1>(
       residual_out, normed_out, residual, rms_weight, scratch, eps,
       s_rms_warp_sums, s_scale, int(threadIdx.x));
@@ -208,10 +208,9 @@ __global__ void swizzle_hidden_packs_kernel(
   }
 }
 
-// Adds a swizzled down-projection row to the natural residual row, then writes
-// the post-FFN residual and next RMS-normalized hidden state in natural order.
+// RMS-normalizes a swizzled down-projection row, then adds the residual.
 __global__ __launch_bounds__(kFfnThreads, 1) void
-residual_add_rmsnorm_from_swizzled_down_kernel(
+rmsnorm_residual_from_swizzled_down_kernel(
     floatX *__restrict__ residual_out,
     floatX *__restrict__ normed_out,
     const floatX *__restrict__ down_swizzled,
@@ -230,22 +229,8 @@ residual_add_rmsnorm_from_swizzled_down_kernel(
 
   const FfnBf16Pack down_pack =
       load128g(down_swizzled + row_offset + swizzled_col);
-  float values[kBf16Packed128Elements] = {};
-  const __nv_bfloat162 *down_pairs = gemma4_bf16_pack_pairs(down_pack);
-#pragma unroll
-  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
-    const float2 down = __bfloat1622float2(down_pairs[p]);
-    values[2 * p] = down.x;
-    values[2 * p + 1] = down.y;
-  }
-
   float sum_sq = 0.0f;
-  const FfnBf16Pack residual_pack =
-      load128g(residual + row_offset + natural_col);
-  FfnBf16Pack residual_out_pack;
-  ffn_dev::add_residual_store_pack(
-      residual_pack, values, residual_out_pack, sum_sq);
-  store128(residual_out + row_offset + natural_col, residual_out_pack);
+  gemma4_bf16_pack_accumulate_square(down_pack, sum_sq);
 
   const float total =
       gemma4_block_reduce_sum<kFfnThreads>(
@@ -258,8 +243,13 @@ residual_add_rmsnorm_from_swizzled_down_kernel(
   const FfnBf16Pack gamma_pack =
       load128g(rms_weight + natural_col);
   const FfnBf16Pack normed_pack =
-      ffn_dev::rmsnorm_store_pack(values, gamma_pack, s_scale);
+      gemma4_bf16_pack_apply_rmsnorm(down_pack, gamma_pack, s_scale);
+  const FfnBf16Pack residual_pack =
+      load128g(residual + row_offset + natural_col);
+  const FfnBf16Pack residual_out_pack =
+      gemma4_bf16_pack_add(residual_pack, normed_pack);
   store128wb(normed_out + row_offset + natural_col, normed_pack);
+  store128(residual_out + row_offset + natural_col, residual_out_pack);
 }
 
 // Reorders the swizzled hidden packs produced by the prefill down GEMM back to
@@ -557,7 +547,7 @@ cudaError_t gemma4_ffn_prefill_bf16_impl(const Gemma4FfnBf16Args &args) {
     return status;
   }
 
-  residual_add_rmsnorm_from_swizzled_down_kernel<<<
+  rmsnorm_residual_from_swizzled_down_kernel<<<
       args.rows, kFfnThreads, 0, args.stream>>>(
       args.residual_out, args.normed_out, args.prefill_scratch.down,
       args.residual, args.rms_weight, args.eps);

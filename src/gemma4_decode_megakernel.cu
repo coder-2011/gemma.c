@@ -74,7 +74,10 @@ void decode_megakernel_ffn_tail_kernel(
   phase::phase_ffn_accumulate(args, ffn_scratch);
   grid.sync();
 
-  phase::phase_ffn_finalize_residual_rmsnorm(args, ffn_scratch);
+  phase::phase_ffn_finalize_rmsnorm_residual(args, ffn_scratch);
+  grid.sync();
+
+  phase::phase_scale_layer_hidden(args.residual_out, args.layer_scalar);
   grid.sync();
 
   run_final_decode_spine(

@@ -96,6 +96,17 @@ std::vector<__nv_bfloat16> make_hidden(float first_value) {
   return hidden;
 }
 
+// Mirrors the scaled tied-embedding row returned as the next decode input.
+std::vector<__nv_bfloat16> scaled_embedding_row(
+    const std::vector<__nv_bfloat16> &row) {
+  std::vector<__nv_bfloat16> scaled(row.size());
+  for (size_t i = 0; i < row.size(); ++i) {
+    scaled[i] =
+        __float2bfloat16_rn(bf16_to_float(row[i]) * GEMMA4_EMBEDDING_SCALE);
+  }
+  return scaled;
+}
+
 // Creates an all-ones final RMSNorm weight vector.
 std::vector<__nv_bfloat16> make_norm_weight() {
   return std::vector<__nv_bfloat16>(
@@ -136,6 +147,7 @@ int32_t run_ffn_tail_once(
     DeviceBuffer<__nv_bfloat16> &d_gamma,
     DeviceBuffer<__nv_bfloat16> &d_gate_up,
     DeviceBuffer<__nv_bfloat16> &d_down,
+    DeviceBuffer<__nv_bfloat16> &d_layer_scalar,
     DeviceBuffer<__nv_bfloat16> &d_final_norm,
     DeviceBuffer<__nv_bfloat16> &d_lm_head) {
   Gemma4DecodeMegakernelFfnTailArgs args = {};
@@ -148,6 +160,7 @@ int32_t run_ffn_tail_once(
   args.ffn_norm_weight = d_gamma.get();
   args.ffn_gate_up_decode = d_gate_up.get();
   args.ffn_down_decode = d_down.get();
+  args.layer_scalar = d_layer_scalar.get();
   args.final_norm_weight = d_final_norm.get();
   args.lm_head_col_major = d_lm_head.get();
   args.eps = GEMMA4_RMS_NORM_EPS;
@@ -176,6 +189,8 @@ void run_ffn_tail_zero_weight_case() {
   const std::vector<__nv_bfloat16> x = make_hidden(0.5f);
   const std::vector<__nv_bfloat16> residual = make_hidden(1.0f);
   const std::vector<__nv_bfloat16> norm_weight = make_norm_weight();
+  const std::vector<__nv_bfloat16> layer_scalar(
+      1, __float2bfloat16_rn(0.5f));
 
   DeviceBuffer<__nv_bfloat16> d_x(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_residual(GEMMA4_HIDDEN_SIZE);
@@ -185,6 +200,7 @@ void run_ffn_tail_zero_weight_case() {
   DeviceBuffer<__nv_bfloat16> d_next_hidden(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_gate_up(gate_up_elems);
   DeviceBuffer<__nv_bfloat16> d_down(down_elems);
+  DeviceBuffer<__nv_bfloat16> d_layer_scalar(1);
   DeviceBuffer<__nv_bfloat16> d_final_norm(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_lm_head(lm_head_elems);
   DeviceBuffer<int32_t> d_next_token(1);
@@ -194,6 +210,7 @@ void run_ffn_tail_zero_weight_case() {
   d_x.copy_from(x);
   d_residual.copy_from(residual);
   d_gamma.copy_from(norm_weight);
+  d_layer_scalar.copy_from(layer_scalar);
   d_final_norm.copy_from(norm_weight);
   CHECK_CUDA(cudaMemset(d_gate_up.get(), 0,
                         gate_up_elems * sizeof(__nv_bfloat16)));
@@ -204,7 +221,8 @@ void run_ffn_tail_zero_weight_case() {
   const int32_t token =
       run_ffn_tail_once(d_residual_out, d_normed_out, d_next_hidden,
                         d_next_token, d_scratch, d_x, d_residual, d_gamma,
-                        d_gate_up, d_down, d_final_norm, d_lm_head);
+                        d_gate_up, d_down, d_layer_scalar, d_final_norm,
+                        d_lm_head);
   if (token != kTargetToken) {
     std::fprintf(stderr, "ffn tail token actual=%d expected=%d\n",
                  token, kTargetToken);
@@ -213,7 +231,18 @@ void run_ffn_tail_zero_weight_case() {
 
   std::vector<__nv_bfloat16> actual_next_hidden(GEMMA4_HIDDEN_SIZE);
   d_next_hidden.copy_to(actual_next_hidden);
-  compare_hidden_bits(actual_next_hidden, residual, "ffn tail next hidden");
+  compare_hidden_bits(actual_next_hidden, scaled_embedding_row(residual),
+                      "ffn tail next hidden");
+
+  std::vector<__nv_bfloat16> expected_residual = residual;
+  for (int channel = 0; channel < GEMMA4_HIDDEN_SIZE; ++channel) {
+    expected_residual[channel] =
+        __float2bfloat16_rn(bf16_to_float(residual[channel]) * 0.5f);
+  }
+  std::vector<__nv_bfloat16> actual_residual(GEMMA4_HIDDEN_SIZE);
+  d_residual_out.copy_to(actual_residual);
+  compare_hidden_bits(actual_residual, expected_residual,
+                      "ffn tail layer scalar");
 }
 
 // Verifies the optional FlashAttention phase runs inside the megakernel tail.
@@ -230,6 +259,9 @@ void run_flash_attention_flag_case() {
       static_cast<size_t>(GEMMA4_SLIDING_Q_PROJ_SIZE) * GEMMA4_HIDDEN_SIZE;
   const size_t kv_weight_elems =
       static_cast<size_t>(GEMMA4_SLIDING_KV_PROJ_SIZE) * GEMMA4_HIDDEN_SIZE;
+  const size_t o_weight_elems =
+      static_cast<size_t>(GEMMA4_HIDDEN_SIZE) *
+      GEMMA4_SLIDING_ATTENTION_OUT_SIZE;
   Gemma4KvCacheConfig cache_config = {
       1,
       1,
@@ -243,6 +275,8 @@ void run_flash_attention_flag_case() {
   const std::vector<__nv_bfloat16> x = make_hidden(0.5f);
   const std::vector<__nv_bfloat16> residual = make_hidden(1.0f);
   const std::vector<__nv_bfloat16> norm_weight = make_norm_weight();
+  const std::vector<__nv_bfloat16> layer_scalar(
+      1, __float2bfloat16_rn(1.0f));
   const std::vector<__nv_bfloat16> head_weight(
       GEMMA4_SLIDING_HEAD_DIM, __float2bfloat16_rn(1.0f));
   const std::vector<float> cos(kRotaryHalf, 1.0f);
@@ -259,6 +293,7 @@ void run_flash_attention_flag_case() {
   DeviceBuffer<__nv_bfloat16> d_next_hidden(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_gate_up(gate_up_elems);
   DeviceBuffer<__nv_bfloat16> d_down(down_elems);
+  DeviceBuffer<__nv_bfloat16> d_layer_scalar(1);
   DeviceBuffer<__nv_bfloat16> d_final_norm(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_lm_head(lm_head_elems);
   DeviceBuffer<int32_t> d_next_token(1);
@@ -272,6 +307,7 @@ void run_flash_attention_flag_case() {
   DeviceBuffer<__nv_bfloat16> d_w_q(q_weight_elems);
   DeviceBuffer<__nv_bfloat16> d_w_k(kv_weight_elems);
   DeviceBuffer<__nv_bfloat16> d_w_v(kv_weight_elems);
+  DeviceBuffer<__nv_bfloat16> d_w_o(o_weight_elems);
   DeviceBuffer<__nv_bfloat16> d_attention_q(GEMMA4_SLIDING_Q_PROJ_SIZE);
   DeviceBuffer<__nv_bfloat16> d_attention_out(
       GEMMA4_SLIDING_ATTENTION_OUT_SIZE);
@@ -292,6 +328,7 @@ void run_flash_attention_flag_case() {
   d_x.copy_from(x);
   d_residual.copy_from(residual);
   d_gamma.copy_from(norm_weight);
+  d_layer_scalar.copy_from(layer_scalar);
   d_final_norm.copy_from(norm_weight);
   d_attention_x.copy_from(x);
   d_input_norm.copy_from(norm_weight);
@@ -313,6 +350,8 @@ void run_flash_attention_flag_case() {
                         kv_weight_elems * sizeof(__nv_bfloat16)));
   CHECK_CUDA(cudaMemset(d_w_v.get(), 0,
                         kv_weight_elems * sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_w_o.get(), 0,
+                        o_weight_elems * sizeof(__nv_bfloat16)));
   CHECK_CUDA(cudaMemset(d_attention_out.get(), 0,
                         GEMMA4_SLIDING_ATTENTION_OUT_SIZE *
                             sizeof(__nv_bfloat16)));
@@ -320,7 +359,7 @@ void run_flash_attention_flag_case() {
   write_device_bf16(d_w_k.get(), 0, 1.0f);
   write_device_bf16(d_w_v.get(), 0, 1.0f);
 
-  install_target_row(d_lm_head, kTargetToken, residual);
+  install_target_row(d_lm_head, kTargetToken, x);
 
   Gemma4DecodeMegakernelFfnTailArgs args = {};
   args.residual_out = d_residual_out.get();
@@ -332,6 +371,7 @@ void run_flash_attention_flag_case() {
   args.ffn_norm_weight = d_gamma.get();
   args.ffn_gate_up_decode = d_gate_up.get();
   args.ffn_down_decode = d_down.get();
+  args.layer_scalar = d_layer_scalar.get();
   args.final_norm_weight = d_final_norm.get();
   args.lm_head_col_major = d_lm_head.get();
   args.flags = GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION;
@@ -354,6 +394,9 @@ void run_flash_attention_flag_case() {
   args.attention_x = d_attention_x.get();
   args.attention_input_norm_weight = d_input_norm.get();
   args.attention_weights = {d_w_q.get(), d_w_k.get(), d_w_v.get(), 0, 0, 0};
+  args.attention_o_proj_col_major = d_w_o.get();
+  args.attention_post_norm_weight = d_gamma.get();
+  args.attention_pre_ffn_norm_weight = d_gamma.get();
   args.attention_q_norm_weight = d_q_norm.get();
   args.attention_k_norm_weight = d_k_norm.get();
   args.attention_cos = d_cos.get();

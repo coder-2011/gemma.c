@@ -207,49 +207,22 @@ __device__ inline void load_partial_sum_pack(
 #endif
 }
 
-// Adds the residual pack, stores the post-FFN residual, and contributes to RMS.
-__device__ inline void add_residual_store_pack(
-    const FfnBf16Pack &residual_pack,
-    float (&values)[kBf16Packed128Elements],
-    FfnBf16Pack &out_pack,
-    float &sum_sq) {
-  const __nv_bfloat162 *residual_pairs =
-      gemma4_bf16_pack_pairs(residual_pack);
-  __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(out_pack);
-#pragma unroll
-  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
-    const float2 residual = __bfloat1622float2(residual_pairs[p]);
-    const float x = values[2 * p] + residual.x;
-    const float y = values[2 * p + 1] + residual.y;
-    values[2 * p] = x;
-    values[2 * p + 1] = y;
-    sum_sq = fmaf(x, x, sum_sq);
-    sum_sq = fmaf(y, y, sum_sq);
-    out_pairs[p] = __floats2bfloat162_rn(x, y);
-  }
-}
-
-// Applies RMSNorm to one residual pack using a caller-computed RMS scale.
-__device__ inline FfnBf16Pack rmsnorm_store_pack(
-    const float (&values)[kBf16Packed128Elements],
-    const FfnBf16Pack &gamma_pack,
-    float scale) {
-  const __nv_bfloat162 *gamma_pairs = gemma4_bf16_pack_pairs(gamma_pack);
+// Rounds one accumulated FFN output pack to BF16 before post-FFN RMSNorm.
+__device__ inline FfnBf16Pack accum_to_bf16_pack(
+    const float (&values)[kBf16Packed128Elements]) {
   FfnBf16Pack out_pack;
   __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(out_pack);
 #pragma unroll
   for (int p = 0; p < kBf16Packed128Pairs; ++p) {
-    const float2 gamma = __bfloat1622float2(gamma_pairs[p]);
     out_pairs[p] = __floats2bfloat162_rn(
-        values[2 * p] * scale * gamma.x,
-        values[2 * p + 1] * scale * gamma.y);
+        values[2 * p], values[2 * p + 1]);
   }
   return out_pack;
 }
 
-// Adds the accumulated FFN output to the residual and writes the next normed row.
+// Applies post-FFN RMSNorm to the accumulated FFN output, then adds residual.
 template <int Threads, bool GuardHiddenPack, bool UsePartialGroups>
-__device__ inline void finalize_residual_rmsnorm(
+__device__ inline void finalize_rmsnorm_residual(
     floatX *__restrict__ residual_out,
     floatX *__restrict__ normed_out,
     const floatX *__restrict__ residual,
@@ -261,6 +234,7 @@ __device__ inline void finalize_residual_rmsnorm(
     int hidden_pack) {
   float partial[kBf16Packed128Elements] = {};
   float sum_sq = 0.0f;
+  FfnBf16Pack ffn_pack;
   const bool active_hidden_pack =
       !GuardHiddenPack || hidden_pack < kHiddenPacks;
 
@@ -270,13 +244,8 @@ __device__ inline void finalize_residual_rmsnorm(
     } else {
       load_accum_pack(scratch, hidden_pack, partial);
     }
-
-    const int hidden_col = hidden_pack * kBf16Packed128Elements;
-    const FfnBf16Pack residual_pack = load128g(residual + hidden_col);
-    FfnBf16Pack residual_out_pack;
-    add_residual_store_pack(
-        residual_pack, partial, residual_out_pack, sum_sq);
-    store128(residual_out + hidden_col, residual_out_pack);
+    ffn_pack = accum_to_bf16_pack(partial);
+    gemma4_bf16_pack_accumulate_square(ffn_pack, sum_sq);
   }
 
   const float total =
@@ -290,8 +259,12 @@ __device__ inline void finalize_residual_rmsnorm(
     const int hidden_col = hidden_pack * kBf16Packed128Elements;
     const FfnBf16Pack gamma_pack = load128g(rms_weight + hidden_col);
     const FfnBf16Pack normed_pack =
-        rmsnorm_store_pack(partial, gamma_pack, scale);
+        gemma4_bf16_pack_apply_rmsnorm(ffn_pack, gamma_pack, scale);
+    const FfnBf16Pack residual_pack = load128g(residual + hidden_col);
+    const FfnBf16Pack residual_out_pack =
+        gemma4_bf16_pack_add(residual_pack, normed_pack);
     store128wb(normed_out + hidden_col, normed_pack);
+    store128(residual_out + hidden_col, residual_out_pack);
   }
 }
 

@@ -203,19 +203,21 @@ void run_sparse_case() {
   }
 
   double sum_sq = 0.0;
-  std::vector<float> residual_float(GEMMA4_HIDDEN_SIZE);
+  std::vector<float> ffn_float(GEMMA4_HIDDEN_SIZE);
   for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
-    const float value = ffn_out[col] + bf16_to_float(residual[col]);
-    residual_float[col] = value;
-    expected_residual[col] = __float2bfloat16_rn(value);
+    const __nv_bfloat16 ffn_bf16 = __float2bfloat16_rn(ffn_out[col]);
+    const float value = bf16_to_float(ffn_bf16);
+    ffn_float[col] = value;
     sum_sq += static_cast<double>(value) * value;
   }
   const float scale =
       1.0f / std::sqrt(static_cast<float>(sum_sq / GEMMA4_HIDDEN_SIZE) +
                        GEMMA4_RMS_NORM_EPS);
   for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
-    const float value = residual_float[col] * scale * bf16_to_float(gamma[col]);
-    expected_normed[col] = __float2bfloat16_rn(value);
+    const float normed = ffn_float[col] * scale * bf16_to_float(gamma[col]);
+    expected_normed[col] = __float2bfloat16_rn(normed);
+    expected_residual[col] = __float2bfloat16_rn(
+        bf16_to_float(residual[col]) + bf16_to_float(expected_normed[col]));
   }
 
   CHECK_CUDA(gemma4_ffn_decode_swizzle_weights_bf16(
@@ -272,11 +274,9 @@ void run_sparse_case() {
 
     sum_sq = 0.0;
     for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
-      const int offset = row * GEMMA4_HIDDEN_SIZE + col;
-      const float value =
-          ffn_out[col] + bf16_to_float(residual_prefill[offset]);
-      residual_float[col] = value;
-      expected_prefill_residual[offset] = __float2bfloat16_rn(value);
+      const __nv_bfloat16 ffn_bf16 = __float2bfloat16_rn(ffn_out[col]);
+      const float value = bf16_to_float(ffn_bf16);
+      ffn_float[col] = value;
       sum_sq += static_cast<double>(value) * value;
     }
     const float row_scale =
@@ -284,9 +284,12 @@ void run_sparse_case() {
                          GEMMA4_RMS_NORM_EPS);
     for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
       const int offset = row * GEMMA4_HIDDEN_SIZE + col;
-      const float value =
-          residual_float[col] * row_scale * bf16_to_float(gamma[col]);
-      expected_prefill_normed[offset] = __float2bfloat16_rn(value);
+      const float normed =
+          ffn_float[col] * row_scale * bf16_to_float(gamma[col]);
+      expected_prefill_normed[offset] = __float2bfloat16_rn(normed);
+      expected_prefill_residual[offset] = __float2bfloat16_rn(
+          bf16_to_float(residual_prefill[offset]) +
+          bf16_to_float(expected_prefill_normed[offset]));
     }
   }
 
