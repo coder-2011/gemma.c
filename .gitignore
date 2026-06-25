@@ -5,6 +5,7 @@ skills-lock.json
 models/
 build/benches/
 build/experiments/
+tools/clang_cuda_compat/
 experiments/flash-attention/
 experiments/marlin/
 experiments/sgemm.cu/
