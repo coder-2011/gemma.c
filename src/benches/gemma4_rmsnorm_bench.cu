@@ -170,19 +170,6 @@ int main(int argc, char **argv) {
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  Gemma4BenchmarkContract contract;
-  contract.benchmark = "rmsnorm_bench";
-  contract.timing = "cuda_events_and_cuda_graph_replay_same_stream";
-  contract.cache = "warm_repeated_buffers";
-  contract.launch_overhead = "event_paths_include_launch_graph_paths_exclude_capture";
-  contract.correctness = "custom_vs_cudnn_diff_checked_when_available";
-  contract.notes = "reports kernel and graph timing for RMSNorm variants";
-  contract.warmup = warmup;
-  contract.iters = iters;
-  contract.samples = trials;
-  contract.graph_inner_iters = iters;
-  gemma4_bench_print_environment(contract.benchmark);
-  gemma4_bench_print_contract(contract);
 
   const size_t max_elems = static_cast<size_t>(max_rows) * width;
   const uint64_t seed = make_seed("GEMMA4_RMSNORM_BENCH_SEED");

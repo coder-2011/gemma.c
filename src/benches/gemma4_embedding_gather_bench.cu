@@ -51,16 +51,6 @@ int main(int argc, char **argv) {
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  Gemma4BenchmarkContract contract;
-  contract.benchmark = "embedding_gather_bench";
-  contract.cache = "warm_repeated_buffers";
-  contract.correctness = "shape_and_launch_checked";
-  contract.notes = "zeroed embedding table; reports best/average per token count";
-  contract.warmup = warmup;
-  contract.iters = iters;
-  contract.samples = trials;
-  gemma4_bench_print_environment(contract.benchmark);
-  gemma4_bench_print_contract(contract);
 
   const int hidden_size = GEMMA4_HIDDEN_SIZE;
   const int vocab_size = GEMMA4_VOCAB_SIZE;

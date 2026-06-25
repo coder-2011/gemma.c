@@ -50,22 +50,6 @@ struct DiffStats {
   float max_rel = 0.0f;
 };
 
-struct Gemma4BenchmarkContract {
-  const char *benchmark = "unknown";
-  const char *measurement = "kernel_only";
-  const char *timing = "cuda_events_same_stream";
-  const char *cache = "unspecified";
-  const char *launch_overhead = "included";
-  const char *aggregation = "best_and_average";
-  const char *correctness = "checked_before_timing";
-  const char *clock_policy = "unlocked_boost";
-  const char *notes = "";
-  int warmup = 0;
-  int iters = 0;
-  int samples = 0;
-  int graph_inner_iters = 0;
-};
-
 template <typename T>
 class DeviceBuffer {
  public:
@@ -198,88 +182,6 @@ inline uint64_t make_seed(const char *env_name) {
                        .time_since_epoch()
                        .count());
   return seed;
-}
-
-// Captures a one-line shell command result for best-effort benchmark metadata.
-inline std::string gemma4_bench_capture_first_line(const char *command) {
-  FILE *pipe = popen(command, "r");
-  if (pipe == nullptr) {
-    return "unavailable";
-  }
-
-  char buffer[1024] = {};
-  std::string line = fgets(buffer, sizeof(buffer), pipe) != nullptr
-                         ? std::string(buffer)
-                         : "unavailable";
-  pclose(pipe);
-  while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
-    line.pop_back();
-  }
-  return line.empty() ? "unavailable" : line;
-}
-
-// Prints CUDA, device, and nvidia-smi metadata needed to compare benchmark runs.
-inline void gemma4_bench_print_environment(const char *benchmark_name) {
-  int device = 0;
-  cudaDeviceProp prop{};
-  int driver = 0;
-  int runtime = 0;
-  char pci_bus_id[32] = {};
-
-  CUDA_CHECK(cudaGetDevice(&device));
-  CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-  CUDA_CHECK(cudaDriverGetVersion(&driver));
-  CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
-  CUDA_CHECK(cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), device));
-
-  std::printf("benchmark_env name=%s cuda_device=%d gpu=\"%s\" pci_bus_id=%s "
-              "compute_capability=sm_%d%d global_mem_bytes=%zu "
-              "l2_cache_bytes=%d driver_cuda=%d runtime_cuda=%d\n",
-              benchmark_name, device, prop.name, pci_bus_id, prop.major,
-              prop.minor, static_cast<size_t>(prop.totalGlobalMem),
-              prop.l2CacheSize, driver, runtime);
-
-#if defined(GEMMA4_WEIGHT_LOAD_POLICY)
-  constexpr int weight_load_policy = GEMMA4_WEIGHT_LOAD_POLICY;
-#else
-  constexpr int weight_load_policy = -1;
-#endif
-
-#if defined(__CUDACC_VER_MAJOR__)
-  std::printf("benchmark_compile nvcc=%d.%d.%d arch_flags=compile_command "
-              "weight_load_policy=%d\n",
-              __CUDACC_VER_MAJOR__, __CUDACC_VER_MINOR__,
-              __CUDACC_VER_BUILD__, weight_load_policy);
-#else
-  std::printf("benchmark_compile nvcc=not_nvcc arch_flags=compile_command "
-              "weight_load_policy=%d\n",
-              weight_load_policy);
-#endif
-
-  const std::string smi = gemma4_bench_capture_first_line(
-      "nvidia-smi --query-gpu=name,gpu_bus_id,driver_version,"
-      "persistence_mode,ecc.mode.current,mig.mode.current,power.limit,"
-      "clocks.sm,clocks.mem,temperature.gpu,power.draw,utilization.gpu "
-      "--format=csv,noheader,nounits 2>/dev/null");
-  std::printf("benchmark_nvidia_smi fields=name,bus_id,driver,persistence,"
-              "ecc,mig,power_limit_w,sm_clock_mhz,mem_clock_mhz,temp_c,"
-              "power_draw_w,gpu_util_pct values=\"%s\"\n",
-              smi.c_str());
-}
-
-// Prints the measurement contract beside timing rows so results remain auditable.
-inline void gemma4_bench_print_contract(
-    const Gemma4BenchmarkContract &contract) {
-  std::printf("benchmark_contract name=%s measurement=%s timing=%s cache=%s "
-              "launch_overhead=%s aggregation=%s correctness=%s "
-              "clock_policy=%s warmup=%d iters=%d samples=%d "
-              "graph_inner_iters=%d no_sleep_between_trials=true "
-              "ncu_clock_control=use_--clock-control_none notes=\"%s\"\n",
-              contract.benchmark, contract.measurement, contract.timing,
-              contract.cache, contract.launch_overhead, contract.aggregation,
-              contract.correctness, contract.clock_policy, contract.warmup,
-              contract.iters, contract.samples, contract.graph_inner_iters,
-              contract.notes);
 }
 
 // Flags timings in the range where event overhead and enqueue jitter can dominate.

@@ -305,19 +305,6 @@ int main(int argc, char **argv) {
 
   cudaStream_t stream = nullptr;
   CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-  Gemma4BenchmarkContract contract;
-  contract.benchmark = "sampling_bench";
-  contract.measurement = "stream_device_work";
-  contract.cache = "warm_repeated_buffers";
-  contract.launch_overhead = "cpu_enqueue_excluded_by_cuda_events";
-  contract.aggregation = "min_median_trimmed_mean_mean_stddev_iqr_p95_p99_max_raw_samples";
-  contract.correctness = "fused_vs_materialized_tokens_checked_before_timing";
-  contract.notes = "fused sampler vs materialized logits";
-  contract.warmup = warmup;
-  contract.iters = iters;
-  contract.samples = samples;
-  gemma4_bench_print_environment(contract.benchmark);
-  gemma4_bench_print_contract(contract);
   std::printf("benchmark_guardrail stability_scope=single_process "
               "minimum_effect_us=25 close_call_requires_process_rerun=true "
               "candidate_order=fixed\n");

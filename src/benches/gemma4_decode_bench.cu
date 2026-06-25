@@ -327,16 +327,6 @@ int main(int argc, char **argv) {
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   CublasDecode cublas(stream);
   const uint64_t seed = make_seed("GEMMA4_DECODE_BENCH_SEED");
-  Gemma4BenchmarkContract contract;
-  contract.benchmark = "decode_bench";
-  contract.cache = "warm_repeated_buffers";
-  contract.correctness = "custom_vs_cublas_cudnn_diff_checked";
-  contract.notes = "decode GEMV/GEMM projection variants; no sleeps";
-  contract.warmup = warmup;
-  contract.iters = iters;
-  contract.samples = trials;
-  gemma4_bench_print_environment(contract.benchmark);
-  gemma4_bench_print_contract(contract);
 
   std::printf("selected=%s,iters=%d,warmup_iters=%d,trials=%d,dtype=bf16,base_seed=%llu\n\n",
               selected.c_str(), iters, warmup, trials,

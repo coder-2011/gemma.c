@@ -1007,18 +1007,6 @@ int main(int argc, char **argv) {
 
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    Gemma4BenchmarkContract contract;
-    contract.benchmark = "flash_attention_bench";
-    contract.cache = cache_mode.c_str();
-    contract.aggregation =
-        "median_mean_trimmed_mean_min_max_p95_p99_stddev_iqr_raw_samples";
-    contract.correctness = "flash_attention_checked_against_reference";
-    contract.notes = "cold mode flushes L2 before each measured invocation";
-    contract.warmup = warmup;
-    contract.iters = iters;
-    contract.samples = samples;
-    gemma4_bench_print_environment(contract.benchmark);
-    gemma4_bench_print_contract(contract);
     if (check_seq > 0) {
       run_correctness(batch_size, check_seq, window_size, stream);
     }
