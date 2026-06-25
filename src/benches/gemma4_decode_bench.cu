@@ -7,12 +7,10 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <random>
 #include <string>
 #include <vector>
 
@@ -45,52 +43,6 @@ static const DecodeOp kDecodeOps[] = {
      GEMMA4_VOCAB_SIZE, 1},
 };
 
-__device__ uint32_t gemma4_mix_u32_device(uint32_t x) {
-  x ^= x >> 16;
-  x *= 0x7feb352du;
-  x ^= x >> 15;
-  x *= 0x846ca68bu;
-  x ^= x >> 16;
-  return x;
-}
-
-__global__ void gemma4_fill_random_bf16_kernel(__nv_bfloat16 *ptr,
-                                               size_t count, uint64_t seed,
-                                               float scale) {
-  size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
-  if (i >= count) {
-    return;
-  }
-
-  uint32_t x = uint32_t(i) ^ uint32_t(i >> 32) ^ uint32_t(seed) ^
-               uint32_t(seed >> 32);
-  x = gemma4_mix_u32_device(x);
-  const float u = float(x >> 8) * (1.0f / 16777216.0f);
-  ptr[i] = __float2bfloat16_rn((u * 2.0f - 1.0f) * scale);
-}
-
-static uint64_t make_seed() {
-  if (const char *env = std::getenv("GEMMA4_DECODE_BENCH_SEED")) {
-    return std::strtoull(env, nullptr, 0);
-  }
-
-  std::random_device rd;
-  uint64_t seed = uint64_t(rd()) << 32;
-  seed ^= uint64_t(rd());
-  seed ^= uint64_t(std::chrono::high_resolution_clock::now()
-                       .time_since_epoch()
-                       .count());
-  return seed;
-}
-
-static void fill_random_bf16(__nv_bfloat16 *ptr, size_t count, uint64_t seed,
-                             float scale, cudaStream_t stream) {
-  const int threads = 256;
-  const int blocks = int((count + threads - 1) / threads);
-  gemma4_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(ptr, count, seed, scale);
-  CUDA_CHECK(cudaGetLastError());
-}
-
 struct CublasDecode {
   cublasHandle_t handle = nullptr;
 
@@ -101,9 +53,7 @@ struct CublasDecode {
   }
 
   ~CublasDecode() {
-    if (handle != nullptr) {
-      cublasDestroy(handle);
-    }
+    cublasDestroy(handle);
   }
 
   void gemv(const __nv_bfloat16 *x, const __nv_bfloat16 *w_col_major,
@@ -197,24 +147,12 @@ struct CudnnDecodeConv {
   }
 
   ~CudnnDecodeConv() {
-    if (workspace != nullptr) {
-      cudaFree(workspace);
-    }
-    if (y_desc != nullptr) {
-      cudnnDestroyTensorDescriptor(y_desc);
-    }
-    if (conv_desc != nullptr) {
-      cudnnDestroyConvolutionDescriptor(conv_desc);
-    }
-    if (w_desc != nullptr) {
-      cudnnDestroyFilterDescriptor(w_desc);
-    }
-    if (x_desc != nullptr) {
-      cudnnDestroyTensorDescriptor(x_desc);
-    }
-    if (handle != nullptr) {
-      cudnnDestroy(handle);
-    }
+    cudaFree(workspace);
+    cudnnDestroyTensorDescriptor(y_desc);
+    cudnnDestroyConvolutionDescriptor(conv_desc);
+    cudnnDestroyFilterDescriptor(w_desc);
+    cudnnDestroyTensorDescriptor(x_desc);
+    cudnnDestroy(handle);
   }
 
   void conv(const __nv_bfloat16 *x, const __nv_bfloat16 *w,
@@ -234,24 +172,17 @@ static bool should_run_op(const std::string &selected, const DecodeOp &op) {
 static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
                    cudaStream_t stream, CublasDecode &cublas,
                    uint64_t base_seed) {
-  __nv_bfloat16 *x = nullptr;
-  __nv_bfloat16 *w = nullptr;
-  __nv_bfloat16 *custom_y = nullptr;
-  __nv_bfloat16 *swizzled_y = nullptr;
-  __nv_bfloat16 *gemv_y = nullptr;
-  __nv_bfloat16 *gemm_y = nullptr;
-  __nv_bfloat16 *cudnn_y = nullptr;
   const size_t x_count = size_t(op.k);
   const size_t w_count = size_t(op.n) * size_t(op.k);
   const size_t y_count = size_t(op.n);
 
-  CUDA_CHECK(cudaMalloc(&x, x_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&w, w_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&custom_y, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&swizzled_y, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&gemv_y, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&gemm_y, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMalloc(&cudnn_y, y_count * sizeof(__nv_bfloat16)));
+  DeviceBuffer<__nv_bfloat16> x(x_count);
+  DeviceBuffer<__nv_bfloat16> w(w_count);
+  DeviceBuffer<__nv_bfloat16> custom_y(y_count);
+  DeviceBuffer<__nv_bfloat16> swizzled_y(y_count);
+  DeviceBuffer<__nv_bfloat16> gemv_y(y_count);
+  DeviceBuffer<__nv_bfloat16> gemm_y(y_count);
+  DeviceBuffer<__nv_bfloat16> cudnn_y(y_count);
 
   const uint64_t x_seed = base_seed ^ (uint64_t(op.k) << 32) ^ uint64_t(op.n);
   const uint64_t w_seed =
@@ -379,14 +310,6 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
               cudnn_max_abs, cudnn_mean_abs, cudnn_max_rel);
   std::printf("cudnn_bf16_conv1x1_algo=%d,cudnn_bf16_conv1x1_workspace_bytes=%zu\n\n",
               cudnn_algo, cudnn_workspace_bytes);
-
-  CUDA_CHECK(cudaFree(x));
-  CUDA_CHECK(cudaFree(w));
-  CUDA_CHECK(cudaFree(custom_y));
-  CUDA_CHECK(cudaFree(swizzled_y));
-  CUDA_CHECK(cudaFree(gemv_y));
-  CUDA_CHECK(cudaFree(gemm_y));
-  CUDA_CHECK(cudaFree(cudnn_y));
 }
 
 int main(int argc, char **argv) {
@@ -403,7 +326,7 @@ int main(int argc, char **argv) {
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   CublasDecode cublas(stream);
-  const uint64_t seed = make_seed();
+  const uint64_t seed = make_seed("GEMMA4_DECODE_BENCH_SEED");
   Gemma4BenchmarkContract contract;
   contract.benchmark = "decode_bench";
   contract.cache = "warm_repeated_buffers";

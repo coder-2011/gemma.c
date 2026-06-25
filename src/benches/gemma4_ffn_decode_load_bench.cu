@@ -6,112 +6,15 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <random>
 
 namespace {
 
 constexpr int kHidden = GEMMA4_HIDDEN_SIZE;
 constexpr int kIntermediate = GEMMA4_INTERMEDIATE_SIZE;
-
-__device__ uint32_t mix_u32(uint32_t x) {
-  x ^= x >> 16;
-  x *= 0x7feb352du;
-  x ^= x >> 15;
-  x *= 0x846ca68bu;
-  x ^= x >> 16;
-  return x;
-}
-
-__global__ void fill_random_bf16_kernel(__nv_bfloat16 *ptr,
-                                        size_t count,
-                                        uint64_t seed,
-                                        float scale) {
-  const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
-  if (i >= count) {
-    return;
-  }
-
-  uint32_t x = uint32_t(i) ^ uint32_t(i >> 32) ^ uint32_t(seed) ^
-               uint32_t(seed >> 32);
-  x = mix_u32(x);
-  const float u = float(x >> 8) * (1.0f / 16777216.0f);
-  ptr[i] = __float2bfloat16_rn((u * 2.0f - 1.0f) * scale);
-}
-
-__global__ void flush_cache_kernel(const uint32_t *__restrict__ in,
-                                   uint32_t *__restrict__ out,
-                                   size_t count) {
-  uint32_t acc = 0;
-  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
-       i += size_t(blockDim.x) * gridDim.x) {
-    acc ^= in[i] + uint32_t(i);
-  }
-  out[blockIdx.x * blockDim.x + threadIdx.x] = acc;
-}
-
-template <typename T>
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(size_t count) {
-    CUDA_CHECK(cudaMalloc(&ptr_, count * sizeof(T)));
-  }
-
-  ~DeviceBuffer() {
-    if (ptr_ != nullptr) {
-      cudaFree(ptr_);
-    }
-  }
-
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  operator T *() { return ptr_; }
-  operator const T *() const { return ptr_; }
-
- private:
-  T *ptr_ = nullptr;
-};
-
-void fill_random_bf16(__nv_bfloat16 *ptr,
-                      size_t count,
-                      uint64_t seed,
-                      float scale,
-                      cudaStream_t stream) {
-  constexpr int threads = 256;
-  const int blocks = int((count + threads - 1) / threads);
-  fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(
-      ptr, count, seed, scale);
-  CUDA_CHECK(cudaGetLastError());
-}
-
-void flush_cache(const uint32_t *in,
-                 uint32_t *out,
-                 size_t count,
-                 cudaStream_t stream) {
-  constexpr int threads = 256;
-  constexpr int blocks = 4096;
-  flush_cache_kernel<<<blocks, threads, 0, stream>>>(in, out, count);
-  CUDA_CHECK(cudaGetLastError());
-}
-
-uint64_t make_seed() {
-  if (const char *env = std::getenv("GEMMA4_FFN_LOAD_BENCH_SEED")) {
-    return std::strtoull(env, nullptr, 0);
-  }
-
-  std::random_device rd;
-  uint64_t seed = uint64_t(rd()) << 32;
-  seed ^= uint64_t(rd());
-  seed ^= uint64_t(std::chrono::high_resolution_clock::now()
-                       .time_since_epoch()
-                       .count());
-  return seed;
-}
 
 }  // namespace
 
@@ -128,7 +31,7 @@ int main(int argc, char **argv) {
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-  const uint64_t seed = make_seed();
+  const uint64_t seed = make_seed("GEMMA4_FFN_LOAD_BENCH_SEED");
   const size_t x_elems = kHidden;
   const size_t gate_up_elems =
       static_cast<size_t>(kHidden) * GEMMA4_PACKED_FFN_SIZE;
@@ -154,8 +57,6 @@ int main(int argc, char **argv) {
   CUDA_CHECK(gemma4_ffn_decode_swizzle_weights_bf16(
       d_gate_up, d_gate_up_src, d_down, d_down_src, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
-  CUDA_CHECK(gemma4_ffn_decode_configure_scratch_l2(d_scratch, stream));
-
   int device = 0;
   cudaDeviceProp prop{};
   CUDA_CHECK(cudaGetDevice(&device));

@@ -62,10 +62,6 @@ int main(int argc, char **argv) {
   gemma4_bench_print_environment(contract.benchmark);
   gemma4_bench_print_contract(contract);
 
-  __nv_bfloat16 *d_embeddings = nullptr;
-  __nv_bfloat16 *d_out = nullptr;
-  int32_t *d_token_ids = nullptr;
-
   const int hidden_size = GEMMA4_HIDDEN_SIZE;
   const int vocab_size = GEMMA4_VOCAB_SIZE;
 
@@ -74,9 +70,9 @@ int main(int argc, char **argv) {
   const size_t out_elems = static_cast<size_t>(max_tokens) * hidden_size;
   const size_t out_bytes = out_elems * sizeof(__nv_bfloat16);
 
-  CUDA_CHECK(cudaMalloc(&d_embeddings, embedding_bytes));
-  CUDA_CHECK(cudaMalloc(&d_out, out_bytes));
-  CUDA_CHECK(cudaMalloc(&d_token_ids, static_cast<size_t>(max_tokens) * sizeof(int32_t)));
+  DeviceBuffer<__nv_bfloat16> d_embeddings(embedding_elems);
+  DeviceBuffer<__nv_bfloat16> d_out(out_elems);
+  DeviceBuffer<int32_t> d_token_ids(max_tokens);
   CUDA_CHECK(cudaMemsetAsync(d_embeddings, 0, embedding_bytes, stream));
   CUDA_CHECK(cudaMemsetAsync(d_out, 0, out_bytes, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -124,9 +120,6 @@ int main(int argc, char **argv) {
                 moved_mib);
   }
 
-  CUDA_CHECK(cudaFree(d_embeddings));
-  CUDA_CHECK(cudaFree(d_out));
-  CUDA_CHECK(cudaFree(d_token_ids));
   CUDA_CHECK(cudaStreamDestroy(stream));
   return 0;
 }

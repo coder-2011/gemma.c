@@ -480,9 +480,10 @@ int main(int argc, char **argv) {
     at::Tensor torch_new_v =
         at::randn({1, torch_kv_heads, 1, torch_head_dim}, torch_options);
     at::Tensor torch_out;
-    uint32_t *d_torch_l2_scratch = nullptr;
+    DeviceBuffer<uint8_t> d_torch_l2_scratch_bytes(flush_bytes);
+    uint32_t *d_torch_l2_scratch =
+        reinterpret_cast<uint32_t *>(d_torch_l2_scratch_bytes.get());
     if (flush_bytes > 0) {
-      CUDA_CHECK(cudaMalloc(&d_torch_l2_scratch, flush_bytes));
       CUDA_CHECK(cudaMemsetAsync(d_torch_l2_scratch, 0, flush_bytes,
                                  torch_stream.stream()));
     }
@@ -499,13 +500,12 @@ int main(int argc, char **argv) {
 
     torch_attention_only();
     CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
-    float torch_checksum = torch_out.to(at::kFloat).sum().item<float>();
     std::printf(
         "benchmark_libtorch torch_version=%s dtype=bf16 "
         "layout=\"q=[1,Hq,1,D],k/v=[1,Hkv,S,D]\" seq_len=%d q_heads=%d "
-        "kv_heads=%d head_dim=%d scale=%.9f checksum=%.6f\n",
+        "kv_heads=%d head_dim=%d scale=%.9f\n",
         TORCH_VERSION, seq_len, torch_q_heads, torch_kv_heads, torch_head_dim,
-        torch_scale, torch_checksum);
+        torch_scale);
     print_stats("torch_attention_only",
                 time_cuda_samples(torch_attention_only, torch_stream.stream(),
                                   warmup, iters, samples, cold_cache,
@@ -531,18 +531,15 @@ int main(int argc, char **argv) {
     };
     torch_sliding_decode();
     CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
-    const float sliding_checksum = torch_out.to(at::kFloat).sum().item<float>();
     std::printf(
         "benchmark_libtorch_sliding seq_len=%d key_count=%d q_heads=%d "
-        "kv_heads=%d head_dim=%d checksum=%.6f\n",
-        seq_len, key_count, q_heads, config.num_heads, config.head_dim,
-        sliding_checksum);
+        "kv_heads=%d head_dim=%d\n",
+        seq_len, key_count, q_heads, config.num_heads, config.head_dim);
     print_stats("torch_sliding_decode_attention",
                 time_cuda_samples(torch_sliding_decode, torch_stream.stream(),
                                   warmup, iters, samples, cold_cache,
                                   d_torch_l2_scratch,
                                   flush_bytes / sizeof(uint32_t)));
-    if (d_torch_l2_scratch != nullptr) CUDA_CHECK(cudaFree(d_torch_l2_scratch));
   }
 
   cudaStream_t stream = nullptr;
@@ -571,25 +568,6 @@ int main(int argc, char **argv) {
     h_q[i] = make_value(2000003 + i);
   }
 
-  __nv_bfloat16 *d_cache_k = nullptr;
-  __nv_bfloat16 *d_cache_v = nullptr;
-  __nv_bfloat16 *d_k = nullptr;
-  __nv_bfloat16 *d_v = nullptr;
-  __nv_bfloat16 *d_one_k = nullptr;
-  __nv_bfloat16 *d_one_v = nullptr;
-  __nv_bfloat16 *d_q = nullptr;
-  __nv_bfloat16 *d_out = nullptr;
-  int32_t *d_page_table = nullptr;
-  int32_t *d_seq_lengths = nullptr;
-  int32_t *d_token_batch = nullptr;
-  int32_t *d_token_position = nullptr;
-  int32_t *d_one_batch = nullptr;
-  int32_t *d_one_position = nullptr;
-  int32_t *d_work_scratch = nullptr;
-  float *d_partial_m = nullptr;
-  float *d_partial_l = nullptr;
-  float *d_partial_acc = nullptr;
-  uint32_t *d_l2_scratch = nullptr;
   const size_t work_scratch_i32_size =
       gemma4_flash_attention_sliding_decode_persistent_scratch_i32(
           batch_size, num_splits);
@@ -601,51 +579,50 @@ int main(int argc, char **argv) {
 
   // Partial scratch is allocated for `num_splits`, including any extra empty
   // splits requested by --extra-splits.
-  CUDA_CHECK(cudaMalloc(&d_cache_k, cache_elements(config) * sizeof(*d_cache_k)));
-  CUDA_CHECK(cudaMalloc(&d_cache_v, cache_elements(config) * sizeof(*d_cache_v)));
-  CUDA_CHECK(cudaMalloc(&d_k, h_k.size() * sizeof(*d_k)));
-  CUDA_CHECK(cudaMalloc(&d_v, h_v.size() * sizeof(*d_v)));
-  CUDA_CHECK(cudaMalloc(&d_one_k,
-                        config.num_heads * config.head_dim * sizeof(*d_one_k)));
-  CUDA_CHECK(cudaMalloc(&d_one_v,
-                        config.num_heads * config.head_dim * sizeof(*d_one_v)));
-  CUDA_CHECK(cudaMalloc(&d_q, h_q.size() * sizeof(*d_q)));
-  CUDA_CHECK(cudaMalloc(&d_out, h_q.size() * sizeof(*d_out)));
-  CUDA_CHECK(cudaMalloc(&d_page_table, page_table.size() * sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_seq_lengths, sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_token_batch, token_batch.size() * sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_token_position,
-                        token_position.size() * sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_one_batch, sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_one_position, sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_work_scratch,
-                        work_scratch_i32_size * sizeof(int32_t)));
-  CUDA_CHECK(cudaMalloc(&d_partial_m, partial_m_elements * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_partial_l, partial_m_elements * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_partial_acc,
-                        partial_acc_elements * sizeof(float)));
+  DeviceBuffer<__nv_bfloat16> d_cache_k(
+      static_cast<size_t>(cache_elements(config)));
+  DeviceBuffer<__nv_bfloat16> d_cache_v(
+      static_cast<size_t>(cache_elements(config)));
+  DeviceBuffer<__nv_bfloat16> d_k(h_k.size());
+  DeviceBuffer<__nv_bfloat16> d_v(h_v.size());
+  DeviceBuffer<__nv_bfloat16> d_one_k(config.num_heads * config.head_dim);
+  DeviceBuffer<__nv_bfloat16> d_one_v(config.num_heads * config.head_dim);
+  DeviceBuffer<__nv_bfloat16> d_q(h_q.size());
+  DeviceBuffer<__nv_bfloat16> d_out(h_q.size());
+  DeviceBuffer<int32_t> d_page_table(page_table.size());
+  DeviceBuffer<int32_t> d_seq_lengths(seq_lengths.size());
+  DeviceBuffer<int32_t> d_token_batch(token_batch.size());
+  DeviceBuffer<int32_t> d_token_position(token_position.size());
+  DeviceBuffer<int32_t> d_one_batch(one_batch.size());
+  DeviceBuffer<int32_t> d_one_position(one_position.size());
+  DeviceBuffer<int32_t> d_work_scratch(work_scratch_i32_size);
+  DeviceBuffer<float> d_partial_m(partial_m_elements);
+  DeviceBuffer<float> d_partial_l(partial_m_elements);
+  DeviceBuffer<float> d_partial_acc(partial_acc_elements);
+  DeviceBuffer<uint8_t> d_l2_scratch_bytes(flush_bytes);
+  uint32_t *d_l2_scratch =
+      reinterpret_cast<uint32_t *>(d_l2_scratch_bytes.get());
   if (flush_bytes > 0) {
-    CUDA_CHECK(cudaMalloc(&d_l2_scratch, flush_bytes));
     CUDA_CHECK(cudaMemsetAsync(d_l2_scratch, 0, flush_bytes, stream));
   }
 
-  CUDA_CHECK(cudaMemcpyAsync(d_k, h_k.data(), h_k.size() * sizeof(*d_k),
+  CUDA_CHECK(cudaMemcpyAsync(d_k, h_k.data(), h_k.size() * sizeof(h_k[0]),
                              cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_v, h_v.data(), h_v.size() * sizeof(*d_v),
+  CUDA_CHECK(cudaMemcpyAsync(d_v, h_v.data(), h_v.size() * sizeof(h_v[0]),
                              cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(d_one_k,
                              h_k.data() + (seq_len - 1) * config.num_heads *
                                               config.head_dim,
                              config.num_heads * config.head_dim *
-                                 sizeof(*d_one_k),
+                                 sizeof(h_k[0]),
                              cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(d_one_v,
                              h_v.data() + (seq_len - 1) * config.num_heads *
                                               config.head_dim,
                              config.num_heads * config.head_dim *
-                                 sizeof(*d_one_v),
+                                 sizeof(h_v[0]),
                              cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_q, h_q.data(), h_q.size() * sizeof(*d_q),
+  CUDA_CHECK(cudaMemcpyAsync(d_q, h_q.data(), h_q.size() * sizeof(h_q[0]),
                              cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(d_page_table, page_table.data(),
                              page_table.size() * sizeof(int32_t),
@@ -780,49 +757,32 @@ int main(int argc, char **argv) {
       global_h_q[i] = make_value(5000003 + i);
     }
 
-    __nv_bfloat16 *d_global_cache_k = nullptr;
-    __nv_bfloat16 *d_global_cache_v = nullptr;
-    __nv_bfloat16 *d_global_k = nullptr;
-    __nv_bfloat16 *d_global_v = nullptr;
-    __nv_bfloat16 *d_global_q = nullptr;
-    __nv_bfloat16 *d_global_out = nullptr;
-    int32_t *d_global_page_table = nullptr;
-    float *d_global_partial_m = nullptr;
-    float *d_global_partial_l = nullptr;
-    float *d_global_partial_acc = nullptr;
     const size_t global_partial_m_elements =
         static_cast<size_t>(batch_size) * q_heads * global_splits;
     const size_t global_partial_acc_elements =
         global_partial_m_elements * global_config.head_dim;
 
-    CUDA_CHECK(cudaMalloc(&d_global_cache_k,
-                          cache_elements(global_config) *
-                              sizeof(*d_global_cache_k)));
-    CUDA_CHECK(cudaMalloc(&d_global_cache_v,
-                          cache_elements(global_config) *
-                              sizeof(*d_global_cache_v)));
-    CUDA_CHECK(cudaMalloc(&d_global_k, global_h_k.size() * sizeof(*d_global_k)));
-    CUDA_CHECK(cudaMalloc(&d_global_v, global_h_v.size() * sizeof(*d_global_v)));
-    CUDA_CHECK(cudaMalloc(&d_global_q, global_h_q.size() * sizeof(*d_global_q)));
-    CUDA_CHECK(cudaMalloc(&d_global_out,
-                          global_h_q.size() * sizeof(*d_global_out)));
-    CUDA_CHECK(cudaMalloc(&d_global_page_table,
-                          global_page_table.size() * sizeof(int32_t)));
-    CUDA_CHECK(cudaMalloc(&d_global_partial_m,
-                          global_partial_m_elements * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_global_partial_l,
-                          global_partial_m_elements * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_global_partial_acc,
-                          global_partial_acc_elements * sizeof(float)));
+    DeviceBuffer<__nv_bfloat16> d_global_cache_k(
+        static_cast<size_t>(cache_elements(global_config)));
+    DeviceBuffer<__nv_bfloat16> d_global_cache_v(
+        static_cast<size_t>(cache_elements(global_config)));
+    DeviceBuffer<__nv_bfloat16> d_global_k(global_h_k.size());
+    DeviceBuffer<__nv_bfloat16> d_global_v(global_h_v.size());
+    DeviceBuffer<__nv_bfloat16> d_global_q(global_h_q.size());
+    DeviceBuffer<__nv_bfloat16> d_global_out(global_h_q.size());
+    DeviceBuffer<int32_t> d_global_page_table(global_page_table.size());
+    DeviceBuffer<float> d_global_partial_m(global_partial_m_elements);
+    DeviceBuffer<float> d_global_partial_l(global_partial_m_elements);
+    DeviceBuffer<float> d_global_partial_acc(global_partial_acc_elements);
 
     CUDA_CHECK(cudaMemcpyAsync(d_global_k, global_h_k.data(),
-                               global_h_k.size() * sizeof(*d_global_k),
+                               global_h_k.size() * sizeof(global_h_k[0]),
                                cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_global_v, global_h_v.data(),
-                               global_h_v.size() * sizeof(*d_global_v),
+                               global_h_v.size() * sizeof(global_h_v[0]),
                                cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_global_q, global_h_q.data(),
-                               global_h_q.size() * sizeof(*d_global_q),
+                               global_h_q.size() * sizeof(global_h_q[0]),
                                cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_global_page_table, global_page_table.data(),
                                global_page_table.size() * sizeof(int32_t),
@@ -862,38 +822,8 @@ int main(int argc, char **argv) {
                 time_cuda_samples(global_decode_attention, stream, warmup,
                                   iters, samples, cold_cache, d_l2_scratch,
                                   flush_bytes / sizeof(uint32_t)));
-
-    CUDA_CHECK(cudaFree(d_global_partial_acc));
-    CUDA_CHECK(cudaFree(d_global_partial_l));
-    CUDA_CHECK(cudaFree(d_global_partial_m));
-    CUDA_CHECK(cudaFree(d_global_page_table));
-    CUDA_CHECK(cudaFree(d_global_out));
-    CUDA_CHECK(cudaFree(d_global_q));
-    CUDA_CHECK(cudaFree(d_global_v));
-    CUDA_CHECK(cudaFree(d_global_k));
-    CUDA_CHECK(cudaFree(d_global_cache_v));
-    CUDA_CHECK(cudaFree(d_global_cache_k));
   }
 
-  CUDA_CHECK(cudaFree(d_cache_k));
-  CUDA_CHECK(cudaFree(d_cache_v));
-  CUDA_CHECK(cudaFree(d_k));
-  CUDA_CHECK(cudaFree(d_v));
-  CUDA_CHECK(cudaFree(d_one_k));
-  CUDA_CHECK(cudaFree(d_one_v));
-  CUDA_CHECK(cudaFree(d_q));
-  CUDA_CHECK(cudaFree(d_out));
-  CUDA_CHECK(cudaFree(d_page_table));
-  CUDA_CHECK(cudaFree(d_seq_lengths));
-  CUDA_CHECK(cudaFree(d_token_batch));
-  CUDA_CHECK(cudaFree(d_token_position));
-  CUDA_CHECK(cudaFree(d_one_batch));
-  CUDA_CHECK(cudaFree(d_one_position));
-  CUDA_CHECK(cudaFree(d_work_scratch));
-  CUDA_CHECK(cudaFree(d_partial_m));
-  CUDA_CHECK(cudaFree(d_partial_l));
-  CUDA_CHECK(cudaFree(d_partial_acc));
-  if (d_l2_scratch != nullptr) CUDA_CHECK(cudaFree(d_l2_scratch));
   CUDA_CHECK(cudaStreamDestroy(stream));
   return 0;
 }

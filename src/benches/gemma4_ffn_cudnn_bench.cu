@@ -13,123 +13,16 @@
 #endif
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace {
-
-constexpr int kHidden = GEMMA4_HIDDEN_SIZE;
-constexpr int kIntermediate = GEMMA4_INTERMEDIATE_SIZE;
-
-__device__ uint32_t mix_u32(uint32_t x) {
-  x ^= x >> 16;
-  x *= 0x7feb352du;
-  x ^= x >> 15;
-  x *= 0x846ca68bu;
-  x ^= x >> 16;
-  return x;
-}
-
-__global__ void fill_random_bf16_kernel(__nv_bfloat16 *ptr,
-                                        size_t count,
-                                        uint64_t seed,
-                                        float scale) {
-  const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
-  if (i >= count) {
-    return;
-  }
-
-  uint32_t x = uint32_t(i) ^ uint32_t(i >> 32) ^ uint32_t(seed) ^
-               uint32_t(seed >> 32);
-  x = mix_u32(x);
-  const float u = float(x >> 8) * (1.0f / 16777216.0f);
-  ptr[i] = __float2bfloat16_rn((u * 2.0f - 1.0f) * scale);
-}
-
-void fill_random_bf16(__nv_bfloat16 *ptr,
-                      size_t count,
-                      uint64_t seed,
-                      float scale,
-                      cudaStream_t stream) {
-  constexpr int threads = 256;
-  const int blocks = int((count + threads - 1) / threads);
-  fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(
-      ptr, count, seed, scale);
-  CUDA_CHECK(cudaGetLastError());
-}
-
-__global__ void flush_cache_kernel(const uint32_t *__restrict__ in,
-                                   uint32_t *__restrict__ out,
-                                   size_t count) {
-  uint32_t acc = 0;
-  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
-       i += size_t(blockDim.x) * gridDim.x) {
-    acc ^= in[i] + uint32_t(i);
-  }
-  if ((blockIdx.x * blockDim.x + threadIdx.x) < gridDim.x * blockDim.x) {
-    out[blockIdx.x * blockDim.x + threadIdx.x] = acc;
-  }
-}
-
-void flush_cache(const uint32_t *in,
-                 uint32_t *out,
-                 size_t count,
-                 cudaStream_t stream) {
-  constexpr int threads = 256;
-  constexpr int blocks = 4096;
-  flush_cache_kernel<<<blocks, threads, 0, stream>>>(in, out, count);
-  CUDA_CHECK(cudaGetLastError());
-}
-
-uint64_t make_seed() {
-  if (const char *env = std::getenv("GEMMA4_FFN_CUDNN_BENCH_SEED")) {
-    return std::strtoull(env, nullptr, 0);
-  }
-
-  std::random_device rd;
-  uint64_t seed = uint64_t(rd()) << 32;
-  seed ^= uint64_t(rd());
-  seed ^= uint64_t(std::chrono::high_resolution_clock::now()
-                       .time_since_epoch()
-                       .count());
-  return seed;
-}
-
-template <typename T>
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(size_t count) {
-    CUDA_CHECK(cudaMalloc(&ptr_, count * sizeof(T)));
-  }
-
-  ~DeviceBuffer() {
-    if (ptr_ != nullptr) {
-      cudaFree(ptr_);
-    }
-  }
-
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  operator T *() { return ptr_; }
-  operator const T *() const { return ptr_; }
-
- private:
-  T *ptr_ = nullptr;
-};
-
-double gib_per_second(double bytes, float ms) {
-  const double gib = bytes / (1024.0 * 1024.0 * 1024.0);
-  return gib / (static_cast<double>(ms) / 1000.0);
-}
 
 template <typename Fn>
 TimingStats time_ms_cold(Fn &&fn,
@@ -151,32 +44,22 @@ TimingStats time_ms_cold(Fn &&fn,
 
 namespace fe = cudnn_frontend;
 
-void check_cudnn(cudnnStatus_t status, const char *expr) {
-  if (status != CUDNN_STATUS_SUCCESS) {
-    throw std::runtime_error(std::string("cuDNN error for ") + expr + ": " +
-                             cudnnGetErrorString(status));
-  }
-}
-
-void check_fe(cudnn_frontend::error_t status, const char *expr) {
-  if (status.is_bad()) {
-    throw std::runtime_error(std::string("cuDNN frontend error for ") + expr +
-                             ": " + status.get_message());
-  }
-}
-
 struct CudnnHandle {
   cudnnHandle_t handle = nullptr;
 
   explicit CudnnHandle(cudaStream_t stream) {
-    check_cudnn(cudnnCreate(&handle), "cudnnCreate");
-    check_cudnn(cudnnSetStream(handle, stream), "cudnnSetStream");
+    cudnnStatus_t status = cudnnCreate(&handle);
+    if (status != CUDNN_STATUS_SUCCESS) {
+      throw std::runtime_error(cudnnGetErrorString(status));
+    }
+    status = cudnnSetStream(handle, stream);
+    if (status != CUDNN_STATUS_SUCCESS) {
+      throw std::runtime_error(cudnnGetErrorString(status));
+    }
   }
 
   ~CudnnHandle() {
-    if (handle != nullptr) {
-      cudnnDestroy(handle);
-    }
+    cudnnDestroy(handle);
   }
 
   CudnnHandle(const CudnnHandle &) = delete;
@@ -195,24 +78,16 @@ struct CudnnGraphBase {
   }
 
   ~CudnnGraphBase() {
-    if (workspace != nullptr) {
-      cudaFree(workspace);
-    }
+    cudaFree(workspace);
   }
 
-  void build(const char *name) {
-    check_fe(graph.validate(), (std::string(name) + ".validate").c_str());
-    check_fe(graph.build_operation_graph(cudnn.handle),
-             (std::string(name) + ".build_operation_graph").c_str());
-    check_fe(graph.create_execution_plans(
-                 {fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK}),
-             (std::string(name) + ".create_execution_plans").c_str());
-    check_fe(graph.check_support(),
-             (std::string(name) + ".check_support").c_str());
-    check_fe(graph.build_plans(),
-             (std::string(name) + ".build_plans").c_str());
-    check_fe(graph.get_workspace_size(workspace_size),
-             (std::string(name) + ".get_workspace_size").c_str());
+  void build(const char *) {
+    graph.validate();
+    graph.build_operation_graph(cudnn.handle);
+    graph.create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::FALLBACK});
+    graph.check_support();
+    graph.build_plans();
+    graph.get_workspace_size(workspace_size);
     if (workspace_size > 0) {
       CUDA_CHECK(cudaMalloc(&workspace, static_cast<size_t>(workspace_size)));
     }
@@ -252,12 +127,12 @@ struct CudnnGeGlu : public CudnnGraphBase {
   std::shared_ptr<fe::graph::Tensor_attributes> act;
 
   CudnnGeGlu(int tokens, cudaStream_t stream) : CudnnGraphBase(stream) {
-    x = make_bf16_tensor(graph, "x", {1, tokens, kHidden},
-                         {tokens * kHidden, kHidden, 1});
-    w_gate = make_bf16_tensor(graph, "w_gate", {1, kHidden, kIntermediate},
-                              {kHidden * kIntermediate, kIntermediate, 1});
-    w_up = make_bf16_tensor(graph, "w_up", {1, kHidden, kIntermediate},
-                            {kHidden * kIntermediate, kIntermediate, 1});
+    x = make_bf16_tensor(graph, "x", {1, tokens, GEMMA4_HIDDEN_SIZE},
+                         {tokens * GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, 1});
+    w_gate = make_bf16_tensor(graph, "w_gate", {1, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE},
+                              {GEMMA4_HIDDEN_SIZE * GEMMA4_INTERMEDIATE_SIZE, GEMMA4_INTERMEDIATE_SIZE, 1});
+    w_up = make_bf16_tensor(graph, "w_up", {1, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE},
+                            {GEMMA4_HIDDEN_SIZE * GEMMA4_INTERMEDIATE_SIZE, GEMMA4_INTERMEDIATE_SIZE, 1});
 
     auto gate = graph.matmul(x, w_gate, matmul_attrs("gate_matmul"));
     gate->set_data_type(fe::DataType_t::BFLOAT16);
@@ -282,8 +157,8 @@ struct CudnnGeGlu : public CudnnGraphBase {
                         {w_gate, const_cast<__nv_bfloat16 *>(w_gate_ptr)},
                         {w_up, const_cast<__nv_bfloat16 *>(w_up_ptr)},
                         {act, act_ptr}};
-    check_fe(graph.execute(cudnn.handle, variant_pack, workspace),
-             "geglu.execute");
+    auto status = graph.execute(cudnn.handle, variant_pack, workspace);
+    if (status.is_bad()) throw std::runtime_error(status.get_message());
   }
 };
 
@@ -293,10 +168,10 @@ struct CudnnDown : public CudnnGraphBase {
   std::shared_ptr<fe::graph::Tensor_attributes> out;
 
   CudnnDown(int tokens, cudaStream_t stream) : CudnnGraphBase(stream) {
-    act = make_bf16_tensor(graph, "act", {1, tokens, kIntermediate},
-                           {tokens * kIntermediate, kIntermediate, 1});
-    w_down = make_bf16_tensor(graph, "w_down", {1, kIntermediate, kHidden},
-                              {kIntermediate * kHidden, kHidden, 1});
+    act = make_bf16_tensor(graph, "act", {1, tokens, GEMMA4_INTERMEDIATE_SIZE},
+                           {tokens * GEMMA4_INTERMEDIATE_SIZE, GEMMA4_INTERMEDIATE_SIZE, 1});
+    w_down = make_bf16_tensor(graph, "w_down", {1, GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE},
+                              {GEMMA4_INTERMEDIATE_SIZE * GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, 1});
     out = graph.matmul(act, w_down, matmul_attrs("down_matmul"));
     out->set_output(true).set_data_type(fe::DataType_t::BFLOAT16);
 
@@ -310,8 +185,8 @@ struct CudnnDown : public CudnnGraphBase {
         variant_pack = {{act, const_cast<__nv_bfloat16 *>(act_ptr)},
                         {w_down, const_cast<__nv_bfloat16 *>(w_down_ptr)},
                         {out, out_ptr}};
-    check_fe(graph.execute(cudnn.handle, variant_pack, workspace),
-             "down.execute");
+    auto status = graph.execute(cudnn.handle, variant_pack, workspace);
+    if (status.is_bad()) throw std::runtime_error(status.get_message());
   }
 };
 
@@ -323,14 +198,14 @@ struct CudnnFullFfn : public CudnnGraphBase {
   std::shared_ptr<fe::graph::Tensor_attributes> out;
 
   CudnnFullFfn(int tokens, cudaStream_t stream) : CudnnGraphBase(stream) {
-    x = make_bf16_tensor(graph, "x", {1, tokens, kHidden},
-                         {tokens * kHidden, kHidden, 1});
-    w_gate = make_bf16_tensor(graph, "w_gate", {1, kHidden, kIntermediate},
-                              {kHidden * kIntermediate, kIntermediate, 1});
-    w_up = make_bf16_tensor(graph, "w_up", {1, kHidden, kIntermediate},
-                            {kHidden * kIntermediate, kIntermediate, 1});
-    w_down = make_bf16_tensor(graph, "w_down", {1, kIntermediate, kHidden},
-                              {kIntermediate * kHidden, kHidden, 1});
+    x = make_bf16_tensor(graph, "x", {1, tokens, GEMMA4_HIDDEN_SIZE},
+                         {tokens * GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, 1});
+    w_gate = make_bf16_tensor(graph, "w_gate", {1, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE},
+                              {GEMMA4_HIDDEN_SIZE * GEMMA4_INTERMEDIATE_SIZE, GEMMA4_INTERMEDIATE_SIZE, 1});
+    w_up = make_bf16_tensor(graph, "w_up", {1, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE},
+                            {GEMMA4_HIDDEN_SIZE * GEMMA4_INTERMEDIATE_SIZE, GEMMA4_INTERMEDIATE_SIZE, 1});
+    w_down = make_bf16_tensor(graph, "w_down", {1, GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE},
+                              {GEMMA4_INTERMEDIATE_SIZE * GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, 1});
 
     auto gate = graph.matmul(x, w_gate, matmul_attrs("gate_matmul"));
     gate->set_data_type(fe::DataType_t::BFLOAT16);
@@ -359,8 +234,8 @@ struct CudnnFullFfn : public CudnnGraphBase {
                         {w_up, const_cast<__nv_bfloat16 *>(w_up_ptr)},
                         {w_down, const_cast<__nv_bfloat16 *>(w_down_ptr)},
                         {out, out_ptr}};
-    check_fe(graph.execute(cudnn.handle, variant_pack, workspace),
-             "full_ffn.execute");
+    auto status = graph.execute(cudnn.handle, variant_pack, workspace);
+    if (status.is_bad()) throw std::runtime_error(status.get_message());
   }
 };
 
@@ -398,13 +273,16 @@ int main(int argc, char **argv) {
   gemma4_bench_print_environment(contract.benchmark);
   gemma4_bench_print_contract(contract);
 
-  const uint64_t seed = make_seed();
-  const size_t x_elems = static_cast<size_t>(tokens) * kHidden;
-  const size_t act_elems = static_cast<size_t>(tokens) * kIntermediate;
-  const size_t gate_weight_elems = static_cast<size_t>(kHidden) * kIntermediate;
-  const size_t up_weight_elems = static_cast<size_t>(kHidden) * kIntermediate;
+  const uint64_t seed = make_seed("GEMMA4_FFN_CUDNN_BENCH_SEED");
+  const size_t x_elems = static_cast<size_t>(tokens) * GEMMA4_HIDDEN_SIZE;
+  const size_t act_elems =
+      static_cast<size_t>(tokens) * GEMMA4_INTERMEDIATE_SIZE;
+  const size_t gate_weight_elems =
+      static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * GEMMA4_INTERMEDIATE_SIZE;
+  const size_t up_weight_elems =
+      static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * GEMMA4_INTERMEDIATE_SIZE;
   const size_t down_weight_elems =
-      static_cast<size_t>(kIntermediate) * kHidden;
+      static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) * GEMMA4_HIDDEN_SIZE;
 
   DeviceBuffer<__nv_bfloat16> d_x(x_elems);
   DeviceBuffer<__nv_bfloat16> d_w_gate(gate_weight_elems);
@@ -416,9 +294,12 @@ int main(int argc, char **argv) {
   DeviceBuffer<__nv_bfloat16> d_w_down(down_weight_elems);
   DeviceBuffer<__nv_bfloat16> d_w_down_swizzled(down_weight_elems);
   DeviceBuffer<__nv_bfloat16> d_residual(x_elems);
-  DeviceBuffer<__nv_bfloat16> d_rms_weight(kHidden);
+  DeviceBuffer<__nv_bfloat16> d_rms_weight(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_act(act_elems);
   DeviceBuffer<__nv_bfloat16> d_out(x_elems);
+  DeviceBuffer<__nv_bfloat16> d_prefill_out(x_elems);
+  DeviceBuffer<__nv_bfloat16> d_prefill_scratch(
+      gemma4_ffn_prefill_scratch_elements(tokens));
   DeviceBuffer<__nv_bfloat16> d_full_out(x_elems);
   DeviceBuffer<__nv_bfloat16> d_custom_residual_out(x_elems);
   DeviceBuffer<__nv_bfloat16> d_custom_normed_out(x_elems);
@@ -432,13 +313,11 @@ int main(int argc, char **argv) {
                    0.01f, stream);
   fill_random_bf16(d_w_down, down_weight_elems, seed ^ 0x4004u, 0.01f, stream);
   fill_random_bf16(d_residual, x_elems, seed ^ 0x6006u, 0.05f, stream);
-  fill_random_bf16(d_rms_weight, kHidden, seed ^ 0x7007u, 1.0f, stream);
+  fill_random_bf16(d_rms_weight, GEMMA4_HIDDEN_SIZE, seed ^ 0x7007u, 1.0f, stream);
   CUDA_CHECK(gemma4_ffn_decode_swizzle_weights_bf16(
       d_w_gate_up_col_major, d_w_gate_up_col_major_src, d_w_down_swizzled,
       d_w_down, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
-  CUDA_CHECK(gemma4_ffn_decode_configure_scratch_l2(d_custom_scratch, stream));
-
   int device = 0;
   cudaDeviceProp prop{};
   CUDA_CHECK(cudaGetDevice(&device));
@@ -465,27 +344,41 @@ int main(int argc, char **argv) {
       double(x_elems) * sizeof(__nv_bfloat16);
   const double split_bytes = geglu_bytes + down_bytes;
   const double custom_bytes =
-      split_bytes + double(x_elems + kHidden + 2 * x_elems) *
+      split_bytes + double(x_elems + GEMMA4_HIDDEN_SIZE + 2 * x_elems) *
                         sizeof(__nv_bfloat16);
 
   std::printf("device=%s\n", prop.name);
   std::printf("shape=tokens%d,hidden%d,intermediate%d,seed=0x%llx\n",
-              tokens, kHidden, kIntermediate,
+              tokens, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE,
               static_cast<unsigned long long>(seed));
   std::printf("iters=%d,warmup_iters=%d,trials=%d\n", iters, warmup, trials);
   std::printf("cache_flush_bytes=%zu\n", flush_bytes);
-  std::printf("cudnn_frontend=%s\n",
+
+  Gemma4FfnPrefillScratch prefill_scratch = gemma4_ffn_prefill_scratch_from_buffer(d_prefill_scratch, tokens);
+  auto run_custom_prefill_mlp = [&]() {
+    CUDA_CHECK(gemma4_ffn_prefill_mlp_bf16(
+        d_prefill_out, d_x, d_w_gate_up_col_major, d_w_down_swizzled,
+        prefill_scratch, tokens, stream));
+  };
+  run_custom_prefill_mlp();
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  const TimingStats custom_prefill_mlp_stats =
+      time_ms(run_custom_prefill_mlp, stream, warmup, iters, trials);
 #if GEMMA4_HAS_CUDNN_FRONTEND
-              "compiled"
-#else
-              "not_compiled"
+  TimingStats custom_prefill_mlp_graph_stats{-1.0f, -1.0f};
+  try {
+    custom_prefill_mlp_graph_stats = time_ms_graph(
+        run_custom_prefill_mlp, stream, warmup, iters, trials);
+  } catch (const std::exception &e) {
+    std::fprintf(stderr,
+                 "custom prefill MLP CUDA graph timing unavailable: %s\n",
+                 e.what());
+  }
 #endif
-  );
 
 #if !GEMMA4_HAS_CUDNN_FRONTEND
-  std::fprintf(stderr,
-               "cuDNN Frontend headers were not found at compile time; "
-               "skipping cuDNN FFN comparison\n");
+  std::fprintf(stderr, "cuDNN Frontend headers were not found at compile time\n");
   CUDA_CHECK(cudaStreamDestroy(stream));
   return 0;
 #else
@@ -518,6 +411,7 @@ int main(int argc, char **argv) {
 
     run_split();
     run_custom();
+    run_custom_prefill_mlp();
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const TimingStats geglu_stats =
@@ -644,6 +538,14 @@ int main(int argc, char **argv) {
                 custom_stats.best_ms, custom_stats.avg_ms,
                 custom_graph_stats.best_ms, custom_graph_stats.avg_ms,
                 gib_per_second(custom_bytes, custom_stats.best_ms));
+    std::printf("custom_prefill_mlp,%.6f,%.6f,%.6f,%.6f,%.3f,0,\n",
+                custom_prefill_mlp_stats.best_ms,
+                custom_prefill_mlp_stats.avg_ms,
+                custom_prefill_mlp_graph_stats.best_ms,
+                custom_prefill_mlp_graph_stats.avg_ms,
+                gib_per_second(
+                    split_bytes + double(4 * x_elems) * sizeof(__nv_bfloat16),
+                    custom_prefill_mlp_stats.best_ms));
     std::printf("custom_scratch_clear,%.6f,%.6f,%.6f,%.6f,0.000,0,\n",
                 custom_clear_stats.best_ms, custom_clear_stats.avg_ms,
                 custom_clear_graph_stats.best_ms,

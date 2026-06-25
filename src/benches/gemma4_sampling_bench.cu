@@ -69,68 +69,6 @@ bool parse_args(int argc, char **argv, SamplingBenchArgs *args) {
   return args->warmup >= 0 && args->iters > 0 && args->samples > 0;
 }
 
-template <typename T>
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(size_t count) {
-    if (count > 0) {
-      CHECK_CUDA(cudaMalloc(&ptr_, count * sizeof(T)));
-    }
-  }
-
-  ~DeviceBuffer() {
-    if (ptr_ != nullptr) {
-      cudaFree(ptr_);
-    }
-  }
-
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  T *get() { return ptr_; }
-  const T *get() const { return ptr_; }
-
- private:
-  T *ptr_ = nullptr;
-};
-
-__device__ uint32_t mix_u32(uint32_t x) {
-  x ^= x >> 16;
-  x *= 0x7feb352du;
-  x ^= x >> 15;
-  x *= 0x846ca68bu;
-  x ^= x >> 16;
-  return x;
-}
-
-__global__ void fill_random_bf16_kernel(__nv_bfloat16 *ptr,
-                                        size_t count,
-                                        uint64_t seed,
-                                        float scale) {
-  const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
-  if (i >= count) {
-    return;
-  }
-
-  uint32_t x = uint32_t(i) ^ uint32_t(i >> 32) ^ uint32_t(seed) ^
-               uint32_t(seed >> 32);
-  x = mix_u32(x);
-  const float u = float(x >> 8) * (1.0f / 16777216.0f);
-  ptr[i] = __float2bfloat16_rn((u * 2.0f - 1.0f) * scale);
-}
-
-void fill_random_bf16(__nv_bfloat16 *ptr,
-                      size_t count,
-                      uint64_t seed,
-                      float scale,
-                      cudaStream_t stream) {
-  constexpr int threads = 256;
-  const int blocks = int((count + threads - 1) / threads);
-  fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(
-      ptr, count, seed, scale);
-  CHECK_CUDA(cudaGetLastError());
-}
-
 __device__ inline bool better_candidate(float logit,
                                         int32_t token_id,
                                         float best_logit,

@@ -5,9 +5,12 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -62,6 +65,140 @@ struct Gemma4BenchmarkContract {
   int samples = 0;
   int graph_inner_iters = 0;
 };
+
+template <typename T>
+class DeviceBuffer {
+ public:
+  // Allocates device storage for a benchmark buffer, allowing zero-sized cases.
+  explicit DeviceBuffer(size_t count) : count_(count) {
+    if (count_ > 0) {
+      CUDA_CHECK(cudaMalloc(&ptr_, count_ * sizeof(T)));
+    }
+  }
+
+  // Releases the device storage owned by this benchmark buffer.
+  ~DeviceBuffer() {
+    cudaFree(ptr_);
+  }
+
+  DeviceBuffer(const DeviceBuffer &) = delete;
+  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+
+  // Returns the raw device pointer for APIs that do not use implicit conversion.
+  T *get() { return ptr_; }
+
+  // Returns the raw const device pointer for read-only APIs.
+  const T *get() const { return ptr_; }
+
+  // Returns the element count originally requested for this buffer.
+  size_t count() const { return count_; }
+
+  // Preserves older bench call sites that pass DeviceBuffer directly to kernels.
+  operator T *() { return ptr_; }
+
+  // Preserves older bench call sites that pass DeviceBuffer directly to readers.
+  operator const T *() const { return ptr_; }
+
+ private:
+  T *ptr_ = nullptr;
+  size_t count_ = 0;
+};
+
+// Mixes an integer index and seed into deterministic pseudo-random bits.
+static __device__ inline uint32_t gemma4_bench_mix_u32_device(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7feb352du;
+  x ^= x >> 15;
+  x *= 0x846ca68bu;
+  x ^= x >> 16;
+  return x;
+}
+
+// Fills BF16 device memory with deterministic values in [-scale, scale].
+static __global__ void gemma4_bench_fill_random_bf16_kernel(
+    __nv_bfloat16 *ptr,
+    size_t count,
+    uint64_t seed,
+    float scale) {
+  const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  if (i >= count) {
+    return;
+  }
+
+  uint32_t x = uint32_t(i) ^ uint32_t(i >> 32) ^ uint32_t(seed) ^
+               uint32_t(seed >> 32);
+  x = gemma4_bench_mix_u32_device(x);
+  const float u = float(x >> 8) * (1.0f / 16777216.0f);
+  ptr[i] = __float2bfloat16_rn((u * 2.0f - 1.0f) * scale);
+}
+
+// Launches the deterministic BF16 filler outside benchmark timing windows.
+inline void fill_random_bf16(__nv_bfloat16 *ptr,
+                             size_t count,
+                             uint64_t seed,
+                             float scale,
+                             cudaStream_t stream) {
+  if (count == 0) {
+    return;
+  }
+
+  constexpr int threads = 256;
+  const int blocks = int((count + threads - 1) / threads);
+  gemma4_bench_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(
+      ptr, count, seed, scale);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// Streams a scratch buffer through L2 so cold-cache bench regions are explicit.
+static __global__ void gemma4_bench_flush_cache_kernel(
+    const uint32_t *__restrict__ in,
+    uint32_t *__restrict__ out,
+    size_t count) {
+  uint32_t acc = 0;
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+       i += size_t(blockDim.x) * gridDim.x) {
+    acc ^= in[i] + uint32_t(i);
+  }
+  out[blockIdx.x * blockDim.x + threadIdx.x] = acc;
+}
+
+// Launches the fixed-shape cache flush used by cold-cache microbenchmarks.
+inline void flush_cache(const uint32_t *in,
+                        uint32_t *out,
+                        size_t count,
+                        cudaStream_t stream) {
+  if (count == 0) {
+    return;
+  }
+
+  constexpr int threads = 256;
+  constexpr int blocks = 4096;
+  gemma4_bench_flush_cache_kernel<<<blocks, threads, 0, stream>>>(
+      in, out, count);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// Converts bytes and elapsed milliseconds into effective GiB/s.
+inline double gib_per_second(double bytes, float ms) {
+  const double gib = bytes / (1024.0 * 1024.0 * 1024.0);
+  return gib / (static_cast<double>(ms) / 1000.0);
+}
+
+// Builds a benchmark seed from an env override or host entropy.
+inline uint64_t make_seed(const char *env_name) {
+  if (const char *env = std::getenv(env_name)) {
+    return std::strtoull(env, nullptr, 0);
+  }
+
+  // Combine random_device with the clock so repeated short runs get varied seeds.
+  std::random_device rd;
+  uint64_t seed = uint64_t(rd()) << 32;
+  seed ^= uint64_t(rd());
+  seed ^= uint64_t(std::chrono::high_resolution_clock::now()
+                       .time_since_epoch()
+                       .count());
+  return seed;
+}
 
 // Captures a one-line shell command result for best-effort benchmark metadata.
 inline std::string gemma4_bench_capture_first_line(const char *command) {
