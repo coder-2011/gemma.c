@@ -14294,3 +14294,116 @@ Conclusion:
 - No final-logits launch change was kept; the current `1024` threads remain a
   reasonable baseline until a more serious sampler/logits benchmark says
   otherwise.
+
+## 2026-06-25 - FFN LibTorch Baseline Replacement
+
+Question: replace the FFN cuDNN Frontend comparator with a direct LibTorch
+baseline while keeping the same CUDA-event timing contract.
+
+Change:
+
+- Deleted `src/benches/gemma4_ffn_cudnn_bench.cu`.
+- Added `src/benches/gemma4_ffn_libtorch_bench.cu`.
+- Replaced `make ffn-cudnn-bench` with `make ffn-libtorch-bench`.
+- The LibTorch baseline computes packed gate/up, `gelu(..., "tanh") * up`,
+  and down projection with preallocated BF16 tensors. Custom CUDA rows still use
+  the same swizzled weights and CUDA-event timers.
+
+Commands:
+
+```bash
+make ffn-cudnn-bench
+./build/benches/gemma4_ffn_cudnn_bench 20 5 3 16
+make ffn-libtorch-bench
+./build/benches/gemma4_ffn_libtorch_bench 20 5 3 16
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`.
+- Shape: `tokens=16`, hidden `3840`, intermediate `15360`, BF16.
+- Timing: CUDA events on the same stream, `5` warmups, `20` iterations, `3`
+  trials. Graph rows time replay only and exclude capture.
+- Cache policy: warm repeated buffers for direct/graph rows; cold custom rows
+  flush L2 with a `256 MiB` buffer before each measured invocation.
+- Clock policy: clocks were not locked.
+
+Result:
+
+```text
+old cuDNN down graph best ms      0.171701
+new LibTorch down graph best ms   0.172162
+new LibTorch full FFN graph ms    0.547880
+new custom prefill graph ms       0.523838
+custom vs LibTorch max_abs        9.53674e-07
+```
+
+Conclusion:
+
+- The down-projection baseline speed is effectively unchanged across cuDNN and
+  LibTorch for the same shape.
+- The stripped cuDNN `geglu`/`full_ffn` rows were not trustworthy after status
+  checks were removed, so the full-FFN replacement should be compared against
+  the new LibTorch row going forward.
+
+## 2026-06-25 - FFN LibTorch Prefill Shape Sweep
+
+Question: measure custom FFN prefill against the LibTorch full-FFN baseline
+across the token counts `1,2,4,8,16,32,64,128,256,512,1024`, and report the
+single-token decode row from the same benchmark.
+
+Command:
+
+```bash
+make ffn-libtorch-bench
+for tokens in 1 2 4 8 16 32 64 128 256 512 1024; do
+  GEMMA4_FFN_LIBTORCH_BENCH_SEED=0x12345678 \
+    ./build/benches/gemma4_ffn_libtorch_bench 100 20 5 "$tokens"
+done
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`.
+- Timing: CUDA events on the benchmark stream; graph rows time replay only and
+  exclude capture. `20` warmups, `100` iterations, `5` trials.
+- Cache policy: warm repeated buffers for direct/graph rows; cold decode rows
+  flush L2 with the benchmark's `256 MiB` buffer.
+- Clock policy: clocks were not locked. The GPU was idle before and after the
+  sweep; idle snapshots were `210 MHz` SM and `405 MHz` memory.
+- Correctness: custom prefill vs LibTorch max abs stayed at `<=1.90735e-06`.
+
+Graph-best result:
+
+```text
+tokens  libtorch ms  custom prefill ms  speedup
+1          0.515952            0.519453   0.993x
+2          0.534187            0.520805   1.026x
+4          0.536403            0.521169   1.029x
+8          0.539919            0.521788   1.035x
+16         0.547369            0.523215   1.046x
+32         0.535938            0.523210   1.024x
+64         0.549779            0.529066   1.039x
+128        0.597995            0.559966   1.068x
+256        0.930442            0.889440   1.046x
+512        1.766559            1.666567   1.060x
+1024       3.457877            3.113875   1.110x
+```
+
+Decode note:
+
+- The decode row is single-token regardless of the `tokens` argument. At
+  `tokens=1`, custom decode graph best was `0.500241 ms` versus LibTorch
+  one-token full FFN graph best `0.515952 ms`, or `1.031x`.
+- The decode row includes post-FFN residual/RMSNorm work; the LibTorch row is
+  the FFN MLP baseline, so this is a conservative but not perfectly identical
+  comparison.
+
+Conclusion:
+
+- Custom prefill is consistently only modestly faster: roughly tied at one row,
+  `1.02-1.07x` for most smaller/mid shapes, and `1.11x` at `1024` rows.
+- This matches the implementation: custom prefill fuses gate/up + GeGLU, but
+  still writes the activation to HBM before the separate down GEMM.
