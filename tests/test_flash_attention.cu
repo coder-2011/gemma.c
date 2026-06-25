@@ -135,6 +135,29 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
   }
 }
 
+// Compare float vectors with an absolute tolerance.
+void compare_float(const std::vector<float> &actual,
+                   const std::vector<float> &expected,
+                   float tolerance,
+                   const char *label) {
+  float max_abs = 0.0f;
+  int max_index = 0;
+  for (int i = 0; i < static_cast<int>(actual.size()); ++i) {
+    float diff = std::fabs(actual[i] - expected[i]);
+    if (diff > max_abs) {
+      max_abs = diff;
+      max_index = i;
+    }
+  }
+  if (max_abs > tolerance) {
+    std::fprintf(stderr,
+                 "%s max_abs=%g index=%d actual=%g expected=%g tolerance=%g\n",
+                 label, max_abs, max_index, actual[max_index],
+                 expected[max_index], tolerance);
+    std::exit(1);
+  }
+}
+
 // Compare a full BF16 device buffer after copying it back to host memory.
 void compare_device_bf16(const DeviceBuffer<__nv_bfloat16> &actual,
                          const std::vector<__nv_bfloat16> &expected,
@@ -186,7 +209,8 @@ void reference_attention(std::vector<__nv_bfloat16> &expected,
                          int kv_heads,
                          int head_dim,
                          int window_size,
-                         float softmax_scale) {
+                         float softmax_scale,
+                         std::vector<float> *expected_lse = nullptr) {
   const int group = q_heads / kv_heads;
   std::vector<float> scores(seq_len);
   for (int row = 0; row < seq_len; ++row) {
@@ -211,6 +235,10 @@ void reference_attention(std::vector<__nv_bfloat16> &expected,
       for (int col = left; col <= row; ++col) {
         scores[col] = std::exp(scores[col] - max_score);
         denom += scores[col];
+      }
+      // LSE is the scaled row max plus the log of the shifted denominator.
+      if (expected_lse != nullptr) {
+        (*expected_lse)[qh * seq_len + row] = max_score + std::log(denom);
       }
 
       for (int d = 0; d < head_dim; ++d) {
@@ -247,18 +275,22 @@ void run_sliding_prefill_reference_case(int seq_len,
   DeviceBuffer<__nv_bfloat16> d_k(k);
   DeviceBuffer<__nv_bfloat16> d_v(v);
   DeviceBuffer<__nv_bfloat16> d_out(q_count);
+  DeviceBuffer<float> d_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
 
   const float scale = 1.0f / std::sqrt(float(GEMMA4_SLIDING_HEAD_DIM));
   CHECK_CUDA(gemma4_flash_attention_sliding_fwd_bf16(
-      d_out.get(), nullptr, d_q.get(), d_k.get(), d_v.get(), 1, seq_len,
+      d_out.get(), d_lse.get(), d_q.get(), d_k.get(), d_v.get(), 1, seq_len,
       seq_len, window_size, scale, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
   std::vector<__nv_bfloat16> expected(q_count);
+  std::vector<float> expected_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
   reference_attention(expected, q, k, v, seq_len, GEMMA4_NUM_QUERY_HEADS,
                       GEMMA4_SLIDING_KV_HEADS, GEMMA4_SLIDING_HEAD_DIM,
-                      window_size, scale);
+                      window_size, scale, &expected_lse);
   compare_device_bf16(d_out, expected, 0.03125f, label);
+  compare_float(d_lse.copy_to_host(), expected_lse, 0.03125f,
+                "sliding prefill LSE");
 }
 
 // Compare global D=512 prefill with norm/RoPE prep against a CPU reference.
@@ -286,6 +318,7 @@ void run_global_prefill_reference_case() {
   DeviceBuffer<__nv_bfloat16> d_k_prepared(kv_count);
   DeviceBuffer<__nv_bfloat16> d_v_prepared(kv_count);
   DeviceBuffer<__nv_bfloat16> d_out(q_count);
+  DeviceBuffer<float> d_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
   DeviceBuffer<__nv_bfloat16> d_norm_weight(norm_weight);
   DeviceBuffer<float> d_cos(cos);
   DeviceBuffer<float> d_sin(sin);
@@ -293,7 +326,7 @@ void run_global_prefill_reference_case() {
 
   const float scale = 1.0f / std::sqrt(float(GEMMA4_GLOBAL_HEAD_DIM));
   CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
-      d_out.get(), nullptr, d_q_prepared.get(), d_k_prepared.get(),
+      d_out.get(), d_lse.get(), d_q_prepared.get(), d_k_prepared.get(),
       d_v_prepared.get(), d_q.get(), d_k.get(), d_norm_weight.get(),
       d_norm_weight.get(), d_cos.get(), d_sin.get(), d_token_position.get(),
       batch_size, seq_len, seq_len, scale, 0));
@@ -303,11 +336,14 @@ void run_global_prefill_reference_case() {
   std::vector<__nv_bfloat16> q_prepared = d_q_prepared.copy_to_host();
   std::vector<__nv_bfloat16> k_prepared = d_k_prepared.copy_to_host();
   std::vector<__nv_bfloat16> v_prepared = d_v_prepared.copy_to_host();
+  std::vector<float> expected_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
   reference_attention(expected, q_prepared, k_prepared, v_prepared, seq_len,
                       GEMMA4_NUM_QUERY_HEADS, GEMMA4_GLOBAL_KV_HEADS,
-                      GEMMA4_GLOBAL_HEAD_DIM, 0, scale);
+                      GEMMA4_GLOBAL_HEAD_DIM, 0, scale, &expected_lse);
   compare_device_bf16(d_out, expected, 0.03125f,
                       "global D512 prefill partial tile");
+  compare_float(d_lse.copy_to_host(), expected_lse, 0.03125f,
+                "global D512 prefill LSE");
 }
 
 // Validate global paged decode with one live key and direct single-split output.

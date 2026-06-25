@@ -160,12 +160,6 @@ struct Gemma4AttentionDerived {
       kGqaRatio < kHeadsPerBlock ? kGqaRatio : 0;
   static constexpr int kDecodeVWarp = kDecodeKWarp + 1;
 
-  static_assert((Traits::kHeadDim % kWarpSize) == 0);
-  static_assert((Traits::kRotaryDim % 2) == 0);
-  static_assert((kRotaryHalf % kWarpSize) == 0);
-  static_assert((GEMMA4_NUM_QUERY_HEADS % Traits::kKvHeads) == 0);
-  static_assert((GEMMA4_NUM_QUERY_HEADS % kHeadsPerBlock) == 0);
-  static_assert((Traits::kHeadDim % kBf16Packed128Elements) == 0);
   static_assert(kHeadsPerBlock >= kGqaRatio);
   static_assert(!Traits::kHasVProjection || kDecodeVWarp < kHeadsPerBlock);
 };
@@ -557,6 +551,8 @@ __device__ __forceinline__ bool gemma4_score_block_fully_visible(
     int max_seqlen_k,
     int window_size) {
   if (valid_rows <= 0) return false;
+  // Partial K tiles still need masks for columns beyond seqlen_k.
+  if (col_idx_offset + block_n > max_seqlen_k) return false;
 
   // The last key column in this K tile must be no later than the earliest
   // allowed causal key for the first valid query row.
@@ -813,9 +809,6 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   constexpr int kHeadRatio = GEMMA4_NUM_QUERY_HEADS / kKVHeads;
   constexpr int kQRowStride = GEMMA4_NUM_QUERY_HEADS * kHeadDim;
   constexpr int kKVRowStride = kKVHeads * kHeadDim;
-  static_assert(GEMMA4_NUM_QUERY_HEADS % kKVHeads == 0,
-                "Gemma GQA ratio must be integral");
-
   // ponytail: fixed batch-major tensors; add block-info back only for ragged batches.
   const index_t batch = index_t(bidb);
   const int q_tile_start = m_block * kBlockM;
@@ -844,7 +837,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   Tensor acc_o = partition_fragment_C(
       tiled_mma_pv, Shape<Int<kBlockM>, Int<kHeadDim>>{});
 
-  // If a local tile has no visible keys, write zero output and +inf LSE. This
+  // If a local tile has no visible keys, write zero output and -inf LSE. This
   // keeps edge cases defined instead of relying on stale output memory.
   if (n_block_max <= n_block_min) {
     clear(acc_o);
@@ -853,7 +846,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
         tiled_mma_pv, tidx, smem_);
     if (params.softmax_lse_ptr != nullptr) {
       Tensor empty_lse = make_tensor<float>(Shape<Int<2 * size<1>(acc_o)>>{});
-      cute::fill(empty_lse, INFINITY);
+      cute::fill(empty_lse, -INFINITY);
       gemma4_write_lse_rows<KernelTraits>(
           params, bidb, bidh, m_block, q_tile_remaining, thr_mma_pv,
           empty_lse);
@@ -985,9 +978,9 @@ inline __device__ void gemma4_compute_attn_1rowblock(
 #pragma unroll
     for (int mi = 0; mi < size(lse); ++mi) {
       float sum = softmax.row_sum(mi);
-      const bool invalid_sum = sum == 0.0f || sum != sum;
-      lse(mi) = invalid_sum ? INFINITY
-                            : softmax.row_max(mi) * params.scale_softmax + __logf(sum);
+      lse(mi) = sum == 0.0f
+                    ? -INFINITY
+                    : softmax.row_max(mi) * params.scale_softmax + __logf(sum);
     }
     gemma4_write_lse_rows<KernelTraits>(
         params, bidb, bidh, m_block, q_tile_remaining, thr_mma_pv, lse);
@@ -1210,8 +1203,6 @@ __device__ __forceinline__ void prep_scale_free_head(
 __device__ __forceinline__ float hidden_rms_scale_bf16(
     const __nv_bfloat16 *__restrict__ x,
     int lane) {
-  static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
-                "hidden size must be divisible by Packed128 bf16 width");
   constexpr int kPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
   float sum = 0.0f;
   for (int pack = lane; pack < kPacks; pack += kWarpSize) {
@@ -1234,8 +1225,6 @@ __device__ __forceinline__ void project_normed_head_values_bf16(
     float hidden_scale,
     float (&values)[Gemma4AttentionDerived<Traits>::kValuesPerLane]) {
   using Derived = Gemma4AttentionDerived<Traits>;
-  static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
-                "hidden size must be divisible by Packed128 bf16 width");
   constexpr int kPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 #pragma unroll
   for (int i = 0; i < Derived::kValuesPerLane; ++i) {
@@ -1618,10 +1607,6 @@ cudaError_t prepare_qkv_norm_rope(
     int seq_len,
     cudaStream_t stream) {
   using Derived = Gemma4AttentionDerived<Traits>;
-  if (batch_size <= 0 || seq_len <= 0) {
-    return cudaErrorInvalidValue;
-  }
-
   constexpr int kHeadGroups =
       (GEMMA4_NUM_QUERY_HEADS + Derived::kHeadsPerBlock - 1) /
       Derived::kHeadsPerBlock;
@@ -2698,26 +2683,25 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_persistent_bf
     int32_t num_splits,
     int32_t persistent_blocks,
     cudaStream_t stream) {
+  (void)d_out;
+  (void)d_partial_m;
+  (void)d_partial_l;
+  (void)d_partial_acc;
+  (void)d_work_scratch;
+  (void)work_scratch_i32;
+  (void)d_q_prepared;
+  (void)d_cache_k;
+  (void)d_cache_v;
+  (void)d_page_table;
+  (void)d_seq_lengths;
+  (void)cache_config;
+  (void)cache_layer;
+  (void)batch_size;
   (void)softmax_scale;
+  (void)split_size;
+  (void)num_splits;
   (void)persistent_blocks;
   (void)stream;
-  if (!gemma4_flash_attention::valid_decode_paged_args<
-          gemma4_flash_attention::SlidingAttentionTraits>(
-          d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
-          d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
-          cache_layer, batch_size, split_size, num_splits) ||
-      d_work_scratch == nullptr || work_scratch_i32 <= 0) {
-    return cudaErrorInvalidValue;
-  }
-
-  const size_t required_i32 =
-      gemma4_flash_attention::sliding_decode_persistent_scratch_i32_count(
-          batch_size, num_splits);
-  if (required_i32 == 0 ||
-      required_i32 > size_t(std::numeric_limits<int32_t>::max()) ||
-      size_t(work_scratch_i32) < required_i32) {
-    return cudaErrorInvalidValue;
-  }
   return cudaErrorNotSupported;
 }
 
