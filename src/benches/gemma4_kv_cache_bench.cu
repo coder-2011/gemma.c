@@ -278,20 +278,6 @@ void check_attention_correctness(const std::vector<__nv_bfloat16> &actual,
   }
 }
 
-void print_environment(const cudaDeviceProp &prop,
-                       int driver,
-                       int runtime,
-                       int clock_rate_khz,
-                       int memory_clock_rate_khz) {
-  std::printf(
-      "gpu=%s sm=%d%d memory_gb=%.2f driver=%d runtime=%d l2_cache_bytes=%d "
-      "sms=%d clock_rate_khz=%d memory_clock_rate_khz=%d\n",
-      prop.name, prop.major, prop.minor,
-      double(prop.totalGlobalMem) / 1.0e9, driver, runtime,
-      prop.l2CacheSize, prop.multiProcessorCount, clock_rate_khz,
-      memory_clock_rate_khz);
-}
-
 BenchOptions parse_args(int argc, char **argv) {
   BenchOptions options;
   std::vector<std::string> positional;
@@ -376,18 +362,6 @@ int main(int argc, char **argv) {
 
   int device = 0;
   CUDA_CHECK(cudaGetDevice(&device));
-  cudaDeviceProp prop{};
-  CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-  int driver = 0;
-  int runtime = 0;
-  CUDA_CHECK(cudaDriverGetVersion(&driver));
-  CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
-  int clock_rate_khz = 0;
-  int memory_clock_rate_khz = 0;
-  CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
-                                    device));
-  CUDA_CHECK(cudaDeviceGetAttribute(&memory_clock_rate_khz,
-                                    cudaDevAttrMemoryClockRate, device));
 
   int seq_len = options.seq_len;
   int page_size = options.page_size;
@@ -406,8 +380,11 @@ int main(int argc, char **argv) {
   int64_t flush_bytes =
       cold_cache ? options.flush_bytes : 0;
   if (cold_cache && flush_bytes == 0) {
+    int l2_cache_bytes = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&l2_cache_bytes, cudaDevAttrL2CacheSize,
+                                      device));
     flush_bytes = std::max<int64_t>(64ll * 1024 * 1024,
-                                    int64_t(prop.l2CacheSize) * 4);
+                                    int64_t(l2_cache_bytes) * 4);
   }
 
   int pages_for_seq = div_up(seq_len, page_size);
@@ -429,19 +406,6 @@ int main(int argc, char **argv) {
   int num_splits = actual_splits + options.extra_splits;
   float scale = 1.0f / std::sqrt(float(config.head_dim));
 
-  Gemma4BenchmarkContract contract;
-  contract.benchmark = "kv_cache_bench";
-  contract.cache = options.cache_mode.c_str();
-  contract.aggregation = "median_mean_trimmed_mean_p95_p99_stddev_iqr_raw_samples";
-  contract.correctness = "flash_decode_vs_cpu_reference_checked";
-  contract.notes = "cold mode flushes L2 before each measured invocation";
-  contract.warmup = warmup;
-  contract.iters = iters;
-  contract.samples = samples;
-  gemma4_bench_print_environment(contract.benchmark);
-  gemma4_bench_print_contract(contract);
-  print_environment(prop, driver, runtime, clock_rate_khz,
-                    memory_clock_rate_khz);
   std::printf(
       "contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline "
       "cache_mode=%s l2_flush_bytes=%lld launch_overhead=queued_launches_only "
