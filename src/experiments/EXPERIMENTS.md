@@ -3,6 +3,73 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-25 - Prompt Decode Tail Split and Hot-Path Timing
+
+Question:
+
+- Does `gemma4_prompt` avoid running final RMSNorm + LM-head sampling on
+  intermediate decode layers, while preserving the sampled token produced by the
+  existing monolithic tail?
+- What are first-pass real-weight hot-path timings for the current prompt flow
+  when weight load, tokenizer startup, allocation, and other one-time setup are
+  outside the CUDA-event timing window?
+
+Change:
+
+- Added a decode megakernel attention+FFN launcher that stops after the
+  post-FFN residual/layer-scalar phase.
+- Updated `gemma4_prompt` decode so layers `0..46` use the attention+FFN-only
+  launcher and layer `47` alone runs the final RMSNorm + LM-head sampling tail.
+- Added `gemma4_prompt --benchmark`, with warmup, iteration, and sample counts,
+  to time prefill and decode separately using CUDA events on the same stream.
+
+Commands:
+
+```bash
+make test-decode-megakernel
+make prompt
+./build/gemma4_prompt --benchmark --bench-warmup 1 --bench-iters 1 \
+  --bench-samples 1 --max-new 1 --prompt Hello
+nvidia-smi --query-gpu=name,gpu_bus_id,driver_version,persistence_mode,ecc.mode.current,mig.mode.current,power.limit,clocks.sm,clocks.mem,temperature.gpu,power.draw,utilization.gpu --format=csv,noheader,nounits
+/usr/local/cuda/bin/nvcc --version
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:04:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Model/input: real `models/gemma-4-12B/model.safetensors`, tokenizer
+  `models/gemma-4-12B/tokenizer.json`, prompt `Hello`, prompt length `1`.
+- Timing: CUDA events on stream `0`; weight loading, tokenizer startup,
+  allocation, runtime initialization, and decode setup prefill are outside the
+  measured regions.
+- Warmup/iterations: `1` warmup, `1` timed iteration, `1` sample. This is a
+  smoke benchmark, not a stable tuning run.
+- Cache policy: prefill repeats the same prompt buffers; decode advances
+  statefully after a setup prefill.
+- Clock policy: clocks not locked.
+- Correctness: `test_decode_megakernel` compares the split attention+FFN path
+  plus standalone final spine against the existing monolithic tail token.
+
+Results:
+
+```text
+prompt tokens: 1
+benchmark prompt_len=1 warmup=1 iters=1 samples=1 cache=prefill_repeated_decode_stateful timing=cuda_events_same_stream
+prefill_ms median=37.905 min=37.905 max=37.905
+decode_ms median=70.404 min=70.404 max=70.404
+```
+
+Conclusion:
+
+- The P1 prompt decode bug is fixed at the caller: intermediate layers no longer
+  launch the final sampling tail.
+- The focused smoke test passed, showing the split path preserves the generated
+  token for the deterministic FlashAttention+FFN case.
+- The benchmark harness is intentionally minimal and should be rerun with larger
+  warmup/sample counts before making performance claims.
+
 ## 2026-06-23 - FFN Gate/Up DualGemm Tile Sweep
 
 Question:
