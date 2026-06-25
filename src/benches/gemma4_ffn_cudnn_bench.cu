@@ -366,15 +366,8 @@ int main(int argc, char **argv) {
   const TimingStats custom_prefill_mlp_stats =
       time_ms(run_custom_prefill_mlp, stream, warmup, iters, trials);
 #if GEMMA4_HAS_CUDNN_FRONTEND
-  TimingStats custom_prefill_mlp_graph_stats{-1.0f, -1.0f};
-  try {
-    custom_prefill_mlp_graph_stats = time_ms_graph(
-        run_custom_prefill_mlp, stream, warmup, iters, trials);
-  } catch (const std::exception &e) {
-    std::fprintf(stderr,
-                 "custom prefill MLP CUDA graph timing unavailable: %s\n",
-                 e.what());
-  }
+  const TimingStats custom_prefill_mlp_graph_stats = time_ms_graph(
+      run_custom_prefill_mlp, stream, warmup, iters, trials);
 #endif
 
 #if !GEMMA4_HAS_CUDNN_FRONTEND
@@ -384,7 +377,7 @@ int main(int argc, char **argv) {
 #else
   std::printf("cudnn_version=%zu\n", cudnnGetVersion());
 
-  try {
+  {
     CudnnGeGlu geglu(tokens, stream);
     CudnnDown down(tokens, stream);
 
@@ -435,47 +428,16 @@ int main(int argc, char **argv) {
                                     stream); },
                 stream, warmup, iters, trials);
 
-    TimingStats geglu_graph_stats{-1.0f, -1.0f};
-    TimingStats down_graph_stats{-1.0f, -1.0f};
-    TimingStats split_graph_stats{-1.0f, -1.0f};
-    TimingStats custom_graph_stats{-1.0f, -1.0f};
-    TimingStats custom_clear_graph_stats{-1.0f, -1.0f};
-    try {
-      geglu_graph_stats = time_ms_graph(run_geglu, stream, warmup, iters,
-                                        trials);
-    } catch (const std::exception &e) {
-      std::fprintf(stderr, "geglu CUDA graph timing unavailable: %s\n",
-                   e.what());
-    }
-    try {
-      down_graph_stats = time_ms_graph(run_down, stream, warmup, iters,
-                                       trials);
-    } catch (const std::exception &e) {
-      std::fprintf(stderr, "down CUDA graph timing unavailable: %s\n",
-                   e.what());
-    }
-    try {
-      split_graph_stats = time_ms_graph(run_split, stream, warmup, iters,
-                                        trials);
-    } catch (const std::exception &e) {
-      std::fprintf(stderr, "split CUDA graph timing unavailable: %s\n",
-                   e.what());
-    }
-    try {
-      custom_graph_stats = time_ms_graph(run_custom, stream, warmup, iters,
-                                         trials);
-    } catch (const std::exception &e) {
-      std::fprintf(stderr, "custom CUDA graph timing unavailable: %s\n",
-                   e.what());
-    }
-    try {
-      custom_clear_graph_stats =
-          time_ms_graph(run_custom_clear, stream, warmup, iters, trials);
-    } catch (const std::exception &e) {
-      std::fprintf(stderr,
-                   "custom scratch clear CUDA graph timing unavailable: %s\n",
-                   e.what());
-    }
+    const TimingStats geglu_graph_stats =
+        time_ms_graph(run_geglu, stream, warmup, iters, trials);
+    const TimingStats down_graph_stats =
+        time_ms_graph(run_down, stream, warmup, iters, trials);
+    const TimingStats split_graph_stats =
+        time_ms_graph(run_split, stream, warmup, iters, trials);
+    const TimingStats custom_graph_stats =
+        time_ms_graph(run_custom, stream, warmup, iters, trials);
+    const TimingStats custom_clear_graph_stats =
+        time_ms_graph(run_custom_clear, stream, warmup, iters, trials);
 
     float full_ms = -1.0f;
     float full_graph_ms = -1.0f;
@@ -627,10 +589,6 @@ int main(int argc, char **argv) {
                 cudnn_direct_overhead);
     std::printf("custom_direct_minus_device_ms,%.6f\n",
                 custom_direct_overhead);
-  } catch (const std::exception &e) {
-    std::fprintf(stderr, "benchmark failed: %s\n", e.what());
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    return 1;
   }
 #endif
 
