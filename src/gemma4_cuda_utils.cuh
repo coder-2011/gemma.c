@@ -1,5 +1,4 @@
-#ifndef CUDA_UTILS_CUH
-#define CUDA_UTILS_CUH
+#pragma once
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -11,6 +10,14 @@
 #ifndef GEMMA4_WEIGHT_LOAD_POLICY
 #define GEMMA4_WEIGHT_LOAD_POLICY 1
 #endif
+
+#define GEMMA4_RETURN_IF_CUDA_ERROR(expr)           \
+  do {                                              \
+    cudaError_t gemma4_cuda_status__ = (expr);      \
+    if (gemma4_cuda_status__ != cudaSuccess) {      \
+      return gemma4_cuda_status__;                  \
+    }                                               \
+  } while (0)
 
 static constexpr int WARP_SIZE = 32;
 
@@ -33,6 +40,21 @@ inline bool is_aligned_to(const void *ptr) {
 // Checks the 16-byte alignment needed by Packed128 loads and stores.
 inline bool is_aligned_16(const void *ptr) {
   return is_aligned_to<16>(ptr);
+}
+
+// Checks the 128-byte alignment needed by cooperative scratch handoffs.
+inline bool is_aligned_128(const void *ptr) {
+  return is_aligned_to<128>(ptr);
+}
+
+// Rounds a host pointer up to a power-of-two alignment.
+template <size_t Alignment, typename T>
+inline T *align_ptr_up(T *ptr) {
+  static_assert(Alignment > 0 && (Alignment & (Alignment - 1)) == 0,
+                "alignment must be a nonzero power of two");
+  uintptr_t raw = reinterpret_cast<uintptr_t>(ptr);
+  uintptr_t aligned = (raw + Alignment - 1) & ~(uintptr_t(Alignment) - 1);
+  return reinterpret_cast<T *>(aligned);
 }
 
 template <typename ElementType>
@@ -279,5 +301,3 @@ __device__ inline void warp_reduce_sum_to_lane0(
     }
   }
 }
-
-#endif

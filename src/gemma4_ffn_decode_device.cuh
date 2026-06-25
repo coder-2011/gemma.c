@@ -1,5 +1,4 @@
-#ifndef GEMMA4_FFN_DECODE_DEVICE_CUH
-#define GEMMA4_FFN_DECODE_DEVICE_CUH
+#pragma once
 
 #include "gemma4_ffn.cuh"
 #include "gemma4_cuda_utils.cuh"
@@ -71,6 +70,7 @@ static_assert(kAccumBlocks > 0 && kAccumBlocks <= kIntermediateTiles,
               "FFN accumulate grid must be within the intermediate tile count");
 
 using FfnBf16Pack = Bf16Packed128;
+using ::is_aligned_128;
 
 template <int ColsPerBlock, int Threads>
 __device__ inline void reduce_cols_pair(
@@ -105,11 +105,6 @@ __device__ inline void reduce_cols_pair(
     warp_reduce_sum_to_lane0(a_sums);
     warp_reduce_sum_to_lane0(b_sums);
   }
-}
-
-// Checks the 128-byte alignment required by Gemma4FfnDecodeScratch.
-inline bool is_aligned_128(const void *ptr) {
-  return is_aligned_to<128>(ptr);
 }
 
 // Maps natural hidden packs into the swizzled decode weight layout.
@@ -392,5 +387,3 @@ __device__ inline void zero_accum(
 }
 
 }  // namespace gemma4_ffn_decode_device
-
-#endif

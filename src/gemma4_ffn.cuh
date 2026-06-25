@@ -1,5 +1,4 @@
-#ifndef GEMMA4_FFN_CUH
-#define GEMMA4_FFN_CUH
+#pragma once
 
 #include "gemma4.h"
 
@@ -97,5 +96,3 @@ cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
     __nv_bfloat16 *__restrict__ w_down_swizzled,
     const __nv_bfloat16 *__restrict__ w_down_row_major,
     cudaStream_t stream);
-
-#endif

@@ -66,18 +66,6 @@ float bf16_to_float(__nv_bfloat16 value) {
   return __bfloat162float(value);
 }
 
-// Produces a deterministic BF16 activation value with small magnitude.
-__nv_bfloat16 make_x_value(int index) {
-  const int centered = ((index * 13 + 7) % 97) - 48;
-  return __float2bfloat16_rn(static_cast<float>(centered) / 96.0f);
-}
-
-// Produces a deterministic BF16 weight value with small magnitude.
-__nv_bfloat16 make_w_value(int index) {
-  const int centered = ((index * 19 + 5) % 83) - 41;
-  return __float2bfloat16_rn(static_cast<float>(centered) / 128.0f);
-}
-
 // Installs two nonzero weights per output column and computes the reference.
 void fill_sparse_case(std::vector<__nv_bfloat16> &x,
                       std::vector<__nv_bfloat16> &w,
@@ -87,16 +75,24 @@ void fill_sparse_case(std::vector<__nv_bfloat16> &x,
                       int n) {
   for (int row = 0; row < rows; ++row) {
     for (int col = 0; col < k; ++col) {
+      const int index = row * 37 + col;
+      const int centered = ((index * 13 + 7) % 97) - 48;
       x[static_cast<size_t>(row) * k + col] =
-          make_x_value(row * 37 + col);
+          __float2bfloat16_rn(static_cast<float>(centered) / 96.0f);
     }
   }
 
   for (int col = 0; col < n; ++col) {
     const int k0 = (col * 17 + 3) % k;
     const int k1 = (k0 + k / 2 + 1) % k;
-    w[static_cast<size_t>(col) * k + k0] = make_w_value(col * 11);
-    w[static_cast<size_t>(col) * k + k1] = make_w_value(col * 11 + 1);
+    const int index0 = col * 11;
+    const int index1 = col * 11 + 1;
+    const int centered0 = ((index0 * 19 + 5) % 83) - 41;
+    const int centered1 = ((index1 * 19 + 5) % 83) - 41;
+    w[static_cast<size_t>(col) * k + k0] =
+        __float2bfloat16_rn(static_cast<float>(centered0) / 128.0f);
+    w[static_cast<size_t>(col) * k + k1] =
+        __float2bfloat16_rn(static_cast<float>(centered1) / 128.0f);
   }
 
   for (int row = 0; row < rows; ++row) {

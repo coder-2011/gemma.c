@@ -1,5 +1,4 @@
-#ifndef GEMMA4_MATMUL_KERNELS_CUH
-#define GEMMA4_MATMUL_KERNELS_CUH
+#pragma once
 
 // Public projection API only; implementation lives in gemma4_matmul_kernels.cu.
 
@@ -46,5 +45,3 @@ cudaError_t gemma4_prefill_gemm_bf16(
     int k,
     int n,
     cudaStream_t stream);
-
-#endif

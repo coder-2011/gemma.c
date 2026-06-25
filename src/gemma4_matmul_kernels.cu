@@ -436,17 +436,6 @@ gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
       x, w_col_major, y, blockIdx.x, warp_sums, sums);
 }
 
-static cudaError_t check_decode_args(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_col_major,
-    const __nv_bfloat16 *__restrict__ y) {
-  if (!x || !w_col_major || !y || !is_aligned_16(x) ||
-      !is_aligned_16(w_col_major) || !is_aligned_16(y)) {
-    return cudaErrorInvalidValue;
-  }
-  return cudaSuccess;
-}
-
 template <int ThreadblockM,
           int ThreadblockN,
           int ThreadblockK,
@@ -500,6 +489,71 @@ cudaError_t launch_prefill_cutlass_gemm(
   return cudaGetLastError();
 }
 
+// Launches the measured CUTLASS 64x64x32, 10-stage BF16 GEMM.
+cudaError_t launch_prefill_cutlass_64x64_s10(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int rows,
+    int k,
+    int n,
+    cudaStream_t stream) {
+  return launch_prefill_cutlass_gemm<64, 64, 32, 32, 32, 10>(
+      x, w_col_major, y, rows, k, n, stream);
+}
+
+// Launches the measured CUTLASS 64x128x32, 6-stage BF16 GEMM.
+cudaError_t launch_prefill_cutlass_64x128_s6(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int rows,
+    int k,
+    int n,
+    cudaStream_t stream) {
+  return launch_prefill_cutlass_gemm<64, 128, 32, 32, 64, 6>(
+      x, w_col_major, y, rows, k, n, stream);
+}
+
+// Launches the measured CUTLASS 128x128x32, 5-stage BF16 GEMM.
+cudaError_t launch_prefill_cutlass_128x128_s5(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int rows,
+    int k,
+    int n,
+    cudaStream_t stream) {
+  return launch_prefill_cutlass_gemm<128, 128, 32, 64, 64, 5>(
+      x, w_col_major, y, rows, k, n, stream);
+}
+
+// Launches the measured CUTLASS 128x256x32, 3-stage BF16 GEMM.
+cudaError_t launch_prefill_cutlass_128x256(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int rows,
+    int k,
+    int n,
+    cudaStream_t stream) {
+  return launch_prefill_cutlass_gemm<128, 256, 32, 64, 64, 3>(
+      x, w_col_major, y, rows, k, n, stream);
+}
+
+// Launches the measured CUTLASS 256x128x32, 3-stage BF16 GEMM.
+cudaError_t launch_prefill_cutlass_256x128(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int rows,
+    int k,
+    int n,
+    cudaStream_t stream) {
+  return launch_prefill_cutlass_gemm<256, 128, 32, 64, 64, 3>(
+      x, w_col_major, y, rows, k, n, stream);
+}
+
 template <int K,
           int N,
           int ColsPerBlock,
@@ -510,9 +564,9 @@ cudaError_t launch_decode_gemv(const __nv_bfloat16 *__restrict__ x,
                                const __nv_bfloat16 *__restrict__ w_col_major,
                                __nv_bfloat16 *__restrict__ y,
                                cudaStream_t stream) {
-  const cudaError_t arg_status = check_decode_args(x, w_col_major, y);
-  if (arg_status != cudaSuccess) {
-    return arg_status;
+  if (!x || !w_col_major || !y || !is_aligned_16(x) ||
+      !is_aligned_16(w_col_major) || !is_aligned_16(y)) {
+    return cudaErrorInvalidValue;
   }
 
   constexpr int blocks = N / ColsPerBlock;
@@ -622,6 +676,111 @@ cudaError_t gemma4_prefill_gemm_bf16(
   }
   if (rows == 0) {
     return cudaSuccess;
+  }
+  // These exact 12B prefill shapes were measured on RTX A6000 with CUDA events.
+  if (k == GEMMA4_HIDDEN_SIZE && n == GEMMA4_GLOBAL_K_PROJ_SIZE) {
+    if (rows <= 512) {
+      return launch_prefill_cutlass_64x64_s10(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    return launch_prefill_cutlass_64x128_s6(
+        x, w_col_major, y, rows, k, n, stream);
+  }
+  if (k == GEMMA4_HIDDEN_SIZE && n == GEMMA4_SLIDING_KV_PROJ_SIZE) {
+    if (rows <= 128) {
+      return launch_prefill_cutlass_64x64_s10(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 256) {
+      return launch_prefill_cutlass_64x128_s6(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 512) {
+      return launch_prefill_cutlass_128x128_s5(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    return launch_prefill_cutlass_128x256(
+        x, w_col_major, y, rows, k, n, stream);
+  }
+  if (k == GEMMA4_HIDDEN_SIZE && n == GEMMA4_SLIDING_Q_PROJ_SIZE) {
+    if (rows <= 64) {
+      return launch_prefill_cutlass_64x64_s10(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 128) {
+      return launch_prefill_cutlass_64x128_s6(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 256) {
+      return launch_prefill_cutlass_128x128_s5(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 512) {
+      return launch_prefill_cutlass_256x128(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    return launch_prefill_cutlass_128x256(
+        x, w_col_major, y, rows, k, n, stream);
+  }
+  if (k == GEMMA4_HIDDEN_SIZE && n == GEMMA4_GLOBAL_Q_PROJ_SIZE) {
+    if (rows <= 64) {
+      return launch_prefill_cutlass_64x128_s6(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 128) {
+      return launch_prefill_cutlass_128x128_s5(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 256) {
+      return launch_prefill_cutlass_256x128(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 512) {
+      return launch_prefill_cutlass_128x256(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    return launch_prefill_cutlass_128x128_s5(
+        x, w_col_major, y, rows, k, n, stream);
+  }
+  if (k == GEMMA4_SLIDING_ATTENTION_OUT_SIZE && n == GEMMA4_HIDDEN_SIZE) {
+    if (rows <= 64) {
+      return launch_prefill_cutlass_64x64_s10(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 128) {
+      return launch_prefill_cutlass_64x128_s6(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 256) {
+      return launch_prefill_cutlass_128x128_s5(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 512) {
+      return launch_prefill_cutlass_256x128(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    return launch_prefill_cutlass_128x128_s5(
+        x, w_col_major, y, rows, k, n, stream);
+  }
+  if (k == GEMMA4_GLOBAL_ATTENTION_OUT_SIZE && n == GEMMA4_HIDDEN_SIZE) {
+    if (rows <= 64) {
+      return launch_prefill_cutlass_64x64_s10(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 128) {
+      return launch_prefill_cutlass_64x128_s6(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 256) {
+      return launch_prefill_cutlass_128x128_s5(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    if (rows <= 512) {
+      return launch_prefill_cutlass_128x256(
+          x, w_col_major, y, rows, k, n, stream);
+    }
+    return launch_prefill_cutlass_128x128_s5(
+        x, w_col_major, y, rows, k, n, stream);
   }
   if (rows <= 128) {
     return launch_prefill_cutlass_gemm<64, 128, 64, 32, 64, 3>(

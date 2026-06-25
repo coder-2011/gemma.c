@@ -43,7 +43,6 @@ static_assert(kSwizzleThreads > 0 && kSwizzleThreads <= 1024 && (kSwizzleThreads
 using FfnBf16Pack = ffn_dev::FfnBf16Pack;
 using ffn_dev::atomic_add_accum_pack;
 using ffn_dev::hidden_pack_swizzle_index;
-using ffn_dev::is_aligned_128;
 using ffn_dev::store_partial_pack;
 
 template <typename ElementOutput_,
@@ -348,15 +347,23 @@ cudaError_t launch_cutlass_bf16_gemm(
   return cudaGetLastError();
 }
 
-cudaError_t run_prefill_gate_up_geglu_decode_layout_dual_gemm(
+// Runs one measured CUTLASS DualGemm tile for prefill gate/up plus GeGLU.
+template <int ThreadblockM,
+          int ThreadblockN,
+          int ThreadblockK,
+          int WarpM,
+          int WarpN,
+          int Stages>
+cudaError_t run_prefill_gate_up_geglu_decode_layout_dual_gemm_config(
     floatX *__restrict__ act,
     const floatX *__restrict__ x_swizzled,
     const floatX *__restrict__ w_gate_up_decode,
     int rows,
     cudaStream_t stream) {
   using Element = cutlass::bfloat16_t;
-  using ThreadblockShape = cutlass::gemm::GemmShape<128, 64, 32>;
-  using WarpShape = cutlass::gemm::GemmShape<64, 32, 32>;
+  using ThreadblockShape =
+      cutlass::gemm::GemmShape<ThreadblockM, ThreadblockN, ThreadblockK>;
+  using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, ThreadblockK>;
   using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
   using OutputOp0 = cutlass::epilogue::thread::LinearCombination<
       Element, 8, float, float,
@@ -381,7 +388,7 @@ cudaError_t run_prefill_gate_up_geglu_decode_layout_dual_gemm(
       OutputOp1,
       OutputOp2,
       cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
-      3,
+      Stages,
       false,
       false,
       false>;
@@ -421,20 +428,61 @@ cudaError_t run_prefill_gate_up_geglu_decode_layout_dual_gemm(
   return cudaGetLastError();
 }
 
+cudaError_t run_prefill_gate_up_geglu_decode_layout_dual_gemm(
+    floatX *__restrict__ act,
+    const floatX *__restrict__ x_swizzled,
+    const floatX *__restrict__ w_gate_up_decode,
+    int rows,
+    cudaStream_t stream) {
+  // Row thresholds mirror the measured 12B FFN gate/up DualGemm sweep.
+  if (rows <= 64) {
+    return run_prefill_gate_up_geglu_decode_layout_dual_gemm_config<
+        64, 64, 32, 64, 32, 3>(
+        act, x_swizzled, w_gate_up_decode, rows, stream);
+  }
+  if (rows <= 128) {
+    return run_prefill_gate_up_geglu_decode_layout_dual_gemm_config<
+        128, 64, 32, 64, 32, 5>(
+        act, x_swizzled, w_gate_up_decode, rows, stream);
+  }
+  return run_prefill_gate_up_geglu_decode_layout_dual_gemm_config<
+      256, 64, 32, 64, 32, 3>(
+      act, x_swizzled, w_gate_up_decode, rows, stream);
+}
+
 cudaError_t launch_prefill_down_gemm(
     const floatX *__restrict__ act,
     const floatX *__restrict__ w_down_row_major,
     floatX *__restrict__ down,
     int rows,
     cudaStream_t stream) {
-  if (rows <= 128) {
-    return launch_cutlass_bf16_gemm<cutlass::layout::RowMajor, 64, 128, 64,
-                                    32, 64, 3>(
+  // Row thresholds mirror the measured 12B FFN-down prefill sweep.
+  if (rows <= 64) {
+    return launch_cutlass_bf16_gemm<cutlass::layout::RowMajor, 64, 64, 32,
+                                    32, 32, 10>(
         act, w_down_row_major, down, rows, GEMMA4_INTERMEDIATE_SIZE,
         GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
   }
-  return launch_cutlass_bf16_gemm<cutlass::layout::RowMajor, 128, 128, 64,
-                                  64, 64, 3>(
+  if (rows <= 128) {
+    return launch_cutlass_bf16_gemm<cutlass::layout::RowMajor, 64, 128, 32,
+                                    32, 64, 6>(
+        act, w_down_row_major, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+        GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
+  }
+  if (rows <= 256) {
+    return launch_cutlass_bf16_gemm<cutlass::layout::RowMajor, 128, 128, 64,
+                                    64, 64, 3>(
+        act, w_down_row_major, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+        GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
+  }
+  if (rows <= 512) {
+    return launch_cutlass_bf16_gemm<cutlass::layout::RowMajor, 256, 128, 32,
+                                    64, 64, 3>(
+        act, w_down_row_major, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+        GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
+  }
+  return launch_cutlass_bf16_gemm<cutlass::layout::RowMajor, 128, 128, 32,
+                                  64, 64, 5>(
       act, w_down_row_major, down, rows, GEMMA4_INTERMEDIATE_SIZE,
       GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
 }
@@ -496,9 +544,7 @@ cudaError_t gemma4_ffn_decode_fused_bf16_impl(
   }
 
   cudaError_t status = cudaMemsetAsync(scratch, 0, sizeof(*scratch), stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
   if constexpr (kReductionPolicy == 1) {
     gemma4_ffn_decode_accumulate_partials_bf16_kernel<<<
@@ -509,10 +555,7 @@ cudaError_t gemma4_ffn_decode_fused_bf16_impl(
         kAccumBlocks, kFfnThreads, 0, stream>>>(
         x, w_gate_up_col_major, w_down_row_major, scratch);
   }
-  status = cudaGetLastError();
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetLastError());
 
   gemma4_ffn_decode_finalize_bf16_kernel<<<1, kFfnThreads, 0, stream>>>(
       residual_out, normed_out, residual, rms_weight, scratch, eps);
@@ -529,23 +572,17 @@ cudaError_t gemma4_ffn_prefill_bf16_impl(const Gemma4FfnBf16Args &args) {
   swizzle_hidden_packs_kernel<<<swizzle_grid_dim, block_dim, 0, args.stream>>>(
       args.prefill_scratch.down, args.x, args.rows);
   cudaError_t status = cudaGetLastError();
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
   status = run_prefill_gate_up_geglu_decode_layout_dual_gemm(
       args.prefill_scratch.act, args.prefill_scratch.down,
       args.w_gate_up_decode, args.rows, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
   status = launch_prefill_down_gemm(
       args.prefill_scratch.act, args.w_down_decode,
       args.prefill_scratch.down, args.rows, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
   rmsnorm_residual_from_swizzled_down_kernel<<<
       args.rows, kFfnThreads, 0, args.stream>>>(
@@ -576,21 +613,15 @@ cudaError_t gemma4_ffn_prefill_mlp_bf16_impl(
   swizzle_hidden_packs_kernel<<<swizzle_grid_dim, block_dim, 0, stream>>>(
       scratch.down, x, rows);
   cudaError_t status = cudaGetLastError();
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
   status = run_prefill_gate_up_geglu_decode_layout_dual_gemm(
       scratch.act, scratch.down, w_gate_up_decode, rows, stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
   status = launch_prefill_down_gemm(
       scratch.act, w_down_decode, scratch.down, rows, stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
   unswizzle_hidden_packs_kernel<<<rows, kFfnThreads, 0, stream>>>(
       out, scratch.down);
@@ -620,10 +651,7 @@ cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
   swizzle_gate_up_interleaved_kernel<<<
       gate_up_grid_dim, block_dim, 0, stream>>>(
       w_gate_up_swizzled, w_gate_up_col_major);
-  cudaError_t status = cudaGetLastError();
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetLastError());
 
   const dim3 down_grid_dim(kActualSwizzleBlocksPerRow,
                            GEMMA4_INTERMEDIATE_SIZE);

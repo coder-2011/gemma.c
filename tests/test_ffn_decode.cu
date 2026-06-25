@@ -78,11 +78,6 @@ __nv_bfloat16 make_residual_value(int index) {
   return __float2bfloat16(static_cast<float>(centered) / 128.0f);
 }
 
-__nv_bfloat16 make_gamma_value(int index) {
-  const float value = 0.85f + static_cast<float>((index * 7 + 3) % 41) / 128.0f;
-  return __float2bfloat16(value);
-}
-
 __nv_bfloat16 make_down_value(int tile, int col) {
   const int centered = ((tile * 13 + col * 5 + 17) % 97) - 48;
   return __float2bfloat16(static_cast<float>(centered) / 512.0f);
@@ -132,7 +127,9 @@ void run_sparse_case() {
   for (int i = 0; i < GEMMA4_HIDDEN_SIZE; ++i) {
     x[i] = make_x_value(i);
     residual[i] = make_residual_value(i);
-    gamma[i] = make_gamma_value(i);
+    const float gamma_value =
+        0.85f + static_cast<float>((i * 7 + 3) % 41) / 128.0f;
+    gamma[i] = __float2bfloat16(gamma_value);
   }
 
   DeviceBuffer<__nv_bfloat16> d_x(GEMMA4_HIDDEN_SIZE);

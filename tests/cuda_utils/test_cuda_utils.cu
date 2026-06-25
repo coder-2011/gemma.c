@@ -30,12 +30,6 @@ __global__ void warp_reduce_sum_real_kernel(const float *inp, float *out,
   out[index] = warp_reduce_sum(value);
 }
 
-float make_real_value(int index) {
-  int centered = ((index * 37 + 11) % 113) - 56;
-  float base = static_cast<float>(centered) / 7.0f;
-  return base + 0.001f * static_cast<float>((index % 5) - 2);
-}
-
 }  // namespace
 
 int main() {
@@ -50,7 +44,9 @@ int main() {
   std::vector<float> expected(total_warps);
 
   for (int i = 0; i < total_values; ++i) {
-    inp[i] = make_real_value(i);
+    const int centered = ((i * 37 + 11) % 113) - 56;
+    const float base = static_cast<float>(centered) / 7.0f;
+    inp[i] = base + 0.001f * static_cast<float>((i % 5) - 2);
   }
 
   for (int warp = 0; warp < total_warps; ++warp) {
