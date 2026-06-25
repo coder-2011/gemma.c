@@ -31,18 +31,6 @@ __device__ void gemma4_async_load_input_pack(RmsnormPack *__restrict__ dst,
   __pipeline_memcpy_async(dst, src, sizeof(RmsnormPack));
 }
 
-// Adds one 128-bit BF16 pack for the standalone residual-add wrapper.
-__device__ inline void gemma4_residual_add_pack_bf16(
-    floatX *__restrict__ out,
-    const floatX *__restrict__ inp1,
-    const floatX *__restrict__ inp2,
-    int pack) {
-  RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
-  RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
-  RmsnormPack result = gemma4_bf16_pack_add(a, b);
-  store128(out + pack * kFloatXPerPack, result);
-}
-
 // -----------------------------------------------------------------------------
 // CUDA kernels
 
@@ -345,7 +333,10 @@ gemma4_residual_add_bf16_kernel(
     return;
   }
 
-  gemma4_residual_add_pack_bf16(out, inp1, inp2, pack);
+  RmsnormPack a = load128cs(inp1 + pack * kFloatXPerPack);
+  RmsnormPack b = load128cs(inp2 + pack * kFloatXPerPack);
+  RmsnormPack result = gemma4_bf16_pack_add(a, b);
+  store128(out + pack * kFloatXPerPack, result);
 }
 
 // -----------------------------------------------------------------------------
@@ -364,15 +355,6 @@ bool gemma4_rmsnorm_args_valid(const floatX *out,
   return out != nullptr && inp != nullptr &&
          (width % kFloatXPerPack) == 0 &&
          is_aligned_16(out) && is_aligned_16(inp);
-}
-
-bool gemma4_weighted_rmsnorm_args_valid(const floatX *out,
-                                        const floatX *inp,
-                                        const floatX *__restrict__ weight,
-                                        int rows,
-                                        int width) {
-  return gemma4_rmsnorm_args_valid(out, inp, rows, width) &&
-         (rows == 0 || (weight != nullptr && is_aligned_16(weight)));
 }
 
 bool gemma4_residual_add_rmsnorm_args_valid(floatX *residual,
@@ -401,7 +383,8 @@ cudaError_t gemma4_rmsnorm_bf16_impl(floatX *out,
                                      int width,
                                      float eps,
                                      cudaStream_t stream) {
-  if (!gemma4_weighted_rmsnorm_args_valid(out, inp, weight, rows, width)) {
+  if (!gemma4_rmsnorm_args_valid(out, inp, rows, width) ||
+      (rows != 0 && (weight == nullptr || !is_aligned_16(weight)))) {
     return cudaErrorInvalidValue;
   }
   if (rows == 0) {
@@ -465,7 +448,8 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16_impl(
     int width,
     float eps,
     cudaStream_t stream) {
-  if (!gemma4_weighted_rmsnorm_args_valid(normed, inp1, weight, rows, width)) {
+  if (!gemma4_rmsnorm_args_valid(normed, inp1, rows, width) ||
+      (rows != 0 && (weight == nullptr || !is_aligned_16(weight)))) {
     return cudaErrorInvalidValue;
   }
   if (!gemma4_residual_add_rmsnorm_args_valid(residual, normed, inp1, inp2,

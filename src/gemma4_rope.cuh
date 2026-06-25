@@ -1,5 +1,4 @@
-#ifndef GEMMA4_ROPE_CUH
-#define GEMMA4_ROPE_CUH
+#pragma once
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -127,5 +126,3 @@ __device__ __forceinline__ void rotate_head_bf16(
 }
 
 }  // namespace gemma4_rope
-
-#endif

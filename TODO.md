@@ -4,13 +4,13 @@
 
 ## High-Priority Kernel Work
 
-- Fix the current RMSNorm build break before building new dependent kernels.
-  - `src/gemma4_rmsnorm.cu` still references fallback kernels removed during cleanup.
-  - `make test-rmsnorm` should compile and pass again before RMSNorm-dependent work proceeds.
 - Benchmark the RMSNorm kernels again after the current cleanup/recovery work.
   - Include hidden width `3840` plus Q/K widths `256` and `512`.
   - Confirm the hidden-width-only fused residual+RMSNorm path is skipped for non-hidden widths.
   - Log commands, GPU/clocks, warmup/iteration counts, cache policy, and results in `src/experiments/EXPERIMENTS.md`.
+- Refactor megakernel timing instrumentation.
+  - Remove standalone `__global__` timing wrappers around device functions once the megakernel path owns measurement.
+  - Add flag-gated timing spots in the megakernel hot path so timings cover real in-path work without wrapper launch overhead.
 - Remove the redundant C ABI wrappers across the CUDA path.
   - Most call sites are C++ now, so keep `extern "C"` only where a real Python/ctypes or shared-library boundary still needs it.
   - Prefer direct C++ declarations for internal kernel launchers and helper APIs.
@@ -21,6 +21,8 @@
   - Target decode first: `x @ Wk` / `x @ Wv` should produce final cache values without a contiguous K/V scratch buffer.
   - The epilogue must preserve Gemma semantics: K gets per-head RMSNorm plus RoPE, V gets scale-free RMSNorm, then both scatter into Layout-A paged cache.
   - Benchmark against the lazier baseline first: cuBLAS/cuBLASLt projection into contiguous raw K/V plus fused norm/RoPE/V-norm paged-cache write.
+- Add support for different quantization types.
+  - Keep weight format selection explicit so kernels do not assume BF16 weights forever.
 - Later: investigate persistent producer/consumer orchestration to minimize KV-cache and prepared-Q HBM traffic.
   - Treat the unavoidable paged K/V cache write as the baseline, then look for ways to consume newly written K/V from L2 before it ages out.
   - Prototype a device-side task queue where projection/prep tasks publish ready KV groups and flash-split tasks consume them immediately.
@@ -31,15 +33,15 @@
   - Use one fixed weight layout and let the persistent task scheduler choose prefill-sized GEMM tiles or decode-sized GEMV tiles per work item.
   - Keep prefill and decode projection tasks adjacent by layer/projection where possible so recently streamed weight tiles can get partial L2 reuse.
   - Start with weight-stream-heavy tasks such as FFN gate/up, FFN down, QKV/Q/K projection, O projection, and final LM-head projection; FlashAttention mostly streams KV cache, not layer weights.
+- Idea: try cooperative megakernels as the next step.
+  - Start with a small cooperative launch prototype before folding more of the decode path into it.
+  - Prefer atomics for synchronization instead of `cg::` primitives.
 
 ## Remaining Unfused Inference Buildout
 
 Build the remaining model-path pieces in this rough order. Keep each kernel
 standalone, numerically tested, benchmarked, and logged in
 `src/experiments/EXPERIMENTS.md` before wiring it into the full path.
-
-0. Write a project-owned tokenizer.
-   - Keep it Gemma-specific, deterministic, and small enough to validate against the checkpoint tokenizer files.
 
 1. Q/K per-head RMSNorm
    - Sliding layers: learned-weight RMSNorm over head dim `256`.

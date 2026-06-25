@@ -1,5 +1,4 @@
-#ifndef GEMMA4_RMSNORM_DEVICE_CUH
-#define GEMMA4_RMSNORM_DEVICE_CUH
+#pragma once
 
 #include "gemma4.h"
 #include "gemma4_cuda_utils.cuh"
@@ -51,5 +50,3 @@ __device__ inline void rmsnorm_hidden_row_bf16(
 }
 
 }  // namespace gemma4_rmsnorm_device
-
-#endif

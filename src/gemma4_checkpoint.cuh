@@ -1,5 +1,4 @@
-#ifndef GEMMA4_CHECKPOINT_CUH
-#define GEMMA4_CHECKPOINT_CUH
+#pragma once
 
 #include "gemma4.h"
 
@@ -78,5 +77,3 @@ cudaError_t gemma4_load_text_weights_device_bf16(
 
 // Releases every device allocation owned by a prepared text-weight bundle.
 void gemma4_text_weights_device_free(Gemma4TextWeightsDevice *weights);
-
-#endif

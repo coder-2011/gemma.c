@@ -1,5 +1,4 @@
-#ifndef GEMMA4_H
-#define GEMMA4_H
+#pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -48,7 +47,7 @@
     (GEMMA4_GLOBAL_KV_HEADS * GEMMA4_GLOBAL_HEAD_DIM)
 #define GEMMA4_GLOBAL_ATTENTION_OUT_SIZE GEMMA4_GLOBAL_Q_PROJ_SIZE
 
-typedef struct {
+struct Gemma4DenseConfig {
   int32_t vocab_size;
   int32_t hidden_size;
   int32_t intermediate_size;
@@ -67,9 +66,9 @@ typedef struct {
   float partial_rotary_factor_global;
   float rms_norm_eps;
   float final_logit_softcapping;
-} Gemma4DenseConfig;
+};
 
-typedef struct {
+struct Gemma4AttentionSpec {
   bool global;
   int32_t q_heads;
   int32_t kv_heads;
@@ -77,7 +76,7 @@ typedef struct {
   int32_t window;
   int32_t rotary_dims;
   float rope_theta;
-} Gemma4AttentionSpec;
+};
 
 inline constexpr Gemma4DenseConfig gemma4_config = {
   GEMMA4_VOCAB_SIZE,
@@ -102,5 +101,3 @@ inline constexpr Gemma4DenseConfig gemma4_config = {
 
 bool gemma4_is_global_layer(int32_t layer_index);
 Gemma4AttentionSpec gemma4_attention_spec(int32_t layer_index);
-
-#endif

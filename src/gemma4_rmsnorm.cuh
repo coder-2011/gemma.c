@@ -1,5 +1,4 @@
-#ifndef GEMMA4_RMSNORM_CUH
-#define GEMMA4_RMSNORM_CUH
+#pragma once
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -36,5 +35,3 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16(__nv_bfloat16 *residual,
                                              int width,
                                              float eps,
                                              cudaStream_t stream);
-
-#endif

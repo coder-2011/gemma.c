@@ -265,12 +265,6 @@ size_t element_count(const std::vector<int64_t> &shape) {
   return count;
 }
 
-// Tests whether a layer uses the global-attention checkpoint shape.
-bool is_global_layer(int layer) {
-  return layer == GEMMA4_NUM_LAYERS - 1 ||
-         (layer + 1) % GEMMA4_GLOBAL_LAYER_PERIOD == 0;
-}
-
 // Builds a canonical Hugging Face language-model tensor name.
 std::string layer_name(int layer, const char *suffix) {
   return "model.language_model.layers." + std::to_string(layer) + "." + suffix;
@@ -409,7 +403,9 @@ cudaError_t load_layer_direct(
     Gemma4TextLayerWeightsDevice &dst,
     const Gemma4CheckpointLayerHost &src,
     int layer) {
-  const bool global = is_global_layer(layer);
+  const bool global =
+      layer == GEMMA4_NUM_LAYERS - 1 ||
+      (layer + 1) % GEMMA4_GLOBAL_LAYER_PERIOD == 0;
   const size_t head_dim =
       global ? GEMMA4_GLOBAL_HEAD_DIM : GEMMA4_SLIDING_HEAD_DIM;
   const size_t q_size =
@@ -462,7 +458,9 @@ bool fill_layer_host(
     const char *data_base,
     size_t data_bytes,
     std::string *error) {
-  const bool global = is_global_layer(layer_idx);
+  const bool global =
+      layer_idx == GEMMA4_NUM_LAYERS - 1 ||
+      (layer_idx + 1) % GEMMA4_GLOBAL_LAYER_PERIOD == 0;
   const int q_size =
       global ? GEMMA4_GLOBAL_Q_PROJ_SIZE : GEMMA4_SLIDING_Q_PROJ_SIZE;
   const int k_size =

@@ -151,17 +151,9 @@ void compare_float(const std::vector<float> &actual,
   }
 }
 
-bool uses_learned_weight(RmsnormMode mode) {
-  return mode == RmsnormMode::LearnedWeight;
-}
-
-const char *rmsnorm_label(RmsnormMode mode) {
-  return uses_learned_weight(mode) ? "rmsnorm" : "scale-free rmsnorm";
-}
-
 void run_rmsnorm_case(int rows, int width, RmsnormMode mode) {
   const int elems = rows * width;
-  const bool has_weight = uses_learned_weight(mode);
+  const bool has_weight = mode == RmsnormMode::LearnedWeight;
 
   std::vector<__nv_bfloat16> inp(elems);
   std::vector<__nv_bfloat16> weight(width);
@@ -193,7 +185,7 @@ void run_rmsnorm_case(int rows, int width, RmsnormMode mode) {
 
   d_out.copy_to(actual);
 
-  const char *label = rmsnorm_label(mode);
+  const char *label = has_weight ? "rmsnorm" : "scale-free rmsnorm";
   compare_bf16(actual, expected, 0.03125f, label);
 }
 

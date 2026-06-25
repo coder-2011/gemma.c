@@ -1,5 +1,4 @@
-#ifndef GEMMA4_EMBEDDING_GATHER_CUH
-#define GEMMA4_EMBEDDING_GATHER_CUH
+#pragma once
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -43,5 +42,3 @@ cudaError_t gemma4_embedding_gather_bf16(
     const __nv_bfloat16 *__restrict__ embeddings,
     int32_t num_tokens,
     cudaStream_t stream);
-
-#endif
