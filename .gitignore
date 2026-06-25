@@ -3,6 +3,11 @@
 .agents/
 skills-lock.json
 models/
+build/benches/
 build/experiments/
+experiments/flash-attention/
+experiments/marlin/
+experiments/sgemm.cu/
+experiments/tuna/
 __pycache__/
 *.py[cod]

@@ -3,6 +3,168 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-23 - FFN Gate/Up DualGemm Tile Sweep
+
+Question:
+
+- Is the production CUTLASS `DualGemm` tile for the 12B FFN gate/up prefill
+  path still the best measured choice across prompt row counts?
+
+Change:
+
+- Added `gemma4_ffn_dual_gemm_bench` to sweep the custom gate/up + GeGLU
+  `DualGemm` tile variants separately from the FFN-down GEMM.
+- Increased benchmark input scales after the first run exposed false-positive
+  "fast" templates that were effectively writing zeros under the old loose
+  absolute tolerance.
+- Updated production prefill gate/up dispatch to:
+  - rows `<= 64`: `64x64x32`, warp `64x32`, stages `3`.
+  - rows `<= 128`: `128x64x32`, warp `64x32`, stages `5`.
+  - rows `> 128`: `256x64x32`, warp `64x32`, stages `3`.
+
+Commands:
+
+```bash
+make ffn-dual-gemm-bench
+./build/experiments/gemma4_ffn_dual_gemm_bench 3 1 1 64 all
+./build/experiments/gemma4_ffn_dual_gemm_bench 20 10 3 16,64,96,128,256,512,1024 all \
+  | tee src/experiments/results/2026-06-23_ffn_dual_gemm_12b_warm.txt
+./build/experiments/gemma4_ffn_dual_gemm_bench 50 20 5 16,64,96,128 all \
+  | tee src/experiments/results/2026-06-23_ffn_dual_gemm_small_confirm.txt
+./build/experiments/gemma4_ffn_dual_gemm_bench 50 20 5 256,512,1024 all \
+  | tee src/experiments/results/2026-06-23_ffn_dual_gemm_tail_confirm.txt
+./build/experiments/gemma4_ffn_dual_gemm_bench 20 10 3 2048,4096 all \
+  | tee src/experiments/results/2026-06-23_ffn_dual_gemm_large_probe.txt
+make build/gemma4_ffn.o
+make test-ffn-decode test-prefill-megakernel
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`. Benchmark process PCI bus IDs varied in logs
+  even though `nvidia-smi -L` reported one visible A6000.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Shape: BF16 FFN gate/up `DualGemm`, `M = rows`, `N = 15360`,
+  `K = 3840`, with fused tanh-GELU times up.
+- Timing: CUDA events on the same nonblocking stream over repeated launches;
+  launch overhead excluded from GPU elapsed time.
+- Warmup/iterations: main sweep used `10` warmups, `20` timed iterations, `3`
+  samples. Confirmation sweeps used `20` warmups, `50` timed iterations, `5`
+  samples where noted.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked.
+- Correctness: candidate output compared against the current production tile
+  before timing. Wrong zero-output candidates failed with max_abs around
+  `266-396` after the scale fix. Focused tests passed after the production
+  dispatch edit.
+
+Best corrected timings:
+
+```text
+rows  selected production tile   confirm best ms  speedup vs current
+16    64x64x32 s3                   0.345942 ms          1.096x
+64    64x64x32 s3                   0.351373 ms          1.066x
+96    128x64x32 s5                  0.355635 ms          1.055x
+128   128x64x32 s5                  0.358936 ms          1.054x
+256   256x64x32 s3                  0.473920 ms          1.058x
+512   256x64x32 s3                  0.991025 ms          1.034x
+1024  256x64x32 s3                  1.997306 ms          1.012x
+2048  256x64x32 s3                  3.823846 ms          1.079x
+4096  256x64x32 s3                  7.713193 ms          1.419x
+```
+
+Conclusion:
+
+- The old single `128x64x32 s3` production tile was not the best measured
+  choice for most row counts.
+- The kept dispatch is deliberately small: two new useful tile families plus
+  the measured row thresholds.
+- Several tempting wide-N templates appeared extremely fast only because they
+  produced wrong near-zero outputs; they remain benchmark-only rejected rows.
+
+## 2026-06-23 - CUTLASS 12B Exact Prefill Dispatch Sweep
+
+Question:
+
+- Are the production CUTLASS prefill GEMMs still using the best measured tile for
+  each Gemma 4 12B projection shape?
+
+Change:
+
+- Added exact `sliding_q` and `sliding_kv` shapes to the prefill tuner so the
+  benchmark matches the current unfused prefill path instead of relying on the
+  older packed-QKV proxy shape.
+- Updated production CUTLASS dispatch for exact 12B prefill projection shapes
+  and FFN down. Unknown shapes keep the old generic two-tile fallback.
+
+Commands:
+
+```bash
+nvidia-smi --query-gpu=name,gpu_bus_id,driver_version,persistence_mode,ecc.mode.current,mig.mode.current,power.limit,clocks.sm,clocks.mem,temperature.gpu,power.draw,utilization.gpu --format=csv
+/usr/local/cuda/bin/nvcc --version
+make sgemm-bf16-prefill-bench
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 \
+  --ops ffn_down,sliding_q,sliding_kv,sliding_o,global_q,global_k,global_o \
+  --configs bf16_cutlass_64x64_s10,bf16_cutlass_64x128x64,bf16_cutlass_64x128_s6,bf16_cutlass_128x128x64,bf16_cutlass_128x128_s5,bf16_cutlass_128x256,bf16_cutlass_256x128 \
+  --m 16,64,96,128,256,512,1024 \
+  --iters 20 --warmup 10 \
+  --cublas-backend lt --cublaslt-heuristics 32 --graph-repeats 10 \
+  --skip-build --keep-going \
+  --out build/experiments/gemma4_prefill_tune/2026-06-23_cutlass_12b_exact_prefill_h32.csv
+make test-prefill-gemm test-ffn-decode
+make test-prefill-megakernel
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver 580.126.16, persistence enabled, ECC
+  disabled, power limit 300 W.
+- Toolchain: `/usr/local/cuda/bin/nvcc` reports CUDA 13.0.48, even though the
+  project target notes still say CUDA 12.x.
+- Timing: child benchmark CUDA events, with CUDA graph replay when
+  `GEMMA4_PREFILL_GRAPH_REPEATS=10`.
+- Warmup/iterations: 10 warmup iterations and 20 timed iterations per
+  op/config/M point.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked.
+- Correctness: benchmark checks custom output against the cuBLAS/cuBLASLt
+  reference for every config; focused tests passed after the dispatch edit.
+
+Results:
+
+```text
+Exact measured shape grid, old production CUTLASS dispatch vs new measured dispatch:
+
+op          old_ms_sum  new_ms_sum  old/new
+ffn_down       2.7647      2.6619    1.039x
+sliding_q      0.7964      0.7404    1.076x
+sliding_kv     0.4703      0.3892    1.208x
+sliding_o      0.7674      0.7328    1.047x
+global_q       1.5291      1.4574    1.049x
+global_k       0.3667      0.1911    1.919x
+global_o       1.4875      1.4268    1.043x
+
+Weighted by production layer counts:
+old CUTLASS dispatch: 259.9480 ms
+new CUTLASS dispatch: 242.4376 ms
+old/new speedup:      1.072x
+cuBLASLt h32:         255.9424 ms
+new vs cuBLASLt h32:  1.056x
+```
+
+Conclusion:
+
+- The old row-only `64x128x64` / `128x128x64` CUTLASS rule was leaving
+  measurable performance on the table for exact 12B prefill shapes.
+- Shape-specific dispatch is worth keeping for the current CUTLASS prefill path.
+- Global K still strongly favors cuBLASLt in isolation, so a later unfused
+  baseline should compare replacing that specific CUTLASS call with cuBLASLt
+  rather than only retuning CUTLASS.
+- The FFN gate/up DualGemm tile was intentionally left out of this sweep and
+  handled by the follow-up entry above.
+
 ## 2026-06-20 - Fused LM-Head Gumbel Sampling Smoke
 
 Question:

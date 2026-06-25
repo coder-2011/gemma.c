@@ -1,0 +1,35 @@
+benchmark_env name=ffn_dual_gemm_bench cuda_device=0 gpu="NVIDIA RTX A6000" pci_bus_id=0000:0F:00.0 compute_capability=sm_86 global_mem_bytes=50897289216 l2_cache_bytes=6291456 driver_cuda=13000 runtime_cuda=13000
+benchmark_compile nvcc=13.0.48 arch_flags=compile_command weight_load_policy=-1
+benchmark_nvidia_smi fields=name,bus_id,driver,persistence,ecc,mig,power_limit_w,sm_clock_mhz,mem_clock_mhz,temp_c,power_draw_w,gpu_util_pct values="NVIDIA RTX A6000, 00000000:0F:00.0, 580.126.16, Enabled, Disabled, [N/A], 300.00, 1800, 7601, 32, 46.69, 0"
+benchmark_contract name=ffn_dual_gemm_bench measurement=ffn_gate_up_dual_gemm_only timing=cuda_events_same_stream_repeated_launches cache=warm_repeated_buffers launch_overhead=excluded_from_gpu_elapsed_time aggregation=best_and_average correctness=candidate_vs_current_dualgemm clock_policy=unlocked_boost warmup=10 iters=20 samples=3 graph_inner_iters=0 no_sleep_between_trials=true ncu_clock_control=use_--clock-control_none notes="12B FFN gate/up DualGemm tile sweep"
+config,rows,best_ms,avg_ms,max_abs,mean_abs,max_rel,status
+current_128x64x32_s3,2048,4.125586,4.156371,0,0,0,ok
+current_128x64x32_s3,4096,10.942301,10.978775,0,0,0,ok
+dual_128x64_s4,2048,4.266229,4.300072,0,0,0,ok
+dual_128x64_s4,4096,10.526057,10.692290,0,0,0,ok
+dual_128x64_s5,2048,4.132171,4.165464,0,0,0,ok
+dual_128x64_s5,4096,10.576735,10.679137,0,0,0,ok
+dual_128x64_s6,2048,4.105872,4.258373,0,0,0,ok
+dual_128x64_s6,4096,10.560701,10.788651,0,0,0,ok
+dual_128x64_s10,2048,0,0,392,8.48418,1,wrong
+dual_128x64_s10,4096,0,0,396,8.48559,1,wrong
+dual_128x64x64_s3,2048,4.368825,4.384254,0,0,0,ok
+dual_128x64x64_s3,4096,9.592525,9.717862,0,0,0,ok
+dual_64x64_w64x32_s3,2048,6.005698,6.024786,0,0,0,ok
+dual_64x64_w64x32_s3,4096,12.099227,12.213122,0,0,0,ok
+dual_128x32_s3,2048,5.862880,5.882723,0,0,0,ok
+dual_128x32_s3,4096,17.490429,17.659533,0,0,0,ok
+dual_256x64_s3,2048,3.823846,3.875371,0,0,0,ok
+dual_256x64_s3,4096,7.713193,7.856122,0,0,0,ok
+dual_64x64_s10,2048,0,0,392,8.48418,1,wrong
+dual_64x64_s10,4096,0,0,396,8.48559,1,wrong
+dual_64x128_s6,2048,0,0,392,8.48418,1,wrong
+dual_64x128_s6,4096,0,0,396,8.48559,1,wrong
+dual_128x128_s5,2048,0,0,392,8.48418,1,wrong
+dual_128x128_s5,4096,0,0,396,8.48559,1,wrong
+dual_128x256_s3,2048,0,0,392,8.48418,1,wrong
+dual_128x256_s3,4096,0,0,396,8.48559,1,wrong
+dual_256x128_s3,2048,78.819275,78.827034,0,0,0,ok
+dual_256x128_s3,4096,158.197235,158.207245,0,0,0,ok
+dual_128x128x64_s3,2048,0,0,392,8.48418,1,wrong
+dual_128x128x64_s3,4096,0,0,396,8.48559,1,wrong
