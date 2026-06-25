@@ -32,13 +32,13 @@ TORCH_LDFLAGS ?= -L$(TORCH_LIB) -Xlinker -rpath -Xlinker $(TORCH_LIB)
 TORCH_LIBS ?= -ltorch -ltorch_cuda -ltorch_cpu -lc10_cuda -lc10
 PYTHON_INCLUDE ?= /usr/include/python3.11
 
-.PHONY: all cuda-kernels prompt benchmarks decode-bench embedding-gather-bench sampling-bench rmsnorm-bench rmsnorm-hidden-fused-bench ffn-cudnn-bench ffn-decode-load-bench ffn-dual-gemm-bench flash-attn-bench kv-cache-bench hgemm-bench tokenizer-bench flash-attn-lib test-cuda-utils test-tokenizer test-embedding-gather test-sampling test-rmsnorm test-ffn-decode test-prefill-gemm test-kv-cache test-flash-attention test-flash-attention-cpp test-flash-attention-pytorch test-runtime-state test-decode-megakernel test-prefill-megakernel test-checkpoint-loader clean
+.PHONY: all cuda-kernels prompt benchmarks decode-bench embedding-gather-bench sampling-bench rmsnorm-bench rmsnorm-hidden-fused-bench ffn-cudnn-bench ffn-decode-load-bench flash-attn-bench kv-cache-bench hgemm-bench tokenizer-bench flash-attn-lib test-cuda-utils test-tokenizer test-embedding-gather test-sampling test-rmsnorm test-ffn-decode test-prefill-gemm test-kv-cache test-flash-attention test-flash-attention-cpp test-flash-attention-pytorch test-runtime-state test-decode-megakernel test-prefill-megakernel test-checkpoint-loader clean
 
 all: $(BUILD_DIR)/gemma4.o
 
 cuda-kernels: $(BUILD_DIR)/gemma4_matmul_kernels.o $(BUILD_DIR)/gemma4_sampling.o $(BUILD_DIR)/gemma4_rmsnorm.o $(BUILD_DIR)/gemma4_flash_attention.o $(BUILD_DIR)/gemma4_ffn.o $(BUILD_DIR)/gemma4_kv_cache.o $(BUILD_DIR)/gemma4_runtime.o $(BUILD_DIR)/gemma4_decode_megakernel.o $(BUILD_DIR)/gemma4_prefill_megakernel.o $(BUILD_DIR)/gemma4_checkpoint.o
 prompt: $(BUILD_DIR)/gemma4_prompt
-benchmarks: decode-bench embedding-gather-bench sampling-bench rmsnorm-bench rmsnorm-hidden-fused-bench ffn-cudnn-bench ffn-decode-load-bench ffn-dual-gemm-bench flash-attn-bench kv-cache-bench hgemm-bench tokenizer-bench
+benchmarks: decode-bench embedding-gather-bench sampling-bench rmsnorm-bench rmsnorm-hidden-fused-bench ffn-cudnn-bench ffn-decode-load-bench flash-attn-bench kv-cache-bench hgemm-bench tokenizer-bench
 decode-bench: $(BUILD_DIR)/benches/gemma4_decode_bench
 embedding-gather-bench: $(BUILD_DIR)/benches/gemma4_embedding_gather_bench
 sampling-bench: $(BUILD_DIR)/benches/gemma4_sampling_bench
@@ -46,7 +46,6 @@ rmsnorm-bench: $(BUILD_DIR)/benches/gemma4_rmsnorm_bench
 rmsnorm-hidden-fused-bench: $(BUILD_DIR)/benches/gemma4_rmsnorm_hidden_fused_bench
 ffn-cudnn-bench: $(BUILD_DIR)/benches/gemma4_ffn_cudnn_bench
 ffn-decode-load-bench: $(BUILD_DIR)/benches/gemma4_ffn_decode_load_bench
-ffn-dual-gemm-bench: $(BUILD_DIR)/benches/gemma4_ffn_dual_gemm_bench
 flash-attn-bench: $(BUILD_DIR)/benches/gemma4_flash_attention_bench
 kv-cache-bench: $(BUILD_DIR)/benches/gemma4_kv_cache_bench
 hgemm-bench: $(BUILD_DIR)/benches/16384_512_4096
@@ -155,9 +154,6 @@ $(BUILD_DIR)/benches/gemma4_ffn_cudnn_bench: src/benches/gemma4_ffn_cudnn_bench.
 
 $(BUILD_DIR)/benches/gemma4_ffn_decode_load_bench: src/benches/gemma4_ffn_decode_load_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4_ffn.cu src/gemma4_ffn.cuh src/gemma4_ffn_decode_device.cuh src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/benches
 	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) src/benches/gemma4_ffn_decode_load_bench.cu src/gemma4_ffn.cu -o $@
-
-$(BUILD_DIR)/benches/gemma4_ffn_dual_gemm_bench: src/benches/gemma4_ffn_dual_gemm_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4.h | $(BUILD_DIR)/benches
-	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) src/benches/gemma4_ffn_dual_gemm_bench.cu -o $@
 
 $(BUILD_DIR)/benches/gemma4_flash_attention_bench: src/benches/gemma4_flash_attention_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/benches
 	$(NVCC) $(NVCCFLAGS) $(TORCH_NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) $(TORCH_CPPFLAGS) $(FLASH_ATTN_CUTLASS_CPPFLAGS) src/benches/gemma4_flash_attention_bench.cu src/gemma4_flash_attention.cu $(TORCH_LDFLAGS) $(TORCH_LIBS) -o $@
