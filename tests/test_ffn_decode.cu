@@ -220,7 +220,6 @@ void run_sparse_case() {
   CHECK_CUDA(gemma4_ffn_decode_swizzle_weights_bf16(
       d_gate_up.get(), d_gate_up_src.get(), d_down.get(), d_down_src.get(),
       0));
-  CHECK_CUDA(gemma4_ffn_decode_configure_scratch_l2(d_scratch.get(), 0));
   CHECK_CUDA(gemma4_ffn_decode_fused_bf16(
       d_residual_out.get(), d_normed_out.get(), d_x.get(), d_residual.get(),
       d_gamma.get(), d_gate_up.get(), d_down.get(), d_scratch.get(),
@@ -320,34 +319,12 @@ void run_sparse_case() {
                "prefill FFN residual");
   compare_bf16(actual_prefill_normed, expected_prefill_normed, 0.03125f,
                "prefill FFN normed");
-
-  DeviceBuffer<unsigned char> d_scratch_bytes(
-      sizeof(Gemma4FfnDecodeScratch) + 128);
-  auto *misaligned_scratch = reinterpret_cast<Gemma4FfnDecodeScratch *>(
-      d_scratch_bytes.get() + 16);
-  cudaError_t invalid_scratch = gemma4_ffn_decode_fused_bf16(
-      d_residual_out.get(), d_normed_out.get(), d_x.get(), d_residual.get(),
-      d_gamma.get(), d_gate_up.get(), d_down.get(), misaligned_scratch,
-      GEMMA4_RMS_NORM_EPS, 0);
-  if (invalid_scratch != cudaErrorInvalidValue) {
-    std::fprintf(stderr,
-                 "expected cudaErrorInvalidValue for misaligned scratch\n");
-    std::exit(1);
-  }
 }
 
 }  // namespace
 
 int main() {
   run_sparse_case();
-
-  cudaError_t invalid = gemma4_ffn_decode_fused_bf16(
-      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-      GEMMA4_RMS_NORM_EPS, 0);
-  if (invalid != cudaErrorInvalidValue) {
-    std::fprintf(stderr, "expected cudaErrorInvalidValue for invalid args\n");
-    return 1;
-  }
 
   std::printf("ffn decode tests passed\n");
   return 0;

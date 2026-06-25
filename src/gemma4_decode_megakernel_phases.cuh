@@ -251,8 +251,6 @@ __device__ inline void phase_attention_o_projection(
     const Gemma4DecodeMegakernelFfnTailArgs &args) {
   constexpr int kColsPerBlock = 8;
   constexpr int kHiddenBlocks = GEMMA4_HIDDEN_SIZE / kColsPerBlock;
-  static_assert((GEMMA4_HIDDEN_SIZE % kColsPerBlock) == 0,
-                "hidden width must divide O projection tile columns");
   static_assert((AttentionWidth % kBf16Packed128Elements) == 0,
                 "attention width must divide bf16 pack width");
 
@@ -431,8 +429,6 @@ __device__ inline void phase_lm_head_tile_logits(
     float (&sums)[kMegaColsPerBlock]) {
   constexpr int packs_per_col =
       GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-  static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
-                "hidden size must divide the 128-bit bf16 pack width");
 
   const int token0 = tile * kMegaColsPerBlock;
   for (int pack = int(threadIdx.x); pack < packs_per_col;

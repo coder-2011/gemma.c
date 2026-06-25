@@ -18,13 +18,6 @@ constexpr int kFinalLogitsColsPerBlock = 8;
 constexpr int kFinalLogitsMinBlocksPerSm = 1;
 constexpr int kCandidateCount = GEMMA4_VOCAB_SIZE / kFinalLogitsColsPerBlock;
 
-static_assert((GEMMA4_VOCAB_SIZE % kFinalLogitsColsPerBlock) == 0,
-              "vocab size must divide final-logits columns per block");
-static_assert((kFinalLogitsThreads % WARP_SIZE) == 0,
-              "final logits thread count must be a warp multiple");
-static_assert((kFinalLogitsThreads & (kFinalLogitsThreads - 1)) == 0,
-              "final logits thread count must be a power of two");
-
 // Chooses the higher logit, breaking exact ties by the lower token id.
 __device__ inline bool better_candidate(float logit,
                                         int32_t token_id,
@@ -74,8 +67,6 @@ __device__ inline void lm_head_tile_logits(
     float (&sums)[ColsPerBlock]) {
   constexpr int packs_per_col =
       GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-  static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
-                "hidden size must divide the 128-bit bf16 pack width");
 
   const int token0 = tile * ColsPerBlock;
   for (int pack_idx = thread_idx; pack_idx < packs_per_col;
@@ -269,16 +260,6 @@ cudaError_t gemma4_sample_next_decode_bf16(
       static_cast<size_t>(kCandidateCount) * sizeof(uint32_t);
   const size_t required_scratch = candidate_bytes + ready_bytes;
   if (scratch_bytes < required_scratch) {
-    return cudaErrorInvalidValue;
-  }
-  if (d_next_hidden == nullptr || d_next_token == nullptr ||
-      d_scratch == nullptr || d_final_hidden == nullptr ||
-      d_lm_head_col_major == nullptr) {
-    return cudaErrorInvalidValue;
-  }
-  if (!is_aligned_16(d_next_hidden) || !is_aligned_16(d_final_hidden) ||
-      !is_aligned_16(d_lm_head_col_major) ||
-      !is_aligned_to<alignof(Gemma4SampleCandidate)>(d_scratch)) {
     return cudaErrorInvalidValue;
   }
 

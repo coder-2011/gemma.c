@@ -26,8 +26,6 @@ __device__ inline void kv_cache_write_vec_device(
     int32_t head,
     int32_t vec,
     int32_t vec_stride) {
-  if (token >= token_count || head >= config.num_heads) return;
-
   const int batch = token_batch[token];
   const int position = token_position[token];
   if (batch < 0 || position < 0) return;

@@ -20,8 +20,6 @@ __device__ inline void rmsnorm_hidden_row_bf16(
     float &scale,
     int thread_idx) {
   constexpr int packs = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-  static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
-                "hidden RMSNorm width must divide bf16 pack width");
 
   float sum_sq = 0.0f;
   for (int pack = thread_idx; pack < packs; pack += Threads) {

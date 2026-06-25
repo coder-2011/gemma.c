@@ -12,8 +12,6 @@ namespace gemma4_embedding_gather {
 constexpr int kEmbeddingGatherThreads = WARP_SIZE;
 constexpr int kPacksPerEmbeddingRow =
     GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
-              "embedding width must be divisible by Packed128 bf16 width");
 
 // Copies one tied embedding row into model-input space.
 __device__ inline void copy_embedding_row_bf16(

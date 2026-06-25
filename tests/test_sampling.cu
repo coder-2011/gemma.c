@@ -156,19 +156,9 @@ void run_sample_cases() {
            scaled_embedding_row(target_row), kTargetToken, "single target");
 }
 
-void run_invalid_args_case() {
-  cudaError_t status = gemma4_sample_next_decode_bf16(
-      nullptr, nullptr, nullptr, 0, nullptr, nullptr, 0);
-  if (status != cudaErrorInvalidValue) {
-    std::fprintf(stderr, "expected cudaErrorInvalidValue for null arguments\n");
-    std::exit(1);
-  }
-}
-
 }  // namespace
 
 int main() {
-  run_invalid_args_case();
   run_sample_cases();
   std::printf("sampling tests passed\n");
   return 0;

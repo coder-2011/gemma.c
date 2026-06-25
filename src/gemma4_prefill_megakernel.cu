@@ -248,9 +248,6 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
 
   const int32_t cache_layer =
       gemma4_kv_cache_layer_index(args.layer_index, global);
-  if (cache_layer < 0) {
-    return cudaErrorInvalidValue;
-  }
 
   cudaError_t status = gemma4_rmsnorm_bf16(
       scratch.hidden_work, args.hidden, weights->input_norm_weight, rows,

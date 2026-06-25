@@ -50,17 +50,13 @@ struct DeviceBuffer {
 
   // Releases the device buffer owned by this wrapper.
   ~DeviceBuffer() {
-    if (ptr != nullptr) {
-      cudaFree(ptr);
-    }
+    cudaFree(ptr);
   }
 
   // Allocates `n` elements and frees any previous allocation first.
   cudaError_t allocate(size_t n) {
-    if (ptr != nullptr) {
-      cudaFree(ptr);
-      ptr = nullptr;
-    }
+    cudaFree(ptr);
+    ptr = nullptr;
     count = n;
     if (n == 0) {
       return cudaSuccess;

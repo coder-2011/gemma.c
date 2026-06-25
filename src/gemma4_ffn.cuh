@@ -56,10 +56,6 @@ struct Gemma4FfnBf16Args {
   cudaStream_t stream = nullptr;
 };
 
-cudaError_t gemma4_ffn_decode_configure_scratch_l2(
-    Gemma4FfnDecodeScratch *scratch,
-    cudaStream_t stream);
-
 size_t gemma4_ffn_prefill_scratch_elements(int rows);
 
 Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(

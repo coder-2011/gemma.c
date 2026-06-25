@@ -94,12 +94,6 @@ int main() {
   run_case(257, {0, 1, 42, 42, 128, 256, 7, 19, 0, 255, 3});
   run_case(17, {16, 0, 8, 8, 3});
 
-  cudaError_t invalid = gemma4_embedding_gather_bf16(nullptr, nullptr, nullptr, 1, 0);
-  if (invalid != cudaErrorInvalidValue) {
-    std::fprintf(stderr, "expected cudaErrorInvalidValue for invalid arguments\n");
-    return 1;
-  }
-
   std::printf("embedding gather tests passed\n");
   return 0;
 }

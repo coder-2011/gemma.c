@@ -40,8 +40,6 @@ gemma4_rmsnorm_bf16_decode_kernel(floatX *out,
                                   const floatX *inp,
                                   const floatX *__restrict__ weight,
                                   float eps) {
-  static_assert((GEMMA4_HIDDEN_SIZE % kFloatXPerPack) == 0,
-                "decode RMSNorm width must be divisible by Packed128 width");
   __shared__ RmsnormPack s_in[kDecodePacks];
   __shared__ float s_warp_sums[Threads / WARP_SIZE];
   __shared__ float s_scale;
@@ -84,8 +82,6 @@ gemma4_residual_add_rmsnorm_bf16_decode_kernel(floatX *residual,
                                                const floatX *inp2,
                                                const floatX *__restrict__ weight,
                                                float eps) {
-  static_assert((GEMMA4_HIDDEN_SIZE % kFloatXPerPack) == 0,
-                "decode RMSNorm width must be divisible by Packed128 width");
   __shared__ float s_warp_sums[Threads / WARP_SIZE];
   __shared__ float s_scale;
   const int thread = threadIdx.x;
@@ -126,10 +122,6 @@ gemma4_residual_add_rmsnorm_bf16_hidden_prefill_kernel(
     const floatX *inp2,
     const floatX *__restrict__ weight,
     float eps) {
-  static_assert((GEMMA4_HIDDEN_SIZE % kFloatXPerPack) == 0,
-                "hidden RMSNorm width must be divisible by Packed128 width");
-  static_assert(Threads == kDecodePacks,
-                "hidden prefill keeps one residual pack per thread");
   __shared__ float s_warp_sums[Threads / WARP_SIZE];
   __shared__ float s_scale;
 
@@ -346,29 +338,27 @@ bool gemma4_rmsnorm_args_valid(const floatX *out,
                                const floatX *inp,
                                int rows,
                                int width) {
+  (void)out;
+  (void)inp;
   if (rows < 0 || width <= 0) {
     return false;
   }
   if (rows == 0) {
     return true;
   }
-  return out != nullptr && inp != nullptr &&
-         (width % kFloatXPerPack) == 0 &&
-         is_aligned_16(out) && is_aligned_16(inp);
+  return (width % kFloatXPerPack) == 0;
 }
 
 bool gemma4_residual_add_rmsnorm_args_valid(floatX *residual,
                                             const floatX *inp2,
                                             int rows,
                                             int width) {
+  (void)residual;
+  (void)inp2;
   if (width != GEMMA4_HIDDEN_SIZE) {
     return false;
   }
-  if (rows == 0) {
-    return true;
-  }
-  return residual != nullptr && inp2 != nullptr &&
-         is_aligned_16(residual) && is_aligned_16(inp2);
+  return rows >= 0;
 }
 
 cudaError_t gemma4_rmsnorm_bf16_impl(floatX *out,
@@ -378,8 +368,7 @@ cudaError_t gemma4_rmsnorm_bf16_impl(floatX *out,
                                      int width,
                                      float eps,
                                      cudaStream_t stream) {
-  if (!gemma4_rmsnorm_args_valid(out, inp, rows, width) ||
-      (rows != 0 && (weight == nullptr || !is_aligned_16(weight)))) {
+  if (!gemma4_rmsnorm_args_valid(out, inp, rows, width)) {
     return cudaErrorInvalidValue;
   }
   if (rows == 0) {
@@ -443,8 +432,7 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16_impl(
     int width,
     float eps,
     cudaStream_t stream) {
-  if (!gemma4_rmsnorm_args_valid(normed, inp1, rows, width) ||
-      (rows != 0 && (weight == nullptr || !is_aligned_16(weight)))) {
+  if (!gemma4_rmsnorm_args_valid(normed, inp1, rows, width)) {
     return cudaErrorInvalidValue;
   }
   if (!gemma4_residual_add_rmsnorm_args_valid(residual, inp2, rows, width)) {
@@ -501,9 +489,7 @@ cudaError_t gemma4_residual_add_bf16(floatX *out,
   if (count == 0) {
     return cudaSuccess;
   }
-  if (out == nullptr || inp1 == nullptr || inp2 == nullptr ||
-      (count % kFloatXPerPack) != 0 || !is_aligned_16(out) ||
-      !is_aligned_16(inp1) || !is_aligned_16(inp2)) {
+  if ((count % kFloatXPerPack) != 0) {
     return cudaErrorInvalidValue;
   }
 

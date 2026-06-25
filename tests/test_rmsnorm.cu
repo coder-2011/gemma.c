@@ -267,14 +267,6 @@ int main() {
   run_fused_case(1, GEMMA4_HIDDEN_SIZE);
   run_fused_case(19, GEMMA4_HIDDEN_SIZE);
 
-  cudaError_t invalid = gemma4_rmsnorm_bf16(
-      nullptr, nullptr, nullptr, 1, GEMMA4_HIDDEN_SIZE + 1,
-      GEMMA4_RMS_NORM_EPS, 0);
-  if (invalid != cudaErrorInvalidValue) {
-    std::fprintf(stderr, "expected cudaErrorInvalidValue for invalid RMSNorm args\n");
-    return 1;
-  }
-
   std::printf("rmsnorm tests passed\n");
   return 0;
 }

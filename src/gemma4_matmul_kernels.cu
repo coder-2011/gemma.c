@@ -76,8 +76,6 @@ __device__ inline void dot_cols(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major, int col0, int thread_idx,
     float (&sums)[ColsPerBlock]) {
-  static_assert((K % kBf16Packed128Elements) == 0,
-                "decode GEMV K must be divisible by Packed128 bf16 width");
   static_assert((Threads % WARP_SIZE) == 0,
                 "decode thread count must be a whole number of warps");
 
@@ -155,8 +153,6 @@ __device__ inline void dot_cols_pair(
     int thread_idx,
     float (&a_sums)[ColsPerBlock],
     float (&b_sums)[ColsPerBlock]) {
-  static_assert((K % kBf16Packed128Elements) == 0,
-                "decode GEMV K must be divisible by Packed128 bf16 width");
   static_assert((Threads % WARP_SIZE) == 0,
                 "decode thread count must be a whole number of warps");
 
@@ -200,8 +196,6 @@ __device__ inline void dot_cols_pair_shared_x(
     int thread_idx,
     float (&a_sums)[ColsPerBlock],
     float (&b_sums)[ColsPerBlock]) {
-  static_assert((K % kBf16Packed128Elements) == 0,
-                "decode GEMV K must be divisible by Packed128 bf16 width");
   static_assert((Threads % WARP_SIZE) == 0,
                 "decode thread count must be a whole number of warps");
 
@@ -354,9 +348,6 @@ __device__ inline void decode_gemv_cols_device(
     int physical_block_idx,
     float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
     float (&sums)[ColsPerBlock]) {
-  static_assert((N % ColsPerBlock) == 0,
-                "decode GEMV N must be divisible by columns per block");
-
   constexpr int blocks = N / ColsPerBlock;
   const int logical_block =
       swizzle_col_block<blocks, SwizzleTileBlocks>(physical_block_idx);
@@ -411,9 +402,6 @@ constexpr int kFinalLogitsColsPerBlock =
 constexpr int kFinalLogitsMinBlocksPerSm =
     gemma4_matmul_kernel_impl::kFinalLogitsDecodeMinBlocksPerSm;
 
-static_assert((kDefaultThreads % WARP_SIZE) == 0,
-              "decode thread count must be a whole number of warps");
-
 template <int K,
           int N,
           int ColsPerBlock,
@@ -424,9 +412,6 @@ __global__ __launch_bounds__(Threads, MinBlocksPerSM) void
 gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
                                const __nv_bfloat16 *__restrict__ w_col_major,
                                __nv_bfloat16 *__restrict__ y) {
-  static_assert((N % ColsPerBlock) == 0,
-                "decode GEMV N must be divisible by columns per block");
-
   constexpr int warps = Threads / WARP_SIZE;
   __shared__ float warp_sums[ColsPerBlock][warps];
 

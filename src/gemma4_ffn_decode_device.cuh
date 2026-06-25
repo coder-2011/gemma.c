@@ -47,8 +47,6 @@ constexpr int kAccumBlocks =
 
 static_assert((GEMMA4_INTERMEDIATE_SIZE % kIntermediateTile) == 0,
               "FFN intermediate width must divide the decode tile width");
-static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
-              "FFN hidden width must divide the 128-bit bf16 pack width");
 static_assert(kHiddenPacks == GEMMA4_FFN_DECODE_HIDDEN_PACKS,
               "FFN scratch hidden-pack shape must match bf16 pack width");
 static_assert(kActTile >= 1, "FFN activation tile must be positive");

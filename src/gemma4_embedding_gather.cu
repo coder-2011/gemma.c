@@ -38,12 +38,6 @@ cudaError_t gemma4_embedding_gather_bf16(
   if (num_tokens == 0) {
     return cudaSuccess;
   }
-  if (out == nullptr || token_ids == nullptr || embeddings == nullptr) {
-    return cudaErrorInvalidValue;
-  }
-  if (!is_aligned_16(out) || !is_aligned_16(embeddings)) {
-    return cudaErrorInvalidValue;
-  }
 
   embedding_gather_kernel<<<
       num_tokens, gemma4_embedding_gather::kEmbeddingGatherThreads, 0,
