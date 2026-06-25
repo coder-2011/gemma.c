@@ -1,0 +1,17 @@
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -Isrc
+---
+If:
+  PathMatch: .*\.(cu|cuh)
+CompileFlags:
+  Add:
+    - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_86
+    - -I/usr/local/cuda/targets/x86_64-linux/include
+    - -I/usr/local/cuda/targets/x86_64-linux/include/cccl
+    - -I/tmp/cutlass/include
+    - -I/tmp/cutlass/examples/45_dual_gemm
+    - -I/tmp/cudnn-frontend/include
+    - -I/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/include
