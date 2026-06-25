@@ -35,7 +35,7 @@ constexpr int kMaxRmsnormWarps = kMaxRmsnormThreads / WARP_SIZE;
 constexpr int kResidualAddThreads = 256;
 
 // Maps [row, pack] to a BF16 element offset in a row-major tensor.
-__host__ __device__ inline auto gemma4_rmsnorm_gmem_pack_layout(
+__device__ inline auto gemma4_rmsnorm_gmem_pack_layout(
     int rows,
     int width,
     int packs_per_row) {
@@ -45,19 +45,10 @@ __host__ __device__ inline auto gemma4_rmsnorm_gmem_pack_layout(
 }
 
 // Maps one contiguous pack index to its BF16 element offset.
-__host__ __device__ inline auto gemma4_rmsnorm_vector_pack_layout(int packs) {
+__device__ inline auto gemma4_rmsnorm_vector_pack_layout(int packs) {
   return cute::make_layout(
       cute::make_shape(packs),
       cute::make_stride(sizeof(Bf16Packed128) / sizeof(floatX)));
-}
-
-// Rounds a pack count up to a whole-warp thread count capped for RMSNorm rows.
-int gemma4_rmsnorm_thread_count(int packs_per_row) {
-  int threads = div_up(packs_per_row, WARP_SIZE) * WARP_SIZE;
-  if (threads < WARP_SIZE) {
-    threads = WARP_SIZE;
-  }
-  return threads < kMaxRmsnormThreads ? threads : kMaxRmsnormThreads;
 }
 
 // Returns the dynamic shared-memory bytes needed by one RMSNorm row block.
@@ -259,7 +250,14 @@ cudaError_t gemma4_rmsnorm_launch_bf16(const Gemma4RmsnormRowArgs &args,
     return cudaSuccess;
   }
 
-  const int threads = gemma4_rmsnorm_thread_count(args.packs_per_row);
+  int threads = div_up(args.packs_per_row, WARP_SIZE) * WARP_SIZE;
+  if (threads < WARP_SIZE) {
+    threads = WARP_SIZE;
+  }
+  if (threads > kMaxRmsnormThreads) {
+    threads = kMaxRmsnormThreads;
+  }
+
   const size_t smem = gemma4_rmsnorm_shared_bytes(args.packs_per_row);
   if (args.rows == 1) {
     gemma4_rmsnorm_decode_bf16_kernel<<<1, threads, smem, stream>>>(args);
