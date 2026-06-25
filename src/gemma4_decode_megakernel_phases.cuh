@@ -4,8 +4,7 @@
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_decode_megakernel.cuh"
 #include "gemma4_embedding_gather.cuh"
-#include "gemma4_ffn_decode_device.cuh"
-#include "gemma4_rmsnorm_device.cuh"
+#include "gemma4_ffn.cuh"
 #include "gemma4_sampling.cuh"
 
 #include <cuda_bf16.h>
@@ -14,10 +13,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+extern "C" __device__ void gemma4_rmsnorm_hidden_row_512_bf16_device(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ in,
+    const __nv_bfloat16 *__restrict__ weight,
+    float eps,
+    Bf16Packed128 *__restrict__ cached_row,
+    float *__restrict__ warp_sums,
+    float *__restrict__ scale,
+    int thread_idx);
+
 namespace gemma4_decode_megakernel_phases {
 
 namespace ffn_dev = gemma4_ffn_decode_device;
-namespace rmsnorm_dev = gemma4_rmsnorm_device;
 
 constexpr int kMegaThreads = 512;
 constexpr int kMegaWarps = kMegaThreads / WARP_SIZE;
@@ -315,9 +323,9 @@ __device__ inline void phase_attention_to_ffn(
   __shared__ float warp_sums[kMegaWarps];
   __shared__ float scale;
 
-  rmsnorm_dev::rmsnorm_hidden_row_bf16<kMegaThreads>(
+  gemma4_rmsnorm_hidden_row_512_bf16_device(
       args.normed_out, args.residual_out, args.attention_post_norm_weight,
-      args.eps, cached_input, warp_sums, scale, int(threadIdx.x));
+      args.eps, cached_input, warp_sums, &scale, int(threadIdx.x));
   __syncthreads();
 
   for (int pack = int(threadIdx.x); pack < kFfnHiddenPacks;
@@ -330,9 +338,9 @@ __device__ inline void phase_attention_to_ffn(
   }
   __syncthreads();
 
-  rmsnorm_dev::rmsnorm_hidden_row_bf16<kMegaThreads>(
+  gemma4_rmsnorm_hidden_row_512_bf16_device(
       args.ffn_x, args.ffn_residual, args.attention_pre_ffn_norm_weight,
-      args.eps, cached_input, warp_sums, scale, int(threadIdx.x));
+      args.eps, cached_input, warp_sums, &scale, int(threadIdx.x));
 }
 
 // Finalizes FFN as post-FFN RMSNorm followed by residual add.
@@ -380,9 +388,9 @@ __device__ inline void phase_final_rmsnorm_hidden(
     return;
   }
 
-  rmsnorm_dev::rmsnorm_hidden_row_bf16<kMegaThreads>(
+  gemma4_rmsnorm_hidden_row_512_bf16_device(
       normed_hidden, state, final_norm_weight, GEMMA4_RMS_NORM_EPS,
-      cached_input, warp_sums, scale, int(threadIdx.x));
+      cached_input, warp_sums, &scale, int(threadIdx.x));
 }
 
 // Chooses the higher logit, breaking exact ties by the lower token id.

@@ -5,9 +5,7 @@
 
 #include "gemma4_cuda_utils.cuh"
 
-#ifndef GEMMA4_ROPE_QK_LOAD_CS
-#define GEMMA4_ROPE_QK_LOAD_CS 1
-#endif
+static constexpr int GEMMA4_ROPE_QK_LOAD_CS = 1;
 
 namespace gemma4_rope {
 
@@ -78,13 +76,15 @@ __device__ __forceinline__ void rotate_pack_bf16(
     int rotary_half,
     int pack) {
   const int i = pack * kRopePairsPerPack;
-#if GEMMA4_ROPE_QK_LOAD_CS
-  const RopePack lo = load128cs(head + i);
-  const RopePack hi = load128cs(head + rotary_half + i);
-#else
-  const RopePack lo = load128(head + i);
-  const RopePack hi = load128(head + rotary_half + i);
-#endif
+  RopePack lo;
+  RopePack hi;
+  if constexpr (GEMMA4_ROPE_QK_LOAD_CS) {
+    lo = load128cs(head + i);
+    hi = load128cs(head + rotary_half + i);
+  } else {
+    lo = load128(head + i);
+    hi = load128(head + rotary_half + i);
+  }
   const float4 c0 = load_float4g(cos_row + i);
   const float4 c1 = load_float4g(cos_row + i + 4);
   const float4 s0 = load_float4g(sin_row + i);

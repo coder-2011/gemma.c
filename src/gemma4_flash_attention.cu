@@ -1236,7 +1236,7 @@ __device__ __forceinline__ void project_normed_head_values_bf16(
     const Bf16Packed128 x_pack = load128g(x + element);
     const Bf16Packed128 gamma_pack = load128g(input_norm_weight + element);
     const Bf16Packed128 normed_pack =
-        gemma4_bf16_pack_apply_rmsnorm(x_pack, gamma_pack, hidden_scale);
+        gemma4_bf16_pack_apply_scale_weight(x_pack, gamma_pack, hidden_scale);
 #pragma unroll
     for (int i = 0; i < Derived::kValuesPerLane; ++i) {
       const int dim = lane + i * kWarpSize;

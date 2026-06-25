@@ -10,7 +10,7 @@
 #include <string.h>
 
 #ifndef GEMMA4_WEIGHT_LOAD_POLICY
-#define GEMMA4_WEIGHT_LOAD_POLICY 1
+static constexpr int GEMMA4_WEIGHT_LOAD_POLICY = 1;
 #endif
 
 #define GEMMA4_RETURN_IF_CUDA_ERROR(expr)           \
@@ -245,24 +245,7 @@ __device__ inline Bf16Packed128 gemma4_bf16_pack_add(
   return result;
 }
 
-__device__ inline Bf16Packed128 gemma4_bf16_pack_apply_rmsnorm(
-    const Bf16Packed128 &values,
-    const Bf16Packed128 &gamma,
-    float scale) {
-  const __nv_bfloat162 *value_pairs = gemma4_bf16_pack_pairs(values);
-  const __nv_bfloat162 *gamma_pairs = gemma4_bf16_pack_pairs(gamma);
-  Bf16Packed128 result;
-  __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(result);
-#pragma unroll
-  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
-    float2 value = __bfloat1622float2(value_pairs[p]);
-    float2 weight = __bfloat1622float2(gamma_pairs[p]);
-    out_pairs[p] = __floats2bfloat162_rn(value.x * scale * weight.x,
-                                         value.y * scale * weight.y);
-  }
-  return result;
-}
-
+// Applies a row-wide scalar to one BF16 pack.
 __device__ inline Bf16Packed128 gemma4_bf16_pack_apply_scale(
     const Bf16Packed128 &values,
     float scale) {
@@ -274,6 +257,25 @@ __device__ inline Bf16Packed128 gemma4_bf16_pack_apply_scale(
     float2 value = __bfloat1622float2(value_pairs[p]);
     out_pairs[p] = __floats2bfloat162_rn(value.x * scale,
                                          value.y * scale);
+  }
+  return result;
+}
+
+// Applies a row-wide scalar and per-channel weight to one BF16 pack.
+__device__ inline Bf16Packed128 gemma4_bf16_pack_apply_scale_weight(
+    const Bf16Packed128 &values,
+    const Bf16Packed128 &weight,
+    float scale) {
+  const __nv_bfloat162 *value_pairs = gemma4_bf16_pack_pairs(values);
+  const __nv_bfloat162 *weight_pairs = gemma4_bf16_pack_pairs(weight);
+  Bf16Packed128 result;
+  __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(result);
+#pragma unroll
+  for (int p = 0; p < kBf16Packed128Pairs; ++p) {
+    float2 value = __bfloat1622float2(value_pairs[p]);
+    float2 gamma = __bfloat1622float2(weight_pairs[p]);
+    out_pairs[p] = __floats2bfloat162_rn(value.x * scale * gamma.x,
+                                         value.y * scale * gamma.y);
   }
   return result;
 }
