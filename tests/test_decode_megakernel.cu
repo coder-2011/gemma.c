@@ -289,16 +289,22 @@ void run_flash_attention_flag_case() {
   DeviceBuffer<__nv_bfloat16> d_residual(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_gamma(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_residual_out(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_split_residual_out(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_normed_out(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_split_normed_out(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_next_hidden(GEMMA4_HIDDEN_SIZE);
+  DeviceBuffer<__nv_bfloat16> d_split_next_hidden(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_gate_up(gate_up_elems);
   DeviceBuffer<__nv_bfloat16> d_down(down_elems);
   DeviceBuffer<__nv_bfloat16> d_layer_scalar(1);
   DeviceBuffer<__nv_bfloat16> d_final_norm(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_lm_head(lm_head_elems);
   DeviceBuffer<int32_t> d_next_token(1);
+  DeviceBuffer<int32_t> d_split_next_token(1);
   DeviceBuffer<unsigned char> d_scratch(
       gemma4_decode_megakernel_ffn_tail_scratch_bytes());
+  DeviceBuffer<unsigned char> d_spine_scratch(
+      gemma4_decode_megakernel_spine_scratch_bytes());
 
   DeviceBuffer<__nv_bfloat16> d_attention_x(GEMMA4_HIDDEN_SIZE);
   DeviceBuffer<__nv_bfloat16> d_input_norm(GEMMA4_HIDDEN_SIZE);
@@ -408,10 +414,55 @@ void run_flash_attention_flag_case() {
       0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
+  int32_t current_token = -1;
+  CHECK_CUDA(cudaMemcpy(&current_token, d_next_token.get(),
+                        sizeof(current_token), cudaMemcpyDeviceToHost));
+  if (current_token != kTargetToken) {
+    std::fprintf(stderr, "flash attention tail token actual=%d expected=%d\n",
+                 current_token, kTargetToken);
+    std::exit(1);
+  }
+
   std::vector<__nv_bfloat16> attention_out(GEMMA4_SLIDING_ATTENTION_OUT_SIZE);
   d_attention_out.copy_to(attention_out);
   if (bf16_to_float(attention_out[0]) <= 0.0f) {
     std::fprintf(stderr, "flash attention flag did not produce attention\n");
+    std::exit(1);
+  }
+
+  CHECK_CUDA(cudaMemset(d_cache_k.get(), 0,
+                        GEMMA4_SLIDING_KV_HEADS *
+                            GEMMA4_SLIDING_HEAD_DIM *
+                            sizeof(__nv_bfloat16)));
+  CHECK_CUDA(cudaMemset(d_cache_v.get(), 0,
+                        GEMMA4_SLIDING_KV_HEADS *
+                            GEMMA4_SLIDING_HEAD_DIM *
+                            sizeof(__nv_bfloat16)));
+  args.residual_out = d_split_residual_out.get();
+  args.normed_out = d_split_normed_out.get();
+  args.next_hidden = d_split_next_hidden.get();
+  args.next_token = d_split_next_token.get();
+  CHECK_CUDA(gemma4_decode_megakernel_attention_ffn_bf16(
+      args, d_scratch.get(), gemma4_decode_megakernel_ffn_tail_scratch_bytes(),
+      0));
+
+  Gemma4DecodeMegakernelSpineArgs spine_args = {};
+  spine_args.state = d_split_residual_out.get();
+  spine_args.next_hidden = d_split_next_hidden.get();
+  spine_args.next_token = d_split_next_token.get();
+  spine_args.final_norm_weight = d_final_norm.get();
+  spine_args.lm_head_col_major = d_lm_head.get();
+  CHECK_CUDA(gemma4_decode_megakernel_spine_bf16(
+      spine_args, d_spine_scratch.get(),
+      gemma4_decode_megakernel_spine_scratch_bytes(), 0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  int32_t split_token = -1;
+  CHECK_CUDA(cudaMemcpy(&split_token, d_split_next_token.get(),
+                        sizeof(split_token), cudaMemcpyDeviceToHost));
+  if (split_token != current_token) {
+    std::fprintf(stderr, "split token actual=%d expected=%d\n",
+                 split_token, current_token);
     std::exit(1);
   }
 }

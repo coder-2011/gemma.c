@@ -73,6 +73,13 @@ cudaError_t gemma4_decode_megakernel_spine_bf16(
     size_t scratch_bytes,
     cudaStream_t stream);
 
+// Runs one cooperative attention and FFN phase, stopping after residual_out.
+cudaError_t gemma4_decode_megakernel_attention_ffn_bf16(
+    const Gemma4DecodeMegakernelFfnTailArgs &args,
+    void *__restrict__ scratch,
+    size_t scratch_bytes,
+    cudaStream_t stream);
+
 // Runs one cooperative FFN phase followed by the final sampling tail. When
 // requested by flags, FlashAttention runs before the FFN phase.
 cudaError_t gemma4_decode_megakernel_ffn_tail_bf16(

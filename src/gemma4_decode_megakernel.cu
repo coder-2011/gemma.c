@@ -9,6 +9,11 @@ cudaError_t gemma4_decode_megakernel_ffn_tail_flash_attention_bf16(
     void *__restrict__ scratch,
     size_t scratch_bytes,
     cudaStream_t stream);
+cudaError_t gemma4_decode_megakernel_attention_ffn_flash_attention_bf16(
+    const Gemma4DecodeMegakernelFfnTailArgs &args,
+    void *__restrict__ scratch,
+    size_t scratch_bytes,
+    cudaStream_t stream);
 
 namespace {
 
@@ -58,9 +63,10 @@ void decode_megakernel_spine_kernel(
       active_candidate_count);
 }
 
-// Runs the resident FFN tail followed by the final decode spine.
+// Runs the resident FFN phase, optionally followed by the final decode spine.
+template <bool RunFinalSpine>
 __global__ __launch_bounds__(phase::kMegaThreads, 2)
-void decode_megakernel_ffn_tail_kernel(
+void decode_megakernel_ffn_kernel(
     Gemma4DecodeMegakernelFfnTailArgs args,
     Gemma4FfnDecodeScratch *__restrict__ ffn_scratch,
     Gemma4SampleCandidate *__restrict__ candidates,
@@ -78,12 +84,17 @@ void decode_megakernel_ffn_tail_kernel(
   grid.sync();
 
   phase::phase_scale_layer_hidden(args.residual_out, args.layer_scalar);
-  grid.sync();
-
-  run_final_decode_spine(
-      grid, args.next_hidden, args.next_token, candidates, normed_hidden,
-      args.residual_out, args.final_norm_weight, args.lm_head_col_major,
-      active_candidate_count);
+  if constexpr (RunFinalSpine) {
+    grid.sync();
+    run_final_decode_spine(
+        grid, args.next_hidden, args.next_token, candidates, normed_hidden,
+        args.residual_out, args.final_norm_weight, args.lm_head_col_major,
+        active_candidate_count);
+  } else {
+    (void)candidates;
+    (void)normed_hidden;
+    (void)active_candidate_count;
+  }
 }
 
 }  // namespace
@@ -108,6 +119,21 @@ cudaError_t gemma4_decode_megakernel_spine_bf16(
       args, scratch, scratch_bytes, stream, decode_megakernel_spine_kernel);
 }
 
+// Launches the cooperative attention and FFN phase without final sampling.
+cudaError_t gemma4_decode_megakernel_attention_ffn_bf16(
+    const Gemma4DecodeMegakernelFfnTailArgs &args,
+    void *__restrict__ scratch,
+    size_t scratch_bytes,
+    cudaStream_t stream) {
+  if (phase::ffn_tail_uses_flash_attention(args)) {
+    return gemma4_decode_megakernel_attention_ffn_flash_attention_bf16(
+        args, scratch, scratch_bytes, stream);
+  }
+  return phase::launch_ffn_tail(
+      args, scratch, scratch_bytes, stream,
+      decode_megakernel_ffn_kernel<false>);
+}
+
 // Launches the cooperative FFN-tail phase followed by the final decode spine.
 cudaError_t gemma4_decode_megakernel_ffn_tail_bf16(
     const Gemma4DecodeMegakernelFfnTailArgs &args,
@@ -120,5 +146,5 @@ cudaError_t gemma4_decode_megakernel_ffn_tail_bf16(
   }
   return phase::launch_ffn_tail(
       args, scratch, scratch_bytes, stream,
-      decode_megakernel_ffn_tail_kernel);
+      decode_megakernel_ffn_kernel<true>);
 }
