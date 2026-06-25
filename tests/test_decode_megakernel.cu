@@ -88,7 +88,7 @@ void compare_hidden_bits(const std::vector<__nv_bfloat16> &actual,
   }
 }
 
-// Creates a small nonzero hidden row for deterministic greedy scoring.
+// Creates a small nonzero hidden row for deterministic token scoring.
 std::vector<__nv_bfloat16> make_hidden(float first_value) {
   std::vector<__nv_bfloat16> hidden(GEMMA4_HIDDEN_SIZE);
   hidden[0] = __float2bfloat16_rn(first_value);
@@ -113,7 +113,7 @@ std::vector<__nv_bfloat16> make_norm_weight() {
       GEMMA4_HIDDEN_SIZE, __float2bfloat16_rn(1.0f));
 }
 
-// Clears the LM head and installs the only row that should win greedy decode.
+// Clears the LM head and installs the only row that should win token selection.
 void install_target_row(DeviceBuffer<__nv_bfloat16> &d_lm_head,
                         int32_t token_id,
                         const std::vector<__nv_bfloat16> &row) {

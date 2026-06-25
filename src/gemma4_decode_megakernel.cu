@@ -20,7 +20,7 @@ __device__ inline void run_final_decode_spine(
     cg::grid_group grid,
     __nv_bfloat16 *__restrict__ next_hidden,
     int32_t *__restrict__ next_token,
-    Gemma4GreedyCandidate *__restrict__ candidates,
+    Gemma4SampleCandidate *__restrict__ candidates,
     __nv_bfloat16 *__restrict__ normed_hidden,
     const __nv_bfloat16 *__restrict__ state,
     const __nv_bfloat16 *__restrict__ final_norm_weight,
@@ -30,7 +30,7 @@ __device__ inline void run_final_decode_spine(
       normed_hidden, state, final_norm_weight);
   grid.sync();
 
-  const Gemma4GreedyCandidate candidate =
+  const Gemma4SampleCandidate candidate =
       phase::phase_final_logits_block_candidate(
           normed_hidden, lm_head_col_major);
   if (threadIdx.x == 0) {
@@ -38,7 +38,7 @@ __device__ inline void run_final_decode_spine(
   }
   grid.sync();
 
-  phase::phase_reduce_greedy_and_gather(
+  phase::phase_reduce_candidates_and_gather(
       next_hidden, next_token, lm_head_col_major, candidates,
       active_candidate_count);
 }
@@ -47,7 +47,7 @@ __device__ inline void run_final_decode_spine(
 __global__ __launch_bounds__(phase::kMegaThreads, 1)
 void decode_megakernel_spine_kernel(
     Gemma4DecodeMegakernelSpineArgs args,
-    Gemma4GreedyCandidate *__restrict__ candidates,
+    Gemma4SampleCandidate *__restrict__ candidates,
     __nv_bfloat16 *__restrict__ normed_hidden,
     int32_t active_candidate_count) {
   cg::grid_group grid = cg::this_grid();
@@ -63,7 +63,7 @@ __global__ __launch_bounds__(phase::kMegaThreads, 2)
 void decode_megakernel_ffn_tail_kernel(
     Gemma4DecodeMegakernelFfnTailArgs args,
     Gemma4FfnDecodeScratch *__restrict__ ffn_scratch,
-    Gemma4GreedyCandidate *__restrict__ candidates,
+    Gemma4SampleCandidate *__restrict__ candidates,
     __nv_bfloat16 *__restrict__ normed_hidden,
     int32_t active_candidate_count) {
   cg::grid_group grid = cg::this_grid();

@@ -1,15 +1,16 @@
-#ifndef GEMMA4_DECODE_MEGAKERNEL_PHASES_CUH
-#define GEMMA4_DECODE_MEGAKERNEL_PHASES_CUH
+#pragma once
 
 #include "gemma4.h"
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_decode_megakernel.cuh"
+#include "gemma4_embedding_gather.cuh"
 #include "gemma4_ffn_decode_device.cuh"
 #include "gemma4_rmsnorm_device.cuh"
-#include "gemma4_sampling_device.cuh"
+#include "gemma4_sampling.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -17,12 +18,10 @@ namespace gemma4_decode_megakernel_phases {
 
 namespace ffn_dev = gemma4_ffn_decode_device;
 namespace rmsnorm_dev = gemma4_rmsnorm_device;
-namespace sampling_dev = gemma4_sampling_device;
 
 constexpr int kMegaThreads = 512;
 constexpr int kMegaWarps = kMegaThreads / WARP_SIZE;
 constexpr int kMegaColsPerBlock = 8;
-constexpr int kMegaSwizzleTileBlocks = 1;
 constexpr int kMegaCandidateCount = GEMMA4_VOCAB_SIZE / kMegaColsPerBlock;
 constexpr int kFfnIntermediateTile = ffn_dev::kIntermediateTile;
 constexpr int kFfnIntermediateTiles = ffn_dev::kIntermediateTiles;
@@ -31,29 +30,27 @@ constexpr int kFfnActTile = ffn_dev::kActTile;
 static_assert(ffn_dev::kReductionPolicy == 0,
               "megakernel FFN tail currently uses atomic accumulation");
 static_assert((sizeof(Gemma4FfnDecodeScratch) %
-               alignof(Gemma4GreedyCandidate)) == 0,
+               alignof(Gemma4SampleCandidate)) == 0,
               "FFN scratch must preserve candidate alignment");
-static_assert(((kMegaCandidateCount * sizeof(Gemma4GreedyCandidate)) % 16) ==
+static_assert(((kMegaCandidateCount * sizeof(Gemma4SampleCandidate)) % 16) ==
                   0,
               "candidate scratch must preserve 16-byte hidden-row alignment");
 
-using ffn_dev::is_aligned_128;
-
 struct Gemma4DecodeSpineScratch {
-  Gemma4GreedyCandidate *candidates = nullptr;
+  Gemma4SampleCandidate *candidates = nullptr;
   __nv_bfloat16 *normed_hidden = nullptr;
 };
 
 struct Gemma4DecodeFfnTailScratch {
   Gemma4FfnDecodeScratch *ffn = nullptr;
-  Gemma4GreedyCandidate *candidates = nullptr;
+  Gemma4SampleCandidate *candidates = nullptr;
   __nv_bfloat16 *normed_hidden = nullptr;
 };
 
 // Returns scratch for all per-block candidates plus the normalized hidden row.
 inline size_t spine_scratch_bytes(void) {
   const size_t candidates =
-      static_cast<size_t>(kMegaCandidateCount) * sizeof(Gemma4GreedyCandidate);
+      static_cast<size_t>(kMegaCandidateCount) * sizeof(Gemma4SampleCandidate);
   const size_t normed_hidden =
       static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
   return candidates + normed_hidden + 16;
@@ -62,7 +59,7 @@ inline size_t spine_scratch_bytes(void) {
 // Returns scratch for FFN accumulation plus the final sampling-tail scratch.
 inline size_t ffn_tail_scratch_bytes(void) {
   const size_t candidates =
-      static_cast<size_t>(kMegaCandidateCount) * sizeof(Gemma4GreedyCandidate);
+      static_cast<size_t>(kMegaCandidateCount) * sizeof(Gemma4SampleCandidate);
   const size_t normed_hidden =
       static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
   return sizeof(Gemma4FfnDecodeScratch) + candidates + normed_hidden;
@@ -71,13 +68,12 @@ inline size_t ffn_tail_scratch_bytes(void) {
 // Splits the caller scratch buffer for the final decode spine.
 inline Gemma4DecodeSpineScratch spine_scratch_from_buffer(void *scratch) {
   char *ptr = reinterpret_cast<char *>(scratch);
-  auto *candidates = reinterpret_cast<Gemma4GreedyCandidate *>(ptr);
+  auto *candidates = reinterpret_cast<Gemma4SampleCandidate *>(ptr);
   ptr += static_cast<size_t>(kMegaCandidateCount) *
-         sizeof(Gemma4GreedyCandidate);
+         sizeof(Gemma4SampleCandidate);
 
-  uintptr_t normed_address = reinterpret_cast<uintptr_t>(ptr);
-  normed_address = (normed_address + 15u) & ~uintptr_t(15u);
-  auto *normed_hidden = reinterpret_cast<__nv_bfloat16 *>(normed_address);
+  ptr = align_ptr_up<16>(ptr);
+  auto *normed_hidden = reinterpret_cast<__nv_bfloat16 *>(ptr);
   return {candidates, normed_hidden};
 }
 
@@ -85,9 +81,9 @@ inline Gemma4DecodeSpineScratch spine_scratch_from_buffer(void *scratch) {
 inline Gemma4DecodeFfnTailScratch ffn_tail_scratch_from_buffer(void *scratch) {
   auto *ffn_scratch = reinterpret_cast<Gemma4FfnDecodeScratch *>(scratch);
   char *ptr = reinterpret_cast<char *>(ffn_scratch + 1);
-  auto *candidates = reinterpret_cast<Gemma4GreedyCandidate *>(ptr);
+  auto *candidates = reinterpret_cast<Gemma4SampleCandidate *>(ptr);
   ptr += static_cast<size_t>(kMegaCandidateCount) *
-         sizeof(Gemma4GreedyCandidate);
+         sizeof(Gemma4SampleCandidate);
 
   auto *normed_hidden = reinterpret_cast<__nv_bfloat16 *>(ptr);
   return {ffn_scratch, candidates, normed_hidden};
@@ -126,24 +122,30 @@ inline bool valid_flash_attention_args(
   const int64_t required_keys =
       global ? int64_t(config.max_pages_per_seq) * config.page_size
              : config.window_size;
+  const int64_t cache_token_capacity =
+      int64_t(config.max_pages_per_seq) * config.page_size;
   const int64_t split_capacity =
       int64_t(args.attention_split_size) * args.attention_num_splits;
   const bool needs_v_weight = sliding;
+  const bool needs_partials = args.attention_num_splits > 1;
 
   return (sliding || global) &&
          args.attention_cache_layer >= 0 &&
          args.attention_cache_layer < config.num_layers &&
          config.num_layers > 0 && config.num_pages > 0 &&
          config.page_size > 0 && config.max_pages_per_seq > 0 &&
+         config.num_pages % config.max_pages_per_seq == 0 &&
          args.attention_split_size > 0 &&
          args.attention_num_splits > 0 &&
          split_capacity >= required_keys &&
+         (!sliding || cache_token_capacity >= config.window_size) &&
          args.attention_softmax_scale > 0.0f &&
          args.attention_q != nullptr &&
          args.attention_out != nullptr &&
-         args.attention_partial_m != nullptr &&
-         args.attention_partial_l != nullptr &&
-         args.attention_partial_acc != nullptr &&
+         (!needs_partials ||
+          (args.attention_partial_m != nullptr &&
+           args.attention_partial_l != nullptr &&
+           args.attention_partial_acc != nullptr)) &&
          args.attention_cache_k != nullptr &&
          args.attention_cache_v != nullptr &&
          args.attention_page_table != nullptr &&
@@ -385,29 +387,156 @@ __device__ inline void phase_final_rmsnorm_hidden(
       cached_input, warp_sums, scale, int(threadIdx.x));
 }
 
-// Computes this CTA's final greedy LM-head candidate.
-__device__ inline Gemma4GreedyCandidate phase_final_logits_block_candidate(
+// Chooses the higher logit, breaking exact ties by the lower token id.
+__device__ inline bool phase_better_candidate(float logit,
+                                              int32_t token_id,
+                                              float best_logit,
+                                              int32_t best_token_id) {
+  return logit > best_logit || (logit == best_logit && token_id < best_token_id);
+}
+
+// Reduces each LM-head output column's partial dot product across the CTA.
+__device__ inline void phase_reduce_lm_head_cols(
+    float (&warp_sums)[kMegaColsPerBlock][kMegaWarps],
+    float (&sums)[kMegaColsPerBlock]) {
+  const int lane = int(threadIdx.x) & (WARP_SIZE - 1);
+  const int warp = int(threadIdx.x) / WARP_SIZE;
+
+  warp_reduce_sum_to_lane0(sums);
+
+  if (lane == 0) {
+#pragma unroll
+    for (int col = 0; col < kMegaColsPerBlock; ++col) {
+      warp_sums[col][warp] = sums[col];
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int col = 0; col < kMegaColsPerBlock; ++col) {
+    sums[col] = threadIdx.x < kMegaWarps ? warp_sums[col][lane] : 0.0f;
+  }
+
+  if (warp == 0) {
+    warp_reduce_sum_to_lane0(sums);
+  }
+}
+
+// Computes one final LM-head vocab tile from the normalized hidden row.
+__device__ inline void phase_lm_head_tile_logits(
+    const __nv_bfloat16 *__restrict__ normed_hidden,
+    const __nv_bfloat16 *__restrict__ lm_head_col_major,
+    int tile,
+    float (&warp_sums)[kMegaColsPerBlock][kMegaWarps],
+    float (&sums)[kMegaColsPerBlock]) {
+  constexpr int packs_per_col =
+      GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+  static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
+                "hidden size must divide the 128-bit bf16 pack width");
+
+  const int token0 = tile * kMegaColsPerBlock;
+  for (int pack = int(threadIdx.x); pack < packs_per_col;
+       pack += kMegaThreads) {
+    const int element = pack * kBf16Packed128Elements;
+    const Bf16Packed128 x_pack = load128g(normed_hidden + element);
+#pragma unroll
+    for (int col = 0; col < kMegaColsPerBlock; ++col) {
+      const int token_id = token0 + col;
+      const __nv_bfloat16 *weight =
+          lm_head_col_major +
+          int64_t(token_id) * GEMMA4_HIDDEN_SIZE + element;
+      const Bf16Packed128 w_pack = load128weight(weight);
+      gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
+    }
+  }
+
+  phase_reduce_lm_head_cols(warp_sums, sums);
+}
+
+// Computes this CTA's final LM-head candidate.
+__device__ inline Gemma4SampleCandidate phase_final_logits_block_candidate(
     const __nv_bfloat16 *__restrict__ normed_hidden,
     const __nv_bfloat16 *__restrict__ lm_head_col_major) {
-  return sampling_dev::greedy_lm_head_block_candidate<
-      kMegaColsPerBlock,
-      kMegaThreads,
-      kMegaSwizzleTileBlocks,
-      kMegaCandidateCount>(
-      normed_hidden, lm_head_col_major, int(blockIdx.x), int(gridDim.x),
-      int(threadIdx.x));
+  __shared__ float warp_sums[kMegaColsPerBlock][kMegaWarps];
+
+  float best_logit = -INFINITY;
+  int32_t best_token_id = GEMMA4_VOCAB_SIZE;
+
+  for (int tile = int(blockIdx.x); tile < kMegaCandidateCount;
+       tile += int(gridDim.x)) {
+    float sums[kMegaColsPerBlock] = {};
+    phase_lm_head_tile_logits(
+        normed_hidden, lm_head_col_major, tile, warp_sums, sums);
+
+    if (threadIdx.x == 0) {
+      const int32_t token0 = tile * kMegaColsPerBlock;
+#pragma unroll
+      for (int col = 0; col < kMegaColsPerBlock; ++col) {
+        const float logit = __bfloat162float(__float2bfloat16_rn(sums[col]));
+        const int32_t token_id = token0 + col;
+        if (phase_better_candidate(
+                logit, token_id, best_logit, best_token_id)) {
+          best_logit = logit;
+          best_token_id = token_id;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  return {best_logit, best_token_id};
 }
 
 // Reduces per-block candidates, writes the token, and gathers next hidden.
-__device__ inline void phase_reduce_greedy_and_gather(
+__device__ inline void phase_reduce_candidates_and_gather(
     __nv_bfloat16 *__restrict__ next_hidden,
     int32_t *__restrict__ next_token,
     const __nv_bfloat16 *__restrict__ lm_head_col_major,
-    Gemma4GreedyCandidate *__restrict__ candidates,
+    Gemma4SampleCandidate *__restrict__ candidates,
     int32_t active_candidate_count) {
-  sampling_dev::reduce_greedy_and_gather<kMegaThreads>(
-      next_hidden, next_token, lm_head_col_major, candidates,
-      active_candidate_count, int(blockIdx.x), int(threadIdx.x));
+  __shared__ float s_logits[kMegaThreads];
+  __shared__ int32_t s_token_ids[kMegaThreads];
+
+  if (blockIdx.x != 0) {
+    return;
+  }
+
+  Gemma4SampleCandidate best = {-INFINITY, GEMMA4_VOCAB_SIZE};
+  for (int candidate_idx = int(threadIdx.x);
+       candidate_idx < active_candidate_count;
+       candidate_idx += kMegaThreads) {
+    const Gemma4SampleCandidate candidate = candidates[candidate_idx];
+    if (phase_better_candidate(candidate.logit, candidate.token_id,
+                               best.logit, best.token_id)) {
+      best = candidate;
+    }
+  }
+
+  s_logits[threadIdx.x] = best.logit;
+  s_token_ids[threadIdx.x] = best.token_id;
+  __syncthreads();
+
+  for (int stride = kMegaThreads / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      const float other_logit = s_logits[threadIdx.x + stride];
+      const int32_t other_token_id = s_token_ids[threadIdx.x + stride];
+      if (phase_better_candidate(other_logit, other_token_id,
+                                 s_logits[threadIdx.x],
+                                 s_token_ids[threadIdx.x])) {
+        s_logits[threadIdx.x] = other_logit;
+        s_token_ids[threadIdx.x] = other_token_id;
+      }
+    }
+    __syncthreads();
+  }
+
+  const int32_t selected_token_id = s_token_ids[0];
+  if (threadIdx.x == 0) {
+    *next_token = selected_token_id;
+  }
+  gemma4_embedding_gather::copy_embedding_row_bf16(
+      next_hidden, lm_head_col_major, selected_token_id, int(threadIdx.x),
+      kMegaThreads);
 }
 
 // Sizes the resident cooperative grid for a candidate-producing kernel.
@@ -457,7 +586,7 @@ inline cudaError_t launch_spine(
     cudaStream_t stream,
     Kernel kernel) {
   if (!valid_args(args) || scratch == nullptr ||
-      !is_aligned_to<alignof(Gemma4GreedyCandidate)>(scratch) ||
+      !is_aligned_to<alignof(Gemma4SampleCandidate)>(scratch) ||
       scratch_bytes < spine_scratch_bytes()) {
     return cudaErrorInvalidValue;
   }
@@ -472,7 +601,7 @@ inline cudaError_t launch_spine(
   const Gemma4DecodeSpineScratch scratch_parts =
       spine_scratch_from_buffer(scratch);
   Gemma4DecodeMegakernelSpineArgs kernel_args_value = args;
-  Gemma4GreedyCandidate *candidates_arg = scratch_parts.candidates;
+  Gemma4SampleCandidate *candidates_arg = scratch_parts.candidates;
   __nv_bfloat16 *normed_hidden_arg = scratch_parts.normed_hidden;
   int32_t active_candidate_count_arg = active_candidate_count;
   void *kernel_args[] = {
@@ -519,7 +648,7 @@ inline cudaError_t launch_ffn_tail(
       ffn_tail_scratch_from_buffer(scratch);
   Gemma4DecodeMegakernelFfnTailArgs kernel_args_value = args;
   Gemma4FfnDecodeScratch *ffn_scratch_arg = scratch_parts.ffn;
-  Gemma4GreedyCandidate *candidates_arg = scratch_parts.candidates;
+  Gemma4SampleCandidate *candidates_arg = scratch_parts.candidates;
   __nv_bfloat16 *normed_hidden_arg = scratch_parts.normed_hidden;
   int32_t active_candidate_count_arg = active_candidate_count;
   void *kernel_args[] = {
@@ -544,5 +673,3 @@ inline cudaError_t launch_ffn_tail(
 }
 
 }  // namespace gemma4_decode_megakernel_phases
-
-#endif

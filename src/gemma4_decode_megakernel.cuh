@@ -1,5 +1,4 @@
-#ifndef GEMMA4_DECODE_MEGAKERNEL_CUH
-#define GEMMA4_DECODE_MEGAKERNEL_CUH
+#pragma once
 
 #include "gemma4_flash_attention.cuh"
 
@@ -10,15 +9,15 @@
 
 #define GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION 1u
 
-typedef struct {
+struct Gemma4DecodeMegakernelSpineArgs {
   __nv_bfloat16 *state = nullptr;
   __nv_bfloat16 *next_hidden = nullptr;
   int32_t *next_token = nullptr;
   const __nv_bfloat16 *final_norm_weight = nullptr;
   const __nv_bfloat16 *lm_head_col_major = nullptr;
-} Gemma4DecodeMegakernelSpineArgs;
+};
 
-typedef struct {
+struct Gemma4DecodeMegakernelFfnTailArgs {
   __nv_bfloat16 *residual_out = nullptr;
   __nv_bfloat16 *normed_out = nullptr;
   __nv_bfloat16 *next_hidden = nullptr;
@@ -60,14 +59,14 @@ typedef struct {
   const float *attention_sin = nullptr;
 
   float eps = 1.0e-6f;
-} Gemma4DecodeMegakernelFfnTailArgs;
+};
 
 size_t gemma4_decode_megakernel_spine_scratch_bytes(void);
 
 size_t gemma4_decode_megakernel_ffn_tail_scratch_bytes(void);
 
 // Runs the first cooperative decode megakernel spine tail: final RMSNorm,
-// greedy LM-head projection, and tied embedding gather.
+// LM-head projection, token selection, and tied embedding gather.
 cudaError_t gemma4_decode_megakernel_spine_bf16(
     const Gemma4DecodeMegakernelSpineArgs &args,
     void *__restrict__ scratch,
@@ -81,5 +80,3 @@ cudaError_t gemma4_decode_megakernel_ffn_tail_bf16(
     void *__restrict__ scratch,
     size_t scratch_bytes,
     cudaStream_t stream);
-
-#endif
