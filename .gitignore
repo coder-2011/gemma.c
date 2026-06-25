@@ -1,4 +1,7 @@
 .env.local
+/.clang-tidy
+/.clangd
+/.gitmodules
 .venv/
 .agents/
 skills-lock.json
