@@ -73,9 +73,27 @@ void run_prefill_decode_metadata_case() {
     std::exit(1);
   }
 
+  state.h_seq_lengths[0] = 64;
+  state.h_seq_lengths[1] = 66;
+  const std::vector<int32_t> seq_before = state.h_seq_lengths;
+  const std::vector<int32_t> batch_before = state.h_token_batch;
+  const std::vector<int32_t> pos_before = state.h_token_position;
+  const std::vector<int32_t> sliding_pages_before = state.h_sliding_page_table;
+  const std::vector<int32_t> global_pages_before = state.h_global_page_table;
+  const std::vector<int32_t> sliding_slots_before =
+      state.h_sliding_slot_logical_pages;
+  const std::vector<int32_t> global_slots_before =
+      state.h_global_slot_logical_pages;
   cudaError_t too_long = gemma4_runtime_prepare_decode_step(&state, 0);
-  if (too_long != cudaErrorInvalidValue) {
-    std::fprintf(stderr, "expected cudaErrorInvalidValue after max_seq_len\n");
+  if (too_long != cudaErrorInvalidValue ||
+      state.h_seq_lengths != seq_before ||
+      state.h_token_batch != batch_before ||
+      state.h_token_position != pos_before ||
+      state.h_sliding_page_table != sliding_pages_before ||
+      state.h_global_page_table != global_pages_before ||
+      state.h_sliding_slot_logical_pages != sliding_slots_before ||
+      state.h_global_slot_logical_pages != global_slots_before) {
+    std::fprintf(stderr, "failed decode step mutated runtime metadata\n");
     std::exit(1);
   }
   gemma4_runtime_state_free(&state);

@@ -113,15 +113,13 @@ cudaError_t ensure_runtime_pages(
     int32_t position) {
   int32_t page = gemma4_kv_cache_ensure_page(
       state->h_sliding_page_table, state->h_sliding_slot_logical_pages,
-      state->sliding_allocator, state->sliding_cache_config,
-      state->batch_size, batch, position);
+      state->sliding_cache_config, state->batch_size, batch, position);
   if (page < 0) {
     return cudaErrorInvalidValue;
   }
   page = gemma4_kv_cache_ensure_page(
       state->h_global_page_table, state->h_global_slot_logical_pages,
-      state->global_allocator, state->global_cache_config,
-      state->batch_size, batch, position);
+      state->global_cache_config, state->batch_size, batch, position);
   return page < 0 ? cudaErrorInvalidValue : cudaSuccess;
 }
 
@@ -132,15 +130,13 @@ cudaError_t ensure_runtime_range(
     int32_t seq_len) {
   int32_t status = gemma4_kv_cache_ensure_range(
       state->h_sliding_page_table, state->h_sliding_slot_logical_pages,
-      state->sliding_allocator, state->sliding_cache_config,
-      state->batch_size, batch, 0, seq_len);
+      state->sliding_cache_config, state->batch_size, batch, 0, seq_len);
   if (status < 0) {
     return cudaErrorInvalidValue;
   }
   status = gemma4_kv_cache_ensure_range(
       state->h_global_page_table, state->h_global_slot_logical_pages,
-      state->global_allocator, state->global_cache_config,
-      state->batch_size, batch, 0, seq_len);
+      state->global_cache_config, state->batch_size, batch, 0, seq_len);
   return status < 0 ? cudaErrorInvalidValue : cudaSuccess;
 }
 
@@ -192,10 +188,10 @@ cudaError_t gemma4_runtime_state_init(
   state->page_size = page_size;
   state->sliding_cache_config = gemma4_kv_cache_make_config(
       false, sliding_pages, page_size, sliding_pages_per_seq);
+  state->sliding_cache_config.window_size =
+      std::min(max_seq_len, GEMMA4_SLIDING_WINDOW);
   state->global_cache_config = gemma4_kv_cache_make_config(
       true, global_pages, page_size, global_pages_per_seq);
-  state->sliding_allocator = Gemma4KvPageAllocator(sliding_pages);
-  state->global_allocator = Gemma4KvPageAllocator(global_pages);
 
   state->h_sliding_page_table.assign(
       static_cast<size_t>(batch_size) * sliding_pages_per_seq, -1);
@@ -290,8 +286,6 @@ cudaError_t gemma4_runtime_prepare_prefill(
     return cudaErrorInvalidValue;
   }
 
-  state->sliding_allocator.reset();
-  state->global_allocator.reset();
   std::fill(state->h_sliding_page_table.begin(),
             state->h_sliding_page_table.end(), -1);
   std::fill(state->h_global_page_table.begin(),
@@ -326,11 +320,16 @@ cudaError_t gemma4_runtime_prepare_decode_step(
     return cudaErrorInvalidValue;
   }
 
+  // Validate all batches before mutating page tables for this decode step.
   for (int32_t batch = 0; batch < state->batch_size; ++batch) {
     const int32_t pos = state->h_seq_lengths[batch];
     if (pos < 0 || pos >= state->max_seq_len) {
       return cudaErrorInvalidValue;
     }
+  }
+
+  for (int32_t batch = 0; batch < state->batch_size; ++batch) {
+    const int32_t pos = state->h_seq_lengths[batch];
     cudaError_t status = ensure_runtime_pages(state, batch, pos);
     if (status != cudaSuccess) {
       return status;

@@ -178,8 +178,35 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
   }
 
   const Gemma4TextLayerWeightsDevice *weights = args.weights;
-  if (weights->layer_scalar == nullptr ||
-      scratch.capacity_rows < rows || scratch.global != global) {
+  // Cache writes happen after GEMMs; reject missing cache plumbing up front.
+  const bool missing_cache_args =
+      args.cache_k == nullptr || args.cache_v == nullptr ||
+      args.page_table == nullptr || args.token_batch == nullptr ||
+      args.token_position == nullptr;
+  const bool missing_scratch =
+      scratch.hidden_work == nullptr || scratch.hidden_delta == nullptr ||
+      scratch.post_attention_residual == nullptr ||
+      scratch.pre_ffn_normed == nullptr || scratch.q == nullptr ||
+      scratch.k == nullptr || (!global && scratch.v == nullptr) ||
+      scratch.q_prepared == nullptr || scratch.k_prepared == nullptr ||
+      scratch.v_prepared == nullptr || scratch.attention_out == nullptr ||
+      scratch.ffn.act == nullptr || scratch.ffn.down == nullptr;
+  const bool missing_weights =
+      weights->layer_scalar == nullptr ||
+      weights->input_norm_weight == nullptr ||
+      weights->post_attention_norm_weight == nullptr ||
+      weights->pre_feedforward_norm_weight == nullptr ||
+      weights->post_feedforward_norm_weight == nullptr ||
+      weights->q_norm_weight == nullptr || weights->k_norm_weight == nullptr ||
+      weights->q_proj_col_major == nullptr ||
+      weights->k_proj_col_major == nullptr ||
+      (!global && weights->v_proj_col_major == nullptr) ||
+      weights->o_proj_col_major == nullptr ||
+      weights->ffn_gate_up_decode == nullptr ||
+      weights->ffn_down_decode == nullptr;
+  if (missing_cache_args || missing_scratch || missing_weights ||
+      scratch.capacity_rows < rows || scratch.ffn.capacity_rows < rows ||
+      scratch.global != global) {
     return cudaErrorInvalidValue;
   }
 
@@ -189,13 +216,33 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
       global ? GEMMA4_GLOBAL_KV_HEADS : GEMMA4_SLIDING_KV_HEADS;
   const int32_t expected_cache_head_dim =
       global ? GEMMA4_GLOBAL_HEAD_DIM : GEMMA4_SLIDING_HEAD_DIM;
-  const int32_t expected_cache_window = global ? 0 : GEMMA4_SLIDING_WINDOW;
+  const bool valid_cache_window =
+      global ? args.cache_config.window_size == 0
+             : args.cache_config.window_size > 0 &&
+                   args.cache_config.window_size <= GEMMA4_SLIDING_WINDOW;
   if (args.cache_config.num_layers != expected_cache_layers ||
       args.cache_config.num_pages <= 0 || args.cache_config.page_size <= 0 ||
       args.cache_config.max_pages_per_seq <= 0 ||
+      args.cache_config.num_pages % args.cache_config.max_pages_per_seq != 0 ||
       args.cache_config.num_heads != expected_cache_heads ||
       args.cache_config.head_dim != expected_cache_head_dim ||
-      args.cache_config.window_size != expected_cache_window) {
+      !valid_cache_window) {
+    return cudaErrorInvalidValue;
+  }
+  const int32_t cache_batch_capacity =
+      args.cache_config.num_pages / args.cache_config.max_pages_per_seq;
+  if (cache_batch_capacity < args.batch_size) {
+    return cudaErrorInvalidValue;
+  }
+  // Sliding prefill keeps only the live tail, which can straddle an extra page.
+  const int32_t first_cached_pos =
+      (!global && args.seq_len > GEMMA4_SLIDING_WINDOW)
+          ? args.seq_len - GEMMA4_SLIDING_WINDOW
+          : 0;
+  const int32_t required_cache_pages =
+      (args.seq_len - 1) / args.cache_config.page_size -
+      first_cached_pos / args.cache_config.page_size + 1;
+  if (required_cache_pages > args.cache_config.max_pages_per_seq) {
     return cudaErrorInvalidValue;
   }
 

@@ -78,12 +78,6 @@ float bf16_to_float(__nv_bfloat16 value) {
   return __bfloat162float(value);
 }
 
-// Produces deterministic nonzero hidden values for an exact identity oracle.
-__nv_bfloat16 make_hidden_value(int index) {
-  const int centered = ((index * 17 + 3) % 251) - 125;
-  return __float2bfloat16_rn(static_cast<float>(centered) / 128.0f);
-}
-
 // Writes one BF16 scalar into a large device tensor.
 void write_device_bf16(
     const DeviceBuffer<__nv_bfloat16> &dst,
@@ -212,22 +206,6 @@ struct LayerBuffers {
   DeviceBuffer<__nv_bfloat16> ffn_down;
 };
 
-// Returns the number of BF16 entries in one K or V cache buffer.
-size_t cache_elements(const Gemma4KvCacheConfig &config) {
-  return static_cast<size_t>(config.num_layers) * config.num_pages *
-         config.page_size * config.num_heads * config.head_dim;
-}
-
-// Returns true when any BF16 value in the tensor is nonzero.
-bool has_nonzero(const std::vector<__nv_bfloat16> &values) {
-  for (__nv_bfloat16 value : values) {
-    if (bf16_to_float(value) != 0.0f) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // Runs one sliding or global prefill layer and checks scalar/output/cache wiring.
 void run_prefill_layer_case(bool global) {
   constexpr int batch_size = 1;
@@ -240,7 +218,8 @@ void run_prefill_layer_case(bool global) {
   std::vector<__nv_bfloat16> hidden(
       static_cast<size_t>(rows) * GEMMA4_HIDDEN_SIZE);
   for (int i = 0; i < static_cast<int>(hidden.size()); ++i) {
-    hidden[i] = make_hidden_value(i);
+    const int centered = ((i * 17 + 3) % 251) - 125;
+    hidden[i] = __float2bfloat16_rn(static_cast<float>(centered) / 128.0f);
   }
   std::vector<float> cos(seq_len * rotary_half, 1.0f);
   std::vector<float> sin(cos.size(), 0.0f);
@@ -265,13 +244,17 @@ void run_prefill_layer_case(bool global) {
 
   Gemma4KvCacheConfig cache_config =
       gemma4_kv_cache_make_config(global, 1, 4, 1);
-  const size_t cache_size = cache_elements(cache_config);
+  const size_t cache_size =
+      static_cast<size_t>(cache_config.num_layers) * cache_config.num_pages *
+      cache_config.page_size * cache_config.num_heads * cache_config.head_dim;
   DeviceBuffer<__nv_bfloat16> d_cache_k(cache_size);
   DeviceBuffer<__nv_bfloat16> d_cache_v(cache_size);
-  DeviceBuffer<int32_t> d_page_table(rows);
+  const size_t page_table_size =
+      static_cast<size_t>(batch_size) * cache_config.max_pages_per_seq;
+  DeviceBuffer<int32_t> d_page_table(page_table_size);
   DeviceBuffer<int32_t> d_token_batch(rows);
   DeviceBuffer<int32_t> d_token_position(rows);
-  std::vector<int32_t> page_table(rows, 0);
+  std::vector<int32_t> page_table(page_table_size, 0);
   std::vector<int32_t> token_batch(rows, 0);
   std::vector<int32_t> token_position = {0, 1};
   d_cache_k.zero();
@@ -296,7 +279,6 @@ void run_prefill_layer_case(bool global) {
   args.page_table = d_page_table.get();
   args.token_batch = d_token_batch.get();
   args.token_position = d_token_position.get();
-  args.cache_layer = 0;
 
   CHECK_CUDA(gemma4_prefill_megakernel_layer_bf16(args, scratch));
   CHECK_CUDA(cudaDeviceSynchronize());
@@ -310,9 +292,22 @@ void run_prefill_layer_case(bool global) {
                global ? "global prefill scaled output"
                       : "sliding prefill scaled output");
 
-  if (!has_nonzero(d_cache_k.copy_to_host()) ||
-      !has_nonzero(d_cache_v.copy_to_host())) {
-    std::fprintf(stderr, "prefill KV cache write stayed zero\n");
+  const int32_t cache_layer = gemma4_kv_cache_layer_index(layer_index, global);
+  auto cache_layout = gemma4_kv_cache_layout(cache_config);
+  const int64_t first_cache_value = cache_layout(cache_layer, 0, 0, 0, 0);
+  if (bf16_to_float(d_cache_k.copy_to_host()[first_cache_value]) == 0.0f ||
+      bf16_to_float(d_cache_v.copy_to_host()[first_cache_value]) == 0.0f) {
+    std::fprintf(stderr, "prefill KV cache write missed page zero offset zero\n");
+    std::exit(1);
+  }
+
+  Gemma4PrefillMegakernelLayerArgs bad_cache_args = args;
+  bad_cache_args.batch_size = 2;
+  bad_cache_args.seq_len = 1;
+  cudaError_t bad_status =
+      gemma4_prefill_megakernel_layer_bf16(bad_cache_args, scratch);
+  if (bad_status != cudaErrorInvalidValue) {
+    std::fprintf(stderr, "expected invalid prefill cache batch capacity\n");
     std::exit(1);
   }
 }
