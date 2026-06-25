@@ -3,6 +3,7 @@
 #include "gemma4_embedding_gather.cuh"
 #include "gemma4_prefill_megakernel.cuh"
 #include "gemma4_runtime.cuh"
+#include "gemma4_tokenizer.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -11,10 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <sstream>
 #include <string>
-#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -82,137 +80,6 @@ int fail_cuda(cudaError_t status, const char *where) {
   return 1;
 }
 
-// Writes text to a temporary file and returns its path.
-bool write_temp_file(const std::string &text, std::string *path) {
-  char name[] = "/tmp/gemma4_prompt_XXXXXX";
-  const int fd = mkstemp(name);
-  if (fd < 0) {
-    return false;
-  }
-  close(fd);
-
-  std::ofstream out(name, std::ios::binary);
-  if (!out) {
-    std::remove(name);
-    return false;
-  }
-  out << text;
-  *path = name;
-  return true;
-}
-
-// Reads a whole text file into `out`.
-bool read_text_file(const std::string &path, std::string *out) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    return false;
-  }
-  std::ostringstream ss;
-  ss << in.rdbuf();
-  *out = ss.str();
-  return true;
-}
-
-// Quotes a string for use as one POSIX shell argument.
-std::string shell_quote(const std::string &text) {
-  std::string out = "'";
-  for (char c : text) {
-    if (c == '\'') {
-      out += "'\\''";
-    } else {
-      out += c;
-    }
-  }
-  out += "'";
-  return out;
-}
-
-// Runs a short Python tokenizer adapter through uv's ephemeral environment.
-bool run_tokenizer_python(const char *script) {
-  const std::string command =
-      "uv run --quiet --with tokenizers python -c " + shell_quote(script);
-  return std::system(command.c_str()) == 0;
-}
-
-// Encodes prompt text with the local Hugging Face tokenizer JSON.
-bool tokenize_prompt(
-    const std::string &tokenizer_path,
-    const std::string &prompt,
-    std::vector<int32_t> *tokens) {
-  std::string input_path;
-  std::string output_path;
-  if (!write_temp_file(prompt, &input_path) ||
-      !write_temp_file("", &output_path)) {
-    return false;
-  }
-
-  setenv("GEMMA4_TOKENIZER_JSON", tokenizer_path.c_str(), 1);
-  setenv("GEMMA4_TOKENIZER_IN", input_path.c_str(), 1);
-  setenv("GEMMA4_TOKENIZER_OUT", output_path.c_str(), 1);
-  const char *script =
-      "from tokenizers import Tokenizer\n"
-      "import os\n"
-      "tok = Tokenizer.from_file(os.environ['GEMMA4_TOKENIZER_JSON'])\n"
-      "text = open(os.environ['GEMMA4_TOKENIZER_IN'], encoding='utf-8').read()\n"
-      "ids = tok.encode(text).ids\n"
-      "open(os.environ['GEMMA4_TOKENIZER_OUT'], 'w', encoding='utf-8').write(' '.join(map(str, ids)))\n";
-
-  const bool ok = run_tokenizer_python(script);
-  std::string encoded;
-  const bool read_ok = ok && read_text_file(output_path, &encoded);
-  std::remove(input_path.c_str());
-  std::remove(output_path.c_str());
-  if (!read_ok) {
-    return false;
-  }
-
-  tokens->clear();
-  std::istringstream ids(encoded);
-  int32_t token = 0;
-  while (ids >> token) {
-    tokens->push_back(token);
-  }
-  return !tokens->empty();
-}
-
-// Decodes generated token IDs with the local Hugging Face tokenizer JSON.
-bool detokenize_tokens(
-    const std::string &tokenizer_path,
-    const std::vector<int32_t> &tokens,
-    std::string *text) {
-  std::ostringstream ids;
-  for (size_t i = 0; i < tokens.size(); ++i) {
-    if (i != 0) {
-      ids << ' ';
-    }
-    ids << tokens[i];
-  }
-
-  std::string input_path;
-  std::string output_path;
-  if (!write_temp_file(ids.str(), &input_path) ||
-      !write_temp_file("", &output_path)) {
-    return false;
-  }
-
-  setenv("GEMMA4_TOKENIZER_JSON", tokenizer_path.c_str(), 1);
-  setenv("GEMMA4_TOKENIZER_IN", input_path.c_str(), 1);
-  setenv("GEMMA4_TOKENIZER_OUT", output_path.c_str(), 1);
-  const char *script =
-      "from tokenizers import Tokenizer\n"
-      "import os\n"
-      "tok = Tokenizer.from_file(os.environ['GEMMA4_TOKENIZER_JSON'])\n"
-      "ids = [int(x) for x in open(os.environ['GEMMA4_TOKENIZER_IN'], encoding='utf-8').read().split()]\n"
-      "text = tok.decode(ids)\n"
-      "open(os.environ['GEMMA4_TOKENIZER_OUT'], 'w', encoding='utf-8').write(text)\n";
-
-  const bool ok = run_tokenizer_python(script);
-  const bool read_ok = ok && read_text_file(output_path, text);
-  std::remove(input_path.c_str());
-  std::remove(output_path.c_str());
-  return read_ok;
-}
-
 // Parses the tiny prompt-runner CLI.
 bool parse_args(int argc, char **argv, PromptOptions *options) {
   for (int i = 1; i < argc; ++i) {
@@ -236,25 +103,6 @@ bool parse_args(int argc, char **argv, PromptOptions *options) {
     }
   }
   return options->max_new_tokens > 0 && options->page_size > 0;
-}
-
-// Returns ceil(value / divisor) for positive split geometry.
-int32_t ceil_div_i32(int32_t value, int32_t divisor) {
-  return (value + divisor - 1) / divisor;
-}
-
-// Returns Gemma4 Unified's explicit attention logit scale.
-float attention_softmax_scale(void) {
-  return 1.0f;
-}
-
-// Returns the largest prefill layer scratch size for this prompt.
-size_t max_prefill_scratch_elements(int32_t rows) {
-  const size_t sliding =
-      gemma4_prefill_megakernel_layer_scratch_elements(false, rows);
-  const size_t global =
-      gemma4_prefill_megakernel_layer_scratch_elements(true, rows);
-  return std::max(sliding, global);
 }
 
 // Runs every transformer layer over the prompt tokens and fills the KV cache.
@@ -284,7 +132,7 @@ cudaError_t run_prefill_layers(
     args.seq_len = seq_len;
     args.cos = global ? runtime->global_cos : runtime->sliding_cos;
     args.sin = global ? runtime->global_sin : runtime->sliding_sin;
-    args.softmax_scale = attention_softmax_scale();
+    args.softmax_scale = 1.0f;
     args.cache_k = global ? runtime->global_cache_k : runtime->sliding_cache_k;
     args.cache_v = global ? runtime->global_cache_v : runtime->sliding_cache_v;
     args.cache_config =
@@ -390,7 +238,7 @@ Gemma4DecodeMegakernelFfnTailArgs make_decode_args(
   args.attention_cache_layer = gemma4_kv_cache_layer_index(layer, global);
   args.attention_split_size = split_size;
   args.attention_num_splits = global ? global_splits : sliding_splits;
-  args.attention_softmax_scale = attention_softmax_scale();
+  args.attention_softmax_scale = 1.0f;
   args.attention_x = hidden_in;
   args.attention_input_norm_weight = w.input_norm_weight;
   args.attention_weights = {w.q_proj_col_major, w.k_proj_col_major,
@@ -475,8 +323,17 @@ cudaError_t copy_next_token(
 
 // Runs tokenization, prefill, decode, and detokenization for one prompt.
 int run_prompt(const PromptOptions &options) {
+  Gemma4Tokenizer tokenizer;
+  std::string tokenizer_error;
+  if (!tokenizer.load(options.tokenizer_path, &tokenizer_error)) {
+    std::fprintf(stderr, "load tokenizer failed: %s\n",
+                 tokenizer_error.c_str());
+    return 1;
+  }
+
   std::vector<int32_t> prompt_tokens;
-  if (!tokenize_prompt(options.tokenizer_path, options.prompt, &prompt_tokens)) {
+  if (!tokenizer.encode(options.prompt, &prompt_tokens) ||
+      prompt_tokens.empty()) {
     std::fprintf(stderr, "tokenization failed\n");
     return 1;
   }
@@ -534,7 +391,10 @@ int run_prompt(const PromptOptions &options) {
   if (status != cudaSuccess) return fail_cuda(status, "alloc prefill a");
   status = d_prefill_b.allocate(prompt_hidden_elements);
   if (status != cudaSuccess) return fail_cuda(status, "alloc prefill b");
-  status = d_prefill_scratch.allocate(max_prefill_scratch_elements(prompt_len));
+  const size_t prefill_scratch_elements = std::max(
+      gemma4_prefill_megakernel_layer_scratch_elements(false, prompt_len),
+      gemma4_prefill_megakernel_layer_scratch_elements(true, prompt_len));
+  status = d_prefill_scratch.allocate(prefill_scratch_elements);
   if (status != cudaSuccess) return fail_cuda(status, "alloc prefill scratch");
 
   status = d_decode_a.allocate(GEMMA4_HIDDEN_SIZE);
@@ -552,11 +412,11 @@ int run_prompt(const PromptOptions &options) {
 
   const int32_t split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
   const int32_t sliding_splits =
-      ceil_div_i32(GEMMA4_SLIDING_WINDOW, split_size);
+      (GEMMA4_SLIDING_WINDOW + split_size - 1) / split_size;
   const int32_t global_keys =
       runtime.value.global_cache_config.max_pages_per_seq *
       runtime.value.global_cache_config.page_size;
-  const int32_t global_splits = ceil_div_i32(global_keys, split_size);
+  const int32_t global_splits = (global_keys + split_size - 1) / split_size;
   const int32_t max_splits = std::max(sliding_splits, global_splits);
   status = d_partial_m.allocate(GEMMA4_NUM_QUERY_HEADS * max_splits);
   if (status != cudaSuccess) return fail_cuda(status, "alloc partial m");
@@ -622,7 +482,7 @@ int run_prompt(const PromptOptions &options) {
   }
 
   std::string decoded;
-  if (!detokenize_tokens(options.tokenizer_path, generated, &decoded)) {
+  if (!tokenizer.decode(generated, &decoded)) {
     std::fprintf(stderr, "detokenization failed\n");
     return 1;
   }
