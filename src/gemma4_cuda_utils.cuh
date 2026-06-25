@@ -99,7 +99,16 @@ load128g(const ElementType *address) {
 template <typename ElementType>
 __device__ inline Packed128<ElementType>
 load128cs(const ElementType *address) {
+#if defined(__clang__)
+  int4 bits;
+  // Clang CUDA lacks NVCC's int4 __ldcs overload, so use the same PTX load.
+  asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+               : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
+               : "l"(address));
+  return Packed128<ElementType>{bits};
+#else
   return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4 *>(address))};
+#endif
 }
 
 template <typename ElementType>
@@ -141,13 +150,27 @@ __device__ inline void store128(
 template <typename ElementType>
 __device__ inline void store128cs(
     ElementType *address, Packed128<ElementType> value) {
+#if defined(__clang__)
+  const int4 bits = value.bits();
+  // Clang CUDA lacks NVCC's int4 __stcs overload, so use the same PTX store.
+  asm volatile("st.global.cs.v4.u32 [%0], {%1, %2, %3, %4};\n" ::"l"(address),
+               "r"(bits.x), "r"(bits.y), "r"(bits.z), "r"(bits.w));
+#else
   __stcs(reinterpret_cast<int4 *>(address), value.bits());
+#endif
 }
 
 template <typename ElementType>
 __device__ inline void store128wb(
     ElementType *address, Packed128<ElementType> value) {
+#if defined(__clang__)
+  const int4 bits = value.bits();
+  // Clang CUDA lacks NVCC's int4 __stwb overload, so use the same PTX store.
+  asm volatile("st.global.wb.v4.u32 [%0], {%1, %2, %3, %4};\n" ::"l"(address),
+               "r"(bits.x), "r"(bits.y), "r"(bits.z), "r"(bits.w));
+#else
   __stwb(reinterpret_cast<int4 *>(address), value.bits());
+#endif
 }
 
 using Bf16Packed128 = Packed128<__nv_bfloat16>;
