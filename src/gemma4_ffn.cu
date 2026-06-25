@@ -1,12 +1,8 @@
-#include "gemma4_ffn.cuh"
-
 #ifndef GEMMA4_WEIGHT_LOAD_POLICY
 #define GEMMA4_WEIGHT_LOAD_POLICY 0
 #endif
 
-#include "gemma4_cuda_utils.cuh"
-#include "gemma4_ffn_decode_device.cuh"
-#include "gemma4_rmsnorm.cuh"
+#include "gemma4_ffn.cuh"
 
 #include <cutlass/array.h>
 #include <cutlass/epilogue/thread/activation.h>
@@ -18,7 +14,6 @@
 
 #include "device/dual_gemm.h"
 
-#include <math.h>
 
 namespace {
 
@@ -26,8 +21,6 @@ namespace ffn_dev = gemma4_ffn_decode_device;
 
 constexpr int kFfnThreads = GEMMA4_FFN_DECODE_THREADS;
 constexpr int kFfnWarps = kFfnThreads / WARP_SIZE;
-constexpr int kIntermediateTile = ffn_dev::kIntermediateTile;
-constexpr int kIntermediateTiles = ffn_dev::kIntermediateTiles;
 constexpr int kHiddenPacks = ffn_dev::kHiddenPacks;
 constexpr int kActTile = ffn_dev::kActTile;
 constexpr int kReductionPolicy = ffn_dev::kReductionPolicy;
@@ -37,10 +30,6 @@ constexpr int kActualSwizzleBlocksPerRow =
     div_up(kHiddenPacks, kSwizzleThreads);
 constexpr int kAccumBlocks = ffn_dev::kAccumBlocks;
 
-using FfnBf16Pack = ffn_dev::FfnBf16Pack;
-using ffn_dev::atomic_add_accum_pack;
-using ffn_dev::hidden_pack_swizzle_index;
-using ffn_dev::store_partial_pack;
 
 template <typename ElementOutput_,
           int Count,
@@ -71,7 +60,9 @@ class GateGeluTanhUpMul {
   }
 };
 
-__global__ __launch_bounds__(kFfnThreads, 1) void gemma4_ffn_decode_accumulate_bf16_kernel(
+// Launch wrapper for the standalone decode FFN accumulation phase.
+__global__ __launch_bounds__(kFfnThreads, 1) void
+gemma4_ffn_decode_accumulate_bf16_kernel(
     const floatX *__restrict__ x,
     const floatX *__restrict__ w_gate_up_col_major,
     const floatX *__restrict__ w_down_row_major,
@@ -79,42 +70,12 @@ __global__ __launch_bounds__(kFfnThreads, 1) void gemma4_ffn_decode_accumulate_b
   __shared__ float s_matmul_warp_sums[2][kActTile][kFfnWarps];
   __shared__ float s_act[kActTile];
 
-  float partial[kBf16Packed128Elements] = {};
-  const int hidden_pack = threadIdx.x;
-  const int swizzled_hidden_col =
-      hidden_pack_swizzle_index(hidden_pack) * kBf16Packed128Elements;
-
-  if constexpr (kAccumBlocks == kIntermediateTiles) {
-    const int intermediate_begin =
-        static_cast<int>(blockIdx.x) * kIntermediateTile;
-    ffn_dev::accumulate_intermediate_tile<kFfnThreads, false>(
-        x, w_gate_up_col_major, w_down_row_major, intermediate_begin,
-        swizzled_hidden_col, true, partial, s_matmul_warp_sums, s_act);
-  } else if constexpr (kAccumBlocks * 2 > kIntermediateTiles) {
-    const int tile0 = static_cast<int>(blockIdx.x);
-    ffn_dev::accumulate_intermediate_tile<kFfnThreads, false>(
-        x, w_gate_up_col_major, w_down_row_major, tile0 * kIntermediateTile,
-        swizzled_hidden_col, true, partial, s_matmul_warp_sums, s_act);
-
-    const int tile1 = tile0 + kAccumBlocks;
-    if (tile1 < kIntermediateTiles) {
-      ffn_dev::accumulate_intermediate_tile<kFfnThreads, false>(
-          x, w_gate_up_col_major, w_down_row_major, tile1 * kIntermediateTile,
-          swizzled_hidden_col, true, partial, s_matmul_warp_sums, s_act);
-    }
-  } else {
-    for (int tile = static_cast<int>(blockIdx.x); tile < kIntermediateTiles;
-         tile += kAccumBlocks) {
-      const int intermediate_begin = tile * kIntermediateTile;
-      ffn_dev::accumulate_intermediate_tile<kFfnThreads, false>(
-          x, w_gate_up_col_major, w_down_row_major, intermediate_begin,
-          swizzled_hidden_col, true, partial, s_matmul_warp_sums, s_act);
-    }
-  }
-
-  atomic_add_accum_pack(scratch, hidden_pack, partial);
+  ffn_dev::decode_accumulate<kFfnThreads>(
+      x, w_gate_up_col_major, w_down_row_major, scratch, int(blockIdx.x),
+      int(threadIdx.x), s_matmul_warp_sums, s_act);
 }
 
+// Launch wrapper for the optional partial-group decode FFN accumulation phase.
 __global__ __launch_bounds__(kFfnThreads, 1) void
 gemma4_ffn_decode_accumulate_partials_bf16_kernel(
     const floatX *__restrict__ x,
@@ -124,21 +85,12 @@ gemma4_ffn_decode_accumulate_partials_bf16_kernel(
   __shared__ float s_matmul_warp_sums[2][kActTile][kFfnWarps];
   __shared__ float s_act[kActTile];
 
-  float partial[kBf16Packed128Elements] = {};
-  const int hidden_pack = threadIdx.x;
-  const int swizzled_hidden_col =
-      hidden_pack_swizzle_index(hidden_pack) * kBf16Packed128Elements;
-  const int group = static_cast<int>(blockIdx.x);
-
-  for (int tile = group; tile < kIntermediateTiles; tile += kPartialGroups) {
-    ffn_dev::accumulate_intermediate_tile<kFfnThreads, false>(
-        x, w_gate_up_col_major, w_down_row_major, tile * kIntermediateTile,
-        swizzled_hidden_col, true, partial, s_matmul_warp_sums, s_act);
-  }
-
-  store_partial_pack(scratch, group, hidden_pack, partial);
+  ffn_dev::decode_accumulate_partials<kFfnThreads>(
+      x, w_gate_up_col_major, w_down_row_major, scratch, int(blockIdx.x),
+      int(threadIdx.x), s_matmul_warp_sums, s_act);
 }
 
+// Launch wrapper for post-FFN RMSNorm and residual addition.
 __global__ __launch_bounds__(kFfnThreads, 1) void
 gemma4_ffn_decode_finalize_bf16_kernel(
     floatX *__restrict__ residual_out,
@@ -150,27 +102,20 @@ gemma4_ffn_decode_finalize_bf16_kernel(
   __shared__ float s_rms_warp_sums[kFfnWarps];
   __shared__ float s_scale;
 
-  ffn_dev::finalize_rmsnorm_residual<
-      kFfnThreads, false, kReductionPolicy == 1>(
+  ffn_dev::decode_finalize<kFfnThreads>(
       residual_out, normed_out, residual, rms_weight, scratch, eps,
       s_rms_warp_sums, s_scale, int(threadIdx.x));
 }
 
+// Launch wrapper for swizzling hidden packs into decode weight layout.
 __global__ void swizzle_hidden_packs_kernel(
     floatX *__restrict__ dst,
     const floatX *__restrict__ src,
     int rows) {
-  const int row = static_cast<int>(blockIdx.y);
-  const int64_t row_offset = static_cast<int64_t>(row) * GEMMA4_HIDDEN_SIZE;
-  const int pack_stride = static_cast<int>(gridDim.x) * blockDim.x;
-  for (int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-       pack < kHiddenPacks; pack += pack_stride) {
-    const int src_col = pack * kBf16Packed128Elements;
-    const int dst_col =
-        hidden_pack_swizzle_index(pack) * kBf16Packed128Elements;
-    const FfnBf16Pack pack_value = load128g(src + row_offset + src_col);
-    store128(dst + row_offset + dst_col, pack_value);
-  }
+  (void)rows;
+  ffn_dev::swizzle_hidden_packs(
+      dst, src, int(blockIdx.y), int(blockIdx.x), int(gridDim.x),
+      int(blockDim.x), int(threadIdx.x));
 }
 
 // RMS-normalizes a swizzled down-projection row, then adds the residual.
@@ -185,36 +130,9 @@ rmsnorm_residual_from_swizzled_down_kernel(
   __shared__ float s_rms_warp_sums[kFfnWarps];
   __shared__ float s_scale;
 
-  const int row = static_cast<int>(blockIdx.x);
-  const int hidden_pack = static_cast<int>(threadIdx.x);
-  const int natural_col = hidden_pack * kBf16Packed128Elements;
-  const int swizzled_col =
-      hidden_pack_swizzle_index(hidden_pack) * kBf16Packed128Elements;
-  const int64_t row_offset = static_cast<int64_t>(row) * GEMMA4_HIDDEN_SIZE;
-
-  const FfnBf16Pack down_pack =
-      load128g(down_swizzled + row_offset + swizzled_col);
-  float sum_sq = 0.0f;
-  gemma4_bf16_pack_accumulate_square(down_pack, sum_sq);
-
-  const float total =
-      gemma4_block_reduce_sum<kFfnThreads>(
-          sum_sq, s_rms_warp_sums, threadIdx.x);
-  if (threadIdx.x == 0) {
-    s_scale = rsqrtf(total / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
-  }
-  __syncthreads();
-
-  const FfnBf16Pack gamma_pack =
-      load128g(rms_weight + natural_col);
-  const FfnBf16Pack normed_pack =
-      gemma4_bf16_pack_apply_rmsnorm(down_pack, gamma_pack, s_scale);
-  const FfnBf16Pack residual_pack =
-      load128g(residual + row_offset + natural_col);
-  const FfnBf16Pack residual_out_pack =
-      gemma4_bf16_pack_add(residual_pack, normed_pack);
-  store128wb(normed_out + row_offset + natural_col, normed_pack);
-  store128(residual_out + row_offset + natural_col, residual_out_pack);
+  ffn_dev::rmsnorm_residual_from_swizzled_down<kFfnThreads>(
+      residual_out, normed_out, down_swizzled, residual, rms_weight, eps,
+      s_rms_warp_sums, s_scale, int(blockIdx.x), int(threadIdx.x));
 }
 
 // Reorders the swizzled hidden packs produced by the prefill down GEMM back to
@@ -223,40 +141,17 @@ __global__ __launch_bounds__(kFfnThreads, 1) void
 unswizzle_hidden_packs_kernel(
     floatX *__restrict__ dst,
     const floatX *__restrict__ src) {
-  const int row = static_cast<int>(blockIdx.x);
-  const int64_t row_offset = static_cast<int64_t>(row) * GEMMA4_HIDDEN_SIZE;
-
-  for (int hidden_pack = static_cast<int>(threadIdx.x);
-       hidden_pack < kHiddenPacks; hidden_pack += blockDim.x) {
-    const int natural_col = hidden_pack * kBf16Packed128Elements;
-    const int swizzled_col =
-        hidden_pack_swizzle_index(hidden_pack) * kBf16Packed128Elements;
-    const FfnBf16Pack pack = load128g(src + row_offset + swizzled_col);
-    store128(dst + row_offset + natural_col, pack);
-  }
+  ffn_dev::unswizzle_hidden_packs(
+      dst, src, int(blockIdx.x), int(blockDim.x), int(threadIdx.x));
 }
 
+// Launch wrapper for gate/up row interleaving plus hidden-pack swizzling.
 __global__ void swizzle_gate_up_interleaved_kernel(
     floatX *__restrict__ dst,
     const floatX *__restrict__ src) {
-  const int dst_row = static_cast<int>(blockIdx.y);
-  const int src_row =
-      (dst_row & 1) == 0 ? dst_row / 2
-                         : GEMMA4_INTERMEDIATE_SIZE + dst_row / 2;
-  const int64_t src_row_offset =
-      static_cast<int64_t>(src_row) * GEMMA4_HIDDEN_SIZE;
-  const int64_t dst_row_offset =
-      static_cast<int64_t>(dst_row) * GEMMA4_HIDDEN_SIZE;
-  const int pack_stride = static_cast<int>(gridDim.x) * blockDim.x;
-  for (int pack = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
-       pack < kHiddenPacks; pack += pack_stride) {
-    const int src_col = pack * kBf16Packed128Elements;
-    const int dst_col =
-        hidden_pack_swizzle_index(pack) * kBf16Packed128Elements;
-    const FfnBf16Pack pack_value =
-        load128g(src + src_row_offset + src_col);
-    store128(dst + dst_row_offset + dst_col, pack_value);
-  }
+  ffn_dev::swizzle_gate_up_interleaved(
+      dst, src, int(blockIdx.y), int(blockIdx.x), int(gridDim.x),
+      int(blockDim.x), int(threadIdx.x));
 }
 
 template <int ThreadblockM,
