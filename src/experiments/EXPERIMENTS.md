@@ -3,6 +3,249 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-25 - Sampling Bench LibTorch Baseline Port
+
+Question:
+
+- Can the old Python `gemma4_sampling_torch_bench.py` native PyTorch CUDA
+  graph comparison live directly inside the sampling mechanism benchmark?
+
+Change:
+
+- Added a LibTorch CUDA-graph row to `gemma4_sampling_bench`.
+- Kept the existing custom fused sampler and materialized CUDA reference rows.
+- Deleted `gemma4_sampling_torch_bench.py`.
+
+Commands:
+
+```bash
+make sampling-bench
+./build/benches/gemma4_sampling_bench --warmup 5 --iters 10 --samples 3
+make test-sampling
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:06:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Library baseline: LibTorch `2.11.0`.
+- Shape: BF16 hidden `[1, 3840]`, tied LM head `[262144, 3840]`.
+- Timing: CUDA events on each measured stream; LibTorch row uses CUDA graph
+  replay, custom rows use direct CUDA launches.
+- Warmup/iterations: `5` warmups, `10` timed iterations per sample, `3`
+  samples. This is a port smoke run, not a final tuning run.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked.
+- Correctness: LibTorch row checks selected-row gather and scale; custom fused
+  row checks token against the materialized CUDA reference before timing.
+
+Results:
+
+```text
+variant=native_pytorch_cuda_graph median_us=2853.350 samples_us=[2852.541,2853.350,2854.547]
+variant=fused_lm_head_sample_full_vocab median_us=2837.990 samples_us=[2836.016,2838.429,2837.990]
+variant=materialized_lm_head_sample_full_vocab median_us=2871.904 samples_us=[2871.606,2871.904,2872.211]
+```
+
+Conclusion:
+
+- The sampling mechanism now has one C++/CUDA benchmark file with its LibTorch
+  baseline included.
+- The old Python wrapper behavior is preserved by the `native_pytorch_cuda_graph`
+  row and named `--warmup`, `--iters`, and `--samples` aliases.
+- Rerun with larger sample counts before making performance claims.
+
+## 2026-06-25 - KV Cache Bench LibTorch SDPA Baseline Port
+
+Question:
+
+- Can the old Python `gemma4_kv_cache_torch_bench.py` SDPA timing live inside
+  the KV-cache mechanism benchmark without leaving a second benchmark file?
+
+Change:
+
+- Added LibTorch eager SDPA rows to `gemma4_kv_cache_bench`.
+- Preserved the Python baseline knobs: `--seq-len`, `--q-heads`,
+  `--kv-heads`, `--head-dim`, and `--flush-mib`.
+- Kept the existing custom sliding paged-cache rows in the same benchmark.
+- Added a custom global paged-decode row using
+  `gemma4_flash_attention_decode_paged_bf16`.
+- Fixed the custom CPU reference to compare only the live sliding window when
+  `seq_len` exceeds the sliding attention window.
+- Deleted `gemma4_kv_cache_torch_bench.py`.
+- Deleted `gemma4_global_decode_torch_bench.py`.
+- Deleted the decode half of `gemma4_paged_decode_torch_bench.py`; its sliding
+  LibTorch decode row now lives here.
+
+Commands:
+
+```bash
+make kv-cache-bench
+./build/benches/gemma4_kv_cache_bench --warmup 5 --iters 10 --samples 3
+make test-kv-cache
+git diff --check
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:04:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Library baseline: LibTorch `2.11.0`.
+- Torch shape: BF16 `q=[1,16,1,512]`, `k/v=[1,1,4096,512]`, non-causal
+  SDPA with GQA enabled and scale `1/sqrt(512)`.
+- Custom shape: BF16 sliding paged cache, `q_heads=16`, `kv_heads=8`,
+  `head_dim=256`, `key_count=1024`, `split_size=20`.
+- Sliding Torch shape: BF16 `q=[1,16,1,256]`, `k/v=[1,8,1024,256]`,
+  non-causal SDPA with GQA enabled and scale `1/sqrt(256)`.
+- Global custom shape: BF16 global paged cache, `q_heads=16`, `kv_heads=1`,
+  `head_dim=512`, `seq_len=4096`, `split_size=64`.
+- Timing: CUDA events on the same stream as the measured work. LibTorch first
+  use is outside timing through the checksum call and warmups.
+- Warmup/iterations: `5` warmups, `10` timed iterations per sample, `3`
+  samples. This is a port smoke run, not a final tuning run.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked; run snapshot showed idle clocks at
+  `210 MHz` SM and `405 MHz` memory.
+- Correctness: custom flash decode matched the CPU reference with
+  `max_abs=0` and `mean_abs=0`; `make test-kv-cache` passed.
+
+Results:
+
+```text
+torch_attention_only median_ms=1.664547 samples_ms=[1.646912,1.664547,1.674886]
+torch_full_decode_write_plus_attention median_ms=1.663427 samples_ms=[1.652682,1.663427,1.668630]
+torch_sliding_decode_attention median_ms=0.183338 samples_ms=[0.167078,0.183363,0.183338]
+prefill_cache_write median_ms=0.106074 samples_ms=[0.104499,0.106435,0.106074]
+decode_cache_write median_ms=0.015171 samples_ms=[0.013722,0.017741,0.015171]
+flash_decode_paged_attention_direct median_ms=0.035075 samples_ms=[0.032403,0.038118,0.035075]
+flash_full_decode_write_plus_attention median_ms=0.047910 samples_ms=[0.047456,0.049424,0.047910]
+global_decode_paged_attention_direct median_ms=0.266893 samples_ms=[0.265245,0.266893,0.266954]
+```
+
+Conclusion:
+
+- The KV-cache mechanism now has one C++/CUDA benchmark file with its LibTorch
+  SDPA baseline and custom global paged-decode row included.
+- The Torch rows preserve the old Python default global-like SDPA shape; they
+  are useful as a library baseline, not a shape-identical comparison to the
+  sliding custom rows.
+- Rerun with larger sample counts and locked clocks before making performance
+  claims.
+
+## 2026-06-25 - Flash Attention Bench LibTorch Prep Ports
+
+Question:
+
+- Can the prefill half of `gemma4_paged_decode_torch_bench.py` live inside the
+  flash-attention mechanism benchmark?
+- Can `gemma4_decode_prep_torch_bench.py` be represented by a LibTorch
+  decode-prep row in the same mechanism benchmark?
+- Can `gemma4_project_prepare_compare.py` be represented by LibTorch and custom
+  project-prepare rows in the same mechanism benchmark?
+
+Change:
+
+- Added a raw `gemma4_flash_attention_sliding_fwd_bf16` row with LSE output to
+  `gemma4_flash_attention_bench`.
+- Added a LibTorch BF16 SDPA prefill row for `seq_len <= GEMMA4_SLIDING_WINDOW`.
+- Added a LibTorch decode RMSNorm/RoPE/paged-KV-write row.
+- Added LibTorch and custom packed project-plus-prepare rows.
+- Kept the existing `norm_rope_plus_fa` and decode-prep rows distinct.
+- Deleted `gemma4_paged_decode_torch_bench.py` after its decode row landed in
+  the KV-cache bench and its prefill row landed here.
+- Deleted `gemma4_decode_prep_torch_bench.py`.
+- Deleted `gemma4_project_prepare_compare.py`; the optional vLLM operator row
+  was not carried into C++.
+
+Commands:
+
+```bash
+make flash-attn-bench
+./build/benches/gemma4_flash_attention_bench 1024 10 5 3 1 64 warm 64
+git diff --check
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:09:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Library baseline: LibTorch `2.11.0`.
+- Shape: BF16 `q=[1,1024,16,256]`, `k/v=[1,1024,8,256]`, causal prefill,
+  window `1024`, scale `1/sqrt(256)`.
+- Decode-prep shape: BF16 `q=[1,16,256]`, `k/v=[1,8,256]`, weights `[256]`,
+  and paged cache `[1,16,64,8,256]`.
+- Project-prepare shape: BF16 hidden `[1,3840]`, packed QKV weight
+  `[8192,3840]`, output Q `[1,16,256]`, and paged cache `[1,16,64,8,256]`.
+- Timing: CUDA events on the same stream as the measured work.
+- Warmup/iterations: `5` warmups, `10` timed iterations per sample, `3`
+  samples. This is a port smoke run, not a final tuning run.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked.
+- Correctness: existing `check_seq=64` CPU-reference checks passed with
+  `max_abs=0.0078125`; norm/RoPE prep max abs was at most `0.00195312`.
+
+Results:
+
+```text
+prefill_torch_sdpa_graphless median_ms=0.161366 samples_ms=[0.156435,0.161366,0.171440]
+torch_decode_norm_rope_paged_kv_write median_ms=2.418710 samples_ms=[2.091730,2.502110,2.418710]
+torch_project_prepare median_ms=2.394480 samples_ms=[3.446750,2.394480,2.313800]
+custom_project_prepare median_ms=0.495533 samples_ms=[0.495533,0.493709,0.495968]
+sliding_fwd_bf16_return_lse median_ms=0.134902 samples_ms=[0.134262,0.135312,0.134902]
+norm_rope_plus_fa median_ms=0.189395 samples_ms=[0.188262,0.189395,0.190106]
+decode_norm_rope_paged_kv_write median_ms=0.020592 samples_ms=[0.015309,0.030259,0.020592]
+```
+
+Conclusion:
+
+- The paged-decode wrapper's sliding prefill comparison and the decode-prep
+  wrapper's LibTorch baseline now have C++ rows in the flash-attention
+  mechanism bench.
+- The project-prepare wrapper's PyTorch/custom core comparison also has C++
+  rows; the optional vLLM row was intentionally omitted because it depends on a
+  Python package plugin rather than LibTorch.
+- The LibTorch row is a baseline, not a graph-captured replica of the old
+  Python harness.
+- Rerun with larger sample counts and locked clocks before making performance
+  claims.
+
+## 2026-06-25 - Retired Remaining Python Bench Wrappers
+
+Question:
+
+- After the Torch benchmark paths moved into C++ mechanism benches, what should
+  happen to the remaining Python files under `src/benches/`?
+
+Change:
+
+- Deleted `gemma4_flash_attention_compare.py`.
+- Deleted `gemma4_tokenizer_compare.py`.
+- Deleted `gemma4_prefill_tune.py`.
+- Deleted the now-unused shared Python `gemma4_bench_utils.py`.
+- Made `tests/test_flash_attention_pytorch.py` self-contained instead of
+  importing helper functions from the deleted paged-decode benchmark.
+
+Notes:
+
+- The flash-attention C++ bench now carries raw custom sliding attention,
+  LibTorch SDPA prefill, decode-prep, project-prepare, and CPU-reference
+  correctness rows. The deleted Python wrapper's optional Python `flash_attn`
+  comparison was not carried into C++.
+- The tokenizer C++ bench keeps the custom tokenizer benchmark. The deleted
+  Python wrapper's external Hugging Face `transformers` and Rust `tokenizers`
+  comparison rows were not carried into C++.
+- The prefill tuner was already orphaned from the current `Makefile`; its old
+  Tuna/SGEMM sweep orchestration was retired instead of being moved to
+  LibTorch.
+
+Conclusion:
+
+- `src/benches/` now contains no Python benchmark files. The remaining Python in
+  this repo is tests, historical experiment material, and non-bench tooling.
+
 ## 2026-06-25 - Prompt Decode Tail Split and Hot-Path Timing
 
 Question:

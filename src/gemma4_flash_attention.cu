@@ -265,18 +265,6 @@ __forceinline__ __device__ auto gemma4_fa_acc_Aregs(Layout acc_layout) {
   }
 }
 
-// Convert all elements of a register fragment at once using CUTLASS numeric
-// conversion. The common case here is FP32 softmax probabilities -> BF16.
-template <typename ToType, typename Engine, typename Layout>
-__forceinline__ __device__ auto gemma4_fa_convert_type(
-    Tensor<Engine, Layout> const &tensor) {
-  using FromType = typename Engine::value_type;
-  constexpr int numel = decltype(size(tensor))::value;
-  cutlass::NumericArrayConverter<ToType, FromType, numel> convert_op;
-  auto frag = convert_op(*reinterpret_cast<const cutlass::Array<FromType, numel> *>(tensor.data()));
-  return make_tensor(make_rmem_ptr<ToType>(&frag), tensor.layout());
-}
-
 // Thin wrapper around the cp.async wait instruction. N is the number of async
 // groups that may remain outstanding after the wait.
 template <int N>
@@ -496,32 +484,23 @@ struct Gemma4FlashSoftmax {
     }
   }
 
-  // Finish the softmax denominator, normalize O, and optionally return LSE.
-  template <bool ReturnLse, typename Tensor0>
-  __forceinline__ __device__ TensorT normalize_softmax_lse(
-      Tensor0 &acc_o,
-      float softmax_scale) {
-    // Complete the row-sum reduction, normalize O by the softmax denominator,
-    // and optionally produce the log-sum-exp side output for diagnostics/tests.
+  // Finish the softmax denominator and normalize O.
+  template <typename Tensor0>
+  __forceinline__ __device__ void normalize_softmax(Tensor0 &acc_o) {
+    // Complete the row-sum reduction before dividing the accumulated output.
     gemma4_fa_reduce_rows_sum(row_sum, row_sum);
-    TensorT lse = make_fragment_like(row_sum);
     Tensor acc_o_rowcol = make_tensor(acc_o.data(), gemma4_fa_acc_rowcol(acc_o.layout()));
 #pragma unroll
     for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
       float sum = row_sum(mi);
-      // Empty or fully masked rows produce a harmless scale and diagnostic LSE.
+      // Empty or fully masked rows produce a harmless scale.
       const bool invalid_sum = sum == 0.0f || sum != sum;
       float inv_sum = invalid_sum ? 1.0f : 1.0f / sum;
-      if constexpr (ReturnLse) {
-        lse(mi) = invalid_sum ? INFINITY
-                              : row_max(mi) * softmax_scale + __logf(sum);
-      }
 #pragma unroll
       for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
         acc_o_rowcol(mi, ni) *= inv_sum;
       }
     }
-    return lse;
   }
 };
 
@@ -664,7 +643,15 @@ __forceinline__ __device__ void gemma4_store_o_tile(
   constexpr int kBlockM = KernelTraits::kBlockM;
   constexpr int kHeadDim = KernelTraits::kHeadDim;
 
-  Tensor rO = gemma4_fa_convert_type<Element>(acc_o);
+  using AccOElement = typename TensorAccO::value_type;
+  constexpr int kAccONumel = decltype(size(acc_o))::value;
+  cutlass::NumericArrayConverter<Element, AccOElement, kAccONumel>
+      convert_acc_o;
+  const auto *acc_o_array =
+      reinterpret_cast<const cutlass::Array<AccOElement, kAccONumel> *>(
+          acc_o.data());
+  auto acc_o_frag = convert_acc_o(*acc_o_array);
+  Tensor rO = make_tensor(make_rmem_ptr<Element>(&acc_o_frag), acc_o.layout());
   Tensor sO = make_tensor(
       make_smem_ptr(reinterpret_cast<Element *>(smem)),
       typename KernelTraits::SmemLayoutO{});
@@ -784,7 +771,15 @@ __forceinline__ __device__ void gemma4_process_kv_block(
   softmax.template softmax_rescale<IsFirst, MaybeMask>(
       acc_s, acc_o, params.scale_softmax_log2, score_block_fully_visible);
 
-  Tensor rP = gemma4_fa_convert_type<Element>(acc_s);
+  using AccSElement = typename decltype(acc_s)::value_type;
+  constexpr int kAccSNumel = decltype(size(acc_s))::value;
+  cutlass::NumericArrayConverter<Element, AccSElement, kAccSNumel>
+      convert_acc_s;
+  const auto *acc_s_array =
+      reinterpret_cast<const cutlass::Array<AccSElement, kAccSNumel> *>(
+          acc_s.data());
+  auto acc_s_frag = convert_acc_s(*acc_s_array);
+  Tensor rP = make_tensor(make_rmem_ptr<Element>(&acc_s_frag), acc_s.layout());
   Tensor tOrP = make_tensor(
       rP.data(),
       gemma4_fa_acc_Aregs<typename KernelTraits::TiledMmaPV>(rP.layout()));
@@ -798,8 +793,8 @@ __forceinline__ __device__ void gemma4_process_kv_block(
 //   1. stage Q once;
 //   2. stream K/V blocks from right to left;
 //   3. compute QK^T, mask, online softmax, and P*V;
-//   4. normalize and write O plus LSE.
-template <typename KernelTraits, bool IsLocal, bool ReturnLse>
+//   4. normalize and write O, with optional LSE stored at the end.
+template <typename KernelTraits, bool IsLocal>
 inline __device__ void gemma4_compute_attn_1rowblock(
     const Gemma4FlashFwdParams &params,
     const int bidb,
@@ -856,7 +851,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     gemma4_store_o_tile<KernelTraits>(
         params, q_batch_offset, bidh, m_block, q_tile_remaining, acc_o,
         tiled_mma_pv, tidx, smem_);
-    if constexpr (ReturnLse) {
+    if (params.softmax_lse_ptr != nullptr) {
       Tensor empty_lse = make_tensor<float>(Shape<Int<2 * size<1>(acc_o)>>{});
       cute::fill(empty_lse, INFINITY);
       gemma4_write_lse_rows<KernelTraits>(
@@ -984,8 +979,16 @@ inline __device__ void gemma4_compute_attn_1rowblock(
 
   // Finalize O = softmax(QK^T)V and store through shared memory so the MMA
   // accumulator fragment can be rearranged into coalesced global writes.
-  Tensor lse = softmax.template normalize_softmax_lse<ReturnLse>(acc_o, params.scale_softmax);
-  if constexpr (ReturnLse) {
+  softmax.normalize_softmax(acc_o);
+  if (params.softmax_lse_ptr != nullptr) {
+    Tensor lse = make_fragment_like(softmax.row_sum);
+#pragma unroll
+    for (int mi = 0; mi < size(lse); ++mi) {
+      float sum = softmax.row_sum(mi);
+      const bool invalid_sum = sum == 0.0f || sum != sum;
+      lse(mi) = invalid_sum ? INFINITY
+                            : softmax.row_max(mi) * params.scale_softmax + __logf(sum);
+    }
     gemma4_write_lse_rows<KernelTraits>(
         params, bidb, bidh, m_block, q_tile_remaining, thr_mma_pv, lse);
   }
@@ -995,14 +998,13 @@ inline __device__ void gemma4_compute_attn_1rowblock(
 }
 
 // One CTA computes one query row-block for one batch and one query head.
-template <typename KernelTraits, bool IsLocal, bool ReturnLse>
+template <typename KernelTraits, bool IsLocal>
 __global__ void gemma4_flash_fwd_bf16_kernel(
     __grid_constant__ const Gemma4FlashFwdParams params) {
   const int m_block = blockIdx.x;
   const int bidb = blockIdx.y;
   const int bidh = blockIdx.z;
-  gemma4_compute_attn_1rowblock<KernelTraits, IsLocal, ReturnLse>(
-      params, bidb, bidh, m_block);
+  gemma4_compute_attn_1rowblock<KernelTraits, IsLocal>(params, bidb, bidh, m_block);
 }
 
 // Fill the compact launch-parameter struct expected by the specialized kernel.
@@ -1049,11 +1051,11 @@ bool gemma4_fa_valid_sliding_args(
 
 // Dynamic shared memory exceeds the default limit for these FA tiles, so the
 // selected kernel must opt in before launch or attribute introspection.
-template <typename KernelTraits, bool IsLocal, bool ReturnLse>
+template <typename KernelTraits, bool IsLocal>
 cudaError_t set_kernel_smem() {
   static bool initialized = false;
   if (initialized) return cudaSuccess;
-  auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal, ReturnLse>;
+  auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal>;
   cudaError_t status = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
       KernelTraits::kSmemSize);
@@ -1063,32 +1065,20 @@ cudaError_t set_kernel_smem() {
 
 // Common launcher for sliding and global variants. The grid dimensions map to:
 //   x = query row block, y = batch, z = query head.
-template <typename KernelTraits, bool IsLocal, bool ReturnLse>
+template <typename KernelTraits, bool IsLocal>
 cudaError_t launch_attention(
     Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
-  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal, ReturnLse>();
+  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal>();
   GEMMA4_RETURN_IF_CUDA_ERROR(status);
   const dim3 grid_dim(cute::ceil_div(params.seqlen_q, KernelTraits::kBlockM),
                       batch_size,
                       GEMMA4_NUM_QUERY_HEADS);
   constexpr dim3 block_dim(KernelTraits::kNThreads);
-  gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal, ReturnLse>
+  gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal>
       <<<grid_dim, block_dim, KernelTraits::kSmemSize, stream>>>(params);
   return cudaGetLastError();
-}
-
-template <typename KernelTraits, bool IsLocal>
-cudaError_t launch_attention_maybe_lse(
-    Gemma4FlashFwdParams &params,
-    int batch_size,
-    cudaStream_t stream) {
-  return params.softmax_lse_ptr == nullptr
-             ? launch_attention<KernelTraits, IsLocal, false>(
-                   params, batch_size, stream)
-             : launch_attention<KernelTraits, IsLocal, true>(
-                   params, batch_size, stream);
 }
 
 // Gemma 4 sliding layers: head_dim=256, block 64x64, local causal window.
@@ -1096,8 +1086,7 @@ cudaError_t launch_sliding(
     Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
-  return launch_attention_maybe_lse<Gemma4SlidingFa2KernelTraits, true>(
-      params, batch_size, stream);
+  return launch_attention<Gemma4SlidingFa2KernelTraits, true>(params, batch_size, stream);
 }
 
 // Gemma 4 global layers: head_dim=512, block 32x32, full causal attention.
@@ -1105,8 +1094,7 @@ cudaError_t launch_global(
     Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
-  return launch_attention_maybe_lse<Gemma4GlobalFa2KernelTraits, false>(
-      params, batch_size, stream);
+  return launch_attention<Gemma4GlobalFa2KernelTraits, false>(params, batch_size, stream);
 }
 
 // Sum a per-lane value across one warp for the per-head RMSNorm denominator.
@@ -2376,9 +2364,9 @@ cudaError_t launch_decode_paged(
 template <typename KernelTraits, bool IsLocal>
 cudaError_t selected_kernel_attributes(long long *out, int len) {
   if (out == nullptr || len < 10) return cudaErrorInvalidValue;
-  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal, true>();
+  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal>();
   GEMMA4_RETURN_IF_CUDA_ERROR(status);
-  auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal, true>;
+  auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal>;
   cudaFuncAttributes attr{};
   status = cudaFuncGetAttributes(&attr, kernel);
   GEMMA4_RETURN_IF_CUDA_ERROR(status);

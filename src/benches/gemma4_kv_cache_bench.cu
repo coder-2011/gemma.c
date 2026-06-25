@@ -4,6 +4,11 @@
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_bench_utils.cuh"
 
+#include <ATen/ATen.h>
+#include <ATen/ops/scaled_dot_product_attention.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/version.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -13,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,10 +42,14 @@ struct BenchOptions {
   int seq_len = 4096;
   int page_size = 64;
   int split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
+  int global_split_size = 64;
   int warmup = 25;
   int iters = 100;
   int samples = 15;
   int extra_splits = 0;
+  int torch_q_heads = GEMMA4_NUM_QUERY_HEADS;
+  int torch_kv_heads = GEMMA4_GLOBAL_KV_HEADS;
+  int torch_head_dim = GEMMA4_GLOBAL_HEAD_DIM;
   std::string cache_mode = "warm";
   int64_t flush_bytes = 0;
 };
@@ -191,7 +201,8 @@ void cpu_decode_reference(std::vector<__nv_bfloat16> &expected,
                           const std::vector<__nv_bfloat16> &q,
                           const std::vector<__nv_bfloat16> &k,
                           const std::vector<__nv_bfloat16> &v,
-                          int seq_len,
+                          int key_start,
+                          int key_count,
                           int q_heads,
                           int kv_heads,
                           int head_dim,
@@ -199,16 +210,17 @@ void cpu_decode_reference(std::vector<__nv_bfloat16> &expected,
   int group_size = q_heads / kv_heads;
   for (int qh = 0; qh < q_heads; ++qh) {
     int kh = qh / group_size;
-    std::vector<float> scores(seq_len);
+    std::vector<float> scores(key_count);
     float max_score = -INFINITY;
-    for (int pos = 0; pos < seq_len; ++pos) {
+    for (int key = 0; key < key_count; ++key) {
+      int pos = key_start + key;
       float dot = 0.0f;
       for (int d = 0; d < head_dim; ++d) {
         dot += bf16_to_float(q[qh * head_dim + d]) *
                bf16_to_float(k[(pos * kv_heads + kh) * head_dim + d]);
       }
-      scores[pos] = dot * scale;
-      max_score = std::max(max_score, scores[pos]);
+      scores[key] = dot * scale;
+      max_score = std::max(max_score, scores[key]);
     }
     float denom = 0.0f;
     for (float score : scores) {
@@ -216,14 +228,37 @@ void cpu_decode_reference(std::vector<__nv_bfloat16> &expected,
     }
     for (int d = 0; d < head_dim; ++d) {
       float value = 0.0f;
-      for (int pos = 0; pos < seq_len; ++pos) {
-        float weight = std::exp(scores[pos] - max_score) / denom;
+      for (int key = 0; key < key_count; ++key) {
+        int pos = key_start + key;
+        float weight = std::exp(scores[key] - max_score) / denom;
         value += weight *
                  bf16_to_float(v[(pos * kv_heads + kh) * head_dim + d]);
       }
       expected[qh * head_dim + d] = __float2bfloat16_rn(value);
     }
   }
+}
+
+// Calls the same eager SDPA op as the deleted Python benchmark, with GQA enabled.
+at::Tensor run_torch_sdpa(const at::Tensor &q,
+                          const at::Tensor &k,
+                          const at::Tensor &v,
+                          double scale) {
+  return at::scaled_dot_product_attention(
+      q, k, v, std::nullopt, 0.0, false, std::optional<double>(scale), true);
+}
+
+// Runs the former Python full-decode path: write final K/V rows, then SDPA.
+at::Tensor run_torch_full_decode(at::Tensor &k,
+                                 at::Tensor &v,
+                                 const at::Tensor &new_k,
+                                 const at::Tensor &new_v,
+                                 const at::Tensor &q,
+                                 int seq_len,
+                                 double scale) {
+  k.narrow(2, seq_len - 1, 1).copy_(new_k);
+  v.narrow(2, seq_len - 1, 1).copy_(new_v);
+  return run_torch_sdpa(q, k, v, scale);
 }
 
 void check_attention_correctness(const std::vector<__nv_bfloat16> &actual,
@@ -273,6 +308,23 @@ BenchOptions parse_args(int argc, char **argv) {
       options.cache_mode = need_value("--cache");
     } else if (arg == "--flush-bytes") {
       options.flush_bytes = std::stoll(need_value("--flush-bytes"));
+    } else if (arg == "--flush-mib") {
+      options.flush_bytes = std::stoll(need_value("--flush-mib")) * 1024ll *
+                            1024ll;
+    } else if (arg == "--seq-len") {
+      options.seq_len = std::stoi(need_value("--seq-len"));
+    } else if (arg == "--page-size") {
+      options.page_size = std::stoi(need_value("--page-size"));
+    } else if (arg == "--split-size") {
+      options.split_size = std::stoi(need_value("--split-size"));
+    } else if (arg == "--global-split-size") {
+      options.global_split_size = std::stoi(need_value("--global-split-size"));
+    } else if (arg == "--q-heads") {
+      options.torch_q_heads = std::stoi(need_value("--q-heads"));
+    } else if (arg == "--kv-heads") {
+      options.torch_kv_heads = std::stoi(need_value("--kv-heads"));
+    } else if (arg == "--head-dim") {
+      options.torch_head_dim = std::stoi(need_value("--head-dim"));
     } else if (arg == "--warmup") {
       options.warmup = std::stoi(need_value("--warmup"));
     } else if (arg == "--iters") {
@@ -295,15 +347,24 @@ BenchOptions parse_args(int argc, char **argv) {
   if (positional.size() > 6) {
     throw std::runtime_error("usage: gemma4_kv_cache_bench [seq page split "
                              "warmup iters samples] [--cache warm|cold] "
-                             "[--flush-bytes N] [--extra-splits N]");
+                             "[--flush-bytes N] [--flush-mib N] "
+                             "[--seq-len N] [--q-heads N] [--kv-heads N] "
+                             "[--head-dim N] [--global-split-size N] "
+                             "[--extra-splits N]");
   }
   if (options.cache_mode != "warm" && options.cache_mode != "cold") {
     throw std::runtime_error("--cache must be warm or cold");
   }
   if (options.seq_len <= 0 || options.page_size <= 0 ||
-      options.split_size <= 0 || options.warmup < 0 || options.iters <= 0 ||
-      options.samples <= 0 || options.extra_splits < 0) {
+      options.split_size <= 0 || options.global_split_size <= 0 ||
+      options.warmup < 0 || options.iters <= 0 ||
+      options.samples <= 0 || options.extra_splits < 0 ||
+      options.torch_q_heads <= 0 || options.torch_kv_heads <= 0 ||
+      options.torch_head_dim <= 0) {
     throw std::runtime_error("benchmark dimensions/counts must be positive");
+  }
+  if (options.torch_q_heads % options.torch_kv_heads != 0) {
+    throw std::runtime_error("--q-heads must be divisible by --kv-heads");
   }
   return options;
 }
@@ -331,10 +392,14 @@ int main(int argc, char **argv) {
   int seq_len = options.seq_len;
   int page_size = options.page_size;
   int split_size = options.split_size;
+  int global_split_size = options.global_split_size;
   int warmup = options.warmup;
   int iters = options.iters;
   int samples = options.samples;
   bool cold_cache = options.cache_mode == "cold";
+  const int torch_q_heads = options.torch_q_heads;
+  const int torch_kv_heads = options.torch_kv_heads;
+  const int torch_head_dim = options.torch_head_dim;
 
   // Cold-cache mode defines an explicit L2 flush before each measured sample.
   // Warm-cache mode leaves repeated accesses to measure steady-state reuse.
@@ -392,6 +457,93 @@ int main(int argc, char **argv) {
       "dtype=bf16 layout=\"cache=[layers,pages,page_size,kv_heads,head_dim]\" "
       "batch_size=%d q_heads=%d kv_heads=%d head_dim=%d\n",
       batch_size, q_heads, config.num_heads, config.head_dim);
+
+  // LibTorch rows preserve the deleted Python SDPA baseline's global-like shape.
+  {
+    c10::cuda::CUDAGuard torch_device_guard(
+        static_cast<c10::DeviceIndex>(device));
+    const c10::cuda::CUDAStream torch_stream =
+        c10::cuda::getStreamFromPool(false, device);
+    c10::cuda::CUDAStreamGuard torch_stream_guard(torch_stream);
+    at::manual_seed(1234u);
+
+    const auto torch_options =
+        at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
+    at::Tensor torch_q =
+        at::randn({1, torch_q_heads, 1, torch_head_dim}, torch_options);
+    at::Tensor torch_k =
+        at::randn({1, torch_kv_heads, seq_len, torch_head_dim}, torch_options);
+    at::Tensor torch_v =
+        at::randn({1, torch_kv_heads, seq_len, torch_head_dim}, torch_options);
+    at::Tensor torch_new_k =
+        at::randn({1, torch_kv_heads, 1, torch_head_dim}, torch_options);
+    at::Tensor torch_new_v =
+        at::randn({1, torch_kv_heads, 1, torch_head_dim}, torch_options);
+    at::Tensor torch_out;
+    uint32_t *d_torch_l2_scratch = nullptr;
+    if (flush_bytes > 0) {
+      CUDA_CHECK(cudaMalloc(&d_torch_l2_scratch, flush_bytes));
+      CUDA_CHECK(cudaMemsetAsync(d_torch_l2_scratch, 0, flush_bytes,
+                                 torch_stream.stream()));
+    }
+
+    const double torch_scale = 1.0 / std::sqrt(double(torch_head_dim));
+    auto torch_attention_only = [&]() {
+      torch_out = run_torch_sdpa(torch_q, torch_k, torch_v, torch_scale);
+    };
+    auto torch_full_decode = [&]() {
+      torch_out = run_torch_full_decode(torch_k, torch_v, torch_new_k,
+                                        torch_new_v, torch_q, seq_len,
+                                        torch_scale);
+    };
+
+    torch_attention_only();
+    CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
+    float torch_checksum = torch_out.to(at::kFloat).sum().item<float>();
+    std::printf(
+        "benchmark_libtorch torch_version=%s dtype=bf16 "
+        "layout=\"q=[1,Hq,1,D],k/v=[1,Hkv,S,D]\" seq_len=%d q_heads=%d "
+        "kv_heads=%d head_dim=%d scale=%.9f checksum=%.6f\n",
+        TORCH_VERSION, seq_len, torch_q_heads, torch_kv_heads, torch_head_dim,
+        torch_scale, torch_checksum);
+    print_stats("torch_attention_only",
+                time_cuda_samples(torch_attention_only, torch_stream.stream(),
+                                  warmup, iters, samples, cold_cache,
+                                  d_torch_l2_scratch,
+                                  flush_bytes / sizeof(uint32_t)));
+    print_stats("torch_full_decode_write_plus_attention",
+                time_cuda_samples(torch_full_decode, torch_stream.stream(),
+                                  warmup, iters, samples, cold_cache,
+                                  d_torch_l2_scratch,
+                                  flush_bytes / sizeof(uint32_t)));
+
+    at::Tensor torch_sliding_q =
+        at::randn({1, q_heads, 1, config.head_dim}, torch_options);
+    at::Tensor torch_sliding_k =
+        at::randn({1, config.num_heads, key_count, config.head_dim},
+                  torch_options);
+    at::Tensor torch_sliding_v =
+        at::randn({1, config.num_heads, key_count, config.head_dim},
+                  torch_options);
+    auto torch_sliding_decode = [&]() {
+      torch_out = run_torch_sdpa(torch_sliding_q, torch_sliding_k,
+                                 torch_sliding_v, scale);
+    };
+    torch_sliding_decode();
+    CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
+    const float sliding_checksum = torch_out.to(at::kFloat).sum().item<float>();
+    std::printf(
+        "benchmark_libtorch_sliding seq_len=%d key_count=%d q_heads=%d "
+        "kv_heads=%d head_dim=%d checksum=%.6f\n",
+        seq_len, key_count, q_heads, config.num_heads, config.head_dim,
+        sliding_checksum);
+    print_stats("torch_sliding_decode_attention",
+                time_cuda_samples(torch_sliding_decode, torch_stream.stream(),
+                                  warmup, iters, samples, cold_cache,
+                                  d_torch_l2_scratch,
+                                  flush_bytes / sizeof(uint32_t)));
+    if (d_torch_l2_scratch != nullptr) CUDA_CHECK(cudaFree(d_torch_l2_scratch));
+  }
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreate(&stream));
@@ -518,7 +670,8 @@ int main(int argc, char **argv) {
 
   std::vector<__nv_bfloat16> expected(h_q.size());
   std::vector<__nv_bfloat16> actual(h_q.size());
-  cpu_decode_reference(expected, h_q, h_k, h_v, seq_len, q_heads,
+  const int key_start = seq_len - key_count;
+  cpu_decode_reference(expected, h_q, h_k, h_v, key_start, key_count, q_heads,
                        config.num_heads, config.head_dim, scale);
 
   // Correctness check: flash paged decode against the CPU reference.
@@ -604,6 +757,123 @@ int main(int argc, char **argv) {
               time_cuda_samples(flash_full_decode, stream, warmup, iters,
                                 samples, cold_cache, d_l2_scratch,
                                 flush_bytes / sizeof(uint32_t)));
+
+  {
+    const int global_pages = div_up(seq_len, page_size);
+    Gemma4KvCacheConfig global_config =
+        gemma4_kv_cache_make_config(true, global_pages, page_size, global_pages);
+    const int global_capacity = global_pages * page_size;
+    const int global_splits = div_up(global_capacity, global_split_size);
+    const float global_scale = 1.0f / std::sqrt(float(global_config.head_dim));
+    const int global_kv_elems =
+        seq_len * global_config.num_heads * global_config.head_dim;
+    std::vector<int32_t> global_page_table(global_pages);
+    std::iota(global_page_table.begin(), global_page_table.end(), 0);
+    std::vector<__nv_bfloat16> global_h_k(global_kv_elems);
+    std::vector<__nv_bfloat16> global_h_v(global_kv_elems);
+    std::vector<__nv_bfloat16> global_h_q(q_heads * global_config.head_dim);
+    for (int i = 0; i < global_kv_elems; ++i) {
+      global_h_k[i] = make_value(3000003 + i);
+      global_h_v[i] = make_value(4000003 + i);
+    }
+    for (int i = 0; i < static_cast<int>(global_h_q.size()); ++i) {
+      global_h_q[i] = make_value(5000003 + i);
+    }
+
+    __nv_bfloat16 *d_global_cache_k = nullptr;
+    __nv_bfloat16 *d_global_cache_v = nullptr;
+    __nv_bfloat16 *d_global_k = nullptr;
+    __nv_bfloat16 *d_global_v = nullptr;
+    __nv_bfloat16 *d_global_q = nullptr;
+    __nv_bfloat16 *d_global_out = nullptr;
+    int32_t *d_global_page_table = nullptr;
+    float *d_global_partial_m = nullptr;
+    float *d_global_partial_l = nullptr;
+    float *d_global_partial_acc = nullptr;
+    const size_t global_partial_m_elements =
+        static_cast<size_t>(batch_size) * q_heads * global_splits;
+    const size_t global_partial_acc_elements =
+        global_partial_m_elements * global_config.head_dim;
+
+    CUDA_CHECK(cudaMalloc(&d_global_cache_k,
+                          cache_elements(global_config) *
+                              sizeof(*d_global_cache_k)));
+    CUDA_CHECK(cudaMalloc(&d_global_cache_v,
+                          cache_elements(global_config) *
+                              sizeof(*d_global_cache_v)));
+    CUDA_CHECK(cudaMalloc(&d_global_k, global_h_k.size() * sizeof(*d_global_k)));
+    CUDA_CHECK(cudaMalloc(&d_global_v, global_h_v.size() * sizeof(*d_global_v)));
+    CUDA_CHECK(cudaMalloc(&d_global_q, global_h_q.size() * sizeof(*d_global_q)));
+    CUDA_CHECK(cudaMalloc(&d_global_out,
+                          global_h_q.size() * sizeof(*d_global_out)));
+    CUDA_CHECK(cudaMalloc(&d_global_page_table,
+                          global_page_table.size() * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_global_partial_m,
+                          global_partial_m_elements * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_global_partial_l,
+                          global_partial_m_elements * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_global_partial_acc,
+                          global_partial_acc_elements * sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpyAsync(d_global_k, global_h_k.data(),
+                               global_h_k.size() * sizeof(*d_global_k),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_global_v, global_h_v.data(),
+                               global_h_v.size() * sizeof(*d_global_v),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_global_q, global_h_q.data(),
+                               global_h_q.size() * sizeof(*d_global_q),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_global_page_table, global_page_table.data(),
+                               global_page_table.size() * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(gemma4_kv_cache_write_bf16(
+        d_global_cache_k, d_global_cache_v, global_config, d_global_page_table,
+        d_token_batch, d_token_position, seq_len, layer, d_global_k,
+        d_global_v, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    std::vector<__nv_bfloat16> global_expected(global_h_q.size());
+    std::vector<__nv_bfloat16> global_actual(global_h_q.size());
+    cpu_decode_reference(global_expected, global_h_q, global_h_k, global_h_v,
+                         0, seq_len, q_heads, global_config.num_heads,
+                         global_config.head_dim, global_scale);
+
+    auto global_decode_attention = [&]() {
+      CUDA_CHECK(gemma4_flash_attention_decode_paged_bf16(
+          d_global_out, d_global_partial_m, d_global_partial_l,
+          d_global_partial_acc, d_global_q, d_global_cache_k, d_global_cache_v,
+          d_global_page_table, d_seq_lengths, global_config, layer, batch_size,
+          global_scale, global_split_size, global_splits, stream));
+    };
+    global_decode_attention();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(global_actual.data(), d_global_out,
+                          global_actual.size() * sizeof(global_actual[0]),
+                          cudaMemcpyDeviceToHost));
+    check_attention_correctness(global_actual, global_expected);
+
+    std::printf(
+        "global_decode_shape seq_len=%d page_size=%d split_size=%d splits=%d "
+        "q_heads=%d kv_heads=%d head_dim=%d\n",
+        seq_len, page_size, global_split_size, global_splits, q_heads,
+        global_config.num_heads, global_config.head_dim);
+    print_stats("global_decode_paged_attention_direct",
+                time_cuda_samples(global_decode_attention, stream, warmup,
+                                  iters, samples, cold_cache, d_l2_scratch,
+                                  flush_bytes / sizeof(uint32_t)));
+
+    CUDA_CHECK(cudaFree(d_global_partial_acc));
+    CUDA_CHECK(cudaFree(d_global_partial_l));
+    CUDA_CHECK(cudaFree(d_global_partial_m));
+    CUDA_CHECK(cudaFree(d_global_page_table));
+    CUDA_CHECK(cudaFree(d_global_out));
+    CUDA_CHECK(cudaFree(d_global_q));
+    CUDA_CHECK(cudaFree(d_global_v));
+    CUDA_CHECK(cudaFree(d_global_k));
+    CUDA_CHECK(cudaFree(d_global_cache_v));
+    CUDA_CHECK(cudaFree(d_global_cache_k));
+  }
 
   CUDA_CHECK(cudaFree(d_cache_k));
   CUDA_CHECK(cudaFree(d_cache_v));

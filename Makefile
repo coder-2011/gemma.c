@@ -21,9 +21,15 @@ BUILD_DIR := build
 FLASH_ATTN_CUTLASS_INCLUDE ?= $(CUTLASS_INCLUDE)
 FLASH_ATTN_CUTLASS_CPPFLAGS ?= -I$(FLASH_ATTN_CUTLASS_INCLUDE) -I$(CUTLASS_INCLUDE)
 FLASH_ATTN_NVCCFLAGS ?= --expt-relaxed-constexpr --expt-extended-lambda --use_fast_math -D_GLIBCXX_USE_CXX11_ABI=1
-TORCH_INCLUDE ?= .venv/lib/python3.11/site-packages/torch/include
-TORCH_API_INCLUDE ?= .venv/lib/python3.11/site-packages/torch/include/torch/csrc/api/include
-TORCH_LIB ?= .venv/lib/python3.11/site-packages/torch/lib
+TORCH_PYTHON ?= python3
+TORCH_ROOT ?= $(shell $(TORCH_PYTHON) -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)' 2>/dev/null)
+TORCH_INCLUDE ?= $(TORCH_ROOT)/include
+TORCH_API_INCLUDE ?= $(TORCH_INCLUDE)/torch/csrc/api/include
+TORCH_LIB ?= $(TORCH_ROOT)/lib
+TORCH_CPPFLAGS ?= -I$(TORCH_INCLUDE) -I$(TORCH_API_INCLUDE)
+TORCH_NVCCFLAGS ?= -D_GLIBCXX_USE_CXX11_ABI=1
+TORCH_LDFLAGS ?= -L$(TORCH_LIB) -Xlinker -rpath -Xlinker $(TORCH_LIB)
+TORCH_LIBS ?= -ltorch -ltorch_cuda -ltorch_cpu -lc10_cuda -lc10
 PYTHON_INCLUDE ?= /usr/include/python3.11
 
 .PHONY: all cuda-kernels prompt benchmarks decode-bench embedding-gather-bench sampling-bench rmsnorm-bench rmsnorm-hidden-fused-bench ffn-cudnn-bench ffn-decode-load-bench ffn-dual-gemm-bench flash-attn-bench kv-cache-bench hgemm-bench tokenizer-bench flash-attn-lib test-cuda-utils test-tokenizer test-embedding-gather test-sampling test-rmsnorm test-ffn-decode test-prefill-gemm test-kv-cache test-flash-attention test-flash-attention-cpp test-flash-attention-pytorch test-runtime-state test-decode-megakernel test-prefill-megakernel test-checkpoint-loader clean
@@ -136,7 +142,7 @@ $(BUILD_DIR)/benches/gemma4_embedding_gather_bench: src/benches/gemma4_embedding
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/benches/gemma4_embedding_gather_bench.cu src/gemma4_embedding_gather.cu -o $@
 
 $(BUILD_DIR)/benches/gemma4_sampling_bench: src/benches/gemma4_sampling_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4_sampling.cu src/gemma4_sampling.cuh src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_embedding_gather.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/benches
-	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) src/benches/gemma4_sampling_bench.cu src/gemma4_sampling.cu src/gemma4_matmul_kernels.cu -o $@
+	$(NVCC) $(NVCCFLAGS) $(TORCH_NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(TORCH_CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) src/benches/gemma4_sampling_bench.cu src/gemma4_sampling.cu src/gemma4_matmul_kernels.cu $(TORCH_LDFLAGS) $(TORCH_LIBS) -o $@
 
 $(BUILD_DIR)/benches/gemma4_rmsnorm_bench: src/benches/gemma4_rmsnorm_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/benches
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUDNN_INCLUDE) -I$(CUDNN_FRONTEND_INCLUDE) src/benches/gemma4_rmsnorm_bench.cu src/gemma4_rmsnorm.cu $(CUDA_LDFLAGS) $(CUDNN_LDFLAGS) -lnvrtc -lcuda -o $@
@@ -154,10 +160,10 @@ $(BUILD_DIR)/benches/gemma4_ffn_dual_gemm_bench: src/benches/gemma4_ffn_dual_gem
 	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) src/benches/gemma4_ffn_dual_gemm_bench.cu -o $@
 
 $(BUILD_DIR)/benches/gemma4_flash_attention_bench: src/benches/gemma4_flash_attention_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_kv_cache.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/benches
-	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) $(FLASH_ATTN_CUTLASS_CPPFLAGS) src/benches/gemma4_flash_attention_bench.cu src/gemma4_flash_attention.cu -o $@
+	$(NVCC) $(NVCCFLAGS) $(TORCH_NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) $(TORCH_CPPFLAGS) $(FLASH_ATTN_CUTLASS_CPPFLAGS) src/benches/gemma4_flash_attention_bench.cu src/gemma4_flash_attention.cu $(TORCH_LDFLAGS) $(TORCH_LIBS) -o $@
 
 $(BUILD_DIR)/benches/gemma4_kv_cache_bench: src/benches/gemma4_kv_cache_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_rope.cuh src/gemma4_cuda_utils.cuh src/gemma4.cpp src/gemma4.h | $(BUILD_DIR)/benches
-	$(NVCC) $(NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) $(FLASH_ATTN_CUTLASS_CPPFLAGS) src/benches/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4.cpp -o $@
+	$(NVCC) $(NVCCFLAGS) $(TORCH_NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(CPPFLAGS) $(TORCH_CPPFLAGS) $(FLASH_ATTN_CUTLASS_CPPFLAGS) src/benches/gemma4_kv_cache_bench.cu src/gemma4_kv_cache.cu src/gemma4_flash_attention.cu src/gemma4.cpp $(TORCH_LDFLAGS) $(TORCH_LIBS) -o $@
 
 $(BUILD_DIR)/benches/16384_512_4096: src/benches/16384_512_4096.cu | $(BUILD_DIR)/benches
 	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) -DGEMMA4_STANDALONE_BENCH $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) src/benches/16384_512_4096.cu $(CUDA_LDFLAGS) -lcublas -o $@

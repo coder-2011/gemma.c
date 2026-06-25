@@ -1,6 +1,13 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <ATen/ATen.h>
+#include <ATen/TensorIndexing.h>
+#include <ATen/ops/scaled_dot_product_attention.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/version.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -8,6 +15,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -24,6 +32,9 @@ constexpr int kKvHeads = GEMMA4_SLIDING_KV_HEADS;
 constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
 constexpr int kGqaRatio = kQHeads / kKvHeads;
 constexpr int kRotaryHalf = kHeadDim / 2;
+constexpr int kQElements = kQHeads * kHeadDim;
+constexpr int kKvElements = kKvHeads * kHeadDim;
+constexpr int kQkvElements = kQElements + 2 * kKvElements;
 
 struct SampleStats {
   float median_ms = 0.0f;
@@ -202,6 +213,123 @@ void print_stats(const char *name, const SampleStats &stats) {
     std::cout << (i == 0 ? "" : ",") << stats.samples_ms[i];
   }
   std::cout << "]\n";
+}
+
+// Runs the LibTorch SDPA baseline for raw sliding prefill tensors.
+at::Tensor run_torch_prefill_sdpa(const at::Tensor &q,
+                                  const at::Tensor &k,
+                                  const at::Tensor &v,
+                                  double scale) {
+  at::Tensor q_t = q.permute({0, 2, 1, 3});
+  at::Tensor k_t = k.permute({0, 2, 1, 3});
+  at::Tensor v_t = v.permute({0, 2, 1, 3});
+  at::Tensor out_t = at::scaled_dot_product_attention(
+      q_t, k_t, v_t, std::nullopt, 0.0, true,
+      std::optional<double>(scale), true);
+  return out_t.permute({0, 2, 1, 3}).contiguous();
+}
+
+// Applies Gemma Q/K RMSNorm in LibTorch for the decode-prep baseline row.
+at::Tensor torch_rmsnorm(const at::Tensor &x,
+                         const at::Tensor &weight,
+                         bool use_weight) {
+  at::Tensor y = x.to(at::kFloat);
+  at::Tensor mean_sq = y.square().mean(std::vector<int64_t>{-1}, true);
+  y = y * at::rsqrt(mean_sq + GEMMA4_RMS_NORM_EPS);
+  if (use_weight) {
+    y = y * weight.to(at::kFloat).view({1, 1, kHeadDim});
+  }
+  return y;
+}
+
+// Applies sliding RoPE using token-position-selected cos/sin rows.
+at::Tensor torch_apply_rope(const at::Tensor &x,
+                            const at::Tensor &cos,
+                            const at::Tensor &sin,
+                            const at::Tensor &token_position) {
+  at::Tensor rows = token_position.to(at::kLong);
+  at::Tensor c = cos.index_select(0, rows).unsqueeze(1);
+  at::Tensor s = sin.index_select(0, rows).unsqueeze(1);
+  at::Tensor lo = x.slice(-1, 0, kRotaryHalf);
+  at::Tensor hi = x.slice(-1, kRotaryHalf, kHeadDim);
+  return at::cat({lo * c - hi * s, lo * s + hi * c}, -1).to(at::kBFloat16);
+}
+
+// Runs the LibTorch decode Q/K/V norm, RoPE, and paged-cache write baseline.
+void run_torch_decode_prep(at::Tensor &q_prepared,
+                           at::Tensor &cache_k,
+                           at::Tensor &cache_v,
+                           const at::Tensor &q,
+                           const at::Tensor &k,
+                           const at::Tensor &v,
+                           const at::Tensor &q_norm_weight,
+                           const at::Tensor &k_norm_weight,
+                           const at::Tensor &cos,
+                           const at::Tensor &sin,
+                           const at::Tensor &token_position,
+                           int batch_size,
+                           int pages_per_seq,
+                           int slot,
+                           int page_offset) {
+  at::Tensor q_out =
+      torch_apply_rope(torch_rmsnorm(q, q_norm_weight, true), cos, sin,
+                       token_position);
+  at::Tensor k_out =
+      torch_apply_rope(torch_rmsnorm(k, k_norm_weight, true), cos, sin,
+                       token_position);
+  at::Tensor v_out = torch_rmsnorm(v, k_norm_weight, false).to(at::kBFloat16);
+  q_prepared.copy_(q_out);
+
+  const auto long_options =
+      at::TensorOptions().device(at::kCUDA).dtype(at::kLong);
+  at::Tensor batch_index = at::arange(batch_size, long_options);
+  at::Tensor physical_page = batch_index * pages_per_seq + slot;
+  at::Tensor offset = at::full({batch_size}, page_offset, long_options);
+  using at::indexing::Slice;
+  cache_k.index_put_({0, physical_page, offset, Slice(), Slice()}, k_out);
+  cache_v.index_put_({0, physical_page, offset, Slice(), Slice()}, v_out);
+}
+
+// Applies hidden-width RMSNorm before the packed QKV projection baseline.
+at::Tensor torch_hidden_rmsnorm(const at::Tensor &x, const at::Tensor &weight) {
+  at::Tensor y = x.to(at::kFloat);
+  at::Tensor mean_sq = y.square().mean(std::vector<int64_t>{-1}, true);
+  y = y * at::rsqrt(mean_sq + GEMMA4_RMS_NORM_EPS);
+  y = y * weight.to(at::kFloat).view({1, GEMMA4_HIDDEN_SIZE});
+  return y.to(at::kBFloat16);
+}
+
+// Runs the LibTorch packed projection plus decode-prep baseline.
+void run_torch_project_prepare(at::Tensor &q_prepared,
+                               at::Tensor &cache_k,
+                               at::Tensor &cache_v,
+                               const at::Tensor &x,
+                               const at::Tensor &input_norm_weight,
+                               const at::Tensor &qkv_weight,
+                               const at::Tensor &q_norm_weight,
+                               const at::Tensor &k_norm_weight,
+                               const at::Tensor &cos,
+                               const at::Tensor &sin,
+                               const at::Tensor &token_position,
+                               int batch_size,
+                               int pages_per_seq,
+                               int slot,
+                               int page_offset) {
+  at::Tensor x_normed = torch_hidden_rmsnorm(x, input_norm_weight);
+  at::Tensor qkv = at::matmul(x_normed, qkv_weight.t());
+  at::Tensor q = qkv.slice(1, 0, kQElements).view({batch_size, kQHeads, kHeadDim});
+  at::Tensor k = qkv.slice(1, kQElements, kQElements + kKvElements)
+                     .view({batch_size, kKvHeads, kHeadDim});
+  at::Tensor v = qkv.slice(1, kQElements + kKvElements, kQkvElements)
+                     .view({batch_size, kKvHeads, kHeadDim});
+  run_torch_decode_prep(q_prepared, cache_k, cache_v, q, k, v, q_norm_weight,
+                        k_norm_weight, cos, sin, token_position, batch_size,
+                        pages_per_seq, slot, page_offset);
+}
+
+// Returns a CUDA BF16 pointer from a LibTorch tensor for the C ABI row.
+__nv_bfloat16 *torch_bf16_ptr(at::Tensor &tensor) {
+  return reinterpret_cast<__nv_bfloat16 *>(tensor.data_ptr());
 }
 
 void fill_random_bf16(std::vector<__nv_bfloat16> &values, uint32_t seed) {
@@ -562,6 +690,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   __nv_bfloat16 *d_q_norm_weight = nullptr;
   __nv_bfloat16 *d_k_norm_weight = nullptr;
   __nv_bfloat16 *d_out = nullptr;
+  float *d_raw_lse = nullptr;
   int32_t *d_decode_page_table = nullptr;
   int32_t *d_decode_token_position = nullptr;
   float *d_cos = nullptr;
@@ -582,10 +711,11 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   std::vector<int32_t> h_decode_token_position(batch_size, seq_len - 1);
   std::vector<int32_t> h_decode_page_table(
       batch_size * decode_pages_per_seq, -1);
+  const int decode_slot = ((seq_len - 1) / decode_page_size) % decode_pages_per_seq;
+  const int decode_page_offset = (seq_len - 1) % decode_page_size;
   for (int b = 0; b < batch_size; ++b) {
-    const int slot = ((seq_len - 1) / decode_page_size) % decode_pages_per_seq;
-    h_decode_page_table[b * decode_pages_per_seq + slot] =
-        b * decode_pages_per_seq + slot;
+    h_decode_page_table[b * decode_pages_per_seq + decode_slot] =
+        b * decode_pages_per_seq + decode_slot;
   }
   const size_t decode_cache_elems =
       size_t(decode_cache_config.num_layers) * decode_cache_config.num_pages *
@@ -611,6 +741,9 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   CUDA_CHECK(cudaMalloc(&d_k_norm_weight,
                         h_k_norm_weight.size() * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&d_out, h_q.size() * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMalloc(&d_raw_lse,
+                        size_t(batch_size) * kQHeads * seq_len *
+                            sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_decode_page_table,
                         h_decode_page_table.size() * sizeof(int32_t)));
   CUDA_CHECK(cudaMalloc(&d_decode_token_position,
@@ -656,6 +789,221 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
                         h_decode_token_position.size() * sizeof(int32_t),
                         cudaMemcpyHostToDevice));
 
+  auto launch_raw_sliding_fa = [&]() {
+    CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16(
+        d_out, d_raw_lse, d_q, d_k, d_v, batch_size, seq_len, seq_len,
+        window_size, scale, stream));
+  };
+  const SampleStats raw_sliding_timing =
+      time_cuda_samples(launch_raw_sliding_fa, stream, warmup, iters, samples,
+                        cold_cache, d_l2_scratch, l2_flush_words);
+
+  if (seq_len <= window_size) {
+    c10::cuda::CUDAGuard torch_device_guard(0);
+    const c10::cuda::CUDAStream torch_stream =
+        c10::cuda::getStreamFromPool(false, 0);
+    c10::cuda::CUDAStreamGuard torch_stream_guard(torch_stream);
+    at::manual_seed(1235u);
+    const auto torch_options =
+        at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
+    at::Tensor torch_q =
+        at::randn({batch_size, seq_len, kQHeads, kHeadDim}, torch_options);
+    at::Tensor torch_k =
+        at::randn({batch_size, seq_len, kKvHeads, kHeadDim}, torch_options);
+    at::Tensor torch_v =
+        at::randn({batch_size, seq_len, kKvHeads, kHeadDim}, torch_options);
+    at::Tensor torch_out;
+    auto launch_torch_prefill = [&]() {
+      torch_out = run_torch_prefill_sdpa(torch_q, torch_k, torch_v, scale);
+    };
+    launch_torch_prefill();
+    CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
+    const float torch_checksum = torch_out.to(at::kFloat).sum().item<float>();
+    std::cout << "benchmark_libtorch torch_version=" << TORCH_VERSION
+              << " prefill_checksum=" << torch_checksum << "\n";
+    print_stats("prefill_torch_sdpa_graphless",
+                time_cuda_samples(launch_torch_prefill, torch_stream.stream(),
+                                  warmup, iters, samples, cold_cache,
+                                  d_l2_scratch, l2_flush_words));
+  } else {
+    std::cout << "prefill_torch_sdpa_graphless skipped=seq_exceeds_window\n";
+  }
+
+  {
+    c10::cuda::CUDAGuard torch_device_guard(0);
+    const c10::cuda::CUDAStream torch_stream =
+        c10::cuda::getStreamFromPool(false, 0);
+    c10::cuda::CUDAStreamGuard torch_stream_guard(torch_stream);
+    at::manual_seed(1234u);
+    const auto torch_options =
+        at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
+    const auto int_options =
+        at::TensorOptions().device(at::kCUDA).dtype(at::kInt);
+    at::Tensor torch_decode_q =
+        at::randn({batch_size, kQHeads, kHeadDim}, torch_options);
+    at::Tensor torch_decode_k =
+        at::randn({batch_size, kKvHeads, kHeadDim}, torch_options);
+    at::Tensor torch_decode_v =
+        at::randn({batch_size, kKvHeads, kHeadDim}, torch_options);
+    at::Tensor torch_q_weight =
+        at::randn({kHeadDim}, torch_options) * 0.05 + 0.95;
+    at::Tensor torch_k_weight =
+        at::randn({kHeadDim}, torch_options) * 0.05 + 0.95;
+    at::Tensor torch_cos =
+        at::from_blob(h_cos.data(), {seq_len, kRotaryHalf},
+                      at::TensorOptions().dtype(at::kFloat))
+            .clone()
+            .to(at::kCUDA);
+    at::Tensor torch_sin =
+        at::from_blob(h_sin.data(), {seq_len, kRotaryHalf},
+                      at::TensorOptions().dtype(at::kFloat))
+            .clone()
+            .to(at::kCUDA);
+    at::Tensor torch_token_position =
+        at::full({batch_size}, seq_len - 1, int_options);
+    at::Tensor torch_q_prepared =
+        at::empty({batch_size, kQHeads, kHeadDim}, torch_options);
+    at::Tensor torch_cache_k =
+        at::zeros({1, batch_size * decode_pages_per_seq, decode_page_size,
+                   kKvHeads, kHeadDim},
+                  torch_options);
+    at::Tensor torch_cache_v = at::zeros_like(torch_cache_k);
+    auto launch_torch_decode_prep = [&]() {
+      run_torch_decode_prep(torch_q_prepared, torch_cache_k, torch_cache_v,
+                            torch_decode_q, torch_decode_k, torch_decode_v,
+                            torch_q_weight, torch_k_weight, torch_cos,
+                            torch_sin, torch_token_position, batch_size,
+                            decode_pages_per_seq, decode_slot,
+                            decode_page_offset);
+    };
+    launch_torch_decode_prep();
+    CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
+    const float torch_decode_checksum =
+        torch_q_prepared.to(at::kFloat).sum().item<float>();
+    std::cout << "benchmark_libtorch_decode_prep checksum="
+              << torch_decode_checksum << "\n";
+    print_stats("torch_decode_norm_rope_paged_kv_write",
+                time_cuda_samples(launch_torch_decode_prep,
+                                  torch_stream.stream(), warmup, iters,
+                                  samples, cold_cache, d_l2_scratch,
+                                  l2_flush_words));
+  }
+
+  {
+    c10::cuda::CUDAGuard torch_device_guard(0);
+    const c10::cuda::CUDAStream torch_stream =
+        c10::cuda::getStreamFromPool(false, 0);
+    c10::cuda::CUDAStreamGuard torch_stream_guard(torch_stream);
+    at::manual_seed(0u);
+    const auto torch_options =
+        at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
+    const auto int_options =
+        at::TensorOptions().device(at::kCUDA).dtype(at::kInt);
+    Gemma4KvCacheConfig project_config = {
+        1, batch_size * decode_pages_per_seq, decode_page_size,
+        decode_pages_per_seq, kKvHeads, kHeadDim,
+        std::min(seq_len, GEMMA4_SLIDING_WINDOW)};
+    at::Tensor project_x =
+        at::randn({batch_size, GEMMA4_HIDDEN_SIZE}, torch_options);
+    at::Tensor project_input_weight =
+        at::randn({GEMMA4_HIDDEN_SIZE}, torch_options) * 0.01 + 1.0;
+    at::Tensor project_weight =
+        (at::randn({kQkvElements, GEMMA4_HIDDEN_SIZE}, torch_options) /
+         std::sqrt(float(GEMMA4_HIDDEN_SIZE)))
+            .contiguous();
+    at::Tensor project_q_weight =
+        at::randn({kHeadDim}, torch_options) * 0.01 + 1.0;
+    at::Tensor project_k_weight =
+        at::randn({kHeadDim}, torch_options) * 0.01 + 1.0;
+    at::Tensor project_cos =
+        at::from_blob(h_cos.data(), {seq_len, kRotaryHalf},
+                      at::TensorOptions().dtype(at::kFloat))
+            .clone()
+            .to(at::kCUDA);
+    at::Tensor project_sin =
+        at::from_blob(h_sin.data(), {seq_len, kRotaryHalf},
+                      at::TensorOptions().dtype(at::kFloat))
+            .clone()
+            .to(at::kCUDA);
+    at::Tensor project_position =
+        at::full({batch_size}, seq_len - 1, int_options);
+    at::Tensor project_page_table =
+        at::arange(batch_size * decode_pages_per_seq, int_options)
+            .view({batch_size, decode_pages_per_seq});
+    at::Tensor torch_project_q =
+        at::empty({batch_size, kQHeads, kHeadDim}, torch_options);
+    at::Tensor torch_project_cache_k =
+        at::zeros({1, batch_size * decode_pages_per_seq, decode_page_size,
+                   kKvHeads, kHeadDim},
+                  torch_options);
+    at::Tensor torch_project_cache_v = at::zeros_like(torch_project_cache_k);
+    at::Tensor custom_project_q = at::empty_like(torch_project_q);
+    at::Tensor custom_project_cache_k = at::zeros_like(torch_project_cache_k);
+    at::Tensor custom_project_cache_v = at::zeros_like(torch_project_cache_v);
+    Gemma4AttentionProjectionWeights project_weights = {
+        torch_bf16_ptr(project_weight), torch_bf16_ptr(project_weight),
+        torch_bf16_ptr(project_weight), 0, kQElements,
+        kQElements + kKvElements};
+
+    auto launch_torch_project_prepare = [&]() {
+      run_torch_project_prepare(torch_project_q, torch_project_cache_k,
+                                torch_project_cache_v, project_x,
+                                project_input_weight, project_weight,
+                                project_q_weight, project_k_weight,
+                                project_cos, project_sin, project_position,
+                                batch_size, decode_pages_per_seq, decode_slot,
+                                decode_page_offset);
+    };
+    auto launch_custom_project_prepare = [&]() {
+      CUDA_CHECK(gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16(
+          torch_bf16_ptr(custom_project_q),
+          torch_bf16_ptr(custom_project_cache_k),
+          torch_bf16_ptr(custom_project_cache_v), project_config,
+          project_page_table.data_ptr<int32_t>(),
+          project_position.data_ptr<int32_t>(), batch_size, 0,
+          torch_bf16_ptr(project_x), torch_bf16_ptr(project_input_weight),
+          project_weights, torch_bf16_ptr(project_q_weight),
+          torch_bf16_ptr(project_k_weight),
+          reinterpret_cast<const float *>(project_cos.data_ptr()),
+          reinterpret_cast<const float *>(project_sin.data_ptr()),
+          torch_stream.stream()));
+    };
+
+    launch_torch_project_prepare();
+    launch_custom_project_prepare();
+    CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
+    const float q_diff =
+        (torch_project_q.to(at::kFloat) - custom_project_q.to(at::kFloat))
+            .abs()
+            .max()
+            .item<float>();
+    const float k_diff =
+        (torch_project_cache_k.to(at::kFloat) -
+         custom_project_cache_k.to(at::kFloat))
+            .abs()
+            .max()
+            .item<float>();
+    const float v_diff =
+        (torch_project_cache_v.to(at::kFloat) -
+         custom_project_cache_v.to(at::kFloat))
+            .abs()
+            .max()
+            .item<float>();
+    std::cout << "project_prepare_correctness q_max_abs=" << q_diff
+              << " cache_k_max_abs=" << k_diff
+              << " cache_v_max_abs=" << v_diff << "\n";
+    print_stats("torch_project_prepare",
+                time_cuda_samples(launch_torch_project_prepare,
+                                  torch_stream.stream(), warmup, iters,
+                                  samples, cold_cache, d_l2_scratch,
+                                  l2_flush_words));
+    print_stats("custom_project_prepare",
+                time_cuda_samples(launch_custom_project_prepare,
+                                  torch_stream.stream(), warmup, iters,
+                                  samples, cold_cache, d_l2_scratch,
+                                  l2_flush_words));
+  }
+
   auto launch_norm_rope_fa = [&]() {
     CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
         d_out, nullptr, d_q_prepared, d_k_prepared, d_v_prepared,
@@ -690,6 +1038,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
             << " timing=cuda_events_same_stream"
             << " return_lse=false"
             << " launch_overhead=included\n";
+  print_stats("sliding_fwd_bf16_return_lse", raw_sliding_timing);
   print_stats("norm_rope_plus_fa", norm_rope_timing);
   print_stats("decode_norm_rope_paged_kv_write", decode_prep_cache_timing);
   std::cout << "approx_attention_tflops_in_total_path_median=" << tflops << "\n";
@@ -703,6 +1052,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   CUDA_CHECK(cudaFree(d_cos));
   CUDA_CHECK(cudaFree(d_decode_token_position));
   CUDA_CHECK(cudaFree(d_decode_page_table));
+  CUDA_CHECK(cudaFree(d_raw_lse));
   CUDA_CHECK(cudaFree(d_out));
   CUDA_CHECK(cudaFree(d_k_norm_weight));
   CUDA_CHECK(cudaFree(d_q_norm_weight));

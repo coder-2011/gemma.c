@@ -5,6 +5,11 @@
 #include "gemma4_bench_utils.cuh"
 #include "gemma4.h"
 
+#include <ATen/ATen.h>
+#include <ATen/cuda/CUDAGraph.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <torch/version.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -12,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <math.h>
 #include <numeric>
 #include <vector>
@@ -19,6 +25,12 @@
 namespace {
 
 constexpr int kFinalLogitsColsPerBlock = 8;
+
+struct SamplingBenchArgs {
+  int warmup = 25;
+  int iters = 100;
+  int samples = 21;
+};
 
 void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
   if (status != cudaSuccess) {
@@ -29,6 +41,33 @@ void check_cuda(cudaError_t status, const char *expr, const char *file, int line
 }
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+
+// Parses positional args plus the deleted Python wrapper's named aliases.
+bool parse_args(int argc, char **argv, SamplingBenchArgs *args) {
+  int positional = 0;
+  for (int i = 1; i < argc; ++i) {
+    const bool has_value = i + 1 < argc;
+    if (std::strcmp(argv[i], "--warmup") == 0 && has_value) {
+      args->warmup = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--iters") == 0 && has_value) {
+      args->iters = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--samples") == 0 && has_value) {
+      args->samples = std::atoi(argv[++i]);
+    } else if (positional == 0) {
+      args->warmup = std::atoi(argv[i]);
+      ++positional;
+    } else if (positional == 1) {
+      args->iters = std::atoi(argv[i]);
+      ++positional;
+    } else if (positional == 2) {
+      args->samples = std::atoi(argv[i]);
+      ++positional;
+    } else {
+      return false;
+    }
+  }
+  return args->warmup >= 0 && args->iters > 0 && args->samples > 0;
+}
 
 template <typename T>
 class DeviceBuffer {
@@ -98,6 +137,21 @@ __device__ inline bool better_candidate(float logit,
                                         int32_t best_token_id) {
   return logit > best_logit ||
          (logit == best_logit && token_id < best_token_id);
+}
+
+// Runs the native LibTorch LM-head, argmax, gather, and embedding-scale path.
+void run_libtorch_sampling_ops(at::Tensor &logits,
+                               at::Tensor &values,
+                               at::Tensor &token,
+                               at::Tensor &selected,
+                               at::Tensor &next_hidden,
+                               const at::Tensor &hidden,
+                               const at::Tensor &lm_head,
+                               const at::Tensor &lm_head_t) {
+  at::mm_out(logits, hidden, lm_head_t);
+  at::max_out(values, token, logits, 1, false);
+  at::index_select_out(selected, lm_head, 0, token);
+  at::mul_out(next_hidden, selected, at::Scalar(GEMMA4_EMBEDDING_SCALE));
 }
 
 // Selects from materialized final logits and gathers the tied embedding row.
@@ -217,6 +271,54 @@ float sample_stddev(const std::vector<float> &samples, float mean) {
   return sqrtf(sum_sq / float(samples.size() - 1));
 }
 
+// Times a captured LibTorch CUDA graph with events on the graph replay stream.
+std::vector<float> time_libtorch_graph_samples(at::cuda::CUDAGraph &graph,
+                                               c10::cuda::CUDAStream stream,
+                                               int warmup,
+                                               int iters,
+                                               int samples) {
+  c10::cuda::CUDAStreamGuard guard(stream);
+  for (int i = 0; i < warmup; ++i) {
+    graph.replay();
+  }
+  CHECK_CUDA(cudaStreamSynchronize(stream.stream()));
+
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  CHECK_CUDA(cudaEventCreate(&start));
+  CHECK_CUDA(cudaEventCreate(&stop));
+
+  std::vector<float> values;
+  values.reserve(samples);
+  for (int sample = 0; sample < samples; ++sample) {
+    CHECK_CUDA(cudaEventRecord(start, stream.stream()));
+    for (int i = 0; i < iters; ++i) {
+      graph.replay();
+    }
+    CHECK_CUDA(cudaEventRecord(stop, stream.stream()));
+    CHECK_CUDA(cudaEventSynchronize(stop));
+    float total_ms = 0.0f;
+    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+    values.push_back(total_ms / float(iters));
+  }
+
+  CHECK_CUDA(cudaEventDestroy(start));
+  CHECK_CUDA(cudaEventDestroy(stop));
+  return values;
+}
+
+// Verifies the LibTorch row gather and embedding scale against an eager result.
+int64_t check_libtorch_sampling_correctness(const at::Tensor &lm_head,
+                                            const at::Tensor &token,
+                                            const at::Tensor &next_hidden) {
+  const at::Tensor expected =
+      at::index_select(lm_head, 0, token) * GEMMA4_EMBEDDING_SCALE;
+  if (!at::equal(next_hidden, expected)) {
+    throw std::runtime_error("native LibTorch selected-row gather mismatch");
+  }
+  return token.cpu().item<int64_t>();
+}
+
 // Prints summary stats plus raw samples in a line-oriented parseable format.
 void print_stats(const char *variant,
                  int batch_size,
@@ -250,15 +352,18 @@ void print_stats(const char *variant,
 }  // namespace
 
 int main(int argc, char **argv) {
-  const int warmup = argc > 1 ? std::atoi(argv[1]) : 25;
-  const int iters = argc > 2 ? std::atoi(argv[2]) : 100;
-  const int samples = argc > 3 ? std::atoi(argv[3]) : 21;
-  if (warmup < 0 || iters <= 0 || samples <= 0) {
+  SamplingBenchArgs args;
+  if (!parse_args(argc, argv, &args)) {
     std::fprintf(stderr,
-                 "usage: %s [warmup=25] [iters=100] [samples=21]\n",
+                 "usage: %s [warmup=25] [iters=100] [samples=21]\n"
+                 "       %s [--warmup N] [--iters N] [--samples N]\n",
+                 argv[0],
                  argv[0]);
     return 1;
   }
+  const int warmup = args.warmup;
+  const int iters = args.iters;
+  const int samples = args.samples;
 
   cudaStream_t stream = nullptr;
   CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -294,6 +399,57 @@ int main(int argc, char **argv) {
               warmup, iters, samples, GEMMA4_VOCAB_SIZE, GEMMA4_HIDDEN_SIZE);
   std::printf("benchmark_inputs lm_head_seed=0x5678 hidden_seed=0x2468 "
               "lm_head_scale=0.05 hidden_scale=0.05\n");
+  std::printf("benchmark_libtorch torch_version=%s\n", TORCH_VERSION);
+  {
+    at::manual_seed(0x5678u);
+    const auto torch_options =
+        at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
+    at::Tensor torch_lm_head =
+        at::empty({GEMMA4_VOCAB_SIZE, GEMMA4_HIDDEN_SIZE}, torch_options);
+    torch_lm_head.uniform_(-0.05, 0.05);
+    at::Tensor torch_lm_head_t = torch_lm_head.t();
+
+    at::manual_seed(0x2468u);
+    at::Tensor torch_hidden =
+        at::empty({1, GEMMA4_HIDDEN_SIZE}, torch_options);
+    torch_hidden.uniform_(-0.05, 0.05);
+
+    at::Tensor torch_logits = at::empty({1, GEMMA4_VOCAB_SIZE}, torch_options);
+    at::Tensor torch_values = at::empty({1}, torch_options);
+    at::Tensor torch_token =
+        at::empty({1}, at::TensorOptions().device(at::kCUDA).dtype(at::kLong));
+    at::Tensor torch_selected = at::empty_like(torch_hidden);
+    at::Tensor torch_next_hidden = at::empty_like(torch_hidden);
+
+    const c10::cuda::CUDAStream torch_stream =
+        c10::cuda::getStreamFromPool(false, 0);
+    at::cuda::CUDAGraph torch_graph;
+    {
+      c10::cuda::CUDAStreamGuard torch_guard(torch_stream);
+      for (int i = 0; i < 3; ++i) {
+        run_libtorch_sampling_ops(torch_logits, torch_values, torch_token,
+                                  torch_selected, torch_next_hidden,
+                                  torch_hidden, torch_lm_head,
+                                  torch_lm_head_t);
+      }
+      CHECK_CUDA(cudaStreamSynchronize(torch_stream.stream()));
+
+      torch_graph.capture_begin();
+      run_libtorch_sampling_ops(torch_logits, torch_values, torch_token,
+                                torch_selected, torch_next_hidden,
+                                torch_hidden, torch_lm_head, torch_lm_head_t);
+      torch_graph.capture_end();
+      torch_graph.replay();
+      CHECK_CUDA(cudaStreamSynchronize(torch_stream.stream()));
+    }
+    const int64_t torch_token_id = check_libtorch_sampling_correctness(
+        torch_lm_head, torch_token, torch_next_hidden);
+    std::printf("benchmark_correctness_libtorch token=%ld status=passed\n",
+                static_cast<long>(torch_token_id));
+    print_stats("native_pytorch_cuda_graph", 1, 1, 1.0f, 0.0f,
+                time_libtorch_graph_samples(torch_graph, torch_stream, warmup,
+                                            iters, samples));
+  }
 
   const size_t lm_head_elems =
       static_cast<size_t>(GEMMA4_VOCAB_SIZE) * GEMMA4_HIDDEN_SIZE;
@@ -355,7 +511,6 @@ int main(int argc, char **argv) {
   print_stats("materialized_lm_head_sample_full_vocab", 1, 1, 1.0f, 0.0f,
               time_samples(materialized_sample, stream, warmup, iters,
                            samples));
-
   CHECK_CUDA(cudaStreamDestroy(stream));
   return 0;
 }
