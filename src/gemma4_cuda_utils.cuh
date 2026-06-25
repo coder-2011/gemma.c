@@ -31,17 +31,11 @@ inline bool gemma4_is_global_layer(int32_t layer_index) {
          (layer_index + 1) % GEMMA4_GLOBAL_LAYER_PERIOD == 0;
 }
 
-template <typename T, typename U>
-__host__ __device__ constexpr auto div_up(T n, U d)
-    -> decltype((n + d - 1) / d) {
-  return (n + d - 1) / d;
-}
+template <typename T, typename U> __host__ __device__ constexpr auto div_up(T n, U d) {return (n + d - 1) / d;}
 
 // Checks that a host-side pointer satisfies a power-of-two alignment.
 template <size_t Alignment>
 inline bool is_aligned_to(const void *ptr) {
-  static_assert(Alignment > 0 && (Alignment & (Alignment - 1)) == 0,
-                "alignment must be a nonzero power of two");
   return (reinterpret_cast<uintptr_t>(ptr) & (Alignment - 1)) == 0;
 }
 

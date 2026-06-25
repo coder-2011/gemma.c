@@ -31,7 +31,6 @@ struct Gemma4RmsnormRowArgs {
 namespace {
 
 constexpr int kMaxRmsnormThreads = 512;
-constexpr int kMaxRmsnormWarps = kMaxRmsnormThreads / WARP_SIZE;
 constexpr int kResidualAddThreads = 256;
 
 // Maps [row, pack] to a BF16 element offset in a row-major tensor.
@@ -54,7 +53,7 @@ __device__ inline auto gemma4_rmsnorm_vector_pack_layout(int packs) {
 // Returns the dynamic shared-memory bytes needed by one RMSNorm row block.
 size_t gemma4_rmsnorm_shared_bytes(int packs_per_row) {
   return static_cast<size_t>(packs_per_row) * sizeof(Bf16Packed128) +
-         kMaxRmsnormWarps * sizeof(float);
+         kMaxRmsnormThreads * sizeof(float);
 }
 
 // Builds a row argument object shared by decode and prefill launch wrappers.
@@ -82,46 +81,6 @@ __host__ __device__ inline Gemma4RmsnormRowArgs gemma4_rmsnorm_make_args(
   return args;
 }
 
-// Reduces one row's sum of squares across the active CTA threads.
-__device__ inline float gemma4_rmsnorm_reduce_sum(
-    float sum_sq,
-    float *__restrict__ warp_sums,
-    int thread_idx,
-    int thread_count) {
-  const int lane = thread_idx & (WARP_SIZE - 1);
-  const int warp = thread_idx / WARP_SIZE;
-  const int warps = div_up(thread_count, WARP_SIZE);
-
-  sum_sq = warp_reduce_sum(sum_sq);
-  if (lane == 0) {
-    warp_sums[warp] = sum_sq;
-  }
-  __syncthreads();
-
-  sum_sq = thread_idx < warps ? warp_sums[lane] : 0.0f;
-  if (warp == 0) {
-    sum_sq = warp_reduce_sum(sum_sq);
-  }
-  return sum_sq;
-}
-
-// Applies either learned or scale-free RMSNorm to a cached row pack.
-__device__ inline Bf16Packed128 gemma4_rmsnorm_apply_pack(
-    const Gemma4RmsnormRowArgs &args,
-    Bf16Packed128 values,
-    int pack,
-    float scale) {
-  if (args.mode == kScaleFreeRmsnorm) {
-    return gemma4_bf16_pack_apply_scale(values, scale);
-  }
-
-  const auto pack_layout = gemma4_rmsnorm_vector_pack_layout(
-      args.packs_per_row);
-  const Bf16Packed128 gamma = load128g(args.weight + pack_layout(pack));
-  return gemma4_bf16_pack_apply_scale_weight(values, gamma, scale);
-}
-
-// Builds one RMSNorm row, using CuTe layouts for row and pack addressing.
 __device__ void gemma4_rmsnorm_row_bf16(
     const Gemma4RmsnormRowArgs &args,
     int row,
@@ -146,18 +105,37 @@ __device__ void gemma4_rmsnorm_row_bf16(
     gemma4_bf16_pack_accumulate_square(values, sum_sq);
   }
 
-  const float total = gemma4_rmsnorm_reduce_sum(
-      sum_sq, warp_sums, thread_idx, thread_count);
+  const int lane = thread_idx % warpSize;
+  const int warp = thread_idx / warpSize;
+  const int warps = div_up(thread_count, warpSize);
+
+  sum_sq = warp_reduce_sum(sum_sq);
+  if (lane == 0) {
+    warp_sums[warp] = sum_sq;
+  }
+  __syncthreads();
+
+  sum_sq = thread_idx < warps ? warp_sums[lane] : 0.0f;
+  if (warp == 0) {
+    sum_sq = warp_reduce_sum(sum_sq);
+  }
   if (thread_idx == 0) {
-    scale = rsqrtf(total / static_cast<float>(args.width) + args.eps);
+    scale = rsqrtf(sum_sq / static_cast<float>(args.width) + args.eps);
   }
   __syncthreads();
 
   for (int pack = thread_idx; pack < args.packs_per_row; pack += thread_count) {
     const int offset = row_layout(row, pack);
     const Bf16Packed128 values = cached_row[pack];
-    const Bf16Packed128 result =
-        gemma4_rmsnorm_apply_pack(args, values, pack, scale);
+    Bf16Packed128 result;
+    if (args.mode == kScaleFreeRmsnorm) {
+      result = gemma4_bf16_pack_apply_scale(values, scale);
+    } else {
+      const auto pack_layout = gemma4_rmsnorm_vector_pack_layout(
+          args.packs_per_row);
+      const Bf16Packed128 gamma = load128g(args.weight + pack_layout(pack));
+      result = gemma4_bf16_pack_apply_scale_weight(values, gamma, scale);
+    }
     store128(args.out + offset, result);
   }
 }
@@ -250,9 +228,21 @@ cudaError_t gemma4_rmsnorm_launch_bf16(const Gemma4RmsnormRowArgs &args,
     return cudaSuccess;
   }
 
-  int threads = div_up(args.packs_per_row, WARP_SIZE) * WARP_SIZE;
-  if (threads < WARP_SIZE) {
-    threads = WARP_SIZE;
+  int device = 0;
+  cudaError_t status = cudaGetDevice(&device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  int warp_size = 0;
+  status = cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  int threads = div_up(args.packs_per_row, warp_size) * warp_size;
+  if (threads < warp_size) {
+    threads = warp_size;
   }
   if (threads > kMaxRmsnormThreads) {
     threads = kMaxRmsnormThreads;
