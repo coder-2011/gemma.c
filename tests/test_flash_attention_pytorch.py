@@ -11,7 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 GEMMA4_NUM_QUERY_HEADS = 16
 GEMMA4_SLIDING_KV_HEADS = 8
+GEMMA4_GLOBAL_KV_HEADS = 1
 GEMMA4_SLIDING_HEAD_DIM = 256
+GEMMA4_GLOBAL_HEAD_DIM = 512
 GEMMA4_SLIDING_WINDOW = 1024
 MAX_ABS_TOLERANCE = 0.015625
 
@@ -55,7 +57,7 @@ def load_lib(path):
     ]
     kv_write.restype = ctypes.c_int
 
-    decode_direct = lib.gemma4_flash_attention_sliding_decode_paged_bf16
+    decode_direct = lib.gemma4_flash_attention_decode_paged_bf16
     decode_direct.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
@@ -78,11 +80,11 @@ def load_lib(path):
     return kv_write, decode_direct
 
 
-def build_page_table(batch_size, seq_len, page_size):
-    first_key = max(0, seq_len - GEMMA4_SLIDING_WINDOW)
+def build_page_table(batch_size, seq_len, page_size, window_size):
+    first_key = max(0, seq_len - window_size) if window_size > 0 else 0
     key_count = seq_len - first_key
     max_pages_per_seq = max(
-        math.ceil(GEMMA4_SLIDING_WINDOW / page_size) + 1,
+        math.ceil(max(1, window_size) / page_size) + 1,
         math.ceil(key_count / page_size) + 1,
     )
     page_table = torch.full((batch_size, max_pages_per_seq), -1, dtype=torch.int32)
@@ -99,30 +101,30 @@ def build_page_table(batch_size, seq_len, page_size):
 def make_decode_inputs(args, device):
     torch.manual_seed(args.seed)
     page_table_cpu, first_key, key_count, max_pages_per_seq, num_pages = (
-        build_page_table(args.batch_size, args.seq_len, args.page_size)
+        build_page_table(args.batch_size, args.seq_len, args.page_size, args.window_size)
     )
     config = Gemma4KvCacheConfig(
         1,
         num_pages,
         args.page_size,
         max_pages_per_seq,
-        GEMMA4_SLIDING_KV_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
-        GEMMA4_SLIDING_WINDOW,
+        args.kv_heads,
+        args.head_dim,
+        args.window_size,
     )
     dtype = torch.bfloat16
     q = torch.randn(
         args.batch_size,
         GEMMA4_NUM_QUERY_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
+        args.head_dim,
         device=device,
         dtype=dtype,
     )
     k_window = torch.randn(
         args.batch_size,
         key_count,
-        GEMMA4_SLIDING_KV_HEADS,
-        GEMMA4_SLIDING_HEAD_DIM,
+        args.kv_heads,
+        args.head_dim,
         device=device,
         dtype=dtype,
     )
@@ -157,7 +159,7 @@ def make_decode_inputs(args, device):
 
 
 def torch_decode_attention(q, k_window, v_window, out, scale):
-    group = GEMMA4_NUM_QUERY_HEADS // GEMMA4_SLIDING_KV_HEADS
+    group = GEMMA4_NUM_QUERY_HEADS // k_window.shape[2]
     kv_map = torch.arange(GEMMA4_NUM_QUERY_HEADS, device=q.device) // group
     k_gqa = k_window[:, :, kv_map, :].float()
     v_gqa = v_window[:, :, kv_map, :].float()
@@ -170,32 +172,17 @@ def max_abs(a, b):
     return float((a.float() - b.float()).abs().max().item())
 
 
-# Compare sliding paged decode against the PyTorch softmax reference.
-def main() -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required")
-
-    args = SimpleNamespace(
-        batch_size=2,
-        seq_len=10,
-        page_size=4,
-        split_size=3,
-        seed=1234,
-    )
-    lib_path = os.environ.get(
-        "GEMMA4_FLASH_ATTENTION_LIB",
-        str(ROOT / "build/libgemma4_flash_attention.so"),
-    )
-    kv_write, decode_direct = load_lib(lib_path)
-    device = torch.device("cuda")
+# Run one paged decode shape and compare CUDA output with PyTorch softmax.
+def run_decode_case(kv_write, decode_direct, device, args):
     decode = make_decode_inputs(args, device)
     config = decode["config"]
     key_count = decode["key_count"]
-    # Keep this tiny fixture inside the decode launcher's split-capacity guard.
-    config.window_size = key_count
     q_heads = decode["q"].shape[1]
     head_dim = decode["q"].shape[2]
-    num_splits = math.ceil(key_count / args.split_size)
+    required_keys = config.window_size if config.window_size > 0 else (
+        config.max_pages_per_seq * config.page_size
+    )
+    num_splits = args.num_splits or math.ceil(required_keys / args.split_size)
     scale = 1.0 / math.sqrt(head_dim)
 
     cache_k = torch.zeros(decode["cache_shape"], device=device, dtype=torch.bfloat16)
@@ -213,6 +200,10 @@ def main() -> None:
         device=device,
         dtype=torch.float32,
     )
+    if args.poison_partials:
+        partial_m.fill_(float("nan"))
+        partial_l.fill_(float("nan"))
+        partial_acc.fill_(float("nan"))
     stream = ctypes.c_void_p(torch.cuda.current_stream().cuda_stream)
 
     # First write the PyTorch K/V window into the same paged cache used by CUDA.
@@ -253,7 +244,7 @@ def main() -> None:
             num_splits,
             stream,
         ),
-        "gemma4_flash_attention_sliding_decode_paged_bf16",
+        "gemma4_flash_attention_decode_paged_bf16",
     )
     torch_decode_attention(
         decode["q"],
@@ -266,8 +257,91 @@ def main() -> None:
 
     diff = max_abs(out_custom, out_torch)
     if diff > MAX_ABS_TOLERANCE:
-        raise RuntimeError(f"sliding decode vs PyTorch max_abs={diff}")
-    print(f"flash attention PyTorch decode parity max_abs={diff:.8g}")
+        raise RuntimeError(f"{args.name} max_abs={diff}")
+    print(f"{args.name} max_abs={diff:.8g}")
+
+
+# Compare paged decode variants against the PyTorch softmax reference.
+def main() -> None:
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+
+    lib_path = os.environ.get(
+        "GEMMA4_FLASH_ATTENTION_LIB",
+        str(ROOT / "build/libgemma4_flash_attention.so"),
+    )
+    kv_write, decode_direct = load_lib(lib_path)
+    device = torch.device("cuda")
+    cases = [
+        SimpleNamespace(
+            name="sliding decode direct S=1",
+            batch_size=2,
+            seq_len=1,
+            page_size=4,
+            split_size=1,
+            num_splits=1,
+            window_size=1,
+            kv_heads=GEMMA4_SLIDING_KV_HEADS,
+            head_dim=GEMMA4_SLIDING_HEAD_DIM,
+            poison_partials=False,
+            seed=1234,
+        ),
+        SimpleNamespace(
+            name="sliding decode full window S=1024",
+            batch_size=1,
+            seq_len=1024,
+            page_size=64,
+            split_size=64,
+            num_splits=None,
+            window_size=GEMMA4_SLIDING_WINDOW,
+            kv_heads=GEMMA4_SLIDING_KV_HEADS,
+            head_dim=GEMMA4_SLIDING_HEAD_DIM,
+            poison_partials=False,
+            seed=1235,
+        ),
+        SimpleNamespace(
+            name="sliding decode shifted window S=1025",
+            batch_size=1,
+            seq_len=1025,
+            page_size=64,
+            split_size=128,
+            num_splits=None,
+            window_size=GEMMA4_SLIDING_WINDOW,
+            kv_heads=GEMMA4_SLIDING_KV_HEADS,
+            head_dim=GEMMA4_SLIDING_HEAD_DIM,
+            poison_partials=False,
+            seed=1236,
+        ),
+        SimpleNamespace(
+            name="sliding decode overprovisioned splits",
+            batch_size=2,
+            seq_len=10,
+            page_size=4,
+            split_size=3,
+            num_splits=7,
+            window_size=10,
+            kv_heads=GEMMA4_SLIDING_KV_HEADS,
+            head_dim=GEMMA4_SLIDING_HEAD_DIM,
+            poison_partials=True,
+            seed=1237,
+        ),
+        SimpleNamespace(
+            name="global decode D=512 S=65",
+            batch_size=1,
+            seq_len=65,
+            page_size=16,
+            split_size=32,
+            num_splits=None,
+            window_size=0,
+            kv_heads=GEMMA4_GLOBAL_KV_HEADS,
+            head_dim=GEMMA4_GLOBAL_HEAD_DIM,
+            poison_partials=False,
+            seed=1238,
+        ),
+    ]
+    for case in cases:
+        run_decode_case(kv_write, decode_direct, device, case)
+    print("flash attention PyTorch decode parity passed")
 
 
 if __name__ == "__main__":

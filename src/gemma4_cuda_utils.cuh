@@ -1,5 +1,7 @@
 #pragma once
 
+#include "gemma4.h"
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -22,6 +24,12 @@
 static constexpr int WARP_SIZE = 32;
 
 using floatX = __nv_bfloat16;
+
+// Returns true for Gemma 4 global attention layers, including the final layer.
+inline bool gemma4_is_global_layer(int32_t layer_index) {
+  return layer_index == gemma4_config.num_layers - 1 ||
+         (layer_index + 1) % GEMMA4_GLOBAL_LAYER_PERIOD == 0;
+}
 
 template <typename T, typename U>
 __host__ __device__ constexpr auto div_up(T n, U d)

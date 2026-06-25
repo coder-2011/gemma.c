@@ -5,6 +5,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -31,6 +32,12 @@ float bf16_to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
 __nv_bfloat16 make_value(int seed) {
   int centered = ((seed * 37 + 17) % 257) - 128;
   return __float2bfloat16_rn(static_cast<float>(centered) / 64.0f);
+}
+
+// Generate smaller BF16 values so CPU references stay stable across BF16 MMA.
+__nv_bfloat16 make_prefill_value(int seed) {
+  int centered = ((seed * 29 + 11) % 257) - 128;
+  return __float2bfloat16_rn(static_cast<float>(centered) / 512.0f);
 }
 
 // Return total BF16 slots in the paged K/V cache layout.
@@ -167,6 +174,140 @@ void write_device_bf16(const DeviceBuffer<__nv_bfloat16> &dst,
   __nv_bfloat16 bf16 = __float2bfloat16_rn(value);
   CHECK_CUDA(cudaMemcpy(dst.get() + index, &bf16, sizeof(bf16),
                         cudaMemcpyHostToDevice));
+}
+
+// Compute the same causal GQA attention as the raw prefill kernels on CPU.
+void reference_attention(std::vector<__nv_bfloat16> &expected,
+                         const std::vector<__nv_bfloat16> &q,
+                         const std::vector<__nv_bfloat16> &k,
+                         const std::vector<__nv_bfloat16> &v,
+                         int seq_len,
+                         int q_heads,
+                         int kv_heads,
+                         int head_dim,
+                         int window_size,
+                         float softmax_scale) {
+  const int group = q_heads / kv_heads;
+  std::vector<float> scores(seq_len);
+  for (int row = 0; row < seq_len; ++row) {
+    const int left = window_size > 0 ? std::max(0, row - window_size + 1) : 0;
+    for (int qh = 0; qh < q_heads; ++qh) {
+      const int kvh = qh / group;
+      float max_score = -INFINITY;
+      for (int col = left; col <= row; ++col) {
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+          const int64_t q_idx = token_offset(0, row, qh, d, seq_len, q_heads,
+                                             head_dim);
+          const int64_t k_idx = token_offset(0, col, kvh, d, seq_len, kv_heads,
+                                             head_dim);
+          score += bf16_to_float(q[q_idx]) * bf16_to_float(k[k_idx]);
+        }
+        scores[col] = score * softmax_scale;
+        max_score = std::max(max_score, scores[col]);
+      }
+
+      float denom = 0.0f;
+      for (int col = left; col <= row; ++col) {
+        scores[col] = std::exp(scores[col] - max_score);
+        denom += scores[col];
+      }
+
+      for (int d = 0; d < head_dim; ++d) {
+        float out = 0.0f;
+        for (int col = left; col <= row; ++col) {
+          const int64_t v_idx = token_offset(0, col, kvh, d, seq_len, kv_heads,
+                                             head_dim);
+          out += (scores[col] / denom) * bf16_to_float(v[v_idx]);
+        }
+        const int64_t out_idx = token_offset(0, row, qh, d, seq_len, q_heads,
+                                             head_dim);
+        expected[out_idx] = __float2bfloat16_rn(out);
+      }
+    }
+  }
+}
+
+// Compare raw sliding prefill with a CPU reference for one sequence/window shape.
+void run_sliding_prefill_reference_case(int seq_len,
+                                        int window_size,
+                                        const char *label) {
+  const int q_count = seq_len * GEMMA4_SLIDING_Q_PROJ_SIZE;
+  const int kv_count = seq_len * GEMMA4_SLIDING_KV_PROJ_SIZE;
+  std::vector<__nv_bfloat16> q(q_count);
+  std::vector<__nv_bfloat16> k(kv_count);
+  std::vector<__nv_bfloat16> v(kv_count);
+  for (int i = 0; i < q_count; ++i) q[i] = make_prefill_value(1000 + i);
+  for (int i = 0; i < kv_count; ++i) {
+    k[i] = make_prefill_value(2000 + i);
+    v[i] = make_prefill_value(3000 + i);
+  }
+
+  DeviceBuffer<__nv_bfloat16> d_q(q);
+  DeviceBuffer<__nv_bfloat16> d_k(k);
+  DeviceBuffer<__nv_bfloat16> d_v(v);
+  DeviceBuffer<__nv_bfloat16> d_out(q_count);
+
+  const float scale = 1.0f / std::sqrt(float(GEMMA4_SLIDING_HEAD_DIM));
+  CHECK_CUDA(gemma4_flash_attention_sliding_fwd_bf16(
+      d_out.get(), nullptr, d_q.get(), d_k.get(), d_v.get(), 1, seq_len,
+      seq_len, window_size, scale, 0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  std::vector<__nv_bfloat16> expected(q_count);
+  reference_attention(expected, q, k, v, seq_len, GEMMA4_NUM_QUERY_HEADS,
+                      GEMMA4_SLIDING_KV_HEADS, GEMMA4_SLIDING_HEAD_DIM,
+                      window_size, scale);
+  compare_device_bf16(d_out, expected, 0.03125f, label);
+}
+
+// Compare global D=512 prefill with norm/RoPE prep against a CPU reference.
+void run_global_prefill_reference_case() {
+  constexpr int batch_size = 1;
+  constexpr int seq_len = 33;
+  constexpr int q_count = seq_len * GEMMA4_GLOBAL_Q_PROJ_SIZE;
+  constexpr int kv_count = seq_len * GEMMA4_GLOBAL_K_PROJ_SIZE;
+  constexpr int rotary_half = GEMMA4_GLOBAL_HEAD_DIM / 8;
+
+  std::vector<__nv_bfloat16> q(q_count);
+  std::vector<__nv_bfloat16> k(kv_count);
+  std::vector<__nv_bfloat16> norm_weight(
+      GEMMA4_GLOBAL_HEAD_DIM, __float2bfloat16_rn(1.0f));
+  std::vector<float> cos(seq_len * rotary_half, 1.0f);
+  std::vector<float> sin(seq_len * rotary_half, 0.0f);
+  std::vector<int32_t> token_position(seq_len);
+  for (int i = 0; i < q_count; ++i) q[i] = make_prefill_value(4000 + i);
+  for (int i = 0; i < kv_count; ++i) k[i] = make_prefill_value(5000 + i);
+  for (int i = 0; i < seq_len; ++i) token_position[i] = i;
+
+  DeviceBuffer<__nv_bfloat16> d_q(q);
+  DeviceBuffer<__nv_bfloat16> d_k(k);
+  DeviceBuffer<__nv_bfloat16> d_q_prepared(q_count);
+  DeviceBuffer<__nv_bfloat16> d_k_prepared(kv_count);
+  DeviceBuffer<__nv_bfloat16> d_v_prepared(kv_count);
+  DeviceBuffer<__nv_bfloat16> d_out(q_count);
+  DeviceBuffer<__nv_bfloat16> d_norm_weight(norm_weight);
+  DeviceBuffer<float> d_cos(cos);
+  DeviceBuffer<float> d_sin(sin);
+  DeviceBuffer<int32_t> d_token_position(token_position);
+
+  const float scale = 1.0f / std::sqrt(float(GEMMA4_GLOBAL_HEAD_DIM));
+  CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
+      d_out.get(), nullptr, d_q_prepared.get(), d_k_prepared.get(),
+      d_v_prepared.get(), d_q.get(), d_k.get(), d_norm_weight.get(),
+      d_norm_weight.get(), d_cos.get(), d_sin.get(), d_token_position.get(),
+      batch_size, seq_len, seq_len, scale, 0));
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  std::vector<__nv_bfloat16> expected(q_count);
+  std::vector<__nv_bfloat16> q_prepared = d_q_prepared.copy_to_host();
+  std::vector<__nv_bfloat16> k_prepared = d_k_prepared.copy_to_host();
+  std::vector<__nv_bfloat16> v_prepared = d_v_prepared.copy_to_host();
+  reference_attention(expected, q_prepared, k_prepared, v_prepared, seq_len,
+                      GEMMA4_NUM_QUERY_HEADS, GEMMA4_GLOBAL_KV_HEADS,
+                      GEMMA4_GLOBAL_HEAD_DIM, 0, scale);
+  compare_device_bf16(d_out, expected, 0.03125f,
+                      "global D512 prefill partial tile");
 }
 
 // Validate global paged decode with one live key and direct single-split output.
@@ -419,6 +560,13 @@ int main() {
   run_global_flash_decode_case();
   run_sliding_norm_project_prepare_case();
   run_global_prefill_norm_rope_case();
+  run_sliding_prefill_reference_case(
+      5, 5, "sliding prefill nonzero causal");
+  run_sliding_prefill_reference_case(
+      5, 2, "sliding prefill local window");
+  run_sliding_prefill_reference_case(
+      65, 65, "sliding prefill partial tile");
+  run_global_prefill_reference_case();
   std::puts("flash attention tests passed");
   return 0;
 }

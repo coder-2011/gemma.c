@@ -49,31 +49,23 @@ template <typename ElementOutput_,
           int Count,
           typename ElementAccumulator_,
           typename ElementCompute_,
-          cutlass::FloatRoundStyle Round =
-          cutlass::FloatRoundStyle::round_to_nearest>
+          cutlass::FloatRoundStyle Round = cutlass::FloatRoundStyle::round_to_nearest>
+
 class GateGeluTanhUpMul {
  public:
-  using ElementOutput = ElementOutput_;
-  using ElementAccumulator = ElementAccumulator_;
-  using ElementCompute = ElementCompute_;
-  using FragmentOutput = cutlass::Array<ElementOutput, Count>;
-  using FragmentAccumulator = cutlass::Array<ElementAccumulator, Count>;
-  using FragmentCompute = cutlass::Array<ElementCompute, Count>;
+  using FragmentOutput = cutlass::Array<ElementOutput_, Count>;
+  using FragmentAccumulator = cutlass::Array<ElementAccumulator_, Count>;
+  using FragmentCompute = cutlass::Array<ElementCompute_, Count>;
 
   struct Params {};
 
-  CUTLASS_HOST_DEVICE
-  explicit GateGeluTanhUpMul(Params const &) {}
+  CUTLASS_HOST_DEVICE explicit GateGeluTanhUpMul(Params const &) {}
 
-  CUTLASS_HOST_DEVICE
-  FragmentOutput operator()(FragmentAccumulator const &gate,
+  CUTLASS_HOST_DEVICE FragmentOutput operator()(FragmentAccumulator const &gate,
                             FragmentAccumulator const &up) const {
-    cutlass::NumericArrayConverter<ElementCompute, ElementAccumulator, Count,
-                                   Round>
-        to_compute;
-    cutlass::NumericArrayConverter<ElementOutput, ElementCompute, Count,
-                                   Round>
-        to_output;
+    cutlass::NumericArrayConverter<ElementCompute_, ElementAccumulator_, Count, Round> to_compute;
+    cutlass::NumericArrayConverter<ElementOutput_, ElementCompute_, Count, Round> to_output;
+
     FragmentCompute gate_compute = to_compute(gate);
     FragmentCompute up_compute = to_compute(up);
     cutlass::epilogue::thread::GELU_taylor<FragmentCompute> gelu;
@@ -82,8 +74,7 @@ class GateGeluTanhUpMul {
   }
 };
 
-__global__ __launch_bounds__(kFfnThreads, 1) void
-gemma4_ffn_decode_accumulate_bf16_kernel(
+__global__ __launch_bounds__(kFfnThreads, 1) void gemma4_ffn_decode_accumulate_bf16_kernel(
     const floatX *__restrict__ x,
     const floatX *__restrict__ w_gate_up_col_major,
     const floatX *__restrict__ w_down_row_major,
@@ -340,10 +331,6 @@ cudaError_t launch_cutlass_bf16_gemm(
       {1.0f, 0.0f});
 
   Gemm gemm;
-  const cutlass::Status status = gemm(args, nullptr, stream);
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorInvalidValue;
-  }
   return cudaGetLastError();
 }
 
@@ -361,10 +348,19 @@ cudaError_t run_prefill_gate_up_geglu_decode_layout_dual_gemm_config(
     int rows,
     cudaStream_t stream) {
   using Element = cutlass::bfloat16_t;
+  using RowMajor = cutlass::layout::RowMajor;
+  using ColumnMajor = cutlass::layout::ColumnMajor;
+  using TensorOp = cutlass::arch::OpClassTensorOp;
+  using Sm80 = cutlass::arch::Sm80;
+  using ThreadblockSwizzle =
+      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>;
   using ThreadblockShape =
       cutlass::gemm::GemmShape<ThreadblockM, ThreadblockN, ThreadblockK>;
   using WarpShape = cutlass::gemm::GemmShape<WarpM, WarpN, ThreadblockK>;
   using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
+  static constexpr bool kStoreGate = false;
+  static constexpr bool kStoreUp = false;
+  static constexpr bool kSplitKSerial = false;
   using OutputOp0 = cutlass::epilogue::thread::LinearCombination<
       Element, 8, float, float,
       cutlass::epilogue::thread::ScaleType::Nothing>;
@@ -372,29 +368,28 @@ cudaError_t run_prefill_gate_up_geglu_decode_layout_dual_gemm_config(
   using OutputOp2 = GateGeluTanhUpMul<Element, 8, Element, float>;
   using DualGemm = cutlass::gemm::device::DualGemm<
       Element,
-      cutlass::layout::RowMajor,
+      RowMajor,
       Element,
-      cutlass::layout::ColumnMajor,
-      cutlass::layout::ColumnMajor,
+      ColumnMajor,
+      ColumnMajor,
       Element,
-      cutlass::layout::RowMajor,
+      RowMajor,
       float,
-      cutlass::arch::OpClassTensorOp,
-      cutlass::arch::Sm80,
+      TensorOp,
+      Sm80,
       ThreadblockShape,
       WarpShape,
       InstructionShape,
       OutputOp0,
       OutputOp1,
       OutputOp2,
-      cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<1>,
+      ThreadblockSwizzle,
       Stages,
-      false,
-      false,
-      false>;
+      kStoreGate,
+      kStoreUp,
+      kSplitKSerial>;
 
-  const Element *w_gate =
-      reinterpret_cast<const Element *>(w_gate_up_decode);
+  const Element *w_gate = reinterpret_cast<const Element *>(w_gate_up_decode);
   const Element *w_up = w_gate + GEMMA4_HIDDEN_SIZE;
   const Element *act_const = reinterpret_cast<const Element *>(act);
   typename DualGemm::TensorRefD null_ref{};
@@ -418,13 +413,7 @@ cudaError_t run_prefill_gate_up_geglu_decode_layout_dual_gemm_config(
 
   DualGemm gemm;
   cutlass::Status status = gemm.can_implement(args);
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorInvalidValue;
-  }
   status = gemm(args, nullptr, stream);
-  if (status != cutlass::Status::kSuccess) {
-    return cudaErrorInvalidValue;
-  }
   return cudaGetLastError();
 }
 
@@ -497,8 +486,7 @@ bool ffn_common_args_valid(const Gemma4FfnBf16Args &args) {
 }
 
 bool ffn_prefill_decode_layout_args_valid(const Gemma4FfnBf16Args &args) {
-  return ffn_common_args_valid(args) && args.rows > 1 &&
-         args.w_gate_up_decode != nullptr &&
+  return args.rows > 1 && args.w_gate_up_decode != nullptr &&
          args.w_down_decode != nullptr &&
          args.prefill_scratch.act != nullptr &&
          args.prefill_scratch.down != nullptr &&

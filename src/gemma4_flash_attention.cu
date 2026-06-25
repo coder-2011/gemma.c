@@ -1231,6 +1231,7 @@ __device__ __forceinline__ void project_normed_head_values_bf16(
     const __nv_bfloat16 *__restrict__ w_col_major,
     int col_base,
     int lane,
+    float hidden_scale,
     float (&values)[Gemma4AttentionDerived<Traits>::kValuesPerLane]) {
   using Derived = Gemma4AttentionDerived<Traits>;
   static_assert((GEMMA4_HIDDEN_SIZE % kBf16Packed128Elements) == 0,
@@ -1241,13 +1242,12 @@ __device__ __forceinline__ void project_normed_head_values_bf16(
     values[i] = 0.0f;
   }
 
-  const float scale = hidden_rms_scale_bf16(x, lane);
   for (int pack = 0; pack < kPacks; ++pack) {
     const int element = pack * kBf16Packed128Elements;
     const Bf16Packed128 x_pack = load128g(x + element);
     const Bf16Packed128 gamma_pack = load128g(input_norm_weight + element);
     const Bf16Packed128 normed_pack =
-        gemma4_bf16_pack_apply_rmsnorm(x_pack, gamma_pack, scale);
+        gemma4_bf16_pack_apply_rmsnorm(x_pack, gamma_pack, hidden_scale);
 #pragma unroll
     for (int i = 0; i < Derived::kValuesPerLane; ++i) {
       const int dim = lane + i * kWarpSize;
@@ -1491,13 +1491,23 @@ __device__ __forceinline__ void phase_decode_norm_project_prepare_paged_kv(
   const float *cos_row = cos + int64_t(position) * Derived::kRotaryHalf;
   const float *sin_row = sin + int64_t(position) * Derived::kRotaryHalf;
   const __nv_bfloat16 *x_row = x + int64_t(batch) * GEMMA4_HIDDEN_SIZE;
+  // One CTA owns this hidden row; warp 0 computes the RMS scale once and shares
+  // it with the projection warps before any role-specific early returns.
+  __shared__ float hidden_scale_shared;
+  if (warp == 0) {
+    const float hidden_scale = hidden_rms_scale_bf16(x_row, lane);
+    if (lane == 0) hidden_scale_shared = hidden_scale;
+  }
+  __syncthreads();
+  const float hidden_scale = hidden_scale_shared;
 
   if (warp < Derived::kGqaRatio) {
     const int q_head = kv_head * Derived::kGqaRatio + warp;
     float q_values[Derived::kValuesPerLane];
     project_normed_head_values_bf16<Traits>(
         x_row, input_norm_weight, weights.d_q_col_major,
-        weights.q_col_base + q_head * kHeadDim, lane, q_values);
+        weights.q_col_base + q_head * kHeadDim, lane, hidden_scale,
+        q_values);
     const int64_t q_offset = (int64_t(batch) * kQHeads + q_head) * kHeadDim;
     prep_weighted_rope_head_values<Traits>(
         q_prepared + q_offset, q_values, q_norm_weight, cos_row, sin_row, lane);
@@ -1517,7 +1527,8 @@ __device__ __forceinline__ void phase_decode_norm_project_prepare_paged_kv(
   if (warp == Derived::kDecodeKWarp) {
     project_normed_head_values_bf16<Traits>(
         x_row, input_norm_weight, weights.d_k_col_major,
-        weights.k_col_base + kv_head * kHeadDim, lane, values);
+        weights.k_col_base + kv_head * kHeadDim, lane, hidden_scale,
+        values);
     prep_weighted_rope_head_values<Traits>(
         cache_k + cache_offset, values, k_norm_weight, cos_row, sin_row, lane);
     if constexpr (!Traits::kHasVProjection) {
@@ -1526,7 +1537,8 @@ __device__ __forceinline__ void phase_decode_norm_project_prepare_paged_kv(
   } else if constexpr (Traits::kHasVProjection) {
     project_normed_head_values_bf16<Traits>(
         x_row, input_norm_weight, weights.d_v_col_major,
-        weights.v_col_base + kv_head * kHeadDim, lane, values);
+        weights.v_col_base + kv_head * kHeadDim, lane, hidden_scale,
+        values);
     prep_scale_free_head_values<Traits>(cache_v + cache_offset, values, lane);
   }
 }
@@ -1588,8 +1600,7 @@ bool valid_projection_weights(const Gemma4AttentionProjectionWeights &weights) {
   }
 }
 
-// Launch the prefill Q/K/V preparation kernel after validating the raw and
-// prepared buffers.
+// Launch the prefill Q/K/V preparation kernel after caller-side buffer validation.
 template <typename Traits>
 cudaError_t prepare_qkv_norm_rope(
     __nv_bfloat16 *__restrict__ d_q_prepared,
@@ -1607,12 +1618,7 @@ cudaError_t prepare_qkv_norm_rope(
     int seq_len,
     cudaStream_t stream) {
   using Derived = Gemma4AttentionDerived<Traits>;
-  if (d_q_prepared == nullptr || d_k_prepared == nullptr ||
-      d_v_prepared == nullptr || d_q == nullptr || d_k == nullptr ||
-      (Traits::kHasVProjection && d_v == nullptr) ||
-      d_q_norm_weight == nullptr ||
-      d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr ||
-      batch_size <= 0 || seq_len <= 0) {
+  if (batch_size <= 0 || seq_len <= 0) {
     return cudaErrorInvalidValue;
   }
 
@@ -1784,6 +1790,7 @@ template <typename Traits,
           int DecodeThreads = Gemma4AttentionDerived<Traits>::kDecodeThreads>
 __device__ __forceinline__ void phase_decode_paged_grouped_split(
     __nv_bfloat16 *__restrict__ direct_out,
+    bool write_direct,
     float *__restrict__ partial_m,
     float *__restrict__ partial_l,
     float *__restrict__ partial_acc,
@@ -1822,7 +1829,7 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
       config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
   const int32_t key_count = max(0, seq_len - first_key);
   const int32_t actual_splits = (key_count + split_size - 1) / split_size;
-  if (key_count == 0 && direct_out != nullptr) {
+  if (key_count == 0 && write_direct) {
     if (active_dim) {
 #pragma unroll
       for (int i = 0; i < Derived::kGqaRatio; ++i) {
@@ -1926,7 +1933,7 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
 
   // A single split already covers the whole live key range, so it can write the
   // final BF16 attention row directly and avoid the partial scratch/reduce pass.
-  if (direct_out != nullptr) {
+  if (write_direct) {
 #pragma unroll
     for (int i = 0; i < Derived::kGqaRatio; ++i) {
       const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_heads[i];
@@ -1959,6 +1966,7 @@ template <typename Traits>
 __global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kDecodeThreads)
 void decode_paged_grouped_split_kernel(
     __nv_bfloat16 *__restrict__ direct_out,
+    bool write_direct,
     float *__restrict__ partial_m,
     float *__restrict__ partial_l,
     float *__restrict__ partial_acc,
@@ -1973,7 +1981,7 @@ void decode_paged_grouped_split_kernel(
     int32_t split_size,
     int32_t num_splits) {
   phase_decode_paged_grouped_split<Traits>(
-      direct_out, partial_m, partial_l, partial_acc, q, cache_k, cache_v,
+      direct_out, write_direct, partial_m, partial_l, partial_acc, q, cache_k, cache_v,
       page_table, seq_lengths, config, layer, softmax_scale, split_size,
       num_splits, int32_t(blockIdx.x), int32_t(blockIdx.y),
       int32_t(blockIdx.z), int32_t(threadIdx.x), int32_t(gridDim.x));
@@ -2120,7 +2128,7 @@ __device__ inline void phase_megakernel_flash_attention(
     const int kv_head = task / args.attention_num_splits;
     const int split = task - kv_head * args.attention_num_splits;
     phase_decode_paged_grouped_split<Traits, mega_phase::kMegaThreads>(
-        args.attention_num_splits == 1 ? args.attention_out : nullptr,
+        args.attention_out, args.attention_num_splits == 1,
         args.attention_partial_m, args.attention_partial_l,
         args.attention_partial_acc, args.attention_q,
         args.attention_cache_k, args.attention_cache_v,
@@ -2295,7 +2303,7 @@ cudaError_t launch_decode_paged_impl(
   constexpr dim3 block_dim(Derived::kDecodeThreads);
   decode_paged_grouped_split_kernel<Traits>
       <<<split_grid, block_dim, 0, stream>>>(
-      num_splits == 1 ? d_out : nullptr, d_partial_m, d_partial_l,
+      d_out, num_splits == 1, d_partial_m, d_partial_l,
       d_partial_acc, d_q_prepared, d_cache_k, d_cache_v, d_page_table,
       d_seq_lengths, cache_config, cache_layer, softmax_scale, split_size,
       num_splits);
@@ -2628,16 +2636,11 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_bf16(
     int32_t split_size,
     int32_t num_splits,
     cudaStream_t stream) {
-  if (!(softmax_scale > 0.0f) ||
-      !gemma4_flash_attention::valid_decode_paged_args<
-          gemma4_flash_attention::SlidingAttentionTraits>(
-          d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
-          d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
-          cache_layer, batch_size, split_size, num_splits)) {
+  if (cache_config.head_dim != GEMMA4_SLIDING_HEAD_DIM ||
+      cache_config.num_heads != GEMMA4_SLIDING_KV_HEADS) {
     return cudaErrorInvalidValue;
   }
-  return gemma4_flash_attention::launch_decode_paged_impl<
-      gemma4_flash_attention::SlidingAttentionTraits>(
+  return gemma4_flash_attention_decode_paged_bf16(
       d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
       d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
       cache_layer, batch_size, softmax_scale, split_size, num_splits, stream);

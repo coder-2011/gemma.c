@@ -358,14 +358,9 @@ bool gemma4_rmsnorm_args_valid(const floatX *out,
 }
 
 bool gemma4_residual_add_rmsnorm_args_valid(floatX *residual,
-                                            floatX *normed,
-                                            const floatX *inp1,
                                             const floatX *inp2,
                                             int rows,
                                             int width) {
-  if (!gemma4_rmsnorm_args_valid(normed, inp1, rows, width)) {
-    return false;
-  }
   if (width != GEMMA4_HIDDEN_SIZE) {
     return false;
   }
@@ -452,8 +447,7 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16_impl(
       (rows != 0 && (weight == nullptr || !is_aligned_16(weight)))) {
     return cudaErrorInvalidValue;
   }
-  if (!gemma4_residual_add_rmsnorm_args_valid(residual, normed, inp1, inp2,
-                                              rows, width)) {
+  if (!gemma4_residual_add_rmsnorm_args_valid(residual, inp2, rows, width)) {
     return cudaErrorInvalidValue;
   }
   if (rows == 0) {

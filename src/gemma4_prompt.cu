@@ -1,4 +1,5 @@
 #include "gemma4_checkpoint.cuh"
+#include "gemma4_cuda_utils.cuh"
 #include "gemma4_decode_megakernel.cuh"
 #include "gemma4_embedding_gather.cuh"
 #include "gemma4_prefill_megakernel.cuh"

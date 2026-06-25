@@ -99,5 +99,4 @@ inline constexpr Gemma4DenseConfig gemma4_config = {
   GEMMA4_FINAL_LOGIT_SOFTCAPPING,
 };
 
-bool gemma4_is_global_layer(int32_t layer_index);
 Gemma4AttentionSpec gemma4_attention_spec(int32_t layer_index);
