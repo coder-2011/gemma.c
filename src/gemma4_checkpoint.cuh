@@ -61,7 +61,7 @@ struct Gemma4TextWeightsDevice {
 };
 
 // Maps BF16 language tensor views from a Gemma 4 safetensors file.
-void gemma4_checkpoint_open_text_bf16(
+bool gemma4_checkpoint_open_text_bf16(
     Gemma4CheckpointHost *checkpoint,
     const char *path);
 

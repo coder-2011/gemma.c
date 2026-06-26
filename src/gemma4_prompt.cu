@@ -2,7 +2,6 @@
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_decode_megakernel.cuh"
 #include "gemma4_embedding_gather.cuh"
-#include "gemma4_prefill_megakernel.cuh"
 #include "gemma4_runtime.cuh"
 #include "gemma4_tokenizer.cuh"
 
@@ -15,8 +14,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -25,12 +22,6 @@ namespace {
 // Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
 T *raw_ptr(thrust::device_vector<T> &v) {
-  return thrust::raw_pointer_cast(v.data());
-}
-
-// Returns the raw const CUDA pointer owned by a Thrust device vector.
-template <typename T>
-const T *raw_ptr(const thrust::device_vector<T> &v) {
   return thrust::raw_pointer_cast(v.data());
 }
 
@@ -256,28 +247,16 @@ float host_elapsed_ms(PromptClock::time_point start,
 // Prints the CUDA environment fields this executable can query directly.
 cudaError_t print_cuda_environment() {
   int device = 0;
-  cudaError_t status = cudaGetDevice(&device);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDevice(&device));
 
   cudaDeviceProp prop = {};
-  status = cudaGetDeviceProperties(&prop, device);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDeviceProperties(&prop, device));
 
   int driver = 0;
-  status = cudaDriverGetVersion(&driver);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaDriverGetVersion(&driver));
 
   int runtime = 0;
-  status = cudaRuntimeGetVersion(&runtime);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaRuntimeGetVersion(&runtime));
 
   std::printf(
       "environment gpu=\"%s\" sm=%d.%d memory_bytes=%zu cuda_driver=%d "
@@ -300,268 +279,44 @@ cudaError_t measure_cuda_event_steps_ms(
   step_ms.reserve(timed_steps);
 
   for (int32_t i = 0; i < warmup; ++i) {
-    cudaError_t status = fn();
-    if (status != cudaSuccess) {
-      return status;
-    }
+    GEMMA4_RETURN_IF_CUDA_ERROR(fn());
   }
 
-  cudaError_t status = cudaStreamSynchronize(stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaStreamSynchronize(stream));
 
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
-  status = cudaEventCreate(&start);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  status = cudaEventCreate(&stop);
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaEventCreate(&start));
+  cudaError_t status = cudaEventCreate(&stop);
   if (status != cudaSuccess) {
     cudaEventDestroy(start);
     return status;
   }
 
   for (int32_t i = 0; i < timed_steps; ++i) {
-    status = cudaEventRecord(start);
-    if (status != cudaSuccess) {
-      cudaEventDestroy(start);
-      cudaEventDestroy(stop);
-      return status;
-    }
+    status = cudaEventRecord(start, stream);
+    if (status != cudaSuccess) goto done;
     status = fn();
-    if (status != cudaSuccess) {
-      cudaEventDestroy(start);
-      cudaEventDestroy(stop);
-      return status;
-    }
-    status = cudaEventRecord(stop);
-    if (status != cudaSuccess) {
-      cudaEventDestroy(start);
-      cudaEventDestroy(stop);
-      return status;
-    }
+    if (status != cudaSuccess) goto done;
+    status = cudaEventRecord(stop, stream);
+    if (status != cudaSuccess) goto done;
     status = cudaEventSynchronize(stop);
-    if (status != cudaSuccess) {
-      cudaEventDestroy(start);
-      cudaEventDestroy(stop);
-      return status;
-    }
+    if (status != cudaSuccess) goto done;
 
     float total_ms = 0.0f;
     status = cudaEventElapsedTime(&total_ms, start, stop);
-    if (status != cudaSuccess) {
-      cudaEventDestroy(start);
-      cudaEventDestroy(stop);
-      return status;
-    }
+    if (status != cudaSuccess) goto done;
     step_ms.push_back(total_ms);
   }
 
+done:
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
+  if (status != cudaSuccess) {
+    return status;
+  }
   *stats = summarize_benchmark_samples(step_ms);
-  return cudaSuccess;
-}
-
-// Runs every transformer layer over the prompt tokens and fills the KV cache.
-cudaError_t run_prefill_layers(
-    const Gemma4TextWeightsDevice &weights,
-    Gemma4RuntimeState *runtime,
-    __nv_bfloat16 *hidden_a,
-    __nv_bfloat16 *hidden_b,
-    __nv_bfloat16 *scratch_buffer,
-    int32_t seq_len,
-    cudaStream_t stream,
-    __nv_bfloat16 **final_hidden) {
-  __nv_bfloat16 *hidden_in = hidden_a;
-  __nv_bfloat16 *hidden_out = hidden_b;
-  for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
-    const bool global = gemma4_is_global_layer(layer);
-    const Gemma4PrefillMegakernelLayerScratch scratch =
-        gemma4_prefill_megakernel_layer_scratch_from_buffer(
-            scratch_buffer, global, seq_len);
-
-    Gemma4PrefillMegakernelLayerArgs args = {};
-    args.out = hidden_out;
-    args.hidden = hidden_in;
-    args.weights = &weights.layers[layer];
-    args.layer_index = layer;
-    args.batch_size = 1;
-    args.seq_len = seq_len;
-    args.cos = global ? runtime->global_cos : runtime->sliding_cos;
-    args.sin = global ? runtime->global_sin : runtime->sliding_sin;
-    args.softmax_scale = 1.0f;
-    args.cache_k = global ? runtime->global_cache_k : runtime->sliding_cache_k;
-    args.cache_v = global ? runtime->global_cache_v : runtime->sliding_cache_v;
-    args.cache_config =
-        global ? runtime->global_cache_config : runtime->sliding_cache_config;
-    args.page_table =
-        global ? runtime->global_page_table : runtime->sliding_page_table;
-    args.token_batch = runtime->token_batch;
-    args.token_position = runtime->token_position;
-    args.stream = stream;
-
-    cudaError_t status = gemma4_prefill_megakernel_layer_bf16(args, scratch);
-    if (status != cudaSuccess) {
-      return status;
-    }
-    std::swap(hidden_in, hidden_out);
-  }
-  *final_hidden = hidden_in;
-  return cudaSuccess;
-}
-
-// Samples the first generated token from the final prefill row.
-cudaError_t sample_from_prefill(
-    const Gemma4TextWeightsDevice &weights,
-    __nv_bfloat16 *prefill_final_rows,
-    int32_t seq_len,
-    __nv_bfloat16 *decode_hidden,
-    int32_t *next_token,
-    void *scratch,
-    size_t scratch_bytes,
-    cudaStream_t stream) {
-  const size_t row_bytes =
-      static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
-  const __nv_bfloat16 *last_row =
-      prefill_final_rows + static_cast<int64_t>(seq_len - 1) * GEMMA4_HIDDEN_SIZE;
-  cudaError_t status =
-      cudaMemcpyAsync(decode_hidden, last_row, row_bytes,
-                      cudaMemcpyDeviceToDevice, stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  Gemma4DecodeMegakernelSpineArgs args = {};
-  args.state = decode_hidden;
-  args.next_hidden = decode_hidden;
-  args.next_token = next_token;
-  args.final_norm_weight = weights.final_norm_weight;
-  args.lm_head_col_major = weights.token_embedding;
-  return gemma4_decode_megakernel_spine_bf16(
-      args, scratch, scratch_bytes, stream);
-}
-
-// Fills the per-layer decode megakernel arguments for one layer.
-Gemma4DecodeMegakernelFfnTailArgs make_decode_args(
-    const Gemma4TextWeightsDevice &weights,
-    Gemma4RuntimeState *runtime,
-    int32_t layer,
-    __nv_bfloat16 *hidden_in,
-    __nv_bfloat16 *hidden_out,
-    __nv_bfloat16 *normed,
-    __nv_bfloat16 *sampled_hidden,
-    int32_t *next_token,
-    __nv_bfloat16 *attention_q,
-    __nv_bfloat16 *attention_out,
-    float *partial_m,
-    float *partial_l,
-    float *partial_acc,
-    int32_t split_size,
-    int32_t sliding_splits,
-    int32_t global_splits) {
-  const bool global = gemma4_is_global_layer(layer);
-  const Gemma4TextLayerWeightsDevice &w = weights.layers[layer];
-
-  Gemma4DecodeMegakernelFfnTailArgs args = {};
-  args.residual_out = hidden_out;
-  args.normed_out = normed;
-  args.next_hidden = sampled_hidden;
-  args.next_token = next_token;
-  args.ffn_x = normed;
-  args.ffn_residual = hidden_out;
-  args.ffn_norm_weight = w.post_feedforward_norm_weight;
-  args.ffn_gate_up_decode = w.ffn_gate_up_decode;
-  args.ffn_down_decode = w.ffn_down_decode;
-  args.layer_scalar = w.layer_scalar;
-  args.final_norm_weight = weights.final_norm_weight;
-  args.lm_head_col_major = weights.token_embedding;
-  args.flags = GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION;
-
-  args.attention_q = attention_q;
-  args.attention_out = attention_out;
-  args.attention_partial_m = partial_m;
-  args.attention_partial_l = partial_l;
-  args.attention_partial_acc = partial_acc;
-  args.attention_cache_k =
-      global ? runtime->global_cache_k : runtime->sliding_cache_k;
-  args.attention_cache_v =
-      global ? runtime->global_cache_v : runtime->sliding_cache_v;
-  args.attention_cache_config =
-      global ? runtime->global_cache_config : runtime->sliding_cache_config;
-  args.attention_page_table =
-      global ? runtime->global_page_table : runtime->sliding_page_table;
-  args.attention_token_position = runtime->token_position;
-  args.attention_seq_lengths = runtime->seq_lengths;
-  args.attention_cache_layer = gemma4_kv_cache_layer_index(layer, global);
-  args.attention_split_size = split_size;
-  args.attention_num_splits = global ? global_splits : sliding_splits;
-  args.attention_softmax_scale = 1.0f;
-  args.attention_x = hidden_in;
-  args.attention_input_norm_weight = w.input_norm_weight;
-  args.attention_weights = {w.q_proj_col_major, w.k_proj_col_major,
-                            w.v_proj_col_major, 0, 0, 0};
-  args.attention_o_proj_col_major = w.o_proj_col_major;
-  args.attention_post_norm_weight = w.post_attention_norm_weight;
-  args.attention_pre_ffn_norm_weight = w.pre_feedforward_norm_weight;
-  args.attention_q_norm_weight = w.q_norm_weight;
-  args.attention_k_norm_weight = w.k_norm_weight;
-  args.attention_cos = global ? runtime->global_cos : runtime->sliding_cos;
-  args.attention_sin = global ? runtime->global_sin : runtime->sliding_sin;
-  return args;
-}
-
-// Runs all decode layers for one already-sampled token embedding.
-cudaError_t run_decode_step(
-    const Gemma4TextWeightsDevice &weights,
-    Gemma4RuntimeState *runtime,
-    __nv_bfloat16 *decode_hidden_a,
-    __nv_bfloat16 *decode_hidden_b,
-    __nv_bfloat16 *normed,
-    __nv_bfloat16 *sampled_hidden,
-    int32_t *next_token,
-    __nv_bfloat16 *attention_q,
-    __nv_bfloat16 *attention_out,
-    float *partial_m,
-    float *partial_l,
-    float *partial_acc,
-    void *scratch,
-    size_t scratch_bytes,
-    int32_t split_size,
-    int32_t sliding_splits,
-    int32_t global_splits,
-    cudaStream_t stream) {
-  cudaError_t status = gemma4_runtime_prepare_decode_step(runtime, stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  __nv_bfloat16 *hidden_in = decode_hidden_a;
-  __nv_bfloat16 *hidden_out = decode_hidden_b;
-  for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
-    const Gemma4DecodeMegakernelFfnTailArgs args = make_decode_args(
-        weights, runtime, layer, hidden_in, hidden_out, normed,
-        sampled_hidden, next_token, attention_q, attention_out, partial_m,
-        partial_l, partial_acc, split_size, sliding_splits, global_splits);
-    const bool final_layer = layer == GEMMA4_NUM_LAYERS - 1;
-    status = final_layer
-                 ? gemma4_decode_megakernel_ffn_tail_bf16(
-                       args, scratch, scratch_bytes, stream)
-                 : gemma4_decode_megakernel_attention_ffn_bf16(
-                       args, scratch, scratch_bytes, stream);
-    if (status != cudaSuccess) {
-      return status;
-    }
-    std::swap(hidden_in, hidden_out);
-  }
-
-  const size_t row_bytes =
-      static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
-  return cudaMemcpyAsync(
-      decode_hidden_a, sampled_hidden, row_bytes, cudaMemcpyDeviceToDevice,
-      stream);
+  return cudaGetLastError();
 }
 
 // Copies one sampled token from device to host.
@@ -570,16 +325,9 @@ cudaError_t copy_next_token(
     std::vector<int32_t> *generated,
     cudaStream_t stream) {
   int32_t token = -1;
-  cudaError_t status =
-      cudaMemcpyAsync(&token, d_next_token, sizeof(token),
-                      cudaMemcpyDeviceToHost);
-  if (status != cudaSuccess) {
-    return status;
-  }
-  status = cudaStreamSynchronize(stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
+      &token, d_next_token, sizeof(token), cudaMemcpyDeviceToHost, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaStreamSynchronize(stream));
   generated->push_back(token);
   return cudaSuccess;
 }
@@ -636,9 +384,8 @@ int run_prompt(const PromptOptions &options,
       static_cast<size_t>(prompt_len) * GEMMA4_HIDDEN_SIZE;
   thrust::device_vector<__nv_bfloat16> d_prefill_a(prompt_hidden_elements);
   thrust::device_vector<__nv_bfloat16> d_prefill_b(prompt_hidden_elements);
-  const size_t prefill_scratch_elements = std::max(
-      gemma4_prefill_megakernel_layer_scratch_elements(false, prompt_len),
-      gemma4_prefill_megakernel_layer_scratch_elements(true, prompt_len));
+  const size_t prefill_scratch_elements =
+      gemma4_prefill_megakernel_scratch_elements(prompt_len);
   thrust::device_vector<__nv_bfloat16> d_prefill_scratch(
       prefill_scratch_elements);
   thrust::device_vector<__nv_bfloat16> d_decode_a(GEMMA4_HIDDEN_SIZE);
@@ -665,103 +412,96 @@ int run_prompt(const PromptOptions &options,
   thrust::device_vector<float> d_partial_acc(
       static_cast<size_t>(GEMMA4_NUM_QUERY_HEADS) * max_splits *
       GEMMA4_GLOBAL_HEAD_DIM);
-  const size_t spine_scratch_bytes =
-      gemma4_decode_megakernel_spine_scratch_bytes();
-  const size_t decode_scratch_bytes =
-      gemma4_decode_megakernel_ffn_tail_scratch_bytes();
-  thrust::device_vector<unsigned char> d_spine_scratch(
-      spine_scratch_bytes);
+  const size_t decode_scratch_bytes = gemma4_decode_megakernel_scratch_bytes();
   thrust::device_vector<unsigned char> d_decode_scratch(
       decode_scratch_bytes);
 
-  auto copy_prompt_tokens_to_device =
-      [&](const std::vector<int32_t> &tokens) -> cudaError_t {
-    return cudaMemcpyAsync(
-        raw_ptr(d_prompt_tokens), tokens.data(),
-        tokens.size() * sizeof(int32_t), cudaMemcpyHostToDevice, 0);
-  };
-
-  status = copy_prompt_tokens_to_device(prompt_tokens);
-  if (status != cudaSuccess) return fail_cuda(status, "copy prompt tokens");
+  status = cudaMemcpyAsync(
+      raw_ptr(d_prompt_tokens), prompt_tokens.data(),
+      prompt_tokens.size() * sizeof(int32_t), cudaMemcpyHostToDevice, 0);
+  if (status != cudaSuccess) {
+    return fail_cuda(status, "prompt tokens h2d");
+  }
 
   auto run_prefill_once = [&]() -> cudaError_t {
-    cudaError_t inner_status =
-        gemma4_runtime_prepare_prefill(&runtime.value, prompt_len, 0);
-    if (inner_status != cudaSuccess) {
-      return inner_status;
-    }
-    inner_status = gemma4_embedding_gather_bf16(
+    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_embedding_gather_bf16(
         raw_ptr(d_prefill_a), raw_ptr(d_prompt_tokens), weights.value.token_embedding,
-        prompt_len, 0);
-    if (inner_status != cudaSuccess) {
-      return inner_status;
-    }
+        prompt_len, 0));
 
     __nv_bfloat16 *prefill_final_row = nullptr;
-    inner_status = run_prefill_layers(
-        weights.value, &runtime.value, raw_ptr(d_prefill_a), raw_ptr(d_prefill_b),
-        raw_ptr(d_prefill_scratch), prompt_len, 0, &prefill_final_row);
-    if (inner_status != cudaSuccess) {
-      return inner_status;
-    }
-    return sample_from_prefill(
-        weights.value, prefill_final_row, prompt_len, raw_ptr(d_decode_a),
-        raw_ptr(d_next_token), raw_ptr(d_spine_scratch), spine_scratch_bytes, 0);
+    Gemma4PrefillMegakernelArgs args = {};
+    args.hidden_a = raw_ptr(d_prefill_a);
+    args.hidden_b = raw_ptr(d_prefill_b);
+    args.final_hidden = &prefill_final_row;
+    args.scratch = raw_ptr(d_prefill_scratch);
+    args.scratch_elements = prefill_scratch_elements;
+    args.weights = &weights.value;
+    args.runtime = &runtime.value;
+    args.seq_len = prompt_len;
+    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_prefill_megakernel(args));
+
+    const size_t row_bytes =
+        static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
+    const __nv_bfloat16 *last_row =
+        prefill_final_row + int64_t(prompt_len - 1) * GEMMA4_HIDDEN_SIZE;
+    GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
+        raw_ptr(d_decode_a), last_row, row_bytes, cudaMemcpyDeviceToDevice, 0));
+    return gemma4_megakernel_sample_final_bf16(
+        raw_ptr(d_decode_a), raw_ptr(d_next_token), raw_ptr(d_normed),
+        raw_ptr(d_decode_a), &weights.value, raw_ptr(d_decode_scratch),
+        decode_scratch_bytes, Gemma4SamplingStage::kPrefill, 0);
   };
 
   auto run_decode_once = [&]() -> cudaError_t {
-    return run_decode_step(
-        weights.value, &runtime.value, raw_ptr(d_decode_a), raw_ptr(d_decode_b),
-        raw_ptr(d_normed), raw_ptr(d_sampled), raw_ptr(d_next_token),
-        raw_ptr(d_attention_q), raw_ptr(d_attention_out), raw_ptr(d_partial_m),
-        raw_ptr(d_partial_l), raw_ptr(d_partial_acc), raw_ptr(d_decode_scratch),
-        decode_scratch_bytes, split_size, sliding_splits, global_splits, 0);
+    Gemma4DecodeMegakernelArgs args = {};
+    args.hidden_a = raw_ptr(d_decode_a);
+    args.hidden_b = raw_ptr(d_decode_b);
+    args.normed = raw_ptr(d_normed);
+    args.sampled_hidden = raw_ptr(d_sampled);
+    args.next_token = raw_ptr(d_next_token);
+    args.attention_q = raw_ptr(d_attention_q);
+    args.attention_out = raw_ptr(d_attention_out);
+    args.partial_m = raw_ptr(d_partial_m);
+    args.partial_l = raw_ptr(d_partial_l);
+    args.partial_acc = raw_ptr(d_partial_acc);
+    args.scratch = raw_ptr(d_decode_scratch);
+    args.scratch_bytes = decode_scratch_bytes;
+    args.weights = &weights.value;
+    args.runtime = &runtime.value;
+    args.split_size = split_size;
+    args.sliding_splits = sliding_splits;
+    args.global_splits = global_splits;
+    return gemma4_decode_megakernel(args);
   };
 
   auto run_serving_request = [&](PromptRequestTiming *timing) -> cudaError_t {
     const PromptClock::time_point request_start = PromptClock::now();
     std::vector<int32_t> request_prompt_tokens;
-    if (!tokenizer.encode(options.prompt, &request_prompt_tokens) ||
-        static_cast<int32_t>(request_prompt_tokens.size()) != prompt_len) {
-      return cudaErrorInvalidValue;
-    }
+    tokenizer.encode(options.prompt, &request_prompt_tokens);
 
-    cudaError_t inner_status =
-        copy_prompt_tokens_to_device(request_prompt_tokens);
-    if (inner_status != cudaSuccess) {
-      return inner_status;
-    }
-    inner_status = run_prefill_once();
-    if (inner_status != cudaSuccess) {
-      return inner_status;
-    }
+    GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
+        raw_ptr(d_prompt_tokens), request_prompt_tokens.data(),
+        request_prompt_tokens.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+        0));
+    GEMMA4_RETURN_IF_CUDA_ERROR(run_prefill_once());
 
     std::vector<int32_t> generated;
-    inner_status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
-    if (inner_status != cudaSuccess) {
-      return inner_status;
-    }
+    GEMMA4_RETURN_IF_CUDA_ERROR(
+        copy_next_token(raw_ptr(d_next_token), &generated, 0));
     const PromptClock::time_point first_token_time = PromptClock::now();
     PromptClock::time_point previous_token_time = first_token_time;
 
     while (static_cast<int32_t>(generated.size()) < options.max_new_tokens) {
-      inner_status = run_decode_once();
-      if (inner_status != cudaSuccess) {
-        return inner_status;
-      }
-      inner_status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
-      if (inner_status != cudaSuccess) {
-        return inner_status;
-      }
+      GEMMA4_RETURN_IF_CUDA_ERROR(run_decode_once());
+      GEMMA4_RETURN_IF_CUDA_ERROR(
+          copy_next_token(raw_ptr(d_next_token), &generated, 0));
       const PromptClock::time_point token_time = PromptClock::now();
       timing->itl_ms.push_back(host_elapsed_ms(previous_token_time, token_time));
       previous_token_time = token_time;
     }
 
     std::string decoded;
-    if (!tokenizer.decode(generated, &decoded)) {
-      return cudaErrorInvalidValue;
-    }
+    tokenizer.decode(generated, &decoded);
 
     const PromptClock::time_point request_stop = PromptClock::now();
     timing->ttft_ms = host_elapsed_ms(request_start, first_token_time);
@@ -781,11 +521,11 @@ int run_prompt(const PromptOptions &options,
   if (options.benchmark_mode == PromptBenchmarkMode::kDecodeStep) {
     status = run_prefill_once();
     if (status != cudaSuccess) {
-      return fail_cuda(status, "benchmark decode setup");
+      return fail_cuda(status, "benchmark prefill");
     }
     status = cudaStreamSynchronize(0);
     if (status != cudaSuccess) {
-      return fail_cuda(status, "benchmark decode setup sync");
+      return fail_cuda(status, "benchmark prefill sync");
     }
 
     PromptBenchmarkStats decode_stats;
@@ -798,7 +538,7 @@ int run_prompt(const PromptOptions &options,
 
     status = print_cuda_environment();
     if (status != cudaSuccess) {
-      return fail_cuda(status, "benchmark environment");
+      return fail_cuda(status, "cuda environment");
     }
     std::printf(
         "benchmark_mode=%s prompt_len=%d warmup_steps=%d timed_steps=%d "
@@ -849,7 +589,7 @@ int run_prompt(const PromptOptions &options,
 
     status = print_cuda_environment();
     if (status != cudaSuccess) {
-      return fail_cuda(status, "benchmark environment");
+      return fail_cuda(status, "cuda environment");
     }
     std::printf(
         "benchmark_mode=%s prompt_len=%d output_tokens=%d concurrency=1 "
@@ -870,20 +610,20 @@ int run_prompt(const PromptOptions &options,
   if (options.benchmark_mode == PromptBenchmarkMode::kColdStart) {
     status = run_prefill_once();
     if (status != cudaSuccess) {
-      return fail_cuda(status, "cold-start prefill");
+      return fail_cuda(status, "cold prefill");
     }
 
     std::vector<int32_t> generated;
     status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
     if (status != cudaSuccess) {
-      return fail_cuda(status, "cold-start first token");
+      return fail_cuda(status, "copy next token");
     }
 
     const float process_to_first_token_ms =
         host_elapsed_ms(process_start, PromptClock::now());
     status = print_cuda_environment();
     if (status != cudaSuccess) {
-      return fail_cuda(status, "benchmark environment");
+      return fail_cuda(status, "cuda environment");
     }
     std::printf(
         "benchmark_mode=%s prompt_len=%d output_tokens=1 "
@@ -903,22 +643,17 @@ int run_prompt(const PromptOptions &options,
   std::vector<int32_t> generated;
   status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
   if (status != cudaSuccess) {
-    return fail_cuda(status, "copy first token");
+    return fail_cuda(status, "copy next token");
   }
 
   while (static_cast<int32_t>(generated.size()) < options.max_new_tokens) {
-    status = run_decode_step(
-        weights.value, &runtime.value, raw_ptr(d_decode_a), raw_ptr(d_decode_b),
-        raw_ptr(d_normed), raw_ptr(d_sampled), raw_ptr(d_next_token),
-        raw_ptr(d_attention_q), raw_ptr(d_attention_out), raw_ptr(d_partial_m),
-        raw_ptr(d_partial_l), raw_ptr(d_partial_acc), raw_ptr(d_decode_scratch),
-        decode_scratch_bytes, split_size, sliding_splits, global_splits, 0);
+    status = run_decode_once();
     if (status != cudaSuccess) {
       return fail_cuda(status, "decode step");
     }
     status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
     if (status != cudaSuccess) {
-      return fail_cuda(status, "copy decode token");
+      return fail_cuda(status, "copy next token");
     }
   }
 

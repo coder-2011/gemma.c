@@ -19,7 +19,7 @@ struct texture {};
 EOF
 
 if [ "$#" -eq 0 ]; then
-  set -- src/gemma4_decode_megakernel_phases.cu
+  set -- src/gemma4_decode_megakernel.cu
 fi
 
 cd "$ROOT"

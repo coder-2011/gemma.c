@@ -46,7 +46,7 @@ __device__ inline void swizzle_hidden_packs(
   }
 }
 
-// RMS-normalizes a swizzled down-projection row, then adds the residual.
+// RMS-normalizes a swizzled down row, adds the residual, then optionally scales it.
 template <int Threads>
 __device__ inline void rmsnorm_residual_from_swizzled_down(
     __nv_bfloat16 *__restrict__ residual_out,
@@ -55,8 +55,9 @@ __device__ inline void rmsnorm_residual_from_swizzled_down(
     const __nv_bfloat16 *__restrict__ residual,
     const __nv_bfloat16 *__restrict__ rms_weight,
     float eps,
+    float output_scale,
     float *__restrict__ warp_sums,
-    float &scale,
+    float &rms_scale,
     int row_count,
     int row,
     int thread_idx) {
@@ -84,7 +85,7 @@ __device__ inline void rmsnorm_residual_from_swizzled_down(
   const float total =
       gemma4_block_reduce_sum<Threads>(sum_sq, warp_sums, thread_idx);
   if (thread_idx == 0) {
-    scale = rsqrtf(total / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
+    rms_scale = rsqrtf(total / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
   }
   __syncthreads();
 
@@ -92,14 +93,19 @@ __device__ inline void rmsnorm_residual_from_swizzled_down(
       FfnBf16Pack{*reinterpret_cast<const int4 *>(
           rms_weight + natural_col)};
   const FfnBf16Pack normed_pack =
-      gemma4_bf16_pack_apply_scale_weight(down_pack, gamma_pack, scale);
+      gemma4_bf16_pack_apply_scale_weight(down_pack, gamma_pack, rms_scale);
   const FfnBf16Pack residual_pack =
       FfnBf16Pack{*reinterpret_cast<const int4 *>(
           residual + natural_offset)};
   const FfnBf16Pack residual_out_pack =
       gemma4_bf16_pack_add(residual_pack, normed_pack);
+  const FfnBf16Pack scaled_residual_out_pack =
+      output_scale == 1.0f
+          ? residual_out_pack
+          : gemma4_bf16_pack_apply_scale(residual_out_pack, output_scale);
   *reinterpret_cast<int4 *>(normed_out + natural_offset) = normed_pack.bits();
-  *reinterpret_cast<int4 *>(residual_out + natural_offset) = residual_out_pack.bits();
+  *reinterpret_cast<int4 *>(residual_out + natural_offset) =
+      scaled_residual_out_pack.bits();
 }
 
 // Restores swizzled hidden packs to natural hidden-column order.
@@ -223,7 +229,7 @@ __global__ void swizzle_hidden_packs_kernel(
       int(gridDim.x), int(blockDim.x), int(threadIdx.x));
 }
 
-// RMS-normalizes a swizzled down-projection row, then adds the residual.
+// RMS-normalizes swizzled down rows, adds residuals, then optionally scales them.
 __global__ __launch_bounds__(kFfnThreads, 1) void
 rmsnorm_residual_from_swizzled_down_kernel(
     __nv_bfloat16 *__restrict__ residual_out,
@@ -231,13 +237,17 @@ rmsnorm_residual_from_swizzled_down_kernel(
     const __nv_bfloat16 *__restrict__ down_swizzled,
     const __nv_bfloat16 *__restrict__ residual,
     const __nv_bfloat16 *__restrict__ rms_weight,
+    const __nv_bfloat16 *__restrict__ layer_scalar,
     float eps) {
   __shared__ float s_rms_warp_sums[kFfnWarps];
-  __shared__ float s_scale;
+  __shared__ float s_rms_scale;
+  const float output_scale =
+      layer_scalar == nullptr ? 1.0f : __bfloat162float(__ldg(layer_scalar));
 
   ffn_dev::rmsnorm_residual_from_swizzled_down<kFfnThreads>(
       residual_out, normed_out, down_swizzled, residual, rms_weight, eps,
-      s_rms_warp_sums, s_scale, int(gridDim.x), int(blockIdx.x),
+      output_scale,
+      s_rms_warp_sums, s_rms_scale, int(gridDim.x), int(blockIdx.x),
       int(threadIdx.x));
 }
 
@@ -473,6 +483,7 @@ cudaError_t gemma4_ffn_decode_fused_bf16_impl(
     const __nv_bfloat16 *__restrict__ w_gate_up_decode,
     const __nv_bfloat16 *__restrict__ w_down_decode,
     Gemma4FfnDecodeScratch *__restrict__ scratch,
+    const __nv_bfloat16 *__restrict__ layer_scalar,
     float eps,
     cudaStream_t stream) {
   const dim3 block_dim(kSwizzleThreads);
@@ -491,7 +502,8 @@ cudaError_t gemma4_ffn_decode_fused_bf16_impl(
   GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
   rmsnorm_residual_from_swizzled_down_kernel<<<1, kFfnThreads, 0, stream>>>(
-      residual_out, normed_out, scratch->down, residual, rms_weight, eps);
+      residual_out, normed_out, scratch->down, residual, rms_weight,
+      layer_scalar, eps);
   return cudaGetLastError();
 }
 
@@ -521,7 +533,7 @@ cudaError_t gemma4_ffn_prefill_bf16_impl(const Gemma4FfnBf16Args &args) {
   rmsnorm_residual_from_swizzled_down_kernel<<<
       args.rows, kFfnThreads, 0, args.stream>>>(
       args.residual_out, args.normed_out, args.prefill_scratch.down,
-      args.residual, args.rms_weight, args.eps);
+      args.residual, args.rms_weight, nullptr, args.eps);
   return cudaGetLastError();
 }
 
@@ -585,7 +597,7 @@ cudaError_t gemma4_ffn_bf16(const Gemma4FfnBf16Args &args) {
     return gemma4_ffn_decode_fused_bf16_impl(
         args.residual_out, args.normed_out, args.x, args.residual,
         args.rms_weight, args.w_gate_up_decode, args.w_down_decode,
-        args.decode_scratch, args.eps, args.stream);
+        args.decode_scratch, nullptr, args.eps, args.stream);
   }
   return gemma4_ffn_prefill_bf16_impl(args);
 }
@@ -636,9 +648,10 @@ cudaError_t gemma4_ffn_decode_fused_bf16(
     const __nv_bfloat16 *__restrict__ w_gate_up_decode,
     const __nv_bfloat16 *__restrict__ w_down_decode,
     Gemma4FfnDecodeScratch *__restrict__ scratch,
+    const __nv_bfloat16 *__restrict__ layer_scalar,
     float eps,
     cudaStream_t stream) {
   return gemma4_ffn_decode_fused_bf16_impl(
       residual_out, normed_out, x, residual, rms_weight,
-      w_gate_up_decode, w_down_decode, scratch, eps, stream);
+      w_gate_up_decode, w_down_decode, scratch, layer_scalar, eps, stream);
 }

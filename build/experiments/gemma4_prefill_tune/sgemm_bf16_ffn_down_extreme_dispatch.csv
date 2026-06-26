@@ -1,7 +1,0 @@
-backend,cublas_backend,cublas_algo,op,m,k,n,route,config,chosen_ms,cublas_ms,custom_ms,speedup,weight
-sgemm-bf16,lt,default_tensor,ffn_down,8,21504,5376,cublas,bf16_16x32,0.3383,0.3383,0.3852,1.0,60
-sgemm-bf16,lt,default_tensor,ffn_down,16,21504,5376,cublas,bf16_16x32,0.3407,0.3407,0.3853,1.0,60
-sgemm-bf16,lt,default_tensor,ffn_down,32,21504,5376,cublas,bf16_32x32,0.3407,0.3407,0.4119,1.0,60
-sgemm-bf16,lt,default_tensor,ffn_down,64,21504,5376,cublas,bf16_16x64,0.3542,0.3542,0.7778,1.0,60
-sgemm-bf16,lt,default_tensor,ffn_down,128,21504,5376,cublas,bf16_128x64,0.3753,0.3753,1.491,1.0,60
-sgemm-bf16,lt,default_tensor,ffn_down,256,21504,5376,cublas,bf16_128x64,0.4127,0.4127,2.9172,1.0,60

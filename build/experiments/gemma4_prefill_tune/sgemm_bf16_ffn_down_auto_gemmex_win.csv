@@ -1,8 +1,0 @@
-backend,cublas_backend,cublas_algo,op,config,m,k,n,cublas_ms,custom_ms,speedup,custom_tflops,max_abs
-sgemm-bf16,gemmex,default_tensor,ffn_down,bf16_auto_ffn_down,8,21504,5376,3.6761,0.3504,10.492,5.28,0.03125
-sgemm-bf16,gemmex,default_tensor,ffn_down,bf16_auto_ffn_down,16,21504,5376,4.0123,0.3506,11.443,10.55,0.03125
-sgemm-bf16,gemmex,default_tensor,ffn_down,bf16_auto_ffn_down,32,21504,5376,2.8335,0.3527,8.034,20.98,0.03125
-sgemm-bf16,gemmex,default_tensor,ffn_down,bf16_auto_ffn_down,64,21504,5376,3.2531,0.3541,9.188,41.79,0.03125
-sgemm-bf16,gemmex,default_tensor,ffn_down,bf16_auto_ffn_down,96,21504,5376,2.9703,0.357,8.321,62.18,0.046875
-sgemm-bf16,gemmex,default_tensor,ffn_down,bf16_auto_ffn_down,128,21504,5376,3.8941,0.3634,10.715,81.43,0.0625
-sgemm-bf16,gemmex,default_tensor,ffn_down,bf16_auto_ffn_down,256,21504,5376,3.8283,0.4881,7.843,121.26,0.03125

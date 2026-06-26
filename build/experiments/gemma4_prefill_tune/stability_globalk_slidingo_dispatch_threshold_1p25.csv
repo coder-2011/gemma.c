@@ -1,9 +1,0 @@
-backend,op,m,k,n,route,config,chosen_ms,cublas_ms,custom_ms,speedup,weight
-sgemm-bf16,global_k,256,5376,2048,cublas,bf16_16x32,0.0611,0.0611,0.334,1.0,10
-sgemm-bf16,global_k,512,5376,2048,custom,bf16_16x64,0.6567,1.4737,0.6567,2.2440992843002894,10
-sgemm-bf16,sliding_o,256,8192,5376,cublas,bf16_64x128,1.4026,1.4026,1.1946,1.0,50
-sgemm-bf16,sliding_o,512,8192,5376,cublas,bf16_64x128,0.3002,0.3002,2.4096,1.0,50
-tuna,global_k,256,5376,2048,cublas,wmma_16x32,0.0611,0.0611,0.3324,1.0,10
-tuna,global_k,512,5376,2048,custom,wmma_16x64,0.6505,1.3369,0.6505,2.0551883166794775,10
-tuna,sliding_o,256,8192,5376,cublas,wmma_64x64,1.2734,1.2734,1.2467,1.0,50
-tuna,sliding_o,512,8192,5376,cublas,wmma_64x64,0.3042,0.3042,2.5324,1.0,50

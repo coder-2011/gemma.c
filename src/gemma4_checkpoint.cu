@@ -91,24 +91,45 @@ cudaError_t load_layer_ffn_decode(
 
 }  // namespace
 
-void gemma4_checkpoint_open_text_bf16(Gemma4CheckpointHost *checkpoint, const char *path) {
+bool gemma4_checkpoint_open_text_bf16(
+    Gemma4CheckpointHost *checkpoint,
+    const char *path) {
+  if (checkpoint == nullptr || path == nullptr) {
+    return false;
+  }
+  *checkpoint = Gemma4CheckpointHost();
+
   MappedFile file;
   const int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    return false;
+  }
+
   struct stat st = {};
-  fstat(fd, &st);
+  if (fstat(fd, &st) != 0 || st.st_size < 8) {
+    close(fd);
+    return false;
+  }
   file.bytes = static_cast<size_t>(st.st_size);
-  file.mapping = mmap(nullptr, file.bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+  void *mapping = mmap(nullptr, file.bytes, PROT_READ, MAP_PRIVATE, fd, 0);
   close(fd);
-  *checkpoint = Gemma4CheckpointHost();
+  if (mapping == MAP_FAILED) {
+    return false;
+  }
+  file.mapping = mapping;
 
   const char *bytes = static_cast<const char *>(file.mapping);
   uint64_t header_bytes = 0;
   memcpy(&header_bytes, bytes, sizeof(header_bytes));
+  if (header_bytes > static_cast<uint64_t>(file.bytes - 8)) {
+    return false;
+  }
   const size_t data_start = 8 + static_cast<size_t>(header_bytes);
 
 
   const std::string header(bytes + 8, bytes + 8 + header_bytes);
   const char *data_base = bytes + data_start;
+  const size_t data_bytes = file.bytes - data_start;
 
   struct TensorRequest {
     std::string name;
@@ -152,15 +173,38 @@ void gemma4_checkpoint_open_text_bf16(Gemma4CheckpointHost *checkpoint, const ch
 
     const std::string key = "\"" + request.name + "\":";
     const size_t object = header.find(key);
+    if (object == std::string::npos) {
+      return false;
+    }
+
+    const size_t object_end = header.find('}', object + key.size());
     const size_t offsets = header.find(kOffsets, object + key.size());
+    if (object_end == std::string::npos ||
+        offsets == std::string::npos ||
+        offsets > object_end) {
+      return false;
+    }
+
     unsigned long long first = 0;
-    sscanf(header.c_str() + offsets + sizeof(kOffsets) - 1, "%llu", &first);
+    unsigned long long second = 0;
+    const char *offset_text = header.c_str() + offsets + sizeof(kOffsets) - 1;
+    if (sscanf(offset_text, "%llu , %llu", &first, &second) != 2 ||
+        second < first) {
+      return false;
+    }
+
+    const size_t expected_bytes = request.elements * sizeof(__nv_bfloat16);
+    if (second - first != expected_bytes ||
+        second > static_cast<unsigned long long>(data_bytes)) {
+      return false;
+    }
     *request.out = reinterpret_cast<const __nv_bfloat16 *>(data_base + first);
   }
 
   checkpoint->mapping = file.mapping;
   checkpoint->mapping_bytes = file.bytes;
   file.mapping = nullptr;
+  return true;
 }
 
 cudaError_t gemma4_load_text_weights_device_bf16(
@@ -172,7 +216,10 @@ cudaError_t gemma4_load_text_weights_device_bf16(
   *weights = Gemma4TextWeightsDevice();
 
   Gemma4CheckpointHost checkpoint;
-  gemma4_checkpoint_open_text_bf16(&checkpoint, path);
+  if (!gemma4_checkpoint_open_text_bf16(&checkpoint, path)) {
+    if (error != nullptr) *error = "failed to load checkpoint";
+    return cudaErrorInvalidValue;
+  }
 
   struct DeviceCopy {
     __nv_bfloat16 **dst = nullptr;

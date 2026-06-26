@@ -14581,3 +14581,74 @@ Conclusion:
   perfectly apples-to-apples because the local path is an in-process runner,
   while vLLM is serving through an HTTP-compatible API and had to disable CUDA
   graph capture due memory pressure.
+
+## 2026-06-26 - Prompt Benchmark Rerun After Decode Layer-Scalar Fusion
+
+Question: rerun the prompt benchmark after the decode megakernel rewrite and
+confirm the local path is still at least as fast as the previous README result.
+
+Root-cause fix before final timing:
+
+- Initial local warm-serving rerun regressed to `40.739 ms` p50 TTFT and
+  `9.200 tok/s` p50 decode TPS, while CUDA-event decode-step timing was still
+  `75.430 ms` p50. That pointed at host launch/setup overhead rather than GPU
+  math.
+- The regression came from a separate cooperative one-block `layer_scalar`
+  launch on every decode layer. The fix folds that scalar into the existing
+  post-FFN RMSNorm/residual kernel, removing 48 host launches per generated
+  token.
+
+Checks:
+
+```bash
+make cuda-kernels prompt test-ffn-decode test-decode-megakernel \
+  test-prefill-megakernel test-sampling test-flash-attention-cpp \
+  test-flash-attention-pytorch
+```
+
+All listed checks passed. `test_ffn_decode` now covers the fused layer-scalar
+case.
+
+Commands:
+
+```bash
+./build/gemma4_prompt --benchmark-mode decode-step --bench-warmup 3 \
+  --bench-iters 5 --bench-samples 3 --max-new 16 --prompt Hello \
+  | tee build/bench_results/gemma4_prompt_decode_step_hello_scaled_fused_20260626.txt
+
+./build/gemma4_prompt --benchmark-mode warm-serving --bench-warmup 3 \
+  --bench-iters 5 --bench-samples 3 --max-new 16 --prompt Hello \
+  | tee build/bench_results/gemma4_prompt_warm_equal_hello_out16_c1_20260626.txt
+```
+
+vLLM was rerun with the same server and client contract as the prior entry. The
+first serving pass emitted Triton JIT warnings for `_compute_slot_mapping_kernel`,
+`kernel_unified_attention`, and `reduce_segments`; the charted result is the
+second pass, with a third pass used only as a sanity check.
+
+Result:
+
+```text
+runner                         p50 TTFT ms   p50 TPOT ms   p50 decode TPS
+gemma4_prompt local                 38.469        73.707            13.567
+vLLM serve compiled no CG          422.551       181.401             5.513
+```
+
+Artifacts:
+
+- `build/bench_results/gemma4_prompt_decode_step_hello_scaled_fused_20260626.txt`
+- `build/bench_results/gemma4_prompt_warm_equal_hello_out16_c1_20260626.txt`
+- `build/bench_results/vllm_warm_equal_hello_out16_c1_compiled_nocg_20260626.json`
+- `build/bench_results/vllm_warm_equal_hello_out16_c1_compiled_nocg_warm3_20260626.json`
+- `build/bench_results/gemma4_vs_vllm_summary_20260626.json`
+- `docs/benchmarks/ttft_p50_gemma4_vs_vllm.png`
+- `docs/benchmarks/tps_p50_gemma4_vs_vllm.png`
+
+Conclusion:
+
+- The local runner beat the previous README baseline on all three local metrics:
+  TTFT `38.469 ms` vs `38.878 ms`, TPOT `73.707 ms` vs `75.120 ms`, and decode
+  TPS `13.567 tok/s` vs `13.312 tok/s`.
+- Today’s vLLM serving baseline was much slower than the prior vLLM run despite
+  repeated warm passes, so the README reports today’s measured number rather
+  than carrying forward the older external baseline.
