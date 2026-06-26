@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
   const uint64_t seed = make_seed("GEMMA4_FFN_LIBTORCH_BENCH_SEED");
   const c10::cuda::CUDAStream torch_stream = c10::cuda::getStreamFromPool(false, 0);
   c10::cuda::CUDAStreamGuard torch_guard(torch_stream);
-  cudaStream_t stream = torch_stream.stream();
+  const cudaStream_t stream = torch_stream.stream();
   const auto bf16_options = at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
 
   const size_t x_elems = static_cast<size_t>(tokens) * GEMMA4_HIDDEN_SIZE;
@@ -104,14 +104,16 @@ int main(int argc, char **argv) {
   cudaDeviceProp prop{};
   CUDA_CHECK(cudaGetDevice(&device));
   CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+  constexpr size_t kMinFlushBytes = 256ull * 1024ull * 1024ull;
+  constexpr size_t kFlushOutCount = size_t(4096) * 256;
   const size_t flush_bytes =
-      std::max<size_t>(256ull * 1024ull * 1024ull,
+      std::max<size_t>(kMinFlushBytes,
                        static_cast<size_t>(prop.l2CacheSize) * 4ull);
   const size_t flush_count = flush_bytes / sizeof(uint32_t);
   DeviceBuffer<uint32_t> d_flush_in(flush_count);
-  DeviceBuffer<uint32_t> d_flush_out(size_t(4096) * 256);
+  DeviceBuffer<uint32_t> d_flush_out(kFlushOutCount);
   CUDA_CHECK(cudaMemsetAsync(d_flush_in, 0x5a, flush_bytes, stream));
-  CUDA_CHECK(cudaMemsetAsync(d_flush_out, 0, size_t(4096) * 256 * sizeof(uint32_t), stream));
+  CUDA_CHECK(cudaMemsetAsync(d_flush_out, 0, kFlushOutCount * sizeof(uint32_t), stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   const double geglu_bytes =

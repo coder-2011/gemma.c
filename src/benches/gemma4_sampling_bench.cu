@@ -25,6 +25,7 @@
 namespace {
 
 constexpr int kFinalLogitsColsPerBlock = 8;
+constexpr int kMaterializedSampleThreads = 1024;
 
 struct SamplingBenchArgs {
   int warmup = 25;
@@ -93,13 +94,14 @@ void run_libtorch_sampling_ops(at::Tensor &logits,
 }
 
 // Selects from materialized final logits and gathers the tied embedding row.
-__global__ __launch_bounds__(1024) void materialized_logits_sample_embed_kernel(
+__global__ __launch_bounds__(kMaterializedSampleThreads)
+void materialized_logits_sample_embed_kernel(
     __nv_bfloat16 *__restrict__ d_next_hidden,
     int32_t *__restrict__ d_next_token,
     const __nv_bfloat16 *__restrict__ d_lm_head_col_major,
     const __nv_bfloat16 *__restrict__ d_logits) {
-  __shared__ float s_logits[1024];
-  __shared__ int32_t s_token_ids[1024];
+  __shared__ float s_logits[kMaterializedSampleThreads];
+  __shared__ int32_t s_token_ids[kMaterializedSampleThreads];
 
   const int thread_idx = threadIdx.x;
   float best_logit = -INFINITY;
@@ -376,7 +378,7 @@ int main(int argc, char **argv) {
                                             iters, samples));
   }
 
-  const size_t lm_head_elems =
+  constexpr size_t lm_head_elems =
       static_cast<size_t>(GEMMA4_VOCAB_SIZE) * GEMMA4_HIDDEN_SIZE;
   DeviceBuffer<__nv_bfloat16> d_lm_head(lm_head_elems);
   DeviceBuffer<__nv_bfloat16> d_final_hidden(GEMMA4_HIDDEN_SIZE);
@@ -385,7 +387,7 @@ int main(int argc, char **argv) {
   DeviceBuffer<__nv_bfloat16> d_materialized_logits(GEMMA4_VOCAB_SIZE);
   DeviceBuffer<int32_t> d_fused_token(1);
   DeviceBuffer<int32_t> d_materialized_token(1);
-  const size_t fused_scratch_bytes =
+  constexpr size_t fused_scratch_bytes =
       static_cast<size_t>(GEMMA4_VOCAB_SIZE / kFinalLogitsColsPerBlock) *
       (sizeof(Gemma4SampleCandidate) + sizeof(uint32_t));
   DeviceBuffer<unsigned char> d_fused_scratch(fused_scratch_bytes);
@@ -405,7 +407,8 @@ int main(int argc, char **argv) {
     CHECK_CUDA(gemma4_projection_decode(
         GEMMA4_PROJECTION_FINAL_LOGITS, d_final_hidden.get(),
         d_lm_head.get(), d_materialized_logits.get(), stream));
-    materialized_logits_sample_embed_kernel<<<1, 1024, 0, stream>>>(
+    materialized_logits_sample_embed_kernel<<<
+        1, kMaterializedSampleThreads, 0, stream>>>(
         d_materialized_hidden.get(),
         d_materialized_token.get(), d_lm_head.get(),
         d_materialized_logits.get());

@@ -31,7 +31,7 @@ namespace {
 __global__ void gemma4_rmsnorm_fill_constant_bf16_kernel(__nv_bfloat16 *ptr,
                                                          size_t count,
                                                          float value) {
-  size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  const size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
   if (i < count) {
     ptr[i] = __float2bfloat16_rn(value);
   }
@@ -42,7 +42,7 @@ void fill_constant_bf16(__nv_bfloat16 *ptr,
                         float value,
                         cudaStream_t stream) {
   constexpr int threads = 256;
-  int blocks = int((count + threads - 1) / threads);
+  const int blocks = int((count + threads - 1) / threads);
   gemma4_rmsnorm_fill_constant_bf16_kernel<<<blocks, threads, 0, stream>>>(
       ptr, count, value);
   CUDA_CHECK(cudaGetLastError());
@@ -275,24 +275,24 @@ int main(int argc, char **argv) {
     run_split();
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    TimingStats rms_stats =
+    const TimingStats rms_stats =
         time_ms(run_rms, stream, warmup, iters, trials);
-    TimingStats residual_stats =
+    const TimingStats residual_stats =
         time_ms(run_residual, stream, warmup, iters, trials);
-    TimingStats scale_free_stats =
+    const TimingStats scale_free_stats =
         time_ms(run_scale_free, stream, warmup, iters, trials);
     TimingStats fused_stats{-1.0f, -1.0f};
     if (has_fused) {
       fused_stats = time_ms(run_fused, stream, warmup, iters, trials);
     }
-    TimingStats split_stats =
+    const TimingStats split_stats =
         time_ms(run_split, stream, warmup, iters, trials);
 
     float fused_graph_ms = -1.0f;
     float split_graph_ms = -1.0f;
     if (has_fused) {
       try {
-        TimingStats fused_graph_stats =
+        const TimingStats fused_graph_stats =
             time_ms_graph(run_fused, stream, warmup, iters, trials);
         fused_graph_ms = fused_graph_stats.best_ms;
       } catch (const std::exception &e) {
@@ -304,7 +304,7 @@ int main(int argc, char **argv) {
       }
     }
     try {
-      TimingStats split_graph_stats =
+      const TimingStats split_graph_stats =
           time_ms_graph(run_split, stream, warmup, iters, trials);
       split_graph_ms = split_graph_stats.best_ms;
     } catch (const std::exception &e) {
@@ -316,7 +316,7 @@ int main(int argc, char **argv) {
     float rms_graph_ms = -1.0f;
     double rms_graph_gib_s = 0.0;
     try {
-      TimingStats rms_graph_stats =
+      const TimingStats rms_graph_stats =
           time_ms_graph(run_rms, stream, warmup, iters, trials);
       rms_graph_ms = rms_graph_stats.best_ms;
       rms_graph_gib_s = gib_per_second(rms_bytes, rms_graph_ms);
@@ -329,7 +329,7 @@ int main(int argc, char **argv) {
     float scale_free_graph_ms = -1.0f;
     double scale_free_graph_gib_s = 0.0;
     try {
-      TimingStats scale_free_graph_stats =
+      const TimingStats scale_free_graph_stats =
           time_ms_graph(run_scale_free, stream, warmup, iters, trials);
       scale_free_graph_ms = scale_free_graph_stats.best_ms;
       scale_free_graph_gib_s =
@@ -363,13 +363,13 @@ int main(int argc, char **argv) {
       };
       run_cudnn();
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      TimingStats cudnn_stats =
+      const TimingStats cudnn_stats =
           time_ms(run_cudnn, stream, warmup, iters, trials);
       cudnn_ms = cudnn_stats.best_ms;
       cudnn_gib_s = gib_per_second(rms_bytes, cudnn_ms);
 
       try {
-        TimingStats cudnn_graph_stats =
+        const TimingStats cudnn_graph_stats =
             time_ms_graph(run_cudnn, stream, warmup, iters, trials);
         cudnn_graph_ms = cudnn_graph_stats.best_ms;
         cudnn_graph_gib_s = gib_per_second(rms_bytes, cudnn_graph_ms);
@@ -378,7 +378,7 @@ int main(int argc, char **argv) {
                      "cuDNN RMSNorm CUDA graph timing unavailable for rows=%d: %s\n",
                      rows, e.what());
       }
-      DiffStats out_diff =
+      const DiffStats out_diff =
           diff_stats_bf16(d_rms_out, d_rms_cudnn_out, count);
       cudnn_max_abs = out_diff.max_abs;
 
@@ -388,13 +388,13 @@ int main(int argc, char **argv) {
       };
       run_cudnn_one_scale();
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      TimingStats cudnn_one_scale_stats =
+      const TimingStats cudnn_one_scale_stats =
           time_ms(run_cudnn_one_scale, stream, warmup, iters, trials);
       cudnn_one_scale_ms = cudnn_one_scale_stats.best_ms;
       cudnn_one_scale_gib_s = gib_per_second(rms_bytes, cudnn_one_scale_ms);
 
       try {
-        TimingStats cudnn_one_scale_graph_stats =
+        const TimingStats cudnn_one_scale_graph_stats =
             time_ms_graph(run_cudnn_one_scale, stream, warmup, iters, trials);
         cudnn_one_scale_graph_ms = cudnn_one_scale_graph_stats.best_ms;
         cudnn_one_scale_graph_gib_s =
@@ -406,7 +406,7 @@ int main(int argc, char **argv) {
                      rows, e.what());
       }
 
-      DiffStats one_scale_out_diff = diff_stats_bf16(
+      const DiffStats one_scale_out_diff = diff_stats_bf16(
           d_scale_free_out, d_scale_free_cudnn_out, count);
       cudnn_one_scale_max_abs = one_scale_out_diff.max_abs;
 
@@ -416,12 +416,12 @@ int main(int argc, char **argv) {
       };
       run_cudnn_split();
       CUDA_CHECK(cudaStreamSynchronize(stream));
-      TimingStats cudnn_split_stats =
+      const TimingStats cudnn_split_stats =
           time_ms(run_cudnn_split, stream, warmup, iters, trials);
       cudnn_split_ms = cudnn_split_stats.best_ms;
 
       try {
-        TimingStats cudnn_split_graph_stats =
+        const TimingStats cudnn_split_graph_stats =
             time_ms_graph(run_cudnn_split, stream, warmup, iters, trials);
         cudnn_split_graph_ms = cudnn_split_graph_stats.best_ms;
       } catch (const std::exception &e) {
@@ -435,7 +435,7 @@ int main(int argc, char **argv) {
         run_fused();
         run_cudnn_split();
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        DiffStats split_out_diff =
+        const DiffStats split_out_diff =
             diff_stats_bf16(d_fused_normed, d_rms_cudnn_out, count);
         cudnn_split_max_abs = split_out_diff.max_abs;
       }
@@ -445,17 +445,17 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    float fused_graph_vs_split_graph =
+    const float fused_graph_vs_split_graph =
         (fused_graph_ms > 0.0f && split_graph_ms > 0.0f)
             ? split_graph_ms / fused_graph_ms
             : -1.0f;
-    float fused_vs_cudnn_split =
+    const float fused_vs_cudnn_split =
         has_fused && cudnn_split_ms > 0.0f
             ? cudnn_split_ms / fused_stats.best_ms
             : -1.0f;
-    float fused_vs_split =
+    const float fused_vs_split =
         has_fused ? split_stats.best_ms / fused_stats.best_ms : -1.0f;
-    float scale_free_vs_cudnn_one_scale =
+    const float scale_free_vs_cudnn_one_scale =
         cudnn_one_scale_ms > 0.0f
             ? cudnn_one_scale_ms / scale_free_stats.best_ms
             : -1.0f;

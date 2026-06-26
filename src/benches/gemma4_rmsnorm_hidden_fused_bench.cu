@@ -45,7 +45,7 @@ int main(int argc, char **argv) {
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-  const int width = GEMMA4_HIDDEN_SIZE;
+  constexpr int width = GEMMA4_HIDDEN_SIZE;
   const size_t max_elems = static_cast<size_t>(max_rows) * width;
   const uint64_t seed = make_seed("GEMMA4_RMSNORM_BENCH_SEED");
 
@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
     run_fused();
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    TimingStats graph_stats =
+    const TimingStats graph_stats =
         time_ms_graph(run_fused, stream, warmup, iters, trials);
     std::printf("%d,%.6f,%.6f,%.3f\n", rows, graph_stats.best_ms,
                 graph_stats.avg_ms,

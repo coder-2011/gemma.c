@@ -60,23 +60,23 @@ std::string parse_string_arg(char **argv,
   return index < argc ? std::string(argv[index]) : std::string(default_value);
 }
 
-size_t q_elements(int batch_size, int seq_len) {
+constexpr size_t q_elements(int batch_size, int seq_len) {
   return size_t(batch_size) * seq_len * kQHeads * kHeadDim;
 }
 
-size_t kv_elements(int batch_size, int seq_len) {
+constexpr size_t kv_elements(int batch_size, int seq_len) {
   return size_t(batch_size) * seq_len * kKvHeads * kHeadDim;
 }
 
-size_t rope_table_elements(int seq_len) {
+constexpr size_t rope_table_elements(int seq_len) {
   return size_t(seq_len) * kRotaryHalf;
 }
 
-size_t q_index(int batch, int row, int head, int dim, int seq_len) {
+constexpr size_t q_index(int batch, int row, int head, int dim, int seq_len) {
   return (((size_t(batch) * seq_len + row) * kQHeads + head) * kHeadDim) + dim;
 }
 
-size_t kv_index(int batch, int row, int head, int dim, int seq_len) {
+constexpr size_t kv_index(int batch, int row, int head, int dim, int seq_len) {
   return (((size_t(batch) * seq_len + row) * kKvHeads + head) * kHeadDim) + dim;
 }
 
@@ -581,7 +581,7 @@ void run_correctness(int batch_size, int seq_len, int window_size,
   CUDA_CHECK(cudaMemcpy(h_v_gpu.data(), d_v_prepared,
                         h_v_gpu.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost));
-  std::vector<__nv_bfloat16> h_ref =
+  const std::vector<__nv_bfloat16> h_ref =
       reference_sliding_attention(h_q_prepared, h_k_prepared, h_v_prepared,
                                   batch_size, seq_len, window_size, scale);
   const DiffStats q_diff = diff_stats_host(h_q_gpu, h_q_prepared);
@@ -651,7 +651,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   const int decode_page_size = 64;
   const int decode_pages_per_seq =
       std::max(1, (seq_len + decode_page_size - 1) / decode_page_size);
-  Gemma4KvCacheConfig decode_cache_config = {
+  const Gemma4KvCacheConfig decode_cache_config = {
       1,
       batch_size * decode_pages_per_seq,
       decode_page_size,
@@ -841,7 +841,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
         at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
     const auto int_options =
         at::TensorOptions().device(at::kCUDA).dtype(at::kInt);
-    Gemma4KvCacheConfig project_config = {
+    const Gemma4KvCacheConfig project_config = {
         1, batch_size * decode_pages_per_seq, decode_page_size,
         decode_pages_per_seq, kKvHeads, kHeadDim,
         std::min(seq_len, GEMMA4_SLIDING_WINDOW)};
@@ -882,7 +882,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
     at::Tensor custom_project_q = at::empty_like(torch_project_q);
     at::Tensor custom_project_cache_k = at::zeros_like(torch_project_cache_k);
     at::Tensor custom_project_cache_v = at::zeros_like(torch_project_cache_v);
-    Gemma4AttentionProjectionWeights project_weights = {
+    const Gemma4AttentionProjectionWeights project_weights = {
         torch_bf16_ptr(project_weight), torch_bf16_ptr(project_weight),
         torch_bf16_ptr(project_weight), 0, kQElements,
         kQElements + kKvElements};
@@ -1003,7 +1003,7 @@ int main(int argc, char **argv) {
     const int check_seq = parse_arg(argv, argc, 6, 64);
     const std::string cache_mode = parse_string_arg(argv, argc, 7, "warm");
     const int flush_mib = parse_arg(argv, argc, 8, 64);
-    const int window_size = GEMMA4_SLIDING_WINDOW;
+    constexpr int window_size = GEMMA4_SLIDING_WINDOW;
 
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));

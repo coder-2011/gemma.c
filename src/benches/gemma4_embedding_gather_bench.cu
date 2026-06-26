@@ -52,8 +52,8 @@ int main(int argc, char **argv) {
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
-  const int hidden_size = GEMMA4_HIDDEN_SIZE;
-  const int vocab_size = GEMMA4_VOCAB_SIZE;
+  constexpr int hidden_size = GEMMA4_HIDDEN_SIZE;
+  constexpr int vocab_size = GEMMA4_VOCAB_SIZE;
 
   const size_t embedding_elems = static_cast<size_t>(vocab_size) * hidden_size;
   const size_t embedding_bytes = embedding_elems * sizeof(__nv_bfloat16);
@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
     run_gather();
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    TimingStats stats = time_ms(run_gather, stream, warmup, iters, trials);
+    const TimingStats stats = time_ms(run_gather, stream, warmup, iters, trials);
     const double moved_bytes = 2.0 * static_cast<double>(token_count) *
                                hidden_size * sizeof(__nv_bfloat16);
     const double moved_gib = moved_bytes / (1024.0 * 1024.0 * 1024.0);

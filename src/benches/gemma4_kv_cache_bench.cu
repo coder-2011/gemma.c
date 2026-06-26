@@ -57,18 +57,18 @@ struct BenchOptions {
 float bf16_to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
 
 __nv_bfloat16 make_value(int seed) {
-  int centered = ((seed * 37 + 17) % 257) - 128;
+  const int centered = ((seed * 37 + 17) % 257) - 128;
   return __float2bfloat16_rn(static_cast<float>(centered) / 64.0f);
 }
 
-int64_t cache_elements(const Gemma4KvCacheConfig &config) {
+constexpr int64_t cache_elements(const Gemma4KvCacheConfig &config) {
   return int64_t(config.num_layers) * config.num_pages * config.page_size *
          config.num_heads * config.head_dim;
 }
 
 __global__ void l2_flush_kernel(uint32_t *__restrict__ scratch,
                                 int64_t words) {
-  int64_t stride = int64_t(blockDim.x) * gridDim.x;
+  const int64_t stride = int64_t(blockDim.x) * gridDim.x;
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < words;
        i += stride) {
     scratch[i] = scratch[i] + 1u;
@@ -88,19 +88,20 @@ void flush_l2(cudaStream_t stream,
 float percentile(const std::vector<float> &sorted, float pct) {
   if (sorted.empty()) return 0.0f;
   if (sorted.size() == 1) return sorted.front();
-  float index = pct * 0.01f * static_cast<float>(sorted.size() - 1);
-  int lo = static_cast<int>(std::floor(index));
-  int hi = static_cast<int>(std::ceil(index));
-  float frac = index - static_cast<float>(lo);
+  const float index = pct * 0.01f * static_cast<float>(sorted.size() - 1);
+  const int lo = static_cast<int>(std::floor(index));
+  const int hi = static_cast<int>(std::ceil(index));
+  const float frac = index - static_cast<float>(lo);
   return sorted[lo] * (1.0f - frac) + sorted[hi] * frac;
 }
 
 float trimmed_mean(const std::vector<float> &sorted, float trim_fraction) {
   if (sorted.empty()) return 0.0f;
-  int trim = static_cast<int>(std::floor(sorted.size() * trim_fraction));
-  int begin = std::min<int>(trim, sorted.size() - 1);
-  int end = std::max<int>(begin + 1, sorted.size() - trim);
-  float sum = std::accumulate(sorted.begin() + begin, sorted.begin() + end, 0.0f);
+  const int trim = static_cast<int>(std::floor(sorted.size() * trim_fraction));
+  const int begin = std::min<int>(trim, sorted.size() - 1);
+  const int end = std::max<int>(begin + 1, sorted.size() - trim);
+  const float sum =
+      std::accumulate(sorted.begin() + begin, sorted.begin() + end, 0.0f);
   return sum / static_cast<float>(end - begin);
 }
 
@@ -121,7 +122,7 @@ SampleStats summarize_samples(std::vector<float> values) {
   stats.trimmed_mean_ms = trimmed_mean(sorted, 0.1f);
   float variance = 0.0f;
   for (float sample : stats.samples_ms) {
-    float diff = sample - stats.mean_ms;
+    const float diff = sample - stats.mean_ms;
     variance += diff * diff;
   }
   variance /= static_cast<float>(stats.samples_ms.size());
@@ -207,13 +208,13 @@ void cpu_decode_reference(std::vector<__nv_bfloat16> &expected,
                           int kv_heads,
                           int head_dim,
                           float scale) {
-  int group_size = q_heads / kv_heads;
+  const int group_size = q_heads / kv_heads;
   for (int qh = 0; qh < q_heads; ++qh) {
-    int kh = qh / group_size;
+    const int kh = qh / group_size;
     std::vector<float> scores(key_count);
     float max_score = -INFINITY;
     for (int key = 0; key < key_count; ++key) {
-      int pos = key_start + key;
+      const int pos = key_start + key;
       float dot = 0.0f;
       for (int d = 0; d < head_dim; ++d) {
         dot += bf16_to_float(q[qh * head_dim + d]) *
@@ -229,8 +230,8 @@ void cpu_decode_reference(std::vector<__nv_bfloat16> &expected,
     for (int d = 0; d < head_dim; ++d) {
       float value = 0.0f;
       for (int key = 0; key < key_count; ++key) {
-        int pos = key_start + key;
-        float weight = std::exp(scores[key] - max_score) / denom;
+        const int pos = key_start + key;
+        const float weight = std::exp(scores[key] - max_score) / denom;
         value += weight *
                  bf16_to_float(v[(pos * kv_heads + kh) * head_dim + d]);
       }
@@ -266,8 +267,8 @@ void check_attention_correctness(const std::vector<__nv_bfloat16> &actual,
   float max_abs = 0.0f;
   float mean_abs = 0.0f;
   for (int i = 0; i < static_cast<int>(actual.size()); ++i) {
-    float diff = std::fabs(bf16_to_float(actual[i]) -
-                           bf16_to_float(expected[i]));
+    const float diff = std::fabs(bf16_to_float(actual[i]) -
+                                 bf16_to_float(expected[i]));
     max_abs = std::max(max_abs, diff);
     mean_abs += diff;
   }
@@ -358,19 +359,19 @@ BenchOptions parse_args(int argc, char **argv) {
 }  // namespace
 
 int main(int argc, char **argv) {
-  BenchOptions options = parse_args(argc, argv);
+  const BenchOptions options = parse_args(argc, argv);
 
   int device = 0;
   CUDA_CHECK(cudaGetDevice(&device));
 
-  int seq_len = options.seq_len;
-  int page_size = options.page_size;
-  int split_size = options.split_size;
-  int global_split_size = options.global_split_size;
-  int warmup = options.warmup;
-  int iters = options.iters;
-  int samples = options.samples;
-  bool cold_cache = options.cache_mode == "cold";
+  const int seq_len = options.seq_len;
+  const int page_size = options.page_size;
+  const int split_size = options.split_size;
+  const int global_split_size = options.global_split_size;
+  const int warmup = options.warmup;
+  const int iters = options.iters;
+  const int samples = options.samples;
+  const bool cold_cache = options.cache_mode == "cold";
   const int torch_q_heads = options.torch_q_heads;
   const int torch_kv_heads = options.torch_kv_heads;
   const int torch_head_dim = options.torch_head_dim;
@@ -387,24 +388,24 @@ int main(int argc, char **argv) {
                                     int64_t(l2_cache_bytes) * 4);
   }
 
-  int pages_for_seq = div_up(seq_len, page_size);
-  int max_pages_per_seq =
+  const int pages_for_seq = div_up(seq_len, page_size);
+  const int max_pages_per_seq =
       std::max(pages_for_seq, div_up(GEMMA4_SLIDING_WINDOW, page_size) + 1);
-  Gemma4KvCacheConfig config =
+  const Gemma4KvCacheConfig config =
       gemma4_kv_cache_make_config(false, max_pages_per_seq, page_size,
                                   max_pages_per_seq);
-  int batch_size = 1;
-  int layer = 0;
-  int q_heads = GEMMA4_NUM_QUERY_HEADS;
+  const int batch_size = 1;
+  const int layer = 0;
+  constexpr int q_heads = GEMMA4_NUM_QUERY_HEADS;
 
   // Decode attends over the active sliding window, not necessarily the full
   // constructed sequence. `actual_splits` is the live work; `num_splits` is the
   // fixed scratch/layout stride used to test graph-compatible overprovisioning.
-  int key_count = config.window_size > 0 ? std::min(seq_len, config.window_size)
-                                         : seq_len;
-  int actual_splits = div_up(key_count, split_size);
-  int num_splits = actual_splits + options.extra_splits;
-  float scale = 1.0f / std::sqrt(float(config.head_dim));
+  const int key_count =
+      config.window_size > 0 ? std::min(seq_len, config.window_size) : seq_len;
+  const int actual_splits = div_up(key_count, split_size);
+  const int num_splits = actual_splits + options.extra_splits;
+  const float scale = 1.0f / std::sqrt(float(config.head_dim));
 
   std::printf(
       "contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline "
@@ -511,16 +512,16 @@ int main(int argc, char **argv) {
 
   std::vector<int32_t> page_table(max_pages_per_seq);
   std::iota(page_table.begin(), page_table.end(), 0);
-  std::vector<int32_t> seq_lengths = {seq_len};
-  std::vector<int32_t> token_batch(seq_len, 0);
+  const std::vector<int32_t> seq_lengths = {seq_len};
+  const std::vector<int32_t> token_batch(seq_len, 0);
   std::vector<int32_t> token_position(seq_len);
   std::iota(token_position.begin(), token_position.end(), 0);
-  std::vector<int32_t> one_batch = {0};
-  std::vector<int32_t> one_position = {seq_len - 1};
+  const std::vector<int32_t> one_batch = {0};
+  const std::vector<int32_t> one_position = {seq_len - 1};
 
   // Host K/V represent the full prefill sequence. `one_k`/`one_v` below are
   // the final token reused by the steady-state decode-write microbenchmark.
-  int kv_elems = seq_len * config.num_heads * config.head_dim;
+  const int kv_elems = seq_len * config.num_heads * config.head_dim;
   std::vector<__nv_bfloat16> h_k(kv_elems);
   std::vector<__nv_bfloat16> h_v(kv_elems);
   for (int i = 0; i < kv_elems; ++i) {
@@ -701,7 +702,7 @@ int main(int argc, char **argv) {
 
   {
     const int global_pages = div_up(seq_len, page_size);
-    Gemma4KvCacheConfig global_config =
+    const Gemma4KvCacheConfig global_config =
         gemma4_kv_cache_make_config(true, global_pages, page_size, global_pages);
     const int global_capacity = global_pages * page_size;
     const int global_splits = div_up(global_capacity, global_split_size);

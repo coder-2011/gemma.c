@@ -139,11 +139,12 @@ static __global__ void gemma4_bench_flush_cache_kernel(
     uint32_t *__restrict__ out,
     size_t count) {
   uint32_t acc = 0;
-  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
-       i += size_t(blockDim.x) * gridDim.x) {
+  const size_t thread_index = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+  const size_t stride = size_t(blockDim.x) * gridDim.x;
+  for (size_t i = thread_index; i < count; i += stride) {
     acc ^= in[i] + uint32_t(i);
   }
-  out[blockIdx.x * blockDim.x + threadIdx.x] = acc;
+  out[thread_index] = acc;
 }
 
 // Launches the fixed-shape cache flush used by cold-cache microbenchmarks.

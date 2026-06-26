@@ -119,7 +119,7 @@ template <typename KernelTraits,
           bool IsLocal>
 cudaError_t selected_direct_reference_kernel_attributes(long long *out, int len) {
   if (out == nullptr || len < 10) return cudaErrorInvalidValue;
-  auto kernel = &flash::flash_fwd_kernel<
+  const auto kernel = &flash::flash_fwd_kernel<
       KernelTraits,
       /*Is_dropout=*/false,
       IsCausal,
@@ -130,13 +130,13 @@ cudaError_t selected_direct_reference_kernel_attributes(long long *out, int len)
       /*Is_softcap=*/false,
       /*Return_softmax=*/false>;
   if (KernelTraits::kSmemSize >= 48 * 1024) {
-    cudaError_t status = cudaFuncSetAttribute(
+    const cudaError_t status = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
         KernelTraits::kSmemSize);
     if (status != cudaSuccess) return status;
   }
   cudaFuncAttributes attr{};
-  cudaError_t status = cudaFuncGetAttributes(&attr, kernel);
+  const cudaError_t status = cudaFuncGetAttributes(&attr, kernel);
   if (status != cudaSuccess) return status;
   out[0] = static_cast<long long>(attr.sharedSizeBytes);
   out[1] = static_cast<long long>(attr.constSizeBytes);
@@ -156,7 +156,7 @@ template <typename KernelTraits,
           bool IsLocal>
 cudaError_t launch_direct_reference(flash::Flash_fwd_params &params,
                                     cudaStream_t stream) {
-  auto kernel = &flash::flash_fwd_kernel<
+  const auto kernel = &flash::flash_fwd_kernel<
       KernelTraits,
       /*Is_dropout=*/false,
       IsCausal,
@@ -167,7 +167,7 @@ cudaError_t launch_direct_reference(flash::Flash_fwd_params &params,
       /*Is_softcap=*/false,
       /*Return_softmax=*/false>;
   if (KernelTraits::kSmemSize >= 48 * 1024) {
-    cudaError_t status = cudaFuncSetAttribute(
+    const cudaError_t status = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
         KernelTraits::kSmemSize);
     if (status != cudaSuccess) return status;

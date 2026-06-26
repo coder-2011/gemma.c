@@ -22,7 +22,7 @@ struct DecodeOp {
   int layers_per_token;
 };
 
-static const DecodeOp kDecodeOps[] = {
+static constexpr DecodeOp kDecodeOps[] = {
     {"ffn_gate_up", GEMMA4_PROJECTION_FFN_GATE_UP, GEMMA4_HIDDEN_SIZE,
      GEMMA4_PACKED_FFN_SIZE, GEMMA4_NUM_LAYERS},
     {"ffn_down", GEMMA4_PROJECTION_FFN_DOWN, GEMMA4_INTERMEDIATE_SIZE,
