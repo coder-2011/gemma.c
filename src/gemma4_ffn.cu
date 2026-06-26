@@ -183,11 +183,9 @@ namespace ffn_dev = gemma4_ffn_decode_device;
 constexpr int kFfnThreads = GEMMA4_FFN_DECODE_THREADS;
 constexpr int kFfnWarps = kFfnThreads / 32;
 constexpr int kHiddenPacks = ffn_dev::kHiddenPacks;
-static_assert(kFfnThreads == kHiddenPacks,
-              "FFN decode maps one CTA thread to one hidden pack");
+static_assert(kFfnThreads == kHiddenPacks, "FFN decode maps one CTA thread to one hidden pack");
 constexpr int kSwizzleThreads = 96;
-constexpr int kActualSwizzleBlocksPerRow =
-    div_up(kHiddenPacks, kSwizzleThreads);
+constexpr int kActualSwizzleBlocksPerRow = div_up(kHiddenPacks, kSwizzleThreads);
 
 // Applies GeGLU in the DualGemm epilogue after gate/up fragments are materialized.
 template <typename ElementOutput_,
