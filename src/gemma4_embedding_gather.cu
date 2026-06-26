@@ -4,8 +4,36 @@
 
 #include <stdint.h>
 
+namespace gemma4_embedding_gather {
+
+constexpr int kEmbeddingGatherThreads = 32;
+constexpr int kPacksPerEmbeddingRow =
+    GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+
+// Copies one tied embedding row with coalesced 128-bit BF16 pack traffic.
+__device__ void copy_embedding_row_bf16(
+    __nv_bfloat16 *__restrict__ out_row,
+    const __nv_bfloat16 *__restrict__ embeddings,
+    int32_t token_id,
+    int lane,
+    int thread_count) {
+  const __nv_bfloat16 *embedding_row =
+      embeddings + static_cast<int64_t>(token_id) * GEMMA4_HIDDEN_SIZE;
+
+  for (int pack_idx = lane; pack_idx < kPacksPerEmbeddingRow;
+       pack_idx += thread_count) {
+    const int offset = pack_idx * kBf16Packed128Elements;
+    Bf16Packed128 pack = Bf16Packed128{*reinterpret_cast<const int4 *>(embedding_row + offset)};
+    pack = gemma4_bf16_pack_apply_scale(pack, GEMMA4_EMBEDDING_SCALE);
+    *reinterpret_cast<int4 *>(out_row + offset) = pack.bits();
+  }
+}
+
+}  // namespace gemma4_embedding_gather
+
 namespace {
 
+// Launches one CTA per token so lanes cooperatively copy one embedding row.
 __global__ __launch_bounds__(gemma4_embedding_gather::kEmbeddingGatherThreads)
 void embedding_gather_kernel(
     __nv_bfloat16 *__restrict__ out,
@@ -38,15 +66,10 @@ cudaError_t gemma4_embedding_gather_bf16(
   if (num_tokens == 0) {
     return cudaSuccess;
   }
-  if (out == nullptr || token_ids == nullptr || embeddings == nullptr) {
-    return cudaErrorInvalidValue;
-  }
-  if (!is_aligned_16(out) || !is_aligned_16(embeddings)) {
-    return cudaErrorInvalidValue;
-  }
 
-  embedding_gather_kernel<<<
-      num_tokens, gemma4_embedding_gather::kEmbeddingGatherThreads, 0,
-      stream>>>(out, token_ids, embeddings);
+  const dim3 grid_dim(num_tokens);
+  const dim3 block_dim(gemma4_embedding_gather::kEmbeddingGatherThreads);
+  embedding_gather_kernel<<<grid_dim, block_dim, 0, stream>>>(
+      out, token_ids, embeddings);
   return cudaGetLastError();
 }

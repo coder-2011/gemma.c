@@ -89,7 +89,7 @@ grid.y = max(q_heads, kv_heads)
 An experimental `GEMMA4_ROPE_HEAD_FAST_GRID=1` build swaps the dimensions to
 make heads adjacent for the same row. The first split benchmark did not show a
 broad win for that ordering, so the default remains row-fast. The packed Q/K
-input loads use the streaming `load128cs` path by default.
+input loads use direct 128-bit pack loads by default.
 
 Within each block, threads cover `rotary_dim / 2` element pairs. If the head
 index exists for Q, the block rotates that Q head. If the same head index also

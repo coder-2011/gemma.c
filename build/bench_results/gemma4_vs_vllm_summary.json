@@ -1,0 +1,35 @@
+{
+  "benchmark_contract": {
+    "prompt": "Hello",
+    "prompt_tokens_per_request": 1,
+    "output_tokens_per_request": 16,
+    "concurrency": 1,
+    "warmup_requests": 3,
+    "measured_requests": 15,
+    "local_timing": "host wall clock, in-process, tokenization and prompt H2D included, model load excluded",
+    "vllm_timing": "vllm bench serve OpenAI completions, streaming TTFT/TPOT, HTTP/server included, model load excluded",
+    "vllm_runtime": "compiled vLLM, enforce_eager=false, cudagraph_mode=NONE",
+    "known_caveat": "The request shape is matched, but the surfaces are not identical: local runner is in-process while vLLM is an HTTP server benchmark."
+  },
+  "results": {
+    "gemma4_prompt": {
+      "ttft_p50_ms": 38.878,
+      "decode_tps_p50": 13.312,
+      "source": "build/bench_results/gemma4_prompt_warm_equal_hello_out16_c1.txt"
+    },
+    "vllm": {
+      "ttft_p50_ms": 208.5118442773819,
+      "tpot_p50_ms": 96.76242719093958,
+      "decode_tps_p50": 10.334589871611197,
+      "source": "build/bench_results/vllm_warm_equal_hello_out16_c1_compiled_nocg_warm2.json"
+    },
+    "ratios": {
+      "ttft_speedup_lower_is_better": 5.363234844317658,
+      "decode_tps_speedup_higher_is_better": 1.2881014307657876
+    }
+  },
+  "charts": {
+    "ttft": "build/bench_results/ttft_p50_gemma4_vs_vllm.png",
+    "tps": "build/bench_results/tps_p50_gemma4_vs_vllm.png"
+  }
+}

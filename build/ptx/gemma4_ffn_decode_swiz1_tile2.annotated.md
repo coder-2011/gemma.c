@@ -138,7 +138,7 @@ This corresponds to:
 ```cpp
 for (int pack = threadIdx.x; pack < kHiddenPacks; pack += kFfnThreads) {
   s_x[shared_x_chunk_index(pack)] =
-      load128g(x + pack * kBf16Packed128Elements);
+      Bf16Packed128{*reinterpret_cast<const int4 *>(x + pack * kBf16Packed128Elements)};
 }
 __syncthreads();
 ```
@@ -319,7 +319,7 @@ ld.global.cs.v4.s32 {%r102,%r103,%r104,%r105}, [%rd28]; // gate col 1 pack
 ld.global.cs.v4.s32 {%r106,%r107,%r108,%r109}, [%rd29]; // up col 1 pack
 ```
 
-`.cs` is the cache streaming hint from `load128cs`. That matches the access pattern: each weight vector is streamed once for this token/tile and not reused heavily by this CTA.
+`.cs` is the cache streaming hint from the old streaming pack-load path. That matches the access pattern: each weight vector is streamed once for this token/tile and not reused heavily by this CTA.
 
 The dot product is a chain of `fma.rn.f32`:
 
@@ -504,10 +504,14 @@ This is:
 
 ```cpp
 if (owns_hidden_pack) {
-  down_pack0 = load128cs(w_down_row_major + intermediate_col0 * 5376 + hidden_col);
+  down_pack0 =
+      Bf16Packed128{*reinterpret_cast<const int4 *>(
+          w_down_row_major + intermediate_col0 * 5376 + hidden_col)};
   partial += s_act[0] * down_pack0;
 
-  down_pack1 = load128cs(w_down_row_major + (intermediate_col0 + 1) * 5376 + hidden_col);
+  down_pack1 =
+      Bf16Packed128{*reinterpret_cast<const int4 *>(
+          w_down_row_major + (intermediate_col0 + 1) * 5376 + hidden_col)};
   partial += s_act[1] * down_pack1;
 }
 __syncthreads();
@@ -628,7 +632,7 @@ st.global.v4.u32 [%rd55], {%r299, %r300, %r301, %r302};
 This is:
 
 ```cpp
-residual_pack = load128g(residual + hidden_col);
+residual_pack = Bf16Packed128{*reinterpret_cast<const int4 *>(residual + hidden_col)};
 values[i] = partial[i] + residual[i];
 sum_sq += values[i] * values[i];
 store residual_out as BF16;

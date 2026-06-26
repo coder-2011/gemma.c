@@ -1,0 +1,8 @@
+prompt tokens: 1
+environment gpu="NVIDIA RTX A6000" sm=8.6 memory_bytes=50897289216 cuda_driver=13000 cuda_runtime=13000
+benchmark_mode=warm-serving prompt_len=1 output_tokens=16 concurrency=1 warmup_requests=3 measured_requests=15 timing=host_wall_clock model_load=excluded cuda_context=excluded tokenization=included prompt_h2d=included streaming=host_token_copy detokenization=e2e_only
+ttft_ms n=15 mean_ms=38.939 p50_ms=38.878 p90_ms=39.191 p95_ms=39.191 p99_ms=39.760 min_ms=38.601 max_ms=39.760
+tpot_ms n=15 mean_ms=75.177 p50_ms=75.120 p90_ms=75.859 p95_ms=75.859 p99_ms=77.000 min_ms=74.205 max_ms=77.000
+itl_ms n=225 mean_ms=75.177 p50_ms=74.802 p90_ms=75.989 p95_ms=78.141 p99_ms=84.681 min_ms=73.450 max_ms=92.719
+e2e_ms n=15 mean_ms=1166.595 p50_ms=1165.651 p90_ms=1176.634 p95_ms=1176.634 p99_ms=1194.083 min_ms=1151.966 max_ms=1194.083
+per_user_tps n=15 mean=13.303 p50=13.312 p90=13.406 p95=13.406 p99=13.476 min=12.987 max=13.476

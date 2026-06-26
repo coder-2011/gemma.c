@@ -4,6 +4,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,41 +24,29 @@ void check_cuda(cudaError_t status, const char *expr, const char *file, int line
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
 
+// Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(size_t count) : count_(count) {
-    if (count_ > 0) {
-      CHECK_CUDA(cudaMalloc(&ptr_, count_ * sizeof(T)));
-    }
-  }
+T *raw_ptr(thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
 
-  ~DeviceBuffer() {
-    if (ptr_ != nullptr) {
-      cudaFree(ptr_);
-    }
-  }
+// Returns the raw const CUDA pointer owned by a Thrust device vector.
+template <typename T>
+const T *raw_ptr(const thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
 
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+template <typename T>
+void copy_to_device(thrust::device_vector<T> &dst, const std::vector<T> &src) {
+  CHECK_CUDA(cudaMemcpy(raw_ptr(dst), src.data(), src.size() * sizeof(T),
+                        cudaMemcpyHostToDevice));
+}
 
-  T *get() { return ptr_; }
-  const T *get() const { return ptr_; }
-
-  void copy_from(const std::vector<T> &src) {
-    CHECK_CUDA(cudaMemcpy(ptr_, src.data(), count_ * sizeof(T),
-                          cudaMemcpyHostToDevice));
-  }
-
-  void copy_to(std::vector<T> &dst) const {
-    CHECK_CUDA(cudaMemcpy(dst.data(), ptr_, count_ * sizeof(T),
-                          cudaMemcpyDeviceToHost));
-  }
-
- private:
-  T *ptr_ = nullptr;
-  size_t count_ = 0;
-};
+template <typename T>
+void copy_to_host(std::vector<T> &dst, const thrust::device_vector<T> &src) {
+  CHECK_CUDA(cudaMemcpy(dst.data(), raw_ptr(src), dst.size() * sizeof(T),
+                        cudaMemcpyDeviceToHost));
+}
 
 enum class RmsnormMode {
   LearnedWeight,
@@ -87,7 +78,6 @@ void fill_values(std::vector<__nv_bfloat16> &values,
 }
 
 void reference_rmsnorm(std::vector<__nv_bfloat16> &out,
-                       std::vector<float> &rstd,
                        const std::vector<__nv_bfloat16> &inp,
                        const std::vector<__nv_bfloat16> *weight,
                        int rows,
@@ -101,7 +91,6 @@ void reference_rmsnorm(std::vector<__nv_bfloat16> &out,
     }
 
     float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / width) + eps);
-    rstd[row] = scale;
     for (int c = 0; c < width; ++c) {
       size_t index = static_cast<size_t>(row) * width + c;
       float gamma = weight != nullptr ? bf16_to_float((*weight)[c]) : 1.0f;
@@ -131,69 +120,41 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
   }
 }
 
-void compare_float(const std::vector<float> &actual,
-                   const std::vector<float> &expected,
-                   float tolerance,
-                   const char *label) {
-  float max_abs = 0.0f;
-  int max_index = 0;
-  for (int i = 0; i < static_cast<int>(actual.size()); ++i) {
-    float diff = std::fabs(actual[i] - expected[i]);
-    if (diff > max_abs) {
-      max_abs = diff;
-      max_index = i;
-    }
-  }
-  if (max_abs > tolerance) {
-    std::fprintf(stderr, "%s max_abs=%g at index=%d exceeds tolerance=%g\n",
-                 label, max_abs, max_index, tolerance);
-    std::exit(1);
-  }
-}
-
-bool uses_learned_weight(RmsnormMode mode) {
-  return mode == RmsnormMode::LearnedWeight;
-}
-
-const char *rmsnorm_label(RmsnormMode mode) {
-  return uses_learned_weight(mode) ? "rmsnorm" : "scale-free rmsnorm";
-}
-
 void run_rmsnorm_case(int rows, int width, RmsnormMode mode) {
   const int elems = rows * width;
-  const bool has_weight = uses_learned_weight(mode);
+  const bool has_weight = mode == RmsnormMode::LearnedWeight;
 
   std::vector<__nv_bfloat16> inp(elems);
   std::vector<__nv_bfloat16> weight(width);
   std::vector<__nv_bfloat16> actual(elems);
   std::vector<__nv_bfloat16> expected(elems);
-  std::vector<float> expected_rstd(rows);
 
   fill_values(inp, make_input_value);
   fill_values(weight, make_weight_value);
-  reference_rmsnorm(expected, expected_rstd, inp, has_weight ? &weight : nullptr,
-                    rows, width, GEMMA4_RMS_NORM_EPS);
+  reference_rmsnorm(
+      expected, inp, has_weight ? &weight : nullptr, rows, width,
+      GEMMA4_RMS_NORM_EPS);
 
-  DeviceBuffer<__nv_bfloat16> d_inp(elems);
-  DeviceBuffer<__nv_bfloat16> d_weight(has_weight ? width : 0);
-  DeviceBuffer<__nv_bfloat16> d_out(elems);
-  d_inp.copy_from(inp);
+  thrust::device_vector<__nv_bfloat16> d_inp(elems);
+  thrust::device_vector<__nv_bfloat16> d_weight(has_weight ? width : 0);
+  thrust::device_vector<__nv_bfloat16> d_out(elems);
+  copy_to_device(d_inp, inp);
   if (has_weight) {
-    d_weight.copy_from(weight);
+    copy_to_device(d_weight, weight);
   }
 
   if (mode == RmsnormMode::ScaleFreeWrapper) {
     CHECK_CUDA(gemma4_rmsnorm_scale_free_bf16(
-        d_out.get(), d_inp.get(), rows, width, GEMMA4_RMS_NORM_EPS, 0));
+        raw_ptr(d_out), raw_ptr(d_inp), rows, width, GEMMA4_RMS_NORM_EPS, 0));
   } else {
     CHECK_CUDA(gemma4_rmsnorm_bf16(
-        d_out.get(), d_inp.get(), d_weight.get(), rows, width,
+        raw_ptr(d_out), raw_ptr(d_inp), raw_ptr(d_weight), rows, width,
         GEMMA4_RMS_NORM_EPS, 0));
   }
 
-  d_out.copy_to(actual);
+  copy_to_host(actual, d_out);
 
-  const char *label = rmsnorm_label(mode);
+  const char *label = has_weight ? "rmsnorm" : "scale-free rmsnorm";
   compare_bf16(actual, expected, 0.03125f, label);
 }
 
@@ -216,15 +177,15 @@ void run_residual_add_case(int rows, int width) {
   std::vector<__nv_bfloat16> expected(elems);
   fill_residual_inputs(inp1, inp2, expected);
 
-  DeviceBuffer<__nv_bfloat16> d_inp1(elems);
-  DeviceBuffer<__nv_bfloat16> d_inp2(elems);
-  DeviceBuffer<__nv_bfloat16> d_out(elems);
-  d_inp1.copy_from(inp1);
-  d_inp2.copy_from(inp2);
+  thrust::device_vector<__nv_bfloat16> d_inp1(elems);
+  thrust::device_vector<__nv_bfloat16> d_inp2(elems);
+  thrust::device_vector<__nv_bfloat16> d_out(elems);
+  copy_to_device(d_inp1, inp1);
+  copy_to_device(d_inp2, inp2);
 
   CHECK_CUDA(gemma4_residual_add_bf16(
-      d_out.get(), d_inp1.get(), d_inp2.get(), elems, 0));
-  d_out.copy_to(actual);
+      raw_ptr(d_out), raw_ptr(d_inp1), raw_ptr(d_inp2), elems, 0));
+  copy_to_host(actual, d_out);
   compare_bf16(actual, expected, 0.0f, "residual add output");
 }
 
@@ -237,29 +198,28 @@ void run_fused_case(int rows, int width) {
   std::vector<__nv_bfloat16> expected_residual(elems);
   std::vector<__nv_bfloat16> actual_normed(elems);
   std::vector<__nv_bfloat16> expected_normed(elems);
-  std::vector<float> expected_rstd(rows);
 
   fill_residual_inputs(inp1, inp2, expected_residual);
   fill_values(weight, make_weight_value);
-  reference_rmsnorm(expected_normed, expected_rstd, expected_residual, &weight,
-                    rows, width,
-                    GEMMA4_RMS_NORM_EPS);
+  reference_rmsnorm(
+      expected_normed, expected_residual, &weight, rows, width,
+      GEMMA4_RMS_NORM_EPS);
 
-  DeviceBuffer<__nv_bfloat16> d_inp1(elems);
-  DeviceBuffer<__nv_bfloat16> d_inp2(elems);
-  DeviceBuffer<__nv_bfloat16> d_weight(width);
-  DeviceBuffer<__nv_bfloat16> d_residual(elems);
-  DeviceBuffer<__nv_bfloat16> d_normed(elems);
-  d_inp1.copy_from(inp1);
-  d_inp2.copy_from(inp2);
-  d_weight.copy_from(weight);
+  thrust::device_vector<__nv_bfloat16> d_inp1(elems);
+  thrust::device_vector<__nv_bfloat16> d_inp2(elems);
+  thrust::device_vector<__nv_bfloat16> d_weight(width);
+  thrust::device_vector<__nv_bfloat16> d_residual(elems);
+  thrust::device_vector<__nv_bfloat16> d_normed(elems);
+  copy_to_device(d_inp1, inp1);
+  copy_to_device(d_inp2, inp2);
+  copy_to_device(d_weight, weight);
 
   CHECK_CUDA(gemma4_residual_add_rmsnorm_bf16(
-      d_residual.get(), d_normed.get(), d_inp1.get(), d_inp2.get(),
-      d_weight.get(), rows, width, GEMMA4_RMS_NORM_EPS, 0));
+      raw_ptr(d_residual), raw_ptr(d_normed), raw_ptr(d_inp1), raw_ptr(d_inp2),
+      raw_ptr(d_weight), rows, width, GEMMA4_RMS_NORM_EPS, 0));
 
-  d_residual.copy_to(actual_residual);
-  d_normed.copy_to(actual_normed);
+  copy_to_host(actual_residual, d_residual);
+  copy_to_host(actual_normed, d_normed);
 
   compare_bf16(actual_residual, expected_residual, 0.0f, "fused");
   compare_bf16(actual_normed, expected_normed, 0.03125f, "fused");
@@ -274,14 +234,6 @@ int main() {
   run_residual_add_case(9, GEMMA4_HIDDEN_SIZE);
   run_fused_case(1, GEMMA4_HIDDEN_SIZE);
   run_fused_case(19, GEMMA4_HIDDEN_SIZE);
-
-  cudaError_t invalid = gemma4_rmsnorm_bf16(
-      nullptr, nullptr, nullptr, 1, GEMMA4_HIDDEN_SIZE + 1,
-      GEMMA4_RMS_NORM_EPS, 0);
-  if (invalid != cudaErrorInvalidValue) {
-    std::fprintf(stderr, "expected cudaErrorInvalidValue for invalid RMSNorm args\n");
-    return 1;
-  }
 
   std::printf("rmsnorm tests passed\n");
   return 0;

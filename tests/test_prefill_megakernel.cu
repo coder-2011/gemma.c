@@ -4,6 +4,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -22,75 +25,55 @@ void check_cuda(cudaError_t status, const char *expr, const char *file, int line
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
 
-// Owns one device allocation used by this integrated CUDA test.
+// Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(size_t count) : count_(count) {
-    if (count_ > 0) {
-      CHECK_CUDA(cudaMalloc(&ptr_, count_ * sizeof(T)));
-    }
+T *raw_ptr(thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
+
+// Returns the raw const CUDA pointer owned by a Thrust device vector.
+template <typename T>
+const T *raw_ptr(const thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
+
+template <typename T>
+void copy_to_device(thrust::device_vector<T> &dst, const std::vector<T> &src) {
+  if (!src.empty()) {
+    CHECK_CUDA(cudaMemcpy(raw_ptr(dst), src.data(), src.size() * sizeof(T),
+                          cudaMemcpyHostToDevice));
   }
+}
 
-  ~DeviceBuffer() {
-    if (ptr_ != nullptr) {
-      cudaFree(ptr_);
-    }
+template <typename T>
+std::vector<T> copy_to_host(const thrust::device_vector<T> &src) {
+  std::vector<T> dst(src.size());
+  if (!dst.empty()) {
+    CHECK_CUDA(cudaMemcpy(dst.data(), raw_ptr(src), dst.size() * sizeof(T),
+                          cudaMemcpyDeviceToHost));
   }
+  return dst;
+}
 
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  T *get() const { return ptr_; }
-
-  // Copies host data into this device allocation.
-  void copy_from(const std::vector<T> &src) const {
-    if (!src.empty()) {
-      CHECK_CUDA(cudaMemcpy(ptr_, src.data(), src.size() * sizeof(T),
-                            cudaMemcpyHostToDevice));
-    }
+template <typename T>
+void zero_device(thrust::device_vector<T> &dst) {
+  if (dst.size() > 0) {
+    CHECK_CUDA(cudaMemset(raw_ptr(dst), 0, dst.size() * sizeof(T)));
   }
-
-  // Copies this full device allocation back to host memory.
-  std::vector<T> copy_to_host() const {
-    std::vector<T> dst(count_);
-    if (!dst.empty()) {
-      CHECK_CUDA(cudaMemcpy(dst.data(), ptr_, dst.size() * sizeof(T),
-                            cudaMemcpyDeviceToHost));
-    }
-    return dst;
-  }
-
-  // Clears this allocation without staging a host vector.
-  void zero() const {
-    if (count_ > 0) {
-      CHECK_CUDA(cudaMemset(ptr_, 0, count_ * sizeof(T)));
-    }
-  }
-
- private:
-  T *ptr_ = nullptr;
-  size_t count_ = 0;
-};
+}
 
 // Converts BF16 values to FP32 for tolerance checks.
 float bf16_to_float(__nv_bfloat16 value) {
   return __bfloat162float(value);
 }
 
-// Produces deterministic nonzero hidden values for an exact identity oracle.
-__nv_bfloat16 make_hidden_value(int index) {
-  const int centered = ((index * 17 + 3) % 251) - 125;
-  return __float2bfloat16_rn(static_cast<float>(centered) / 128.0f);
-}
-
 // Writes one BF16 scalar into a large device tensor.
 void write_device_bf16(
-    const DeviceBuffer<__nv_bfloat16> &dst,
+    thrust::device_vector<__nv_bfloat16> &dst,
     int64_t index,
     float value) {
   __nv_bfloat16 bf16 = __float2bfloat16_rn(value);
-  CHECK_CUDA(cudaMemcpy(dst.get() + index, &bf16, sizeof(bf16),
+  CHECK_CUDA(cudaMemcpy(raw_ptr(dst) + index, &bf16, sizeof(bf16),
                         cudaMemcpyHostToDevice));
 }
 
@@ -141,32 +124,32 @@ struct LayerBuffers {
         v_proj(global ? 0 : static_cast<size_t>(kv_width) * GEMMA4_HIDDEN_SIZE),
         o_proj(static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * q_width),
         ffn_gate_up(static_cast<size_t>(GEMMA4_PACKED_FFN_SIZE) *
-                    GEMMA4_HIDDEN_SIZE),
+                        GEMMA4_HIDDEN_SIZE),
         ffn_down(static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) *
-                 GEMMA4_HIDDEN_SIZE) {}
+                     GEMMA4_HIDDEN_SIZE) {}
 
   // Initializes weights to make the runner output a scaled hidden tensor.
-  void initialize() const {
+  void initialize() {
     std::vector<__nv_bfloat16> hidden_ones(
         GEMMA4_HIDDEN_SIZE, __float2bfloat16_rn(1.0f));
     std::vector<__nv_bfloat16> head_ones(
         head_dim, __float2bfloat16_rn(1.0f));
     std::vector<__nv_bfloat16> scalar(1, __float2bfloat16_rn(0.5f));
 
-    input_norm.copy_from(hidden_ones);
-    post_attention_norm.copy_from(hidden_ones);
-    pre_feedforward_norm.copy_from(hidden_ones);
-    post_feedforward_norm.copy_from(hidden_ones);
-    layer_scalar.copy_from(scalar);
-    q_norm.copy_from(head_ones);
-    k_norm.copy_from(head_ones);
+    copy_to_device(input_norm, hidden_ones);
+    copy_to_device(post_attention_norm, hidden_ones);
+    copy_to_device(pre_feedforward_norm, hidden_ones);
+    copy_to_device(post_feedforward_norm, hidden_ones);
+    copy_to_device(layer_scalar, scalar);
+    copy_to_device(q_norm, head_ones);
+    copy_to_device(k_norm, head_ones);
 
-    q_proj.zero();
-    k_proj.zero();
-    v_proj.zero();
-    o_proj.zero();
-    ffn_gate_up.zero();
-    ffn_down.zero();
+    zero_device(q_proj);
+    zero_device(k_proj);
+    zero_device(v_proj);
+    zero_device(o_proj);
+    zero_device(ffn_gate_up);
+    zero_device(ffn_down);
 
     write_device_bf16(k_proj, 0, 1.0f);
     if (!global) {
@@ -175,21 +158,21 @@ struct LayerBuffers {
   }
 
   // Returns the production layer-weight view consumed by the runner.
-  Gemma4TextLayerWeightsDevice view() const {
+  Gemma4TextLayerWeightsDevice view() {
     Gemma4TextLayerWeightsDevice weights = {};
-    weights.input_norm_weight = input_norm.get();
-    weights.post_attention_norm_weight = post_attention_norm.get();
-    weights.pre_feedforward_norm_weight = pre_feedforward_norm.get();
-    weights.post_feedforward_norm_weight = post_feedforward_norm.get();
-    weights.layer_scalar = layer_scalar.get();
-    weights.q_norm_weight = q_norm.get();
-    weights.k_norm_weight = k_norm.get();
-    weights.q_proj_col_major = q_proj.get();
-    weights.k_proj_col_major = k_proj.get();
-    weights.v_proj_col_major = global ? nullptr : v_proj.get();
-    weights.o_proj_col_major = o_proj.get();
-    weights.ffn_gate_up_decode = ffn_gate_up.get();
-    weights.ffn_down_decode = ffn_down.get();
+    weights.input_norm_weight = raw_ptr(input_norm);
+    weights.post_attention_norm_weight = raw_ptr(post_attention_norm);
+    weights.pre_feedforward_norm_weight = raw_ptr(pre_feedforward_norm);
+    weights.post_feedforward_norm_weight = raw_ptr(post_feedforward_norm);
+    weights.layer_scalar = raw_ptr(layer_scalar);
+    weights.q_norm_weight = raw_ptr(q_norm);
+    weights.k_norm_weight = raw_ptr(k_norm);
+    weights.q_proj_col_major = raw_ptr(q_proj);
+    weights.k_proj_col_major = raw_ptr(k_proj);
+    weights.v_proj_col_major = global ? nullptr : raw_ptr(v_proj);
+    weights.o_proj_col_major = raw_ptr(o_proj);
+    weights.ffn_gate_up_decode = raw_ptr(ffn_gate_up);
+    weights.ffn_down_decode = raw_ptr(ffn_down);
     return weights;
   }
 
@@ -197,36 +180,20 @@ struct LayerBuffers {
   int32_t q_width;
   int32_t kv_width;
   int32_t head_dim;
-  DeviceBuffer<__nv_bfloat16> input_norm;
-  DeviceBuffer<__nv_bfloat16> post_attention_norm;
-  DeviceBuffer<__nv_bfloat16> pre_feedforward_norm;
-  DeviceBuffer<__nv_bfloat16> post_feedforward_norm;
-  DeviceBuffer<__nv_bfloat16> layer_scalar;
-  DeviceBuffer<__nv_bfloat16> q_norm;
-  DeviceBuffer<__nv_bfloat16> k_norm;
-  DeviceBuffer<__nv_bfloat16> q_proj;
-  DeviceBuffer<__nv_bfloat16> k_proj;
-  DeviceBuffer<__nv_bfloat16> v_proj;
-  DeviceBuffer<__nv_bfloat16> o_proj;
-  DeviceBuffer<__nv_bfloat16> ffn_gate_up;
-  DeviceBuffer<__nv_bfloat16> ffn_down;
+  thrust::device_vector<__nv_bfloat16> input_norm;
+  thrust::device_vector<__nv_bfloat16> post_attention_norm;
+  thrust::device_vector<__nv_bfloat16> pre_feedforward_norm;
+  thrust::device_vector<__nv_bfloat16> post_feedforward_norm;
+  thrust::device_vector<__nv_bfloat16> layer_scalar;
+  thrust::device_vector<__nv_bfloat16> q_norm;
+  thrust::device_vector<__nv_bfloat16> k_norm;
+  thrust::device_vector<__nv_bfloat16> q_proj;
+  thrust::device_vector<__nv_bfloat16> k_proj;
+  thrust::device_vector<__nv_bfloat16> v_proj;
+  thrust::device_vector<__nv_bfloat16> o_proj;
+  thrust::device_vector<__nv_bfloat16> ffn_gate_up;
+  thrust::device_vector<__nv_bfloat16> ffn_down;
 };
-
-// Returns the number of BF16 entries in one K or V cache buffer.
-size_t cache_elements(const Gemma4KvCacheConfig &config) {
-  return static_cast<size_t>(config.num_layers) * config.num_pages *
-         config.page_size * config.num_heads * config.head_dim;
-}
-
-// Returns true when any BF16 value in the tensor is nonzero.
-bool has_nonzero(const std::vector<__nv_bfloat16> &values) {
-  for (__nv_bfloat16 value : values) {
-    if (bf16_to_float(value) != 0.0f) {
-      return true;
-    }
-  }
-  return false;
-}
 
 // Runs one sliding or global prefill layer and checks scalar/output/cache wiring.
 void run_prefill_layer_case(bool global) {
@@ -240,7 +207,8 @@ void run_prefill_layer_case(bool global) {
   std::vector<__nv_bfloat16> hidden(
       static_cast<size_t>(rows) * GEMMA4_HIDDEN_SIZE);
   for (int i = 0; i < static_cast<int>(hidden.size()); ++i) {
-    hidden[i] = make_hidden_value(i);
+    const int centered = ((i * 17 + 3) % 251) - 125;
+    hidden[i] = __float2bfloat16_rn(static_cast<float>(centered) / 128.0f);
   }
   std::vector<float> cos(seq_len * rotary_half, 1.0f);
   std::vector<float> sin(cos.size(), 0.0f);
@@ -249,54 +217,57 @@ void run_prefill_layer_case(bool global) {
   layer.initialize();
   Gemma4TextLayerWeightsDevice weights = layer.view();
 
-  DeviceBuffer<__nv_bfloat16> d_hidden(hidden.size());
-  DeviceBuffer<__nv_bfloat16> d_out(hidden.size());
-  DeviceBuffer<float> d_cos(cos.size());
-  DeviceBuffer<float> d_sin(sin.size());
-  d_hidden.copy_from(hidden);
-  d_cos.copy_from(cos);
-  d_sin.copy_from(sin);
+  thrust::device_vector<__nv_bfloat16> d_hidden(hidden.size());
+  thrust::device_vector<__nv_bfloat16> d_out(hidden.size());
+  thrust::device_vector<float> d_cos(cos.size());
+  thrust::device_vector<float> d_sin(sin.size());
+  copy_to_device(d_hidden, hidden);
+  copy_to_device(d_cos, cos);
+  copy_to_device(d_sin, sin);
 
-  DeviceBuffer<__nv_bfloat16> d_scratch(
+  thrust::device_vector<__nv_bfloat16> d_scratch(
       gemma4_prefill_megakernel_layer_scratch_elements(global, rows));
   Gemma4PrefillMegakernelLayerScratch scratch =
       gemma4_prefill_megakernel_layer_scratch_from_buffer(
-          d_scratch.get(), global, rows);
+          raw_ptr(d_scratch), global, rows);
 
   Gemma4KvCacheConfig cache_config =
       gemma4_kv_cache_make_config(global, 1, 4, 1);
-  const size_t cache_size = cache_elements(cache_config);
-  DeviceBuffer<__nv_bfloat16> d_cache_k(cache_size);
-  DeviceBuffer<__nv_bfloat16> d_cache_v(cache_size);
-  DeviceBuffer<int32_t> d_page_table(rows);
-  DeviceBuffer<int32_t> d_token_batch(rows);
-  DeviceBuffer<int32_t> d_token_position(rows);
-  std::vector<int32_t> page_table(rows, 0);
+  const size_t cache_size =
+      static_cast<size_t>(cache_config.num_layers) * cache_config.num_pages *
+      cache_config.page_size * cache_config.num_heads * cache_config.head_dim;
+  thrust::device_vector<__nv_bfloat16> d_cache_k(cache_size);
+  thrust::device_vector<__nv_bfloat16> d_cache_v(cache_size);
+  const size_t page_table_size =
+      static_cast<size_t>(batch_size) * cache_config.max_pages_per_seq;
+  thrust::device_vector<int32_t> d_page_table(page_table_size);
+  thrust::device_vector<int32_t> d_token_batch(rows);
+  thrust::device_vector<int32_t> d_token_position(rows);
+  std::vector<int32_t> page_table(page_table_size, 0);
   std::vector<int32_t> token_batch(rows, 0);
   std::vector<int32_t> token_position = {0, 1};
-  d_cache_k.zero();
-  d_cache_v.zero();
-  d_page_table.copy_from(page_table);
-  d_token_batch.copy_from(token_batch);
-  d_token_position.copy_from(token_position);
+  zero_device(d_cache_k);
+  zero_device(d_cache_v);
+  copy_to_device(d_page_table, page_table);
+  copy_to_device(d_token_batch, token_batch);
+  copy_to_device(d_token_position, token_position);
 
   Gemma4PrefillMegakernelLayerArgs args = {};
-  args.out = d_out.get();
-  args.hidden = d_hidden.get();
+  args.out = raw_ptr(d_out);
+  args.hidden = raw_ptr(d_hidden);
   args.weights = &weights;
   args.layer_index = layer_index;
   args.batch_size = batch_size;
   args.seq_len = seq_len;
-  args.cos = d_cos.get();
-  args.sin = d_sin.get();
+  args.cos = raw_ptr(d_cos);
+  args.sin = raw_ptr(d_sin);
   args.softmax_scale = 1.0f;
-  args.cache_k = d_cache_k.get();
-  args.cache_v = d_cache_v.get();
+  args.cache_k = raw_ptr(d_cache_k);
+  args.cache_v = raw_ptr(d_cache_v);
   args.cache_config = cache_config;
-  args.page_table = d_page_table.get();
-  args.token_batch = d_token_batch.get();
-  args.token_position = d_token_position.get();
-  args.cache_layer = 0;
+  args.page_table = raw_ptr(d_page_table);
+  args.token_batch = raw_ptr(d_token_batch);
+  args.token_position = raw_ptr(d_token_position);
 
   CHECK_CUDA(gemma4_prefill_megakernel_layer_bf16(args, scratch));
   CHECK_CUDA(cudaDeviceSynchronize());
@@ -306,13 +277,26 @@ void run_prefill_layer_case(bool global) {
     expected[i] = __float2bfloat16_rn(bf16_to_float(expected[i]) * 0.5f);
   }
 
-  compare_bf16(d_out.copy_to_host(), expected, 0.0f,
+  compare_bf16(copy_to_host(d_out), expected, 0.0f,
                global ? "global prefill scaled output"
                       : "sliding prefill scaled output");
 
-  if (!has_nonzero(d_cache_k.copy_to_host()) ||
-      !has_nonzero(d_cache_v.copy_to_host())) {
-    std::fprintf(stderr, "prefill KV cache write stayed zero\n");
+  const int32_t cache_layer = gemma4_kv_cache_layer_index(layer_index, global);
+  const int64_t first_cache_value =
+      gemma4_kv_cache_offset(cache_config, cache_layer, 0, 0, 0, 0);
+  if (bf16_to_float(copy_to_host(d_cache_k)[first_cache_value]) == 0.0f ||
+      bf16_to_float(copy_to_host(d_cache_v)[first_cache_value]) == 0.0f) {
+    std::fprintf(stderr, "prefill KV cache write missed page zero offset zero\n");
+    std::exit(1);
+  }
+
+  Gemma4PrefillMegakernelLayerArgs bad_cache_args = args;
+  bad_cache_args.batch_size = 2;
+  bad_cache_args.seq_len = 1;
+  cudaError_t bad_status =
+      gemma4_prefill_megakernel_layer_bf16(bad_cache_args, scratch);
+  if (bad_status != cudaErrorInvalidValue) {
+    std::fprintf(stderr, "expected invalid prefill cache batch capacity\n");
     std::exit(1);
   }
 }

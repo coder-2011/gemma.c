@@ -1,5 +1,4 @@
-#ifndef GEMMA4_RUNTIME_CUH
-#define GEMMA4_RUNTIME_CUH
+#pragma once
 
 #include "gemma4.h"
 #include "gemma4_kv_cache.cuh"
@@ -40,9 +39,6 @@ struct Gemma4RuntimeState {
   std::vector<int32_t> h_seq_lengths;
   std::vector<int32_t> h_token_batch;
   std::vector<int32_t> h_token_position;
-
-  Gemma4KvPageAllocator sliding_allocator = Gemma4KvPageAllocator(0);
-  Gemma4KvPageAllocator global_allocator = Gemma4KvPageAllocator(0);
 };
 
 // Allocates runtime buffers; `state` must be zero-initialized or freed.
@@ -66,5 +62,3 @@ cudaError_t gemma4_runtime_prepare_prefill(
 cudaError_t gemma4_runtime_prepare_decode_step(
     Gemma4RuntimeState *state,
     cudaStream_t stream);
-
-#endif

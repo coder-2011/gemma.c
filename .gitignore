@@ -1,8 +1,17 @@
 .env.local
+/.clang-tidy
+/.clangd
+/.gitmodules
 .venv/
 .agents/
 skills-lock.json
 models/
+build/benches/
 build/experiments/
+tools/clang_cuda_compat/
+experiments/flash-attention/
+experiments/marlin/
+experiments/sgemm.cu/
+experiments/tuna/
 __pycache__/
 *.py[cod]

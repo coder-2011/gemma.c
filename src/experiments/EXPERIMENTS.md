@@ -3,6 +3,478 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-25 - Sampling Bench LibTorch Baseline Port
+
+Question:
+
+- Can the old Python `gemma4_sampling_torch_bench.py` native PyTorch CUDA
+  graph comparison live directly inside the sampling mechanism benchmark?
+
+Change:
+
+- Added a LibTorch CUDA-graph row to `gemma4_sampling_bench`.
+- Kept the existing custom fused sampler and materialized CUDA reference rows.
+- Deleted `gemma4_sampling_torch_bench.py`.
+
+Commands:
+
+```bash
+make sampling-bench
+./build/benches/gemma4_sampling_bench --warmup 5 --iters 10 --samples 3
+make test-sampling
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:06:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Library baseline: LibTorch `2.11.0`.
+- Shape: BF16 hidden `[1, 3840]`, tied LM head `[262144, 3840]`.
+- Timing: CUDA events on each measured stream; LibTorch row uses CUDA graph
+  replay, custom rows use direct CUDA launches.
+- Warmup/iterations: `5` warmups, `10` timed iterations per sample, `3`
+  samples. This is a port smoke run, not a final tuning run.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked.
+- Correctness: LibTorch row checks selected-row gather and scale; custom fused
+  row checks token against the materialized CUDA reference before timing.
+
+Results:
+
+```text
+variant=native_pytorch_cuda_graph median_us=2853.350 samples_us=[2852.541,2853.350,2854.547]
+variant=fused_lm_head_sample_full_vocab median_us=2837.990 samples_us=[2836.016,2838.429,2837.990]
+variant=materialized_lm_head_sample_full_vocab median_us=2871.904 samples_us=[2871.606,2871.904,2872.211]
+```
+
+Conclusion:
+
+- The sampling mechanism now has one C++/CUDA benchmark file with its LibTorch
+  baseline included.
+- The old Python wrapper behavior is preserved by the `native_pytorch_cuda_graph`
+  row and named `--warmup`, `--iters`, and `--samples` aliases.
+- Rerun with larger sample counts before making performance claims.
+
+## 2026-06-25 - KV Cache Bench LibTorch SDPA Baseline Port
+
+Question:
+
+- Can the old Python `gemma4_kv_cache_torch_bench.py` SDPA timing live inside
+  the KV-cache mechanism benchmark without leaving a second benchmark file?
+
+Change:
+
+- Added LibTorch eager SDPA rows to `gemma4_kv_cache_bench`.
+- Preserved the Python baseline knobs: `--seq-len`, `--q-heads`,
+  `--kv-heads`, `--head-dim`, and `--flush-mib`.
+- Kept the existing custom sliding paged-cache rows in the same benchmark.
+- Added a custom global paged-decode row using
+  `gemma4_flash_attention_decode_paged_bf16`.
+- Fixed the custom CPU reference to compare only the live sliding window when
+  `seq_len` exceeds the sliding attention window.
+- Deleted `gemma4_kv_cache_torch_bench.py`.
+- Deleted `gemma4_global_decode_torch_bench.py`.
+- Deleted the decode half of `gemma4_paged_decode_torch_bench.py`; its sliding
+  LibTorch decode row now lives here.
+
+Commands:
+
+```bash
+make kv-cache-bench
+./build/benches/gemma4_kv_cache_bench --warmup 5 --iters 10 --samples 3
+make test-kv-cache
+git diff --check
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:04:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Library baseline: LibTorch `2.11.0`.
+- Torch shape: BF16 `q=[1,16,1,512]`, `k/v=[1,1,4096,512]`, non-causal
+  SDPA with GQA enabled and scale `1/sqrt(512)`.
+- Custom shape: BF16 sliding paged cache, `q_heads=16`, `kv_heads=8`,
+  `head_dim=256`, `key_count=1024`, `split_size=20`.
+- Sliding Torch shape: BF16 `q=[1,16,1,256]`, `k/v=[1,8,1024,256]`,
+  non-causal SDPA with GQA enabled and scale `1/sqrt(256)`.
+- Global custom shape: BF16 global paged cache, `q_heads=16`, `kv_heads=1`,
+  `head_dim=512`, `seq_len=4096`, `split_size=64`.
+- Timing: CUDA events on the same stream as the measured work. LibTorch first
+  use is outside timing through the checksum call and warmups.
+- Warmup/iterations: `5` warmups, `10` timed iterations per sample, `3`
+  samples. This is a port smoke run, not a final tuning run.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked; run snapshot showed idle clocks at
+  `210 MHz` SM and `405 MHz` memory.
+- Correctness: custom flash decode matched the CPU reference with
+  `max_abs=0` and `mean_abs=0`; `make test-kv-cache` passed.
+
+Results:
+
+```text
+torch_attention_only median_ms=1.664547 samples_ms=[1.646912,1.664547,1.674886]
+torch_full_decode_write_plus_attention median_ms=1.663427 samples_ms=[1.652682,1.663427,1.668630]
+torch_sliding_decode_attention median_ms=0.183338 samples_ms=[0.167078,0.183363,0.183338]
+prefill_cache_write median_ms=0.106074 samples_ms=[0.104499,0.106435,0.106074]
+decode_cache_write median_ms=0.015171 samples_ms=[0.013722,0.017741,0.015171]
+flash_decode_paged_attention_direct median_ms=0.035075 samples_ms=[0.032403,0.038118,0.035075]
+flash_full_decode_write_plus_attention median_ms=0.047910 samples_ms=[0.047456,0.049424,0.047910]
+global_decode_paged_attention_direct median_ms=0.266893 samples_ms=[0.265245,0.266893,0.266954]
+```
+
+Conclusion:
+
+- The KV-cache mechanism now has one C++/CUDA benchmark file with its LibTorch
+  SDPA baseline and custom global paged-decode row included.
+- The Torch rows preserve the old Python default global-like SDPA shape; they
+  are useful as a library baseline, not a shape-identical comparison to the
+  sliding custom rows.
+- Rerun with larger sample counts and locked clocks before making performance
+  claims.
+
+## 2026-06-25 - Flash Attention Bench LibTorch Prep Ports
+
+Question:
+
+- Can the prefill half of `gemma4_paged_decode_torch_bench.py` live inside the
+  flash-attention mechanism benchmark?
+- Can `gemma4_decode_prep_torch_bench.py` be represented by a LibTorch
+  decode-prep row in the same mechanism benchmark?
+- Can `gemma4_project_prepare_compare.py` be represented by LibTorch and custom
+  project-prepare rows in the same mechanism benchmark?
+
+Change:
+
+- Added a raw `gemma4_flash_attention_sliding_fwd_bf16` row with LSE output to
+  `gemma4_flash_attention_bench`.
+- Added a LibTorch BF16 SDPA prefill row for `seq_len <= GEMMA4_SLIDING_WINDOW`.
+- Added a LibTorch decode RMSNorm/RoPE/paged-KV-write row.
+- Added LibTorch and custom packed project-plus-prepare rows.
+- Kept the existing `norm_rope_plus_fa` and decode-prep rows distinct.
+- Deleted `gemma4_paged_decode_torch_bench.py` after its decode row landed in
+  the KV-cache bench and its prefill row landed here.
+- Deleted `gemma4_decode_prep_torch_bench.py`.
+- Deleted `gemma4_project_prepare_compare.py`; the optional vLLM operator row
+  was not carried into C++.
+
+Commands:
+
+```bash
+make flash-attn-bench
+./build/benches/gemma4_flash_attention_bench 1024 10 5 3 1 64 warm 64
+git diff --check
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:09:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Library baseline: LibTorch `2.11.0`.
+- Shape: BF16 `q=[1,1024,16,256]`, `k/v=[1,1024,8,256]`, causal prefill,
+  window `1024`, scale `1/sqrt(256)`.
+- Decode-prep shape: BF16 `q=[1,16,256]`, `k/v=[1,8,256]`, weights `[256]`,
+  and paged cache `[1,16,64,8,256]`.
+- Project-prepare shape: BF16 hidden `[1,3840]`, packed QKV weight
+  `[8192,3840]`, output Q `[1,16,256]`, and paged cache `[1,16,64,8,256]`.
+- Timing: CUDA events on the same stream as the measured work.
+- Warmup/iterations: `5` warmups, `10` timed iterations per sample, `3`
+  samples. This is a port smoke run, not a final tuning run.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked.
+- Correctness: existing `check_seq=64` CPU-reference checks passed with
+  `max_abs=0.0078125`; norm/RoPE prep max abs was at most `0.00195312`.
+
+Results:
+
+```text
+prefill_torch_sdpa_graphless median_ms=0.161366 samples_ms=[0.156435,0.161366,0.171440]
+torch_decode_norm_rope_paged_kv_write median_ms=2.418710 samples_ms=[2.091730,2.502110,2.418710]
+torch_project_prepare median_ms=2.394480 samples_ms=[3.446750,2.394480,2.313800]
+custom_project_prepare median_ms=0.495533 samples_ms=[0.495533,0.493709,0.495968]
+sliding_fwd_bf16_return_lse median_ms=0.134902 samples_ms=[0.134262,0.135312,0.134902]
+norm_rope_plus_fa median_ms=0.189395 samples_ms=[0.188262,0.189395,0.190106]
+decode_norm_rope_paged_kv_write median_ms=0.020592 samples_ms=[0.015309,0.030259,0.020592]
+```
+
+Conclusion:
+
+- The paged-decode wrapper's sliding prefill comparison and the decode-prep
+  wrapper's LibTorch baseline now have C++ rows in the flash-attention
+  mechanism bench.
+- The project-prepare wrapper's PyTorch/custom core comparison also has C++
+  rows; the optional vLLM row was intentionally omitted because it depends on a
+  Python package plugin rather than LibTorch.
+- The LibTorch row is a baseline, not a graph-captured replica of the old
+  Python harness.
+- Rerun with larger sample counts and locked clocks before making performance
+  claims.
+
+## 2026-06-25 - Retired Remaining Python Bench Wrappers
+
+Question:
+
+- After the Torch benchmark paths moved into C++ mechanism benches, what should
+  happen to the remaining Python files under `src/benches/`?
+
+Change:
+
+- Deleted `gemma4_flash_attention_compare.py`.
+- Deleted `gemma4_tokenizer_compare.py`.
+- Deleted `gemma4_prefill_tune.py`.
+- Deleted the now-unused shared Python `gemma4_bench_utils.py`.
+- Made `tests/test_flash_attention_pytorch.py` self-contained instead of
+  importing helper functions from the deleted paged-decode benchmark.
+
+Notes:
+
+- The flash-attention C++ bench now carries raw custom sliding attention,
+  LibTorch SDPA prefill, decode-prep, project-prepare, and CPU-reference
+  correctness rows. The deleted Python wrapper's optional Python `flash_attn`
+  comparison was not carried into C++.
+- The tokenizer C++ bench keeps the custom tokenizer benchmark. The deleted
+  Python wrapper's external Hugging Face `transformers` and Rust `tokenizers`
+  comparison rows were not carried into C++.
+- The prefill tuner was already orphaned from the current `Makefile`; its old
+  Tuna/SGEMM sweep orchestration was retired instead of being moved to
+  LibTorch.
+
+Conclusion:
+
+- `src/benches/` now contains no Python benchmark files. The remaining Python in
+  this repo is tests, historical experiment material, and non-bench tooling.
+
+## 2026-06-25 - Prompt Decode Tail Split and Hot-Path Timing
+
+Question:
+
+- Does `gemma4_prompt` avoid running final RMSNorm + LM-head sampling on
+  intermediate decode layers, while preserving the sampled token produced by the
+  existing monolithic tail?
+- What are first-pass real-weight hot-path timings for the current prompt flow
+  when weight load, tokenizer startup, allocation, and other one-time setup are
+  outside the CUDA-event timing window?
+
+Change:
+
+- Added a decode megakernel attention+FFN launcher that stops after the
+  post-FFN residual/layer-scalar phase.
+- Updated `gemma4_prompt` decode so layers `0..46` use the attention+FFN-only
+  launcher and layer `47` alone runs the final RMSNorm + LM-head sampling tail.
+- Added `gemma4_prompt --benchmark`, with warmup, iteration, and sample counts,
+  to time prefill and decode separately using CUDA events on the same stream.
+
+Commands:
+
+```bash
+make test-decode-megakernel
+make prompt
+./build/gemma4_prompt --benchmark --bench-warmup 1 --bench-iters 1 \
+  --bench-samples 1 --max-new 1 --prompt Hello
+nvidia-smi --query-gpu=name,gpu_bus_id,driver_version,persistence_mode,ecc.mode.current,mig.mode.current,power.limit,clocks.sm,clocks.mem,temperature.gpu,power.draw,utilization.gpu --format=csv,noheader,nounits
+/usr/local/cuda/bin/nvcc --version
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:04:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Model/input: real `models/gemma-4-12B/model.safetensors`, tokenizer
+  `models/gemma-4-12B/tokenizer.json`, prompt `Hello`, prompt length `1`.
+- Timing: CUDA events on stream `0`; weight loading, tokenizer startup,
+  allocation, runtime initialization, and decode setup prefill are outside the
+  measured regions.
+- Warmup/iterations: `1` warmup, `1` timed iteration, `1` sample. This is a
+  smoke benchmark, not a stable tuning run.
+- Cache policy: prefill repeats the same prompt buffers; decode advances
+  statefully after a setup prefill.
+- Clock policy: clocks not locked.
+- Correctness: `test_decode_megakernel` compares the split attention+FFN path
+  plus standalone final spine against the existing monolithic tail token.
+
+Results:
+
+```text
+prompt tokens: 1
+benchmark prompt_len=1 warmup=1 iters=1 samples=1 cache=prefill_repeated_decode_stateful timing=cuda_events_same_stream
+prefill_ms median=37.905 min=37.905 max=37.905
+decode_ms median=70.404 min=70.404 max=70.404
+```
+
+Conclusion:
+
+- The P1 prompt decode bug is fixed at the caller: intermediate layers no longer
+  launch the final sampling tail.
+- The focused smoke test passed, showing the split path preserves the generated
+  token for the deterministic FlashAttention+FFN case.
+- The benchmark harness is intentionally minimal and should be rerun with larger
+  warmup/sample counts before making performance claims.
+
+## 2026-06-23 - FFN Gate/Up DualGemm Tile Sweep
+
+Question:
+
+- Is the production CUTLASS `DualGemm` tile for the 12B FFN gate/up prefill
+  path still the best measured choice across prompt row counts?
+
+Change:
+
+- Added `gemma4_ffn_dual_gemm_bench` to sweep the custom gate/up + GeGLU
+  `DualGemm` tile variants separately from the FFN-down GEMM.
+- Increased benchmark input scales after the first run exposed false-positive
+  "fast" templates that were effectively writing zeros under the old loose
+  absolute tolerance.
+- Updated production prefill gate/up dispatch to:
+  - rows `<= 64`: `64x64x32`, warp `64x32`, stages `3`.
+  - rows `<= 128`: `128x64x32`, warp `64x32`, stages `5`.
+  - rows `> 128`: `256x64x32`, warp `64x32`, stages `3`.
+
+Commands:
+
+```bash
+make ffn-dual-gemm-bench
+./build/experiments/gemma4_ffn_dual_gemm_bench 3 1 1 64 all
+./build/experiments/gemma4_ffn_dual_gemm_bench 20 10 3 16,64,96,128,256,512,1024 all \
+  | tee src/experiments/results/2026-06-23_ffn_dual_gemm_12b_warm.txt
+./build/experiments/gemma4_ffn_dual_gemm_bench 50 20 5 16,64,96,128 all \
+  | tee src/experiments/results/2026-06-23_ffn_dual_gemm_small_confirm.txt
+./build/experiments/gemma4_ffn_dual_gemm_bench 50 20 5 256,512,1024 all \
+  | tee src/experiments/results/2026-06-23_ffn_dual_gemm_tail_confirm.txt
+./build/experiments/gemma4_ffn_dual_gemm_bench 20 10 3 2048,4096 all \
+  | tee src/experiments/results/2026-06-23_ffn_dual_gemm_large_probe.txt
+make build/gemma4_ffn.o
+make test-ffn-decode test-prefill-megakernel
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`. Benchmark process PCI bus IDs varied in logs
+  even though `nvidia-smi -L` reported one visible A6000.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Shape: BF16 FFN gate/up `DualGemm`, `M = rows`, `N = 15360`,
+  `K = 3840`, with fused tanh-GELU times up.
+- Timing: CUDA events on the same nonblocking stream over repeated launches;
+  launch overhead excluded from GPU elapsed time.
+- Warmup/iterations: main sweep used `10` warmups, `20` timed iterations, `3`
+  samples. Confirmation sweeps used `20` warmups, `50` timed iterations, `5`
+  samples where noted.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked.
+- Correctness: candidate output compared against the current production tile
+  before timing. Wrong zero-output candidates failed with max_abs around
+  `266-396` after the scale fix. Focused tests passed after the production
+  dispatch edit.
+
+Best corrected timings:
+
+```text
+rows  selected production tile   confirm best ms  speedup vs current
+16    64x64x32 s3                   0.345942 ms          1.096x
+64    64x64x32 s3                   0.351373 ms          1.066x
+96    128x64x32 s5                  0.355635 ms          1.055x
+128   128x64x32 s5                  0.358936 ms          1.054x
+256   256x64x32 s3                  0.473920 ms          1.058x
+512   256x64x32 s3                  0.991025 ms          1.034x
+1024  256x64x32 s3                  1.997306 ms          1.012x
+2048  256x64x32 s3                  3.823846 ms          1.079x
+4096  256x64x32 s3                  7.713193 ms          1.419x
+```
+
+Conclusion:
+
+- The old single `128x64x32 s3` production tile was not the best measured
+  choice for most row counts.
+- The kept dispatch is deliberately small: two new useful tile families plus
+  the measured row thresholds.
+- Several tempting wide-N templates appeared extremely fast only because they
+  produced wrong near-zero outputs; they remain benchmark-only rejected rows.
+
+## 2026-06-23 - CUTLASS 12B Exact Prefill Dispatch Sweep
+
+Question:
+
+- Are the production CUTLASS prefill GEMMs still using the best measured tile for
+  each Gemma 4 12B projection shape?
+
+Change:
+
+- Added exact `sliding_q` and `sliding_kv` shapes to the prefill tuner so the
+  benchmark matches the current unfused prefill path instead of relying on the
+  older packed-QKV proxy shape.
+- Updated production CUTLASS dispatch for exact 12B prefill projection shapes
+  and FFN down. Unknown shapes keep the old generic two-tile fallback.
+
+Commands:
+
+```bash
+nvidia-smi --query-gpu=name,gpu_bus_id,driver_version,persistence_mode,ecc.mode.current,mig.mode.current,power.limit,clocks.sm,clocks.mem,temperature.gpu,power.draw,utilization.gpu --format=csv
+/usr/local/cuda/bin/nvcc --version
+make sgemm-bf16-prefill-bench
+python3 src/experiments/gemma4_prefill_tune.py \
+  --backend sgemm-bf16 \
+  --ops ffn_down,sliding_q,sliding_kv,sliding_o,global_q,global_k,global_o \
+  --configs bf16_cutlass_64x64_s10,bf16_cutlass_64x128x64,bf16_cutlass_64x128_s6,bf16_cutlass_128x128x64,bf16_cutlass_128x128_s5,bf16_cutlass_128x256,bf16_cutlass_256x128 \
+  --m 16,64,96,128,256,512,1024 \
+  --iters 20 --warmup 10 \
+  --cublas-backend lt --cublaslt-heuristics 32 --graph-repeats 10 \
+  --skip-build --keep-going \
+  --out build/experiments/gemma4_prefill_tune/2026-06-23_cutlass_12b_exact_prefill_h32.csv
+make test-prefill-gemm test-ffn-decode
+make test-prefill-megakernel
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver 580.126.16, persistence enabled, ECC
+  disabled, power limit 300 W.
+- Toolchain: `/usr/local/cuda/bin/nvcc` reports CUDA 13.0.48, even though the
+  project target notes still say CUDA 12.x.
+- Timing: child benchmark CUDA events, with CUDA graph replay when
+  `GEMMA4_PREFILL_GRAPH_REPEATS=10`.
+- Warmup/iterations: 10 warmup iterations and 20 timed iterations per
+  op/config/M point.
+- Cache policy: warm repeated buffers.
+- Clock policy: clocks not locked.
+- Correctness: benchmark checks custom output against the cuBLAS/cuBLASLt
+  reference for every config; focused tests passed after the dispatch edit.
+
+Results:
+
+```text
+Exact measured shape grid, old production CUTLASS dispatch vs new measured dispatch:
+
+op          old_ms_sum  new_ms_sum  old/new
+ffn_down       2.7647      2.6619    1.039x
+sliding_q      0.7964      0.7404    1.076x
+sliding_kv     0.4703      0.3892    1.208x
+sliding_o      0.7674      0.7328    1.047x
+global_q       1.5291      1.4574    1.049x
+global_k       0.3667      0.1911    1.919x
+global_o       1.4875      1.4268    1.043x
+
+Weighted by production layer counts:
+old CUTLASS dispatch: 259.9480 ms
+new CUTLASS dispatch: 242.4376 ms
+old/new speedup:      1.072x
+cuBLASLt h32:         255.9424 ms
+new vs cuBLASLt h32:  1.056x
+```
+
+Conclusion:
+
+- The old row-only `64x128x64` / `128x128x64` CUTLASS rule was leaving
+  measurable performance on the table for exact 12B prefill shapes.
+- Shape-specific dispatch is worth keeping for the current CUTLASS prefill path.
+- Global K still strongly favors cuBLASLt in isolation, so a later unfused
+  baseline should compare replacing that specific CUTLASS call with cuBLASLt
+  rather than only retuning CUTLASS.
+- The FFN gate/up DualGemm tile was intentionally left out of this sweep and
+  handled by the follow-up entry above.
+
 ## 2026-06-20 - Fused LM-Head Gumbel Sampling Smoke
 
 Question:
@@ -2573,7 +3045,7 @@ Cache-order follow-up:
 - Changed the RoPE grid from `(rows, heads)` to `(heads, rows)` so heads are the fastest
   grid dimension, attempting to improve temporal locality for each position's cos/sin
   row.
-- Changed packed Q/K input loads from normal `load128` to streaming `load128cs`, while
+- Changed packed Q/K input loads from direct pack loads to streaming pack loads, while
   keeping output stores normal.
 - PTX confirmed the intended lowering:
   - row now uses `%ctaid.y`
@@ -2620,7 +3092,7 @@ Split A/B follow-up:
 
 - Added compile-time controls:
   - `GEMMA4_ROPE_HEAD_FAST_GRID`
-  - `GEMMA4_ROPE_QK_LOAD_CS`
+  - `GEMMA4_ROPE_QK_STREAMING_PACK`
 - Built four variants from the same source:
   - baseline: row-fast grid, normal Q/K loads
   - headfast: head-fast grid, normal Q/K loads
@@ -2632,7 +3104,7 @@ Build pattern:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
   -DGEMMA4_ROPE_HEAD_FAST_GRID=<0|1> \
-  -DGEMMA4_ROPE_QK_LOAD_CS=<0|1> \
+  -DGEMMA4_ROPE_QK_STREAMING_PACK=<0|1> \
   src/experiments/gemma4_rope_bench.cu src/gemma4_rope.cu -lcudnn \
   -o build/experiments/rope_variants/<variant>
 ```
@@ -2646,28 +3118,28 @@ GEMMA4_ROPE_BENCH_SEED=0x20260521 \
 
 Custom CUDA graph timings:
 
-| Case | Seq | Baseline | Head-fast only | `load128cs` only | Both | Best |
+| Case | Seq | Baseline | Head-fast only | streaming-pack only | Both | Best |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Sliding | 1 | 0.001666 | 0.001707 | 0.001553 | 0.001646 | `load128cs` |
-| Sliding | 4 | 0.001672 | 0.001959 | 0.001639 | 0.001901 | `load128cs` |
+| Sliding | 1 | 0.001666 | 0.001707 | 0.001553 | 0.001646 | streaming-pack |
+| Sliding | 4 | 0.001672 | 0.001959 | 0.001639 | 0.001901 | streaming-pack |
 | Sliding | 16 | 0.002134 | 0.002122 | 0.002083 | 0.002015 | both |
 | Sliding | 64 | 0.003097 | 0.003188 | 0.003091 | 0.003065 | both |
 | Sliding | 256 | 0.016482 | 0.016036 | 0.015215 | 0.014943 | both |
-| Sliding | 1024 | 0.076787 | 0.076737 | 0.075305 | 0.076946 | `load128cs` |
+| Sliding | 1024 | 0.076787 | 0.076737 | 0.075305 | 0.076946 | streaming-pack |
 | Global | 1 | 0.001496 | 0.001556 | 0.001711 | 0.001563 | baseline |
 | Global | 4 | 0.001565 | 0.001646 | 0.001601 | 0.001651 | baseline |
-| Global | 16 | 0.001658 | 0.001820 | 0.001638 | 0.001956 | `load128cs` |
-| Global | 64 | 0.002805 | 0.002773 | 0.002658 | 0.002917 | `load128cs` |
-| Global | 256 | 0.006691 | 0.006674 | 0.006654 | 0.006777 | `load128cs` |
+| Global | 16 | 0.001658 | 0.001820 | 0.001638 | 0.001956 | streaming-pack |
+| Global | 64 | 0.002805 | 0.002773 | 0.002658 | 0.002917 | streaming-pack |
+| Global | 256 | 0.006691 | 0.006674 | 0.006654 | 0.006777 | streaming-pack |
 | Global | 1024 | 0.029790 | 0.031470 | 0.029804 | 0.031625 | baseline |
 
 Conclusion:
 
 - Head-fast grid order alone was not a clear win and hurt several small/large cases.
-- `load128cs` alone was the best isolated change overall: it improved sliding
+- The streaming-pack load variant was the best isolated change overall: it improved sliding
   `seq=1024` by about `2%`, improved several mid-size sliding/global cases, and was
   essentially tied with baseline at global `seq=1024`.
-- The retained default is row-fast grid with `load128cs` enabled. Head-fast grid remains
+- The retained default is row-fast grid with streaming pack loads enabled. Head-fast grid remains
   available behind `GEMMA4_ROPE_HEAD_FAST_GRID=1` for future experiments.
 
 ## 2026-05-21 - RoPE FP32 accumulation numerical consistency
@@ -5042,14 +5514,14 @@ Reason:
 
 - The decode GEMV kernels were still loading one BF16 pair per instruction through `__nv_bfloat162`.
 - The input vector is small and reused by every CTA, while projection weights are large one-pass streams.
-- This pass keeps normal cached loads for the reused input vector and marks the weight stream with the existing `Packed128` + `load128cs` helper.
+- This pass keeps normal cached loads for the reused input vector and marks the weight stream with an explicit streaming pack load.
 
 Implementation:
 
 - Changed the fixed-four decode dot helper from half2-style 32-bit loads to `Packed128<__nv_bfloat16>` loads.
 - Each load now covers 8 BF16 values per thread.
-- Weight row loads use `load128cs`, which SASS emits as `LDG.E.EF.128` on this build.
-- Input-vector loads use `load128`, which SASS emits as `LDG.E.128.CONSTANT` on this build.
+- Weight row loads use streaming 128-bit pack loads, which SASS emits as `LDG.E.EF.128` on this build.
+- Input-vector loads use direct 128-bit pack loads, which SASS emits as `LDG.E.128.CONSTANT` on this build.
 - Packed the four BF16 outputs into one 64-bit store in the fixed-four path.
 - Templated the dot helper on `Threads` so the packed loop can use the compile-time stride.
 - Added `__restrict__` on kernel/device pointer parameters.
@@ -5537,7 +6009,7 @@ Decode GEMV implementation conclusions:
 - Prefill dense GEMMs should use cuBLAS or cuBLASLt. Those library GEMMs can use tensor cores automatically for BF16 tensor-op math when the library selects a tensor-core algorithm.
 - cuBLAS and cuDNN are host APIs. They cannot be called from inside a device-side fused kernel.
 - `Packed128` is already implemented and retained. Decode GEMV uses 128-bit BF16 packed loads instead of the older 32-bit half2-style BF16 pair load pattern.
-- The useful retained cache hint is streaming global load for weights through `load128cs`, because weights are streamed through the decode GEMV.
+- The useful retained cache hint is streaming global load for weights, because weights are streamed through the decode GEMV.
 - The input vector load remains normally cached, because the same input row is reused across output columns.
 - Broad L2 persisting-cache windows or persisting hints for the B/weight matrix were tried and removed because they hurt performance.
 - There is no broad persisting L2 policy currently retained for decode GEMV.
@@ -5627,7 +6099,7 @@ Follow-up work:
 Change:
 
 - Updated the generic decode GEMV route from `cols_per_block=2` to `cols_per_block=8`.
-- Added an eight-BF16 output store helper so an eight-column block writes its result with one 128-bit store.
+- Changed the eight-column block to write its eight BF16 outputs with one 128-bit store.
 - Changed the fixed decode output paths for `ffn_down`, `global_o`, and `final_logits` from the old four-column store path to the same eight-column kernel route.
 - Removed the now-unused fixed4 helper/kernel code so the matmul source no longer has a 64-bit BF16 output-store path.
 
@@ -5966,10 +6438,10 @@ GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 1
 
 Variants tested:
 
-- Baseline: current `load128cs` streaming weight loads.
+- Baseline: current streaming 128-bit weight loads.
 - `prefetch_next_iter`: inline `prefetch.global.L2` for the next K-stride `x` pack and all eight next K-stride weight packs.
 - `prefetch_next_col`: inline `prefetch.global.L2` for the next output column's weight pack before loading/computing the current column.
-- `normal_weight_load`: replace streaming `load128cs` weight loads with normal `load128` weight loads.
+- `normal_weight_load`: replace streaming 128-bit weight loads with normal direct 128-bit weight loads.
 
 Resource result:
 
@@ -6005,7 +6477,7 @@ Weighted decode projection total:
 Conclusion:
 
 - Do not keep explicit L2 prefetching in this kernel.
-- Do not switch the weight loads from streaming `load128cs` to normal `load128`.
+- Do not switch the weight loads from streaming 128-bit loads to normal direct 128-bit loads.
 - The current access pattern already has coalesced 128-bit streaming weight loads and enough resident warps to hide latency; extra prefetch instructions mostly add overhead.
 - Shared-memory double buffering is not attractive for this mapping because the weight packs are one-use data with no cross-thread reuse, and `x` is already loaded once per thread and reused across all eight columns.
 - A useful async-copy/double-buffer design likely needs a different tile mapping where staged data is reused by multiple consumers.
@@ -6126,9 +6598,9 @@ Question:
 
 Implementation:
 
-- Added inlined decode load helpers:
-  - `gemma4_load_activation_pack(...)` uses `load128(...)`.
-  - `gemma4_load_streaming_weight_pack<K>(...)` uses `load128cs(...)`.
+- Added inlined decode pack-load helpers:
+  - activation packs use direct 128-bit loads.
+  - weight packs use streaming 128-bit loads.
 - Added a compile-time contract that `Gemma4Bf16Pack` maps to one aligned `int4` load.
 - Added a host-side decode pointer guard for non-null, 16-byte-aligned `x`, `w_col_major`, and `y`.
 - Kept the runtime path as global memory -> registers -> ALUs; no shared-memory staging.
@@ -6187,7 +6659,7 @@ Conclusion:
 
 - Keep this shape. The helper split makes the intended memory policy explicit without changing the generated load instructions.
 - The tiny timing delta is noise-level against the prior direct-load baseline.
-- This reinforces the current decision: use `load128` for reused activation packs, `load128cs` for streaming weight packs, and avoid shared-memory async copy until the GEMV mapping has real staged-data reuse.
+- This reinforces the current decision: use direct loads for reused activation packs, streaming loads for weight packs, and avoid shared-memory async copy until the GEMV mapping has real staged-data reuse.
 
 ## 2026-05-19 - Decode GEMV register double-buffer cleanup and bench
 
@@ -6344,7 +6816,7 @@ Conclusion:
 
 - The cp.async path is correct and actually emits cp.async instructions, but it is slower for this GEMV mapping.
 - The slowdown is expected: each weight pack is still one-use data, so shared-memory staging adds async-copy, commit/wait, and shared-load overhead without reducing DRAM traffic.
-- Keep cp.async as a compile-time experiment path only. The runtime default should remain the direct `load128`/`load128cs` path.
+- Keep cp.async as a compile-time experiment path only. The runtime default should remain the direct 128-bit pack-load path.
 
 ## 2026-05-19 - Nsight Compute counter profiling attempt for decode GEMV
 
@@ -6439,7 +6911,7 @@ Conclusion:
 - This is not a benchmark-code or cuBLAS/cuDNN issue; it reproduces with a CUDA-only harness.
 - No reliable hardware-counter conclusion can be drawn from this environment. To answer the bandwidth-vs-latency question properly, rerun the same `ncu` commands on a production instance or another host where CUPTI/Nsight Compute profiling is supported.
 
-## 2026-05-19 - Decode GEMV cp.async debug with load128/load128cs staging
+## 2026-05-19 - Decode GEMV cp.async debug with direct/streaming staging
 
 Runtime file tested: `src/gemma4_matmul_kernels.cu`
 
@@ -6452,8 +6924,8 @@ Implementation:
 - Kept the same two-stage shared-memory layout used by the cp.async path:
   `Gemma4Bf16Pack weight_stages[2][Threads]`.
 - Added two compile-time sibling variants:
-  - `GEMMA4_DECODE_SHARED_STAGE_LOAD128`
-  - `GEMMA4_DECODE_SHARED_STAGE_LOAD128CS`
+  - `GEMMA4_DECODE_SHARED_STAGE_DIRECT_PACK`
+  - `GEMMA4_DECODE_SHARED_STAGE_STREAMING_PACK`
 - Both variants use the same shared-stage consume path as cp.async, but stage data with normal global loads instead of `__pipeline_memcpy_async`.
 - The direct default path remains unchanged.
 
@@ -6466,16 +6938,16 @@ GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 1
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER"
 GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
 
-make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_LOAD128"
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_DIRECT_PACK"
 GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
 
-make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_LOAD128CS"
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_STREAMING_PACK"
 GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
 ```
 
 Timing, seeded `all 50 10 3`:
 
-| Op | Direct | cp.async | Shared `load128` | Shared `load128cs` |
+| Op | Direct | cp.async | Shared direct pack | Shared streaming pack |
 | --- | ---: | ---: | ---: | ---: |
 | `ffn_gate_up` | 0.651158 | 0.654705 | 0.652065 | 0.651222 |
 | `ffn_down` | 0.328492 | 0.329076 | 0.329271 | 0.328312 |
@@ -6492,8 +6964,8 @@ Weighted decode projection total:
 | --- | ---: |
 | Direct | 86.988 |
 | cp.async | 87.481 |
-| Shared `load128` | 87.105 |
-| Shared `load128cs` | 86.983 |
+| Shared direct pack | 87.105 |
+| Shared streaming pack | 86.983 |
 
 PTX/resource check:
 
@@ -6501,13 +6973,13 @@ PTX/resource check:
 | --- | --- | --- | --- | --- |
 | Direct | `63`, `72` | `512B`, `1024B` | `0/0` | `ld.global.cs=56`, `ld.global.nc=7` |
 | cp.async | `54`, `55` | `16896B`, `33792B` | `0/0` | `cp.async.cg.shared.global=56`, `commit_group=56`, `wait_group=56` |
-| Shared `load128` | `59`, `60` | `16896B`, `33792B` | `0/0` | `ld.global.nc=63`, no cp.async |
-| Shared `load128cs` | `64` | `16896B`, `33792B` | `0/0` | `ld.global.cs=56`, `ld.global.nc=7`, no cp.async |
+| Shared direct pack | `59`, `60` | `16896B`, `33792B` | `0/0` | `ld.global.nc=63`, no cp.async |
+| Shared streaming pack | `64` | `16896B`, `33792B` | `0/0` | `ld.global.cs=56`, `ld.global.nc=7`, no cp.async |
 
 Interpretation:
 
-- Shared-memory staging itself is not the issue. Shared `load128cs` is essentially tied with direct.
-- The weight load policy matters: shared `load128cs` beats shared `load128`, matching the direct path's streaming-weight policy.
+- Shared-memory staging itself is not the issue. Shared streaming pack loads are essentially tied with direct.
+- The weight load policy matters: shared streaming pack loads beat shared direct pack loads, matching the direct path's streaming-weight policy.
 - The cp.async-specific overhead is the likely issue in this mapping: the compiler emits one `cp.async`, one commit, and one wait group per staged weight pack group in the unrolled column loop.
 - The work between issuing the next stage and waiting for it is only one 16-byte-pack BF16 dot contribution, so there is not enough independent compute to amortize commit/wait overhead.
 
@@ -6948,15 +7420,15 @@ Tuning sweep:
 | Late weight load, min-blocks 1 | 0.090030 | 0.090300 | -0.21% |
 | Late weight load, min-blocks 2 | 0.089957 | 0.090114 | -0.29% |
 | Late weight load, min-blocks 2, cached input loads | 0.089807 | 0.090009 | -0.46% |
-| Same plus streaming stores | 0.089786 | 0.089957 | -0.48% |
+| Same plus alternate write variant | 0.089786 | 0.089957 | -0.48% |
 | Final simplified kept code | 0.089864 | 0.090050 | -0.39% |
 
-The streaming-store candidate moved the aggregate by only about `0.023%` versus the
+The alternate-store candidate moved the aggregate by only about `0.023%` versus the
 previous candidate, below the requested `0.05%` stopping threshold, so tuning stopped
 there. The final kept code uses the meaningful settings only:
 
 - `__launch_bounds__(Threads, 2)` for the hidden prefill kernel
-- cached `load128g` input loads for `inp1` and `inp2`
+- cached input pack loads for `inp1` and `inp2`
 - no early gamma/weight prefetch; load the weight at output application time
 - ordinary global stores for residual and normed outputs
 
@@ -9556,9 +10028,9 @@ Implementation:
   - `accum_hi[672][4]`
 - This keeps scratch float storage unchanged while making each lo/hi vector
   instruction contiguous across warp lanes.
-- Changed FFN decode's default weight load policy in this translation unit to
-  streaming `.cs` (`GEMMA4_WEIGHT_LOAD_POLICY=0`) so the enormous one-use FFN
-  weights do not compete as aggressively for cache.
+- Changed FFN decode's default weight loads in this translation unit to
+  streaming `.cs` so the enormous one-use FFN weights do not compete as
+  aggressively for cache.
 - Changed the default intermediate tile from `512` to `672`, reducing scratch
   reduction turns from `42` to `32`.
 
@@ -12492,7 +12964,7 @@ Scope:
   compile-time specialization through `softmax_rescale_impl`.
 - Folded causal and local block-visibility helpers into the single templated
   `gemma4_score_block_fully_visible<IsLocal>` helper.
-- Reused one O-store helper and one LSE-row writer for the empty-block path and
+- Reused one O-output path and one LSE-row writer for the empty-block path and
   normal epilogue.
 - Removed dead FA helper generality: `ScaleMax`, `AInRegs`/`BInRegs`, and the
   unpredicated `gemma4_fa_copy` wrapper.
@@ -13011,8 +13483,8 @@ Change:
 - Replaced the local projection decode GEMV body in
   `src/gemma4_matmul_kernels.cu` with
   `gemma4_matmul_device::decode_gemv_cols_device`.
-- Kept `GEMMA4_WEIGHT_LOAD_POLICY=0` for the projection decode translation unit,
-  preserving the previous `.cs` streaming weight-load behavior.
+- Kept streaming weight loads for the projection decode translation unit,
+  preserving the previous `.cs` behavior.
 - Added `src/gemma4_matmul_device.cuh` to the projection object dependencies.
 - Removed a tracked empty `src/src/gemma4_ffn_decode.cu` file and a tracked
   Python bytecode cache file.
@@ -13822,3 +14294,290 @@ Conclusion:
 - No final-logits launch change was kept; the current `1024` threads remain a
   reasonable baseline until a more serious sampler/logits benchmark says
   otherwise.
+
+## 2026-06-25 - FFN LibTorch Baseline Replacement
+
+Question: replace the FFN cuDNN Frontend comparator with a direct LibTorch
+baseline while keeping the same CUDA-event timing contract.
+
+Change:
+
+- Deleted `src/benches/gemma4_ffn_cudnn_bench.cu`.
+- Added `src/benches/gemma4_ffn_libtorch_bench.cu`.
+- Replaced `make ffn-cudnn-bench` with `make ffn-libtorch-bench`.
+- The LibTorch baseline computes packed gate/up, `gelu(..., "tanh") * up`,
+  and down projection with preallocated BF16 tensors. Custom CUDA rows still use
+  the same swizzled weights and CUDA-event timers.
+
+Commands:
+
+```bash
+make ffn-cudnn-bench
+./build/benches/gemma4_ffn_cudnn_bench 20 5 3 16
+make ffn-libtorch-bench
+./build/benches/gemma4_ffn_libtorch_bench 20 5 3 16
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`.
+- Shape: `tokens=16`, hidden `3840`, intermediate `15360`, BF16.
+- Timing: CUDA events on the same stream, `5` warmups, `20` iterations, `3`
+  trials. Graph rows time replay only and exclude capture.
+- Cache policy: warm repeated buffers for direct/graph rows; cold custom rows
+  flush L2 with a `256 MiB` buffer before each measured invocation.
+- Clock policy: clocks were not locked.
+
+Result:
+
+```text
+old cuDNN down graph best ms      0.171701
+new LibTorch down graph best ms   0.172162
+new LibTorch full FFN graph ms    0.547880
+new custom prefill graph ms       0.523838
+custom vs LibTorch max_abs        9.53674e-07
+```
+
+Conclusion:
+
+- The down-projection baseline speed is effectively unchanged across cuDNN and
+  LibTorch for the same shape.
+- The stripped cuDNN `geglu`/`full_ffn` rows were not trustworthy after status
+  checks were removed, so the full-FFN replacement should be compared against
+  the new LibTorch row going forward.
+
+## 2026-06-25 - FFN LibTorch Prefill Shape Sweep
+
+Question: measure custom FFN prefill against the LibTorch full-FFN baseline
+across the token counts `1,2,4,8,16,32,64,128,256,512,1024`, and report the
+single-token decode row from the same benchmark.
+
+Command:
+
+```bash
+make ffn-libtorch-bench
+for tokens in 1 2 4 8 16 32 64 128 256 512 1024; do
+  GEMMA4_FFN_LIBTORCH_BENCH_SEED=0x12345678 \
+    ./build/benches/gemma4_ffn_libtorch_bench 100 20 5 "$tokens"
+done
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`.
+- Timing: CUDA events on the benchmark stream; graph rows time replay only and
+  exclude capture. `20` warmups, `100` iterations, `5` trials.
+- Cache policy: warm repeated buffers for direct/graph rows; cold decode rows
+  flush L2 with the benchmark's `256 MiB` buffer.
+- Clock policy: clocks were not locked. The GPU was idle before and after the
+  sweep; idle snapshots were `210 MHz` SM and `405 MHz` memory.
+- Correctness: custom prefill vs LibTorch max abs stayed at `<=1.90735e-06`.
+
+Graph-best result:
+
+```text
+tokens  libtorch ms  custom prefill ms  speedup
+1          0.515952            0.519453   0.993x
+2          0.534187            0.520805   1.026x
+4          0.536403            0.521169   1.029x
+8          0.539919            0.521788   1.035x
+16         0.547369            0.523215   1.046x
+32         0.535938            0.523210   1.024x
+64         0.549779            0.529066   1.039x
+128        0.597995            0.559966   1.068x
+256        0.930442            0.889440   1.046x
+512        1.766559            1.666567   1.060x
+1024       3.457877            3.113875   1.110x
+```
+
+Decode note:
+
+- The decode row is single-token regardless of the `tokens` argument. At
+  `tokens=1`, custom decode graph best was `0.500241 ms` versus LibTorch
+  one-token full FFN graph best `0.515952 ms`, or `1.031x`.
+- The decode row includes post-FFN residual/RMSNorm work; the LibTorch row is
+  the FFN MLP baseline, so this is a conservative but not perfectly identical
+  comparison.
+
+Conclusion:
+
+- Custom prefill is consistently only modestly faster: roughly tied at one row,
+  `1.02-1.07x` for most smaller/mid shapes, and `1.11x` at `1024` rows.
+- This matches the implementation: custom prefill fuses gate/up + GeGLU, but
+  still writes the activation to HBM before the separate down GEMM.
+
+## 2026-06-26 - FFN Decode Stage and Cache-Load Ablation
+
+Question: check whether steady-state FFN decode benefits from changing the
+CUTLASS buffering stages or explicit cache-policy vector loads. The cache-load
+variants only touched the handwritten FFN pack loads in swizzle/finalize; the
+CUTLASS GEMM internal loads stayed on their library path.
+
+Commands:
+
+```bash
+make -B build/benches/gemma4_ffn_libtorch_bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=0x12345678 \
+  ./build/benches/gemma4_ffn_libtorch_bench 50 10 5 1
+
+make -B build/benches/gemma4_ffn_libtorch_bench \
+  CPPFLAGS='-Isrc -DGEMMA4_FFN_DOWN_STAGE_ROWS64=2'
+make -B build/benches/gemma4_ffn_libtorch_bench \
+  CPPFLAGS='-Isrc -DGEMMA4_FFN_DOWN_STAGE_ROWS64=12'
+make -B build/benches/gemma4_ffn_libtorch_bench \
+  CPPFLAGS='-Isrc -DGEMMA4_FFN_GATE_UP_STAGE_ROWS128=3 -DGEMMA4_FFN_DOWN_STAGE_ROWS128=2'
+make -B build/benches/gemma4_ffn_libtorch_bench \
+  CPPFLAGS='-Isrc -DGEMMA4_FFN_VECTOR_LOAD_POLICY=N'
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`.
+- Toolchain: CUDA `13.0.48`, PyTorch `2.11.0+cu130`.
+- Timing: CUDA events on the benchmark stream; graph rows time replay only and
+  exclude capture. `10` warmups, `50` iterations, `5` trials, `tokens=1`.
+- Cache policy: warm repeated buffers for graph rows; cold rows use the
+  benchmark's L2 flush. Clocks were not locked.
+- Correctness: custom prefill vs LibTorch full FFN max abs was `9.53674e-07`
+  in every measured variant.
+
+Result:
+
+```text
+variant              graph ms  graph-clear ms  cold-flush-clear ms
+default direct         0.520710       0.519597             0.523085
+down stages=2          0.623961       0.622887             0.626543
+down stages=12         0.521533       0.520452             0.524011
+load __ldg             0.520214       0.519139             0.522956
+load ld.global.cg      0.520431       0.519351             0.523465
+load ld.global.ca      0.520799       0.519624             0.523666
+load ld.global.cs      0.520404       0.519312             0.523331
+```
+
+Rows-128 prefill stage check:
+
+```text
+variant                   custom prefill graph ms  libtorch full graph ms
+default gate/down 5/6                    0.554886              0.597487
+reduced gate/down 3/2                    0.722149              0.597111
+```
+
+Notes:
+
+- For the single-token path, `rows <= 64` is the active stage branch. Default
+  stages are gate/up `3` and down `10`.
+- At `tokens=128`, the active prefill branch uses gate/up `5` and down `6`.
+- Gate/up `Stages=2` did not compile because the CUTLASS DualGemm example path
+  asserts `Stages >= 3`.
+
+Conclusion:
+
+- Keep the current down `Stages=10` default. Reducing it to `2` regressed
+  decode by about `20%`; increasing it to `12` was slightly slower than
+  default. The `tokens=128` reduced-stage check also regressed badly, so the
+  existing deeper prefill staging should stay.
+- Keep direct/default FFN vector loads. `__ldg`, `cg`, `ca`, and `cs` were all
+  within noise on this benchmark, and the tiny `__ldg` win was not large enough
+  to justify changing the default.
+- Follow-up cleanup removed the live ablation knobs after this result; rerunning
+  the sweep requires reintroducing temporary compile-time hooks.
+
+## 2026-06-26 - Prompt Runner Warm Serving vs vLLM
+
+Question: compare the local `gemma4_prompt` warm serving path against vLLM on
+the same A6000 for single-user TTFT and decode TPS.
+
+Commands:
+
+```bash
+make prompt
+./build/gemma4_prompt --benchmark-mode warm-serving --bench-warmup 3 \
+  --bench-iters 5 --bench-samples 3 --max-new 16 --prompt Hello \
+  | tee build/bench_results/gemma4_prompt_warm_equal_hello_out16_c1.txt
+
+python3 - <<'PY'
+from pathlib import Path
+path = Path("build/bench_results/hello_prompt_15x.jsonl")
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text('{"prompt":"Hello","output_tokens":16}\n' * 15)
+PY
+
+uv run vllm serve models/gemma-4-12B --host 127.0.0.1 --port 8000 \
+  --served-model-name gemma4-12b --dtype bfloat16 --max-model-len 64 \
+  --gpu-memory-utilization 0.99 --language-model-only --trust-remote-code \
+  --disable-log-stats --max-num-seqs 1 --max-num-batched-tokens 64 \
+  -cc.cudagraph_mode=NONE
+
+uv run vllm bench serve --backend openai \
+  --base-url http://127.0.0.1:8000 --model gemma4-12b \
+  --tokenizer models/gemma-4-12B --trust-remote-code \
+  --dataset-name custom --dataset-path build/bench_results/hello_prompt_15x.jsonl \
+  --skip-chat-template --output-len 16 --num-prompts 15 --num-warmups 3 \
+  --request-rate inf --max-concurrency 1 --temperature 0 \
+  --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,95,99 \
+  --save-result --result-dir build/bench_results \
+  --result-filename vllm_warm_equal_hello_out16_c1_compiled_nocg_warm2.json \
+  --disable-tqdm
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, MIG disabled, power limit `300 W`.
+- Software: local runner reported CUDA driver/runtime `13000`; vLLM `0.23.0`
+  on PyTorch `2.11.0+cu130`. `nvcc` was not on the shell path for this run.
+- Shape: literal prompt text `Hello`, prompt length `1` token for both paths,
+  output length `16`, concurrency `1`, `3` warmup requests, `15` measured
+  requests.
+- Local timing: host wall clock; model load, CUDA context, and allocation
+  excluded; tokenization, prompt H2D copy, prefill, per-token host sync, and
+  decode included. Detokenization is included only in end-to-end latency.
+- vLLM timing: `vllm bench serve` through the OpenAI completions endpoint;
+  tokenizer, HTTP/server overhead, scheduler, prefill, decode, and streaming
+  are included.
+- vLLM caveat: the unconstrained compiled vLLM server failed KV-cache
+  initialization on this A6000. The measured vLLM baseline kept compile enabled
+  but required `max_num_seqs=1`, `max_num_batched_tokens=64`,
+  `gpu_memory_utilization=0.99`, and disabled CUDA graph capture with
+  `-cc.cudagraph_mode=NONE`. Startup only succeeded after the compile cache was
+  warm.
+- Cache/clock policy: serving benchmark uses warm steady-state requests after
+  warmup. Clocks were not locked.
+- Equality caveat: the request shape and token counts are matched exactly, but
+  the interfaces are still different. The local runner is in-process, while
+  vLLM is measured as an HTTP serving stack. A perfectly identical comparison
+  would require either wrapping the local runner in the same serving protocol or
+  adding a vLLM in-process TTFT/TPOT harness with the same streaming semantics.
+- Run note: the first vLLM pass JIT-compiled three Triton kernels during
+  initial/warmup traffic. The charted result is the second pass on the same
+  already-warmed server; no new JIT warnings appeared during that pass.
+
+Result:
+
+```text
+runner                         p50 TTFT ms   p50 TPOT ms   p50 decode TPS
+gemma4_prompt local                 38.878        75.120            13.312
+vLLM serve compiled no CG          208.512        96.762            10.335
+```
+
+Artifacts:
+
+- `build/bench_results/gemma4_prompt_warm_equal_hello_out16_c1.txt`
+- `build/bench_results/hello_prompt_15x.jsonl`
+- `build/bench_results/vllm_warm_equal_hello_out16_c1_compiled_nocg_warm2.json`
+- `build/bench_results/gemma4_vs_vllm_summary.json`
+- `build/bench_results/ttft_p50_gemma4_vs_vllm.png`
+- `build/bench_results/tps_p50_gemma4_vs_vllm.png`
+
+Conclusion:
+
+- Under the compiled/no-CUDA-graph vLLM baseline that fits on this machine, the
+  local runner wins on both requested P50 metrics: lower TTFT and higher decode
+  TPS.
+- Do not generalize this as a production vLLM win yet. The comparison is not
+  perfectly apples-to-apples because the local path is an in-process runner,
+  while vLLM is serving through an HTTP-compatible API and had to disable CUDA
+  graph capture due memory pressure.

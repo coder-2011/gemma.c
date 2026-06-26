@@ -24,18 +24,19 @@ struct PrefillAttentionShape {
 
 // Scales one 128-bit BF16 pack for the local scale benchmark wrapper.
 __device__ inline void scale_hidden_pack_bf16(
-    floatX *__restrict__ out,
-    const floatX *__restrict__ in,
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ in,
     float scale,
     int pack) {
   const int offset = pack * kBf16Packed128Elements;
-  Bf16Packed128 values = load128g(in + offset);
-  Bf16Packed128 result = gemma4_bf16_pack_apply_scale(values, scale);
-  store128(out + offset, result);
+  const Bf16Packed128 values =
+      Bf16Packed128{*reinterpret_cast<const int4 *>(in + offset)};
+  const Bf16Packed128 result = gemma4_bf16_pack_apply_scale(values, scale);
+  *reinterpret_cast<int4 *>(out + offset) = result.bits();
 }
 
 // Returns the fixed Gemma 4 attention dimensions for the selected layer type.
-PrefillAttentionShape prefill_attention_shape(bool global) {
+constexpr PrefillAttentionShape prefill_attention_shape(bool global) {
   if (global) {
     return {GEMMA4_GLOBAL_Q_PROJ_SIZE,
             GEMMA4_GLOBAL_K_PROJ_SIZE,
@@ -50,9 +51,9 @@ PrefillAttentionShape prefill_attention_shape(bool global) {
 
 // Multiplies one hidden tensor by the per-layer scalar after both sublayers.
 __global__ __launch_bounds__(kScaleThreads) void scale_hidden_bf16_kernel(
-    floatX *__restrict__ out,
-    const floatX *__restrict__ in,
-    const floatX *__restrict__ layer_scalar,
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ in,
+    const __nv_bfloat16 *__restrict__ layer_scalar,
     int packs) {
   const int pack = blockIdx.x * blockDim.x + threadIdx.x;
   if (pack >= packs) {
@@ -163,8 +164,7 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
   if (rows64 == 0) {
     return cudaSuccess;
   }
-  if (rows64 > INT_MAX ||
-      rows64 > INT_MAX / GEMMA4_HIDDEN_SIZE) {
+  if (rows64 > INT_MAX / GEMMA4_HIDDEN_SIZE) {
     return cudaErrorInvalidValue;
   }
 
@@ -172,14 +172,31 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
   const PrefillAttentionShape shape = prefill_attention_shape(global);
   const int32_t rows = static_cast<int32_t>(rows64);
   if (args.out == nullptr || args.hidden == nullptr ||
-      args.weights == nullptr || args.cos == nullptr || args.sin == nullptr ||
+      args.weights == nullptr ||
       args.softmax_scale <= 0.0f || !is_aligned_16(args.out)) {
     return cudaErrorInvalidValue;
   }
 
   const Gemma4TextLayerWeightsDevice *weights = args.weights;
-  if (weights->layer_scalar == nullptr ||
-      scratch.capacity_rows < rows || scratch.global != global) {
+  // Token pointers are used by FA and long-sliding cache pointer arithmetic.
+  const bool missing_token_args =
+      args.token_batch == nullptr || args.token_position == nullptr;
+  const bool missing_scratch =
+      scratch.hidden_work == nullptr ||
+      scratch.post_attention_residual == nullptr ||
+      scratch.pre_ffn_normed == nullptr ||
+      scratch.ffn.act == nullptr || scratch.ffn.down == nullptr;
+  const bool missing_weights =
+      weights->layer_scalar == nullptr ||
+      weights->input_norm_weight == nullptr ||
+      weights->post_attention_norm_weight == nullptr ||
+      weights->pre_feedforward_norm_weight == nullptr ||
+      weights->post_feedforward_norm_weight == nullptr ||
+      weights->ffn_gate_up_decode == nullptr ||
+      weights->ffn_down_decode == nullptr;
+  if (missing_token_args || missing_scratch || missing_weights ||
+      scratch.capacity_rows < rows ||
+      scratch.global != global) {
     return cudaErrorInvalidValue;
   }
 
@@ -189,21 +206,38 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
       global ? GEMMA4_GLOBAL_KV_HEADS : GEMMA4_SLIDING_KV_HEADS;
   const int32_t expected_cache_head_dim =
       global ? GEMMA4_GLOBAL_HEAD_DIM : GEMMA4_SLIDING_HEAD_DIM;
-  const int32_t expected_cache_window = global ? 0 : GEMMA4_SLIDING_WINDOW;
+  const bool valid_cache_window =
+      global ? args.cache_config.window_size == 0
+             : args.cache_config.window_size > 0 &&
+                   args.cache_config.window_size <= GEMMA4_SLIDING_WINDOW;
   if (args.cache_config.num_layers != expected_cache_layers ||
       args.cache_config.num_pages <= 0 || args.cache_config.page_size <= 0 ||
       args.cache_config.max_pages_per_seq <= 0 ||
+      args.cache_config.num_pages % args.cache_config.max_pages_per_seq != 0 ||
       args.cache_config.num_heads != expected_cache_heads ||
       args.cache_config.head_dim != expected_cache_head_dim ||
-      args.cache_config.window_size != expected_cache_window) {
+      !valid_cache_window) {
+    return cudaErrorInvalidValue;
+  }
+  const int32_t cache_batch_capacity =
+      args.cache_config.num_pages / args.cache_config.max_pages_per_seq;
+  if (cache_batch_capacity < args.batch_size) {
+    return cudaErrorInvalidValue;
+  }
+  // Sliding prefill keeps only the live tail, which can straddle an extra page.
+  const int32_t first_cached_pos =
+      (!global && args.seq_len > GEMMA4_SLIDING_WINDOW)
+          ? args.seq_len - GEMMA4_SLIDING_WINDOW
+          : 0;
+  const int32_t required_cache_pages =
+      (args.seq_len - 1) / args.cache_config.page_size -
+      first_cached_pos / args.cache_config.page_size + 1;
+  if (required_cache_pages > args.cache_config.max_pages_per_seq) {
     return cudaErrorInvalidValue;
   }
 
   const int32_t cache_layer =
       gemma4_kv_cache_layer_index(args.layer_index, global);
-  if (cache_layer < 0) {
-    return cudaErrorInvalidValue;
-  }
 
   cudaError_t status = gemma4_rmsnorm_bf16(
       scratch.hidden_work, args.hidden, weights->input_norm_weight, rows,

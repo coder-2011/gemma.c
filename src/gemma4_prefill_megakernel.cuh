@@ -1,5 +1,4 @@
-#ifndef GEMMA4_PREFILL_MEGAKERNEL_CUH
-#define GEMMA4_PREFILL_MEGAKERNEL_CUH
+#pragma once
 
 #include "gemma4_checkpoint.cuh"
 #include "gemma4_ffn.cuh"
@@ -10,7 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef struct {
+struct Gemma4PrefillMegakernelLayerScratch {
   int32_t capacity_rows = 0;
   bool global = false;
   __nv_bfloat16 *hidden_work = nullptr;
@@ -25,9 +24,9 @@ typedef struct {
   __nv_bfloat16 *v_prepared = nullptr;
   __nv_bfloat16 *attention_out = nullptr;
   Gemma4FfnPrefillScratch ffn = {};
-} Gemma4PrefillMegakernelLayerScratch;
+};
 
-typedef struct {
+struct Gemma4PrefillMegakernelLayerArgs {
   __nv_bfloat16 *out = nullptr;
   const __nv_bfloat16 *hidden = nullptr;
   const Gemma4TextLayerWeightsDevice *weights = nullptr;
@@ -44,11 +43,10 @@ typedef struct {
   const int32_t *page_table = nullptr;
   const int32_t *token_batch = nullptr;
   const int32_t *token_position = nullptr;
-  int32_t cache_layer = 0;
 
   float eps = GEMMA4_RMS_NORM_EPS;
   cudaStream_t stream = nullptr;
-} Gemma4PrefillMegakernelLayerArgs;
+};
 
 // Returns the BF16 scratch elements needed for one prefill layer runner call.
 size_t gemma4_prefill_megakernel_layer_scratch_elements(bool global,
@@ -65,5 +63,3 @@ gemma4_prefill_megakernel_layer_scratch_from_buffer(
 cudaError_t gemma4_prefill_megakernel_layer_bf16(
     const Gemma4PrefillMegakernelLayerArgs &args,
     const Gemma4PrefillMegakernelLayerScratch &scratch);
-
-#endif

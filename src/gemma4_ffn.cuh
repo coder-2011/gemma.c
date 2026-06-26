@@ -1,34 +1,29 @@
-#ifndef GEMMA4_FFN_CUH
-#define GEMMA4_FFN_CUH
+#pragma once
 
 #include "gemma4.h"
+#include "gemma4_cuda_utils.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stddef.h>
 
-#define GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS 8
-#define GEMMA4_FFN_DECODE_FLOAT_PACK_ELEMENTS 4
-#define GEMMA4_FFN_DECODE_HIDDEN_PACKS \
-    (GEMMA4_HIDDEN_SIZE / GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS)
+static constexpr int GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS = 8;
+static constexpr int GEMMA4_FFN_DECODE_HIDDEN_PACKS =
+    GEMMA4_HIDDEN_SIZE / GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS;
 
-#ifndef GEMMA4_FFN_DECODE_REDUCTION_POLICY
-#define GEMMA4_FFN_DECODE_REDUCTION_POLICY 0
+#ifndef GEMMA4_FFN_DECODE_SWIZZLE_X
+static constexpr int GEMMA4_FFN_DECODE_SWIZZLE_X = 1;
 #endif
 
-#ifndef GEMMA4_FFN_DECODE_PARTIAL_GROUPS
-#define GEMMA4_FFN_DECODE_PARTIAL_GROUPS \
-    (2 * GEMMA4_FFN_DECODE_HIDDEN_PACKS)
+#ifndef GEMMA4_FFN_DECODE_THREADS
+static constexpr int GEMMA4_FFN_DECODE_THREADS =
+    GEMMA4_FFN_DECODE_HIDDEN_PACKS;
 #endif
 
 struct alignas(128) Gemma4FfnDecodeScratch {
-#if GEMMA4_FFN_DECODE_REDUCTION_POLICY == 1
-  float partials[GEMMA4_FFN_DECODE_PARTIAL_GROUPS]
-                [GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS]
-                [GEMMA4_FFN_DECODE_HIDDEN_PACKS];
-#endif
-  float accum[GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS]
-             [GEMMA4_FFN_DECODE_HIDDEN_PACKS];
+  __nv_bfloat16 act[GEMMA4_INTERMEDIATE_SIZE];
+  // Reused as swizzled hidden input before gate/up and swizzled down output.
+  __nv_bfloat16 down[GEMMA4_HIDDEN_SIZE];
 };
 
 struct Gemma4FfnPrefillScratch {
@@ -57,10 +52,6 @@ struct Gemma4FfnBf16Args {
   cudaStream_t stream = nullptr;
 };
 
-cudaError_t gemma4_ffn_decode_configure_scratch_l2(
-    Gemma4FfnDecodeScratch *scratch,
-    cudaStream_t stream);
-
 size_t gemma4_ffn_prefill_scratch_elements(int rows);
 
 Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
@@ -85,8 +76,8 @@ cudaError_t gemma4_ffn_decode_fused_bf16(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ residual,
     const __nv_bfloat16 *__restrict__ rms_weight,
-    const __nv_bfloat16 *__restrict__ w_gate_up_col_major,
-    const __nv_bfloat16 *__restrict__ w_down_row_major,
+    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
+    const __nv_bfloat16 *__restrict__ w_down_decode,
     Gemma4FfnDecodeScratch *__restrict__ scratch,
     float eps,
     cudaStream_t stream);
@@ -98,4 +89,28 @@ cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
     const __nv_bfloat16 *__restrict__ w_down_row_major,
     cudaStream_t stream);
 
-#endif
+namespace gemma4_ffn_decode_device {
+
+constexpr int kHiddenPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+constexpr int kSwizzleX = GEMMA4_FFN_DECODE_SWIZZLE_X;
+
+static_assert(kHiddenPacks == GEMMA4_FFN_DECODE_HIDDEN_PACKS,
+              "FFN scratch hidden-pack shape must match bf16 pack width");
+static_assert(kSwizzleX == 0 || kSwizzleX == 1,
+              "FFN hidden-pack swizzle must be 0 or 1");
+
+using FfnBf16Pack = Bf16Packed128;
+
+// Maps natural hidden packs into the swizzled decode weight layout.
+__host__ __device__ inline int hidden_pack_swizzle_index(int chunk) {
+  if constexpr (kSwizzleX) {
+    constexpr int kSwizzleChunks = 8;
+    const unsigned u = static_cast<unsigned>(chunk);
+    const unsigned col = u & (kSwizzleChunks - 1);
+    const unsigned row = (u >> 3) & (kSwizzleChunks - 1);
+    return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
+  }
+  return chunk;
+}
+
+}  // namespace gemma4_ffn_decode_device

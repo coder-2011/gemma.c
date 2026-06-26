@@ -1,5 +1,4 @@
-#ifndef GEMMA4_FLASH_ATTENTION_CUH
-#define GEMMA4_FLASH_ATTENTION_CUH
+#pragma once
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -177,5 +176,3 @@ extern "C" int gemma4_flash_attention_sliding_threads_per_block();
 extern "C" cudaError_t gemma4_flash_attention_sliding_kernel_attributes(
     long long *out,
     int len);
-
-#endif

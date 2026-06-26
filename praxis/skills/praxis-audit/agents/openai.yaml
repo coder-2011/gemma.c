@@ -1,0 +1,4 @@
+interface:
+  display_name: "Praxis Audit"
+  short_description: "Apply the Praxis coding prompt"
+  default_prompt: "Use praxis-audit before editing code."
