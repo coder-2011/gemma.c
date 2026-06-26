@@ -87,7 +87,6 @@ void fill_values(std::vector<__nv_bfloat16> &values,
 }
 
 void reference_rmsnorm(std::vector<__nv_bfloat16> &out,
-                       std::vector<float> &rstd,
                        const std::vector<__nv_bfloat16> &inp,
                        const std::vector<__nv_bfloat16> *weight,
                        int rows,
@@ -101,7 +100,6 @@ void reference_rmsnorm(std::vector<__nv_bfloat16> &out,
     }
 
     float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / width) + eps);
-    rstd[row] = scale;
     for (int c = 0; c < width; ++c) {
       size_t index = static_cast<size_t>(row) * width + c;
       float gamma = weight != nullptr ? bf16_to_float((*weight)[c]) : 1.0f;
@@ -131,26 +129,6 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
   }
 }
 
-void compare_float(const std::vector<float> &actual,
-                   const std::vector<float> &expected,
-                   float tolerance,
-                   const char *label) {
-  float max_abs = 0.0f;
-  int max_index = 0;
-  for (int i = 0; i < static_cast<int>(actual.size()); ++i) {
-    float diff = std::fabs(actual[i] - expected[i]);
-    if (diff > max_abs) {
-      max_abs = diff;
-      max_index = i;
-    }
-  }
-  if (max_abs > tolerance) {
-    std::fprintf(stderr, "%s max_abs=%g at index=%d exceeds tolerance=%g\n",
-                 label, max_abs, max_index, tolerance);
-    std::exit(1);
-  }
-}
-
 void run_rmsnorm_case(int rows, int width, RmsnormMode mode) {
   const int elems = rows * width;
   const bool has_weight = mode == RmsnormMode::LearnedWeight;
@@ -159,12 +137,12 @@ void run_rmsnorm_case(int rows, int width, RmsnormMode mode) {
   std::vector<__nv_bfloat16> weight(width);
   std::vector<__nv_bfloat16> actual(elems);
   std::vector<__nv_bfloat16> expected(elems);
-  std::vector<float> expected_rstd(rows);
 
   fill_values(inp, make_input_value);
   fill_values(weight, make_weight_value);
-  reference_rmsnorm(expected, expected_rstd, inp, has_weight ? &weight : nullptr,
-                    rows, width, GEMMA4_RMS_NORM_EPS);
+  reference_rmsnorm(
+      expected, inp, has_weight ? &weight : nullptr, rows, width,
+      GEMMA4_RMS_NORM_EPS);
 
   DeviceBuffer<__nv_bfloat16> d_inp(elems);
   DeviceBuffer<__nv_bfloat16> d_weight(has_weight ? width : 0);
@@ -229,13 +207,12 @@ void run_fused_case(int rows, int width) {
   std::vector<__nv_bfloat16> expected_residual(elems);
   std::vector<__nv_bfloat16> actual_normed(elems);
   std::vector<__nv_bfloat16> expected_normed(elems);
-  std::vector<float> expected_rstd(rows);
 
   fill_residual_inputs(inp1, inp2, expected_residual);
   fill_values(weight, make_weight_value);
-  reference_rmsnorm(expected_normed, expected_rstd, expected_residual, &weight,
-                    rows, width,
-                    GEMMA4_RMS_NORM_EPS);
+  reference_rmsnorm(
+      expected_normed, expected_residual, &weight, rows, width,
+      GEMMA4_RMS_NORM_EPS);
 
   DeviceBuffer<__nv_bfloat16> d_inp1(elems);
   DeviceBuffer<__nv_bfloat16> d_inp2(elems);

@@ -7,7 +7,6 @@
 #include <cute/layout.hpp>
 
 #include <math.h>
-#include <stdint.h>
 
 enum Gemma4RmsnormMode {
   kLearnedWeightRmsnorm = 0,
@@ -31,30 +30,8 @@ struct Gemma4RmsnormRowArgs {
 namespace {
 
 constexpr int kMaxRmsnormThreads = 512;
+constexpr int kMaxRmsnormWarpSums = 16;
 constexpr int kResidualAddThreads = 256;
-
-// Maps [row, pack] to a BF16 element offset in a row-major tensor.
-__device__ inline auto gemma4_rmsnorm_gmem_pack_layout(
-    int rows,
-    int width,
-    int packs_per_row) {
-  return cute::make_layout(
-      cute::make_shape(rows, packs_per_row),
-      cute::make_stride(width, sizeof(Bf16Packed128) / sizeof(floatX)));
-}
-
-// Maps one contiguous pack index to its BF16 element offset.
-__device__ inline auto gemma4_rmsnorm_vector_pack_layout(int packs) {
-  return cute::make_layout(
-      cute::make_shape(packs),
-      cute::make_stride(sizeof(Bf16Packed128) / sizeof(floatX)));
-}
-
-// Returns the dynamic shared-memory bytes needed by one RMSNorm row block.
-size_t gemma4_rmsnorm_shared_bytes(int packs_per_row) {
-  return static_cast<size_t>(packs_per_row) * sizeof(Bf16Packed128) +
-         kMaxRmsnormThreads * sizeof(float);
-}
 
 // Builds a row argument object shared by decode and prefill launch wrappers.
 __host__ __device__ inline Gemma4RmsnormRowArgs gemma4_rmsnorm_make_args(
@@ -81,6 +58,7 @@ __host__ __device__ inline Gemma4RmsnormRowArgs gemma4_rmsnorm_make_args(
   return args;
 }
 
+// Processes one row with caller-owned scratch and threading.
 __device__ void gemma4_rmsnorm_row_bf16(
     const Gemma4RmsnormRowArgs &args,
     int row,
@@ -89,9 +67,11 @@ __device__ void gemma4_rmsnorm_row_bf16(
     float &scale,
     int thread_idx,
     int thread_count) {
-  const auto row_layout = gemma4_rmsnorm_gmem_pack_layout(
-      args.rows, args.width, args.packs_per_row);
+  const auto row_layout = cute::make_layout(
+      cute::make_shape(args.rows, args.packs_per_row),
+      cute::make_stride(args.width, sizeof(Bf16Packed128) / sizeof(floatX)));
 
+  // Cache the row so the scale pass does not reread input from global memory.
   float sum_sq = 0.0f;
   for (int pack = thread_idx; pack < args.packs_per_row; pack += thread_count) {
     const int offset = row_layout(row, pack);
@@ -109,6 +89,7 @@ __device__ void gemma4_rmsnorm_row_bf16(
   const int warp = thread_idx / warpSize;
   const int warps = div_up(thread_count, warpSize);
 
+  // Reduce one partial per warp, then let warp 0 finish the block sum.
   sum_sq = warp_reduce_sum(sum_sq);
   if (lane == 0) {
     warp_sums[warp] = sum_sq;
@@ -120,10 +101,13 @@ __device__ void gemma4_rmsnorm_row_bf16(
     sum_sq = warp_reduce_sum(sum_sq);
   }
   if (thread_idx == 0) {
-    scale = rsqrtf(sum_sq / static_cast<float>(args.width) + args.eps);
+    scale = rsqrtf(sum_sq / args.width + args.eps);
   }
   __syncthreads();
 
+  const auto pack_layout = cute::make_layout(
+      cute::make_shape(args.packs_per_row),
+      cute::make_stride(sizeof(Bf16Packed128) / sizeof(floatX)));
   for (int pack = thread_idx; pack < args.packs_per_row; pack += thread_count) {
     const int offset = row_layout(row, pack);
     const Bf16Packed128 values = cached_row[pack];
@@ -131,8 +115,6 @@ __device__ void gemma4_rmsnorm_row_bf16(
     if (args.mode == kScaleFreeRmsnorm) {
       result = gemma4_bf16_pack_apply_scale(values, scale);
     } else {
-      const auto pack_layout = gemma4_rmsnorm_vector_pack_layout(
-          args.packs_per_row);
       const Bf16Packed128 gamma = load128g(args.weight + pack_layout(pack));
       result = gemma4_bf16_pack_apply_scale_weight(values, gamma, scale);
     }
@@ -142,16 +124,17 @@ __device__ void gemma4_rmsnorm_row_bf16(
 
 }  // namespace
 
-// Thin decode kernel wrapper around the decode row device function.
+// Thin decode kernel wrapper with fixed hidden-row scratch.
 __global__ __launch_bounds__(kMaxRmsnormThreads, 1) void
 gemma4_rmsnorm_decode_bf16_kernel(Gemma4RmsnormRowArgs args) {
-  extern __shared__ int4 shared_storage[];
-  auto *cached_row = reinterpret_cast<Bf16Packed128 *>(shared_storage);
-  auto *warp_sums = reinterpret_cast<float *>(cached_row + args.packs_per_row);
+  __shared__ Bf16Packed128 cached_row[
+      GEMMA4_HIDDEN_SIZE / (sizeof(Bf16Packed128) / sizeof(floatX))];
+  __shared__ float warp_sums[kMaxRmsnormWarpSums];
   __shared__ float scale;
 
   gemma4_rmsnorm_row_bf16(
-      args, 0, cached_row, warp_sums, scale, int(threadIdx.x), int(blockDim.x));
+      args, 0, cached_row, warp_sums, scale, int(threadIdx.x),
+      kMaxRmsnormThreads);
 }
 
 // Thin prefill kernel wrapper around the prefill row device function.
@@ -181,7 +164,9 @@ gemma4_residual_add_bf16_kernel(
     return;
   }
 
-  const auto layout = gemma4_rmsnorm_vector_pack_layout(packs);
+  const auto layout = cute::make_layout(
+      cute::make_shape(packs),
+      cute::make_stride(sizeof(Bf16Packed128) / sizeof(floatX)));
   const int offset = layout(pack);
   const Bf16Packed128 a = load128g(inp1 + offset);
   const Bf16Packed128 b = load128g(inp2 + offset);
@@ -189,72 +174,22 @@ gemma4_residual_add_bf16_kernel(
   store128(out + offset, result);
 }
 
-// Validates common row-shaped RMSNorm launcher arguments.
-bool gemma4_rmsnorm_args_valid(const floatX *out,
-                               const floatX *inp,
-                               int rows,
-                               int width) {
-  if (rows < 0 || width <= 0) {
-    return false;
-  }
-  if (rows == 0) {
-    return true;
-  }
-  if (out == nullptr || inp == nullptr) {
-    return false;
-  }
-  return (width % (sizeof(Bf16Packed128) / sizeof(floatX))) == 0;
-}
-
-// Validates fused residual-add RMSNorm launcher arguments.
-bool gemma4_residual_add_rmsnorm_args_valid(const floatX *residual,
-                                            const floatX *inp2,
-                                            const floatX *weight,
-                                            int rows,
-                                            int width) {
-  if (rows < 0 || width != GEMMA4_HIDDEN_SIZE) {
-    return false;
-  }
-  if (rows == 0) {
-    return true;
-  }
-  return residual != nullptr && inp2 != nullptr && weight != nullptr;
-}
-
-// Selects decode or prefill by row count while preserving public APIs.
+// Selects fixed hidden-row decode or generic prefill while preserving public APIs.
 cudaError_t gemma4_rmsnorm_launch_bf16(const Gemma4RmsnormRowArgs &args,
                                        cudaStream_t stream) {
-  if (args.rows == 0) {
-    return cudaSuccess;
-  }
-
-  int device = 0;
-  cudaError_t status = cudaGetDevice(&device);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  int warp_size = 0;
-  status = cudaDeviceGetAttribute(&warp_size, cudaDevAttrWarpSize, device);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  int threads = div_up(args.packs_per_row, warp_size) * warp_size;
-  if (threads < warp_size) {
-    threads = warp_size;
-  }
-  if (threads > kMaxRmsnormThreads) {
-    threads = kMaxRmsnormThreads;
-  }
-
-  const size_t smem = gemma4_rmsnorm_shared_bytes(args.packs_per_row);
-  if (args.rows == 1) {
-    gemma4_rmsnorm_decode_bf16_kernel<<<1, threads, smem, stream>>>(args);
-  } else {
-    gemma4_rmsnorm_prefill_bf16_kernel<<<args.rows, threads, smem, stream>>>(
+  if (args.rows == 1 && args.width == GEMMA4_HIDDEN_SIZE) {
+    gemma4_rmsnorm_decode_bf16_kernel<<<1, kMaxRmsnormThreads, 0, stream>>>(
         args);
+    return cudaGetLastError();
   }
+
+  const size_t smem =
+      static_cast<size_t>(args.packs_per_row) * sizeof(Bf16Packed128) +
+      kMaxRmsnormWarpSums * sizeof(float);
+  const dim3 grid_dim(args.rows);
+  const dim3 block_dim(kMaxRmsnormThreads);
+  gemma4_rmsnorm_prefill_bf16_kernel<<<grid_dim, block_dim, smem, stream>>>(
+      args);
   return cudaGetLastError();
 }
 
@@ -271,7 +206,7 @@ extern "C" __device__ void gemma4_rmsnorm_hidden_row_512_bf16_device(
     float *__restrict__ warp_sums,
     float *__restrict__ scale,
     int thread_idx) {
-  Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
+  const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
       out, nullptr, in, nullptr, weight, 1, GEMMA4_HIDDEN_SIZE, eps,
       kLearnedWeightRmsnorm);
   gemma4_rmsnorm_row_bf16(
@@ -286,12 +221,11 @@ cudaError_t gemma4_rmsnorm_bf16(floatX *out,
                                 int width,
                                 float eps,
                                 cudaStream_t stream) {
-  if (!gemma4_rmsnorm_args_valid(out, inp, rows, width) ||
-      (rows > 0 && weight == nullptr)) {
+  if ((width % (sizeof(Bf16Packed128) / sizeof(floatX))) != 0) {
     return cudaErrorInvalidValue;
   }
 
-  Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
+  const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
       out, nullptr, inp, nullptr, weight, rows, width, eps,
       kLearnedWeightRmsnorm);
   return gemma4_rmsnorm_launch_bf16(args, stream);
@@ -304,11 +238,11 @@ cudaError_t gemma4_rmsnorm_scale_free_bf16(floatX *out,
                                            int width,
                                            float eps,
                                            cudaStream_t stream) {
-  if (!gemma4_rmsnorm_args_valid(out, inp, rows, width)) {
+  if ((width % (sizeof(Bf16Packed128) / sizeof(floatX))) != 0) {
     return cudaErrorInvalidValue;
   }
 
-  Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
+  const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
       out, nullptr, inp, nullptr, nullptr, rows, width, eps,
       kScaleFreeRmsnorm);
   return gemma4_rmsnorm_launch_bf16(args, stream);
@@ -320,22 +254,14 @@ cudaError_t gemma4_residual_add_bf16(floatX *out,
                                      const floatX *inp2,
                                      int count,
                                      cudaStream_t stream) {
-  if (count < 0) {
-    return cudaErrorInvalidValue;
-  }
-  if (count == 0) {
-    return cudaSuccess;
-  }
-  if (out == nullptr || inp1 == nullptr || inp2 == nullptr) {
-    return cudaErrorInvalidValue;
-  }
   if ((count % (sizeof(Bf16Packed128) / sizeof(floatX))) != 0) {
     return cudaErrorInvalidValue;
   }
 
   const int packs = count / (sizeof(Bf16Packed128) / sizeof(floatX));
-  const int grid = div_up(packs, kResidualAddThreads);
-  gemma4_residual_add_bf16_kernel<<<grid, kResidualAddThreads, 0, stream>>>(
+  const dim3 grid_dim(div_up(packs, kResidualAddThreads));
+  const dim3 block_dim(kResidualAddThreads);
+  gemma4_residual_add_bf16_kernel<<<grid_dim, block_dim, 0, stream>>>(
       out, inp1, inp2, packs);
   return cudaGetLastError();
 }
@@ -350,15 +276,11 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16(floatX *residual,
                                              int width,
                                              float eps,
                                              cudaStream_t stream) {
-  if (!gemma4_rmsnorm_args_valid(normed, inp1, rows, width)) {
-    return cudaErrorInvalidValue;
-  }
-  if (!gemma4_residual_add_rmsnorm_args_valid(
-          residual, inp2, weight, rows, width)) {
+  if (width != GEMMA4_HIDDEN_SIZE) {
     return cudaErrorInvalidValue;
   }
 
-  Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
+  const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
       normed, residual, inp1, inp2, weight, rows, width, eps,
       kResidualAddLearnedRmsnorm);
   return gemma4_rmsnorm_launch_bf16(args, stream);
