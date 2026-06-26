@@ -117,7 +117,7 @@ __device__ inline void dot_cols(
 
   for (int iter = 0; pack_idx < packs_per_col; ++iter, pack_idx += Threads) {
     const int stage = iter % kStages;
-    Bf16Packed128 x_pack = x_stage[stage];
+    const Bf16Packed128 x_pack = x_stage[stage];
     Bf16Packed128 w_pack[ColsPerBlock];
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
@@ -454,7 +454,7 @@ cudaError_t launch_prefill_cutlass_gemm(
       cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
       Stages>;
 
-  typename Gemm::Arguments args(
+  const typename Gemm::Arguments args(
       {rows, n, k},
       {reinterpret_cast<const Element *>(x), k},
       {reinterpret_cast<const Element *>(w_col_major), k},

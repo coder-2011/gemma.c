@@ -337,7 +337,7 @@ bool validate_post_processor_schema(const std::string &text, size_t *pos) {
 }
 
 // Packs two token IDs into the merge-rank lookup key.
-uint64_t merge_key(int32_t left_id, int32_t right_id) {
+constexpr uint64_t merge_key(int32_t left_id, int32_t right_id) {
   return (uint64_t(uint32_t(left_id)) << 32) | uint32_t(right_id);
 }
 

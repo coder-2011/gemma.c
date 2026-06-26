@@ -275,13 +275,14 @@ cudaError_t gemma4_sample_next_decode_bf16(
       &producer_count);
   if (status != cudaSuccess) { return status; }
 
-  status = cudaMemsetAsync(
-      d_ready_flags, 0, static_cast<size_t>(producer_count) * sizeof(uint32_t),
-      stream);
+  const size_t active_ready_bytes =
+      static_cast<size_t>(producer_count) * sizeof(uint32_t);
+  status = cudaMemsetAsync(d_ready_flags, 0, active_ready_bytes, stream);
   if (status != cudaSuccess) { return status; }
 
-  final_logits_sample_kernel<<<producer_count + 1, kFinalLogitsThreads, 0,
-                               stream>>>(
+  const dim3 grid_dim(producer_count + 1);
+  const dim3 block_dim(kFinalLogitsThreads);
+  final_logits_sample_kernel<<<grid_dim, block_dim, 0, stream>>>(
       d_next_hidden, d_next_token, d_final_hidden, d_lm_head_col_major,
       d_candidates, d_ready_flags, producer_count);
   return cudaGetLastError();

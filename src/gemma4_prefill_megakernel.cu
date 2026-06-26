@@ -29,13 +29,13 @@ __device__ inline void scale_hidden_pack_bf16(
     float scale,
     int pack) {
   const int offset = pack * kBf16Packed128Elements;
-  Bf16Packed128 values = load128g(in + offset);
-  Bf16Packed128 result = gemma4_bf16_pack_apply_scale(values, scale);
+  const Bf16Packed128 values = load128g(in + offset);
+  const Bf16Packed128 result = gemma4_bf16_pack_apply_scale(values, scale);
   store128(out + offset, result);
 }
 
 // Returns the fixed Gemma 4 attention dimensions for the selected layer type.
-PrefillAttentionShape prefill_attention_shape(bool global) {
+constexpr PrefillAttentionShape prefill_attention_shape(bool global) {
   if (global) {
     return {GEMMA4_GLOBAL_Q_PROJ_SIZE,
             GEMMA4_GLOBAL_K_PROJ_SIZE,

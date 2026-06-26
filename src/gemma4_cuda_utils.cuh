@@ -15,7 +15,7 @@ static constexpr int GEMMA4_WEIGHT_LOAD_POLICY = 1;
 
 #define GEMMA4_RETURN_IF_CUDA_ERROR(expr)           \
   do {                                              \
-    cudaError_t gemma4_cuda_status__ = (expr);      \
+    const cudaError_t gemma4_cuda_status__ = (expr); \
     if (gemma4_cuda_status__ != cudaSuccess) {      \
       return gemma4_cuda_status__;                  \
     }                                               \
@@ -24,12 +24,6 @@ static constexpr int GEMMA4_WEIGHT_LOAD_POLICY = 1;
 static constexpr int WARP_SIZE = 32;
 
 using floatX = __nv_bfloat16;
-
-// Returns true for Gemma 4 global attention layers, including the final layer.
-inline bool gemma4_is_global_layer(int32_t layer_index) {
-  return layer_index == gemma4_config.num_layers - 1 ||
-         (layer_index + 1) % GEMMA4_GLOBAL_LAYER_PERIOD == 0;
-}
 
 template <typename T, typename U> __host__ __device__ constexpr auto div_up(T n, U d) {return (n + d - 1) / d;}
 
@@ -54,8 +48,8 @@ template <size_t Alignment, typename T>
 inline T *align_ptr_up(T *ptr) {
   static_assert(Alignment > 0 && (Alignment & (Alignment - 1)) == 0,
                 "alignment must be a nonzero power of two");
-  uintptr_t raw = reinterpret_cast<uintptr_t>(ptr);
-  uintptr_t aligned = (raw + Alignment - 1) & ~(uintptr_t(Alignment) - 1);
+  const uintptr_t raw = reinterpret_cast<uintptr_t>(ptr);
+  const uintptr_t aligned = (raw + Alignment - 1) & ~(uintptr_t(Alignment) - 1);
   return reinterpret_cast<T *>(aligned);
 }
 
@@ -202,7 +196,7 @@ __device__ inline void gemma4_bf16_pack_accumulate_square(
   const __nv_bfloat162 *pairs = gemma4_bf16_pack_pairs(values);
 #pragma unroll
   for (int p = 0; p < kBf16Packed128Pairs; ++p) {
-    float2 value = __bfloat1622float2(pairs[p]);
+    const float2 value = __bfloat1622float2(pairs[p]);
     sum_sq = fmaf(value.x, value.x, sum_sq);
     sum_sq = fmaf(value.y, value.y, sum_sq);
   }
@@ -232,8 +226,8 @@ __device__ inline Bf16Packed128 gemma4_bf16_pack_add(
   __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(result);
 #pragma unroll
   for (int p = 0; p < kBf16Packed128Pairs; ++p) {
-    float2 av = __bfloat1622float2(a_pairs[p]);
-    float2 bv = __bfloat1622float2(b_pairs[p]);
+    const float2 av = __bfloat1622float2(a_pairs[p]);
+    const float2 bv = __bfloat1622float2(b_pairs[p]);
     out_pairs[p] = __floats2bfloat162_rn(av.x + bv.x, av.y + bv.y);
   }
   return result;
@@ -248,7 +242,7 @@ __device__ inline Bf16Packed128 gemma4_bf16_pack_apply_scale(
   __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(result);
 #pragma unroll
   for (int p = 0; p < kBf16Packed128Pairs; ++p) {
-    float2 value = __bfloat1622float2(value_pairs[p]);
+    const float2 value = __bfloat1622float2(value_pairs[p]);
     out_pairs[p] = __floats2bfloat162_rn(value.x * scale,
                                          value.y * scale);
   }
@@ -266,8 +260,8 @@ __device__ inline Bf16Packed128 gemma4_bf16_pack_apply_scale_weight(
   __nv_bfloat162 *out_pairs = gemma4_bf16_pack_pairs(result);
 #pragma unroll
   for (int p = 0; p < kBf16Packed128Pairs; ++p) {
-    float2 value = __bfloat1622float2(value_pairs[p]);
-    float2 gamma = __bfloat1622float2(weight_pairs[p]);
+    const float2 value = __bfloat1622float2(value_pairs[p]);
+    const float2 gamma = __bfloat1622float2(weight_pairs[p]);
     out_pairs[p] = __floats2bfloat162_rn(value.x * scale * gamma.x,
                                          value.y * scale * gamma.y);
   }

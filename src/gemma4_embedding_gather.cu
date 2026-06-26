@@ -67,8 +67,9 @@ cudaError_t gemma4_embedding_gather_bf16(
     return cudaSuccess;
   }
 
-  embedding_gather_kernel<<<
-      num_tokens, gemma4_embedding_gather::kEmbeddingGatherThreads, 0,
-      stream>>>(out, token_ids, embeddings);
+  const dim3 grid_dim(num_tokens);
+  const dim3 block_dim(gemma4_embedding_gather::kEmbeddingGatherThreads);
+  embedding_gather_kernel<<<grid_dim, block_dim, 0, stream>>>(
+      out, token_ids, embeddings);
   return cudaGetLastError();
 }

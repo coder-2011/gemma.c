@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION 1u
+static constexpr uint32_t GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION = 1u;
 
 struct Gemma4DecodeMegakernelSpineArgs {
   __nv_bfloat16 *state = nullptr;

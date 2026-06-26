@@ -56,19 +56,19 @@ struct Gemma4DecodeFfnTailScratch {
 };
 
 // Returns scratch for all per-block candidates plus the normalized hidden row.
-inline size_t spine_scratch_bytes(void) {
-  const size_t candidates =
+constexpr size_t spine_scratch_bytes(void) {
+  constexpr size_t candidates =
       static_cast<size_t>(kMegaCandidateCount) * sizeof(Gemma4SampleCandidate);
-  const size_t normed_hidden =
+  constexpr size_t normed_hidden =
       static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
   return candidates + normed_hidden + 16;
 }
 
 // Returns scratch for FFN accumulation plus the final sampling-tail scratch.
-inline size_t ffn_tail_scratch_bytes(void) {
-  const size_t candidates =
+constexpr size_t ffn_tail_scratch_bytes(void) {
+  constexpr size_t candidates =
       static_cast<size_t>(kMegaCandidateCount) * sizeof(Gemma4SampleCandidate);
-  const size_t normed_hidden =
+  constexpr size_t normed_hidden =
       static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
   return sizeof(Gemma4FfnDecodeScratch) + candidates + normed_hidden;
 }

@@ -6,18 +6,19 @@
 namespace {
 
 // Returns ceil(value / divisor) for positive runtime geometry.
-int32_t ceil_div_i32(int32_t value, int32_t divisor) {
+constexpr int32_t ceil_div_i32(int32_t value, int32_t divisor) {
   return (value + divisor - 1) / divisor;
 }
 
 // Counts BF16 elements in one Layout-A KV cache allocation.
-size_t kv_cache_elements(const Gemma4KvCacheConfig &config) {
+constexpr size_t kv_cache_elements(const Gemma4KvCacheConfig &config) {
   return static_cast<size_t>(config.num_layers) * config.num_pages *
          config.page_size * config.num_heads * config.head_dim;
 }
 
 // Counts sliding page slots needed by any live window, including boundary straddles.
-int32_t sliding_pages_per_sequence(int32_t max_seq_len, int32_t page_size) {
+constexpr int32_t sliding_pages_per_sequence(int32_t max_seq_len,
+                                             int32_t page_size) {
   if (max_seq_len <= GEMMA4_SLIDING_WINDOW) {
     return ceil_div_i32(max_seq_len, page_size);
   }
