@@ -3,6 +3,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
+
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +25,18 @@ void check_cuda(cudaError_t status, const char *expr, const char *file, int line
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
 
+// Returns the raw CUDA pointer owned by a Thrust device vector.
+template <typename T>
+T *raw_ptr(thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
+
+// Returns the raw const CUDA pointer owned by a Thrust device vector.
+template <typename T>
+const T *raw_ptr(const thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
+
 // Convert BF16 test values back to float for comparisons.
 float bf16_to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
 
@@ -37,38 +52,18 @@ int64_t cache_elements(const Gemma4KvCacheConfig &config) {
          config.num_heads * config.head_dim;
 }
 
-// Own one device allocation for short CUDA tests.
-template <typename T>
-struct DeviceBuffer {
-  explicit DeviceBuffer(size_t count_) : count(count_) {
-    CHECK_CUDA(cudaMalloc(&ptr, count * sizeof(T)));
-  }
-
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  ~DeviceBuffer() {
-    if (ptr != nullptr) cudaFree(ptr);
-  }
-
-  T *get() const { return ptr; }
-
-  size_t count = 0;
-  T *ptr = nullptr;
-};
-
 // Copy one host vector into an equally sized device buffer.
 template <typename T>
-void copy_to_device(const DeviceBuffer<T> &dst, const std::vector<T> &src) {
-  CHECK_CUDA(cudaMemcpy(dst.get(), src.data(), src.size() * sizeof(T),
+void copy_to_device(thrust::device_vector<T> &dst, const std::vector<T> &src) {
+  CHECK_CUDA(cudaMemcpy(raw_ptr(dst), src.data(), src.size() * sizeof(T),
                         cudaMemcpyHostToDevice));
 }
 
 // Copy one full device buffer back into a host vector.
 template <typename T>
-std::vector<T> copy_to_host(const DeviceBuffer<T> &src) {
-  std::vector<T> dst(src.count);
-  CHECK_CUDA(cudaMemcpy(dst.data(), src.get(), dst.size() * sizeof(T),
+std::vector<T> copy_to_host(const thrust::device_vector<T> &src) {
+  std::vector<T> dst(src.size());
+  CHECK_CUDA(cudaMemcpy(dst.data(), raw_ptr(src), dst.size() * sizeof(T),
                         cudaMemcpyDeviceToHost));
   return dst;
 }
@@ -111,16 +106,16 @@ void run_invalid_page_write_case() {
     v[i] = make_value(44000 + i);
   }
 
-  DeviceBuffer<__nv_bfloat16> d_cache_k(cache_elements(config));
-  DeviceBuffer<__nv_bfloat16> d_cache_v(cache_elements(config));
-  DeviceBuffer<__nv_bfloat16> d_k(k.size());
-  DeviceBuffer<__nv_bfloat16> d_v(v.size());
-  DeviceBuffer<int32_t> d_page_table(page_table.size());
-  DeviceBuffer<int32_t> d_token_batch(token_batch.size());
-  DeviceBuffer<int32_t> d_token_position(token_position.size());
-  CHECK_CUDA(cudaMemset(d_cache_k.get(), 0,
+  thrust::device_vector<__nv_bfloat16> d_cache_k(cache_elements(config));
+  thrust::device_vector<__nv_bfloat16> d_cache_v(cache_elements(config));
+  thrust::device_vector<__nv_bfloat16> d_k(k.size());
+  thrust::device_vector<__nv_bfloat16> d_v(v.size());
+  thrust::device_vector<int32_t> d_page_table(page_table.size());
+  thrust::device_vector<int32_t> d_token_batch(token_batch.size());
+  thrust::device_vector<int32_t> d_token_position(token_position.size());
+  CHECK_CUDA(cudaMemset(raw_ptr(d_cache_k), 0,
                         cache_elements(config) * sizeof(__nv_bfloat16)));
-  CHECK_CUDA(cudaMemset(d_cache_v.get(), 0,
+  CHECK_CUDA(cudaMemset(raw_ptr(d_cache_v), 0,
                         cache_elements(config) * sizeof(__nv_bfloat16)));
   copy_to_device(d_k, k);
   copy_to_device(d_v, v);
@@ -129,8 +124,8 @@ void run_invalid_page_write_case() {
   copy_to_device(d_token_position, token_position);
 
   CHECK_CUDA(gemma4_kv_cache_write_bf16(
-      d_cache_k.get(), d_cache_v.get(), config, d_page_table.get(),
-      d_token_batch.get(), d_token_position.get(), 1, 0, d_k.get(), d_v.get(), 0));
+      raw_ptr(d_cache_k), raw_ptr(d_cache_v), config, raw_ptr(d_page_table),
+      raw_ptr(d_token_batch), raw_ptr(d_token_position), 1, 0, raw_ptr(d_k), raw_ptr(d_v), 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
   std::vector<__nv_bfloat16> zero(cache_elements(config),

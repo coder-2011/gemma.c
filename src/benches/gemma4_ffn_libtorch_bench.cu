@@ -93,7 +93,8 @@ int main(int argc, char **argv) {
   at::Tensor custom_normed_out = at::empty({GEMMA4_HIDDEN_SIZE}, bf16_options);
   at::Tensor prefill_scratch_buffer = at::empty(
       {static_cast<int64_t>(gemma4_ffn_prefill_scratch_elements(tokens))}, bf16_options);
-  DeviceBuffer<Gemma4FfnDecodeScratch> d_custom_scratch(1);
+  thrust::device_vector<unsigned char> d_custom_scratch(
+      sizeof(Gemma4FfnDecodeScratch));
 
   CUDA_CHECK(gemma4_ffn_decode_swizzle_weights_bf16(
       bf16_ptr(w_gate_up_swizzled), bf16_ptr(w_gate_up),
@@ -110,10 +111,10 @@ int main(int argc, char **argv) {
       std::max<size_t>(kMinFlushBytes,
                        static_cast<size_t>(prop.l2CacheSize) * 4ull);
   const size_t flush_count = flush_bytes / sizeof(uint32_t);
-  DeviceBuffer<uint32_t> d_flush_in(flush_count);
-  DeviceBuffer<uint32_t> d_flush_out(kFlushOutCount);
-  CUDA_CHECK(cudaMemsetAsync(d_flush_in, 0x5a, flush_bytes, stream));
-  CUDA_CHECK(cudaMemsetAsync(d_flush_out, 0, kFlushOutCount * sizeof(uint32_t), stream));
+  thrust::device_vector<uint32_t> d_flush_in(flush_count);
+  thrust::device_vector<uint32_t> d_flush_out(kFlushOutCount);
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_flush_in), 0x5a, flush_bytes));
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_flush_out), 0, kFlushOutCount * sizeof(uint32_t)));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   const double geglu_bytes =
@@ -154,17 +155,19 @@ int main(int argc, char **argv) {
     CUDA_CHECK(gemma4_ffn_decode_fused_bf16(
         bf16_ptr(custom_residual_out), bf16_ptr(custom_normed_out), bf16_ptr(x),
         bf16_ptr(residual), bf16_ptr(rms_weight), bf16_ptr(w_gate_up_swizzled),
-        bf16_ptr(w_down_swizzled), d_custom_scratch.get(), GEMMA4_RMS_NORM_EPS, stream));
+        bf16_ptr(w_down_swizzled),
+        reinterpret_cast<Gemma4FfnDecodeScratch *>(raw_ptr(d_custom_scratch)),
+        GEMMA4_RMS_NORM_EPS, stream));
   };
   auto run_custom_clear = [&]() {
-    CUDA_CHECK(cudaMemsetAsync(d_custom_scratch.get(), 0, sizeof(Gemma4FfnDecodeScratch), stream));
+    CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_custom_scratch), 0, sizeof(Gemma4FfnDecodeScratch)));
   };
   auto run_cold_custom_decode = [&]() {
-    flush_cache(d_flush_in, d_flush_out, flush_count, stream);
+    flush_cache(raw_ptr(d_flush_in), raw_ptr(d_flush_out), flush_count, stream);
     run_custom_decode();
   };
   auto run_cold_custom_clear = [&]() {
-    flush_cache(d_flush_in, d_flush_out, flush_count, stream);
+    flush_cache(raw_ptr(d_flush_in), raw_ptr(d_flush_out), flush_count, stream);
     run_custom_clear();
   };
 
@@ -183,7 +186,12 @@ int main(int argc, char **argv) {
   const TimingStats custom_clear_stats = time_ms(run_custom_clear, stream, warmup, iters, trials);
   const TimingStats cold_custom_decode_stats = time_ms(run_cold_custom_decode, stream, warmup, iters, trials);
   const TimingStats cold_custom_clear_stats = time_ms(run_cold_custom_clear, stream, warmup, iters, trials);
-  const TimingStats cold_flush_stats = time_ms([&]() { flush_cache(d_flush_in, d_flush_out, flush_count, stream); }, stream, warmup, iters, trials);
+  const TimingStats cold_flush_stats = time_ms(
+      [&]() {
+        flush_cache(raw_ptr(d_flush_in), raw_ptr(d_flush_out), flush_count,
+                    stream);
+      },
+      stream, warmup, iters, trials);
   const TimingStats torch_geglu_graph_stats = time_libtorch_graph_ms(run_libtorch_geglu_only, torch_stream, warmup, iters, trials);
   const TimingStats torch_down_graph_stats = time_libtorch_graph_ms(run_libtorch_down_only, torch_stream, warmup, iters, trials);
   const TimingStats torch_full_graph_stats = time_libtorch_graph_ms(run_libtorch_full, torch_stream, warmup, iters, trials);

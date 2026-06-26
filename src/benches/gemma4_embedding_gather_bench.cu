@@ -60,11 +60,11 @@ int main(int argc, char **argv) {
   const size_t out_elems = static_cast<size_t>(max_tokens) * hidden_size;
   const size_t out_bytes = out_elems * sizeof(__nv_bfloat16);
 
-  DeviceBuffer<__nv_bfloat16> d_embeddings(embedding_elems);
-  DeviceBuffer<__nv_bfloat16> d_out(out_elems);
-  DeviceBuffer<int32_t> d_token_ids(max_tokens);
-  CUDA_CHECK(cudaMemsetAsync(d_embeddings, 0, embedding_bytes, stream));
-  CUDA_CHECK(cudaMemsetAsync(d_out, 0, out_bytes, stream));
+  thrust::device_vector<__nv_bfloat16> d_embeddings(embedding_elems);
+  thrust::device_vector<__nv_bfloat16> d_out(out_elems);
+  thrust::device_vector<int32_t> d_token_ids(max_tokens);
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_embeddings), 0, embedding_bytes));
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_out), 0, out_bytes));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   std::vector<int32_t> h_token_ids(max_tokens);
@@ -83,15 +83,16 @@ int main(int argc, char **argv) {
 
   for (int token_count : token_counts_up_to(max_tokens)) {
     fill_token_ids(h_token_ids, token_count, vocab_size);
-    CUDA_CHECK(cudaMemcpyAsync(d_token_ids, h_token_ids.data(),
+    CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_token_ids), h_token_ids.data(),
                                static_cast<size_t>(token_count) *
                                    sizeof(int32_t),
-                               cudaMemcpyHostToDevice, stream));
+                               cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto run_gather = [&]() {
       CUDA_CHECK(gemma4_embedding_gather_bf16(
-          d_out, d_token_ids, d_embeddings, token_count, stream));
+          raw_ptr(d_out), raw_ptr(d_token_ids), raw_ptr(d_embeddings),
+          token_count, stream));
     };
 
     run_gather();

@@ -176,13 +176,13 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   const size_t w_count = size_t(op.n) * size_t(op.k);
   const size_t y_count = size_t(op.n);
 
-  DeviceBuffer<__nv_bfloat16> x(x_count);
-  DeviceBuffer<__nv_bfloat16> w(w_count);
-  DeviceBuffer<__nv_bfloat16> custom_y(y_count);
-  DeviceBuffer<__nv_bfloat16> swizzled_y(y_count);
-  DeviceBuffer<__nv_bfloat16> gemv_y(y_count);
-  DeviceBuffer<__nv_bfloat16> gemm_y(y_count);
-  DeviceBuffer<__nv_bfloat16> cudnn_y(y_count);
+  thrust::device_vector<__nv_bfloat16> x(x_count);
+  thrust::device_vector<__nv_bfloat16> w(w_count);
+  thrust::device_vector<__nv_bfloat16> custom_y(y_count);
+  thrust::device_vector<__nv_bfloat16> swizzled_y(y_count);
+  thrust::device_vector<__nv_bfloat16> gemv_y(y_count);
+  thrust::device_vector<__nv_bfloat16> gemm_y(y_count);
+  thrust::device_vector<__nv_bfloat16> cudnn_y(y_count);
 
   const uint64_t x_seed = base_seed ^ (uint64_t(op.k) << 32) ^ uint64_t(op.n);
   const uint64_t w_seed =
@@ -190,25 +190,26 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
       uint64_t(op.k);
   constexpr float kInputScale = 1.0f;
   constexpr float kWeightScale = 0.5f;
-  fill_random_bf16(x, x_count, x_seed, kInputScale, stream);
-  fill_random_bf16(w, w_count, w_seed, kWeightScale, stream);
-  CUDA_CHECK(cudaMemsetAsync(custom_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  CUDA_CHECK(cudaMemsetAsync(swizzled_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  CUDA_CHECK(cudaMemsetAsync(gemv_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  CUDA_CHECK(cudaMemsetAsync(gemm_y, 0, y_count * sizeof(__nv_bfloat16), stream));
-  CUDA_CHECK(cudaMemsetAsync(cudnn_y, 0, y_count * sizeof(__nv_bfloat16), stream));
+  fill_random_bf16(raw_ptr(x), x_count, x_seed, kInputScale, stream);
+  fill_random_bf16(raw_ptr(w), w_count, w_seed, kWeightScale, stream);
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(custom_y), 0, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(swizzled_y), 0, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(gemv_y), 0, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(gemm_y), 0, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(cudnn_y), 0, y_count * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   auto run_custom = [&]() {
-    CUDA_CHECK(gemma4_projection_decode(op.projection, x, w, custom_y, stream));
+    CUDA_CHECK(gemma4_projection_decode(
+        op.projection, raw_ptr(x), raw_ptr(w), raw_ptr(custom_y), stream));
   };
   auto run_swizzled = [&]() {
     CUDA_CHECK(gemma4_projection_decode_swizzled(
-        op.projection, GEMMA4_DECODE_SWIZZLE_INTERLEAVE_16, x, w, swizzled_y,
-        stream));
+        op.projection, GEMMA4_DECODE_SWIZZLE_INTERLEAVE_16, raw_ptr(x),
+        raw_ptr(w), raw_ptr(swizzled_y), stream));
   };
-  auto run_gemv = [&]() { cublas.gemv(x, w, gemv_y, op.k, op.n); };
-  auto run_gemm = [&]() { cublas.gemm_m1(x, w, gemm_y, op.k, op.n); };
+  auto run_gemv = [&]() { cublas.gemv(raw_ptr(x), raw_ptr(w), raw_ptr(gemv_y), op.k, op.n); };
+  auto run_gemm = [&]() { cublas.gemm_m1(raw_ptr(x), raw_ptr(w), raw_ptr(gemm_y), op.k, op.n); };
 
   run_custom();
   run_swizzled();
@@ -216,9 +217,9 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   run_gemm();
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  const DiffStats swizzled_diff = diff_stats_bf16(custom_y, swizzled_y, op.n);
-  const DiffStats gemv_diff = diff_stats_bf16(custom_y, gemv_y, op.n);
-  const DiffStats gemm_diff = diff_stats_bf16(custom_y, gemm_y, op.n);
+  const DiffStats swizzled_diff = diff_stats_bf16(raw_ptr(custom_y), raw_ptr(swizzled_y), op.n);
+  const DiffStats gemv_diff = diff_stats_bf16(raw_ptr(custom_y), raw_ptr(gemv_y), op.n);
+  const DiffStats gemm_diff = diff_stats_bf16(raw_ptr(custom_y), raw_ptr(gemm_y), op.n);
 
   const TimingStats custom = time_ms(run_custom, stream, warmup, iters, trials);
   const TimingStats swizzled =
@@ -239,10 +240,10 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   size_t cudnn_workspace_bytes = 0;
   try {
     CudnnDecodeConv cudnn(stream, op.k, op.n);
-    auto run_cudnn = [&]() { cudnn.conv(x, w, cudnn_y); };
+    auto run_cudnn = [&]() { cudnn.conv(raw_ptr(x), raw_ptr(w), raw_ptr(cudnn_y)); };
     run_cudnn();
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    const DiffStats cudnn_diff = diff_stats_bf16(custom_y, cudnn_y, op.n);
+    const DiffStats cudnn_diff = diff_stats_bf16(raw_ptr(custom_y), raw_ptr(cudnn_y), op.n);
     const TimingStats cudnn_stats =
         time_ms(run_cudnn, stream, warmup, iters, trials);
     cudnn_best_ms = cudnn_stats.best_ms;

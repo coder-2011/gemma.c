@@ -4,6 +4,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
+
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -22,44 +25,29 @@ void check_cuda(cudaError_t status, const char *expr, const char *file, int line
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
 
-// Owns a simple device allocation for this focused CUDA test.
+// Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
-class DeviceBuffer {
- public:
-  // Allocates `count` elements on the current CUDA device.
-  explicit DeviceBuffer(size_t count) : count_(count) {
-    CHECK_CUDA(cudaMalloc(&ptr_, count_ * sizeof(T)));
-  }
+T *raw_ptr(thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
 
-  // Frees the allocation; tests intentionally ignore cleanup errors.
-  ~DeviceBuffer() {
-    if (ptr_ != nullptr) {
-      cudaFree(ptr_);
-    }
-  }
+// Returns the raw const CUDA pointer owned by a Thrust device vector.
+template <typename T>
+const T *raw_ptr(const thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
 
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+template <typename T>
+void copy_to_device(thrust::device_vector<T> &dst, const std::vector<T> &src) {
+  CHECK_CUDA(cudaMemcpy(raw_ptr(dst), src.data(), src.size() * sizeof(T),
+                        cudaMemcpyHostToDevice));
+}
 
-  // Returns the mutable device pointer.
-  T *get() { return ptr_; }
-
-  // Copies a host vector into the device allocation.
-  void copy_from(const std::vector<T> &src) {
-    CHECK_CUDA(cudaMemcpy(ptr_, src.data(), src.size() * sizeof(T),
-                          cudaMemcpyHostToDevice));
-  }
-
-  // Copies the device allocation into a host vector.
-  void copy_to(std::vector<T> &dst) const {
-    CHECK_CUDA(cudaMemcpy(dst.data(), ptr_, dst.size() * sizeof(T),
-                          cudaMemcpyDeviceToHost));
-  }
-
- private:
-  T *ptr_ = nullptr;
-  size_t count_ = 0;
-};
+template <typename T>
+void copy_to_host(std::vector<T> &dst, const thrust::device_vector<T> &src) {
+  CHECK_CUDA(cudaMemcpy(dst.data(), raw_ptr(src), dst.size() * sizeof(T),
+                        cudaMemcpyDeviceToHost));
+}
 
 // Converts BF16 to FP32 for reference math and tolerance checks.
 float bf16_to_float(__nv_bfloat16 value) {
@@ -119,15 +107,15 @@ void run_sparse_case(int rows, int k, int n, const char *label) {
 
   fill_sparse_case(x, w, expected, rows, k, n);
 
-  DeviceBuffer<__nv_bfloat16> d_x(x.size());
-  DeviceBuffer<__nv_bfloat16> d_w(w.size());
-  DeviceBuffer<__nv_bfloat16> d_y(actual.size());
-  d_x.copy_from(x);
-  d_w.copy_from(w);
+  thrust::device_vector<__nv_bfloat16> d_x(x.size());
+  thrust::device_vector<__nv_bfloat16> d_w(w.size());
+  thrust::device_vector<__nv_bfloat16> d_y(actual.size());
+  copy_to_device(d_x, x);
+  copy_to_device(d_w, w);
 
   CHECK_CUDA(gemma4_prefill_gemm_bf16(
-      d_x.get(), d_w.get(), d_y.get(), rows, k, n, 0));
-  d_y.copy_to(actual);
+      raw_ptr(d_x), raw_ptr(d_w), raw_ptr(d_y), rows, k, n, 0));
+  copy_to_host(actual, d_y);
 
   float max_abs = 0.0f;
   int max_index = 0;
@@ -150,11 +138,11 @@ void run_sparse_case(int rows, int k, int n, const char *label) {
 
 // Verifies basic argument validation for unsupported tensor-core shapes.
 void run_invalid_shape_case() {
-  DeviceBuffer<__nv_bfloat16> d_x(64);
-  DeviceBuffer<__nv_bfloat16> d_w(64);
-  DeviceBuffer<__nv_bfloat16> d_y(64);
+  thrust::device_vector<__nv_bfloat16> d_x(64);
+  thrust::device_vector<__nv_bfloat16> d_w(64);
+  thrust::device_vector<__nv_bfloat16> d_y(64);
   const cudaError_t status =
-      gemma4_prefill_gemm_bf16(d_x.get(), d_w.get(), d_y.get(), 1, 63, 32, 0);
+      gemma4_prefill_gemm_bf16(raw_ptr(d_x), raw_ptr(d_w), raw_ptr(d_y), 1, 63, 32, 0);
   if (status != cudaErrorInvalidValue) {
     std::fprintf(stderr, "invalid prefill GEMM shape returned %d\n", status);
     std::exit(1);

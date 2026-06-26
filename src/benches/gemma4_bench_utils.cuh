@@ -3,6 +3,8 @@
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
 
 #include <algorithm>
 #include <chrono>
@@ -50,43 +52,17 @@ struct DiffStats {
   float max_rel = 0.0f;
 };
 
+// Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
-class DeviceBuffer {
- public:
-  // Allocates device storage for a benchmark buffer, allowing zero-sized cases.
-  explicit DeviceBuffer(size_t count) : count_(count) {
-    if (count_ > 0) {
-      CUDA_CHECK(cudaMalloc(&ptr_, count_ * sizeof(T)));
-    }
-  }
+T *raw_ptr(thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
 
-  // Releases the device storage owned by this benchmark buffer.
-  ~DeviceBuffer() {
-    cudaFree(ptr_);
-  }
-
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  // Returns the raw device pointer for APIs that do not use implicit conversion.
-  T *get() { return ptr_; }
-
-  // Returns the raw const device pointer for read-only APIs.
-  const T *get() const { return ptr_; }
-
-  // Returns the element count originally requested for this buffer.
-  size_t count() const { return count_; }
-
-  // Preserves older bench call sites that pass DeviceBuffer directly to kernels.
-  operator T *() { return ptr_; }
-
-  // Preserves older bench call sites that pass DeviceBuffer directly to readers.
-  operator const T *() const { return ptr_; }
-
- private:
-  T *ptr_ = nullptr;
-  size_t count_ = 0;
-};
+// Returns the raw const CUDA pointer owned by a Thrust device vector.
+template <typename T>
+const T *raw_ptr(const thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
 
 // Mixes an integer index and seed into deterministic pseudo-random bits.
 static __device__ inline uint32_t gemma4_bench_mix_u32_device(uint32_t x) {
@@ -205,11 +181,11 @@ float time_ms_once(Fn &&fn, cudaStream_t stream, int warmup, int iters) {
   cudaEvent_t stop = nullptr;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
-  CUDA_CHECK(cudaEventRecord(start, stream));
+  CUDA_CHECK(cudaEventRecord(start));
   for (int i = 0; i < iters; ++i) {
     fn();
   }
-  CUDA_CHECK(cudaEventRecord(stop, stream));
+  CUDA_CHECK(cudaEventRecord(stop));
   CUDA_CHECK(cudaEventSynchronize(stop));
 
   float total_ms = 0.0f;

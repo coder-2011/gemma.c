@@ -156,9 +156,9 @@ SampleStats time_cuda_samples(Fn &&fn,
       float total_ms = 0.0f;
       for (int i = 0; i < iters_per_sample; ++i) {
         flush_l2(stream, d_l2_scratch, l2_flush_words);
-        CUDA_CHECK(cudaEventRecord(start, stream));
+        CUDA_CHECK(cudaEventRecord(start));
         fn();
-        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
         float iter_ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&iter_ms, start, stop));
@@ -166,11 +166,11 @@ SampleStats time_cuda_samples(Fn &&fn,
       }
       values[sample] = total_ms / static_cast<float>(iters_per_sample);
     } else {
-      CUDA_CHECK(cudaEventRecord(start, stream));
+      CUDA_CHECK(cudaEventRecord(start));
       for (int i = 0; i < iters_per_sample; ++i) {
         fn();
       }
-      CUDA_CHECK(cudaEventRecord(stop, stream));
+      CUDA_CHECK(cudaEventRecord(stop));
       CUDA_CHECK(cudaEventSynchronize(stop));
       float total_ms = 0.0f;
       CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
@@ -445,9 +445,9 @@ int main(int argc, char **argv) {
     at::Tensor torch_new_v =
         at::randn({1, torch_kv_heads, 1, torch_head_dim}, torch_options);
     at::Tensor torch_out;
-    DeviceBuffer<uint8_t> d_torch_l2_scratch_bytes(flush_bytes);
+    thrust::device_vector<uint8_t> d_torch_l2_scratch_bytes(flush_bytes);
     uint32_t *d_torch_l2_scratch =
-        reinterpret_cast<uint32_t *>(d_torch_l2_scratch_bytes.get());
+        reinterpret_cast<uint32_t *>(raw_ptr(d_torch_l2_scratch_bytes));
     if (flush_bytes > 0) {
       CUDA_CHECK(cudaMemsetAsync(d_torch_l2_scratch, 0, flush_bytes,
                                  torch_stream.stream()));
@@ -544,70 +544,71 @@ int main(int argc, char **argv) {
 
   // Partial scratch is allocated for `num_splits`, including any extra empty
   // splits requested by --extra-splits.
-  DeviceBuffer<__nv_bfloat16> d_cache_k(
+  thrust::device_vector<__nv_bfloat16> d_cache_k(
       static_cast<size_t>(cache_elements(config)));
-  DeviceBuffer<__nv_bfloat16> d_cache_v(
+  thrust::device_vector<__nv_bfloat16> d_cache_v(
       static_cast<size_t>(cache_elements(config)));
-  DeviceBuffer<__nv_bfloat16> d_k(h_k.size());
-  DeviceBuffer<__nv_bfloat16> d_v(h_v.size());
-  DeviceBuffer<__nv_bfloat16> d_one_k(config.num_heads * config.head_dim);
-  DeviceBuffer<__nv_bfloat16> d_one_v(config.num_heads * config.head_dim);
-  DeviceBuffer<__nv_bfloat16> d_q(h_q.size());
-  DeviceBuffer<__nv_bfloat16> d_out(h_q.size());
-  DeviceBuffer<int32_t> d_page_table(page_table.size());
-  DeviceBuffer<int32_t> d_seq_lengths(seq_lengths.size());
-  DeviceBuffer<int32_t> d_token_batch(token_batch.size());
-  DeviceBuffer<int32_t> d_token_position(token_position.size());
-  DeviceBuffer<int32_t> d_one_batch(one_batch.size());
-  DeviceBuffer<int32_t> d_one_position(one_position.size());
-  DeviceBuffer<int32_t> d_work_scratch(work_scratch_i32_size);
-  DeviceBuffer<float> d_partial_m(partial_m_elements);
-  DeviceBuffer<float> d_partial_l(partial_m_elements);
-  DeviceBuffer<float> d_partial_acc(partial_acc_elements);
-  DeviceBuffer<uint8_t> d_l2_scratch_bytes(flush_bytes);
+  thrust::device_vector<__nv_bfloat16> d_k(h_k.size());
+  thrust::device_vector<__nv_bfloat16> d_v(h_v.size());
+  thrust::device_vector<__nv_bfloat16> d_one_k(config.num_heads * config.head_dim);
+  thrust::device_vector<__nv_bfloat16> d_one_v(config.num_heads * config.head_dim);
+  thrust::device_vector<__nv_bfloat16> d_q(h_q.size());
+  thrust::device_vector<__nv_bfloat16> d_out(h_q.size());
+  thrust::device_vector<int32_t> d_page_table(page_table.size());
+  thrust::device_vector<int32_t> d_seq_lengths(seq_lengths.size());
+  thrust::device_vector<int32_t> d_token_batch(token_batch.size());
+  thrust::device_vector<int32_t> d_token_position(token_position.size());
+  thrust::device_vector<int32_t> d_one_batch(one_batch.size());
+  thrust::device_vector<int32_t> d_one_position(one_position.size());
+  thrust::device_vector<int32_t> d_work_scratch(work_scratch_i32_size);
+  thrust::device_vector<float> d_partial_m(partial_m_elements);
+  thrust::device_vector<float> d_partial_l(partial_m_elements);
+  thrust::device_vector<float> d_partial_acc(partial_acc_elements);
+  thrust::device_vector<uint8_t> d_l2_scratch_bytes(flush_bytes);
   uint32_t *d_l2_scratch =
-      reinterpret_cast<uint32_t *>(d_l2_scratch_bytes.get());
+      reinterpret_cast<uint32_t *>(raw_ptr(d_l2_scratch_bytes));
   if (flush_bytes > 0) {
-    CUDA_CHECK(cudaMemsetAsync(d_l2_scratch, 0, flush_bytes, stream));
+    CUDA_CHECK(cudaMemsetAsync(d_l2_scratch, 0, flush_bytes));
   }
 
-  CUDA_CHECK(cudaMemcpyAsync(d_k, h_k.data(), h_k.size() * sizeof(h_k[0]),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_v, h_v.data(), h_v.size() * sizeof(h_v[0]),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_one_k,
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_k), h_k.data(), h_k.size() * sizeof(h_k[0]),
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_v), h_v.data(), h_v.size() * sizeof(h_v[0]),
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_one_k),
                              h_k.data() + (seq_len - 1) * config.num_heads *
                                               config.head_dim,
                              config.num_heads * config.head_dim *
                                  sizeof(h_k[0]),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_one_v,
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_one_v),
                              h_v.data() + (seq_len - 1) * config.num_heads *
                                               config.head_dim,
                              config.num_heads * config.head_dim *
                                  sizeof(h_v[0]),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_q, h_q.data(), h_q.size() * sizeof(h_q[0]),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_page_table, page_table.data(),
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_q), h_q.data(), h_q.size() * sizeof(h_q[0]),
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_page_table), page_table.data(),
                              page_table.size() * sizeof(int32_t),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_seq_lengths, seq_lengths.data(), sizeof(int32_t),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_token_batch, token_batch.data(),
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_seq_lengths), seq_lengths.data(), sizeof(int32_t),
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_token_batch), token_batch.data(),
                              token_batch.size() * sizeof(int32_t),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_token_position, token_position.data(),
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_token_position), token_position.data(),
                              token_position.size() * sizeof(int32_t),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_one_batch, one_batch.data(), sizeof(int32_t),
-                             cudaMemcpyHostToDevice, stream));
-  CUDA_CHECK(cudaMemcpyAsync(d_one_position, one_position.data(),
-                             sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_one_batch), one_batch.data(), sizeof(int32_t),
+                             cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_one_position), one_position.data(),
+                             sizeof(int32_t), cudaMemcpyHostToDevice));
 
   CUDA_CHECK(gemma4_kv_cache_write_bf16(
-      d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
-      d_token_position, seq_len, layer, d_k, d_v, stream));
+      raw_ptr(d_cache_k), raw_ptr(d_cache_v), config, raw_ptr(d_page_table), raw_ptr(d_token_batch),
+      raw_ptr(d_token_position), seq_len, layer, raw_ptr(d_k), raw_ptr(d_v),
+      stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   std::vector<__nv_bfloat16> expected(h_q.size());
@@ -618,20 +619,20 @@ int main(int argc, char **argv) {
 
   // Correctness check: flash paged decode against the CPU reference.
   CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_bf16(
-      d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
-      d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
+      raw_ptr(d_out), raw_ptr(d_partial_m), raw_ptr(d_partial_l), raw_ptr(d_partial_acc), raw_ptr(d_q), raw_ptr(d_cache_k),
+      raw_ptr(d_cache_v), raw_ptr(d_page_table), raw_ptr(d_seq_lengths), config, layer, batch_size,
       scale, split_size, num_splits, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
-  CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
+  CUDA_CHECK(cudaMemcpy(actual.data(), raw_ptr(d_out), actual.size() * sizeof(actual[0]),
                         cudaMemcpyDeviceToHost));
   check_attention_correctness(actual, expected);
 
   bool persistent_supported = true;
   cudaError_t persistent_status =
       gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
-      d_out, d_partial_m, d_partial_l, d_partial_acc, d_work_scratch,
-      work_scratch_i32, d_q, d_cache_k, d_cache_v, d_page_table,
-      d_seq_lengths, config, layer, batch_size, scale, split_size,
+      raw_ptr(d_out), raw_ptr(d_partial_m), raw_ptr(d_partial_l), raw_ptr(d_partial_acc), raw_ptr(d_work_scratch),
+      work_scratch_i32, raw_ptr(d_q), raw_ptr(d_cache_k), raw_ptr(d_cache_v), raw_ptr(d_page_table),
+      raw_ptr(d_seq_lengths), config, layer, batch_size, scale, split_size,
       num_splits, 0, stream);
   if (persistent_status == cudaErrorNotSupported) {
     persistent_supported = false;
@@ -639,7 +640,7 @@ int main(int argc, char **argv) {
   } else {
     CUDA_CHECK(persistent_status);
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaMemcpy(actual.data(), d_out, actual.size() * sizeof(actual[0]),
+    CUDA_CHECK(cudaMemcpy(actual.data(), raw_ptr(d_out), actual.size() * sizeof(actual[0]),
                           cudaMemcpyDeviceToHost));
     check_attention_correctness(actual, expected);
   }
@@ -648,25 +649,27 @@ int main(int argc, char **argv) {
   // wraps these in CUDA events on the same stream and optionally flushes L2.
   auto prefill_write = [&]() {
     CUDA_CHECK(gemma4_kv_cache_write_bf16(
-        d_cache_k, d_cache_v, config, d_page_table, d_token_batch,
-        d_token_position, seq_len, layer, d_k, d_v, stream));
+        raw_ptr(d_cache_k), raw_ptr(d_cache_v), config, raw_ptr(d_page_table), raw_ptr(d_token_batch),
+        raw_ptr(d_token_position), seq_len, layer, raw_ptr(d_k), raw_ptr(d_v),
+        stream));
   };
   auto decode_write = [&]() {
     CUDA_CHECK(gemma4_kv_cache_write_bf16(
-        d_cache_k, d_cache_v, config, d_page_table, d_one_batch,
-        d_one_position, 1, layer, d_one_k, d_one_v, stream));
+        raw_ptr(d_cache_k), raw_ptr(d_cache_v), config, raw_ptr(d_page_table), raw_ptr(d_one_batch),
+        raw_ptr(d_one_position), 1, layer, raw_ptr(d_one_k), raw_ptr(d_one_v),
+        stream));
   };
   auto flash_decode_attention = [&]() {
     CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_bf16(
-        d_out, d_partial_m, d_partial_l, d_partial_acc, d_q, d_cache_k,
-        d_cache_v, d_page_table, d_seq_lengths, config, layer, batch_size,
+        raw_ptr(d_out), raw_ptr(d_partial_m), raw_ptr(d_partial_l), raw_ptr(d_partial_acc), raw_ptr(d_q), raw_ptr(d_cache_k),
+        raw_ptr(d_cache_v), raw_ptr(d_page_table), raw_ptr(d_seq_lengths), config, layer, batch_size,
         scale, split_size, num_splits, stream));
   };
   auto flash_decode_attention_persistent = [&]() {
     CUDA_CHECK(gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
-        d_out, d_partial_m, d_partial_l, d_partial_acc, d_work_scratch,
-        work_scratch_i32, d_q, d_cache_k, d_cache_v, d_page_table,
-        d_seq_lengths, config, layer, batch_size, scale, split_size,
+        raw_ptr(d_out), raw_ptr(d_partial_m), raw_ptr(d_partial_l), raw_ptr(d_partial_acc), raw_ptr(d_work_scratch),
+        work_scratch_i32, raw_ptr(d_q), raw_ptr(d_cache_k), raw_ptr(d_cache_v), raw_ptr(d_page_table),
+        raw_ptr(d_seq_lengths), config, layer, batch_size, scale, split_size,
         num_splits, 0, stream));
   };
   auto flash_full_decode = [&]() {
@@ -727,35 +730,35 @@ int main(int argc, char **argv) {
     const size_t global_partial_acc_elements =
         global_partial_m_elements * global_config.head_dim;
 
-    DeviceBuffer<__nv_bfloat16> d_global_cache_k(
+    thrust::device_vector<__nv_bfloat16> d_global_cache_k(
         static_cast<size_t>(cache_elements(global_config)));
-    DeviceBuffer<__nv_bfloat16> d_global_cache_v(
+    thrust::device_vector<__nv_bfloat16> d_global_cache_v(
         static_cast<size_t>(cache_elements(global_config)));
-    DeviceBuffer<__nv_bfloat16> d_global_k(global_h_k.size());
-    DeviceBuffer<__nv_bfloat16> d_global_v(global_h_v.size());
-    DeviceBuffer<__nv_bfloat16> d_global_q(global_h_q.size());
-    DeviceBuffer<__nv_bfloat16> d_global_out(global_h_q.size());
-    DeviceBuffer<int32_t> d_global_page_table(global_page_table.size());
-    DeviceBuffer<float> d_global_partial_m(global_partial_m_elements);
-    DeviceBuffer<float> d_global_partial_l(global_partial_m_elements);
-    DeviceBuffer<float> d_global_partial_acc(global_partial_acc_elements);
+    thrust::device_vector<__nv_bfloat16> d_global_k(global_h_k.size());
+    thrust::device_vector<__nv_bfloat16> d_global_v(global_h_v.size());
+    thrust::device_vector<__nv_bfloat16> d_global_q(global_h_q.size());
+    thrust::device_vector<__nv_bfloat16> d_global_out(global_h_q.size());
+    thrust::device_vector<int32_t> d_global_page_table(global_page_table.size());
+    thrust::device_vector<float> d_global_partial_m(global_partial_m_elements);
+    thrust::device_vector<float> d_global_partial_l(global_partial_m_elements);
+    thrust::device_vector<float> d_global_partial_acc(global_partial_acc_elements);
 
-    CUDA_CHECK(cudaMemcpyAsync(d_global_k, global_h_k.data(),
+    CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_global_k), global_h_k.data(),
                                global_h_k.size() * sizeof(global_h_k[0]),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_global_v, global_h_v.data(),
+                               cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_global_v), global_h_v.data(),
                                global_h_v.size() * sizeof(global_h_v[0]),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_global_q, global_h_q.data(),
+                               cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_global_q), global_h_q.data(),
                                global_h_q.size() * sizeof(global_h_q[0]),
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_global_page_table, global_page_table.data(),
+                               cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_global_page_table), global_page_table.data(),
                                global_page_table.size() * sizeof(int32_t),
-                               cudaMemcpyHostToDevice, stream));
+                               cudaMemcpyHostToDevice));
     CUDA_CHECK(gemma4_kv_cache_write_bf16(
-        d_global_cache_k, d_global_cache_v, global_config, d_global_page_table,
-        d_token_batch, d_token_position, seq_len, layer, d_global_k,
-        d_global_v, stream));
+        raw_ptr(d_global_cache_k), raw_ptr(d_global_cache_v), global_config, raw_ptr(d_global_page_table),
+        raw_ptr(d_token_batch), raw_ptr(d_token_position), seq_len, layer, raw_ptr(d_global_k),
+        raw_ptr(d_global_v), stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<__nv_bfloat16> global_expected(global_h_q.size());
@@ -766,14 +769,14 @@ int main(int argc, char **argv) {
 
     auto global_decode_attention = [&]() {
       CUDA_CHECK(gemma4_flash_attention_decode_paged_bf16(
-          d_global_out, d_global_partial_m, d_global_partial_l,
-          d_global_partial_acc, d_global_q, d_global_cache_k, d_global_cache_v,
-          d_global_page_table, d_seq_lengths, global_config, layer, batch_size,
+          raw_ptr(d_global_out), raw_ptr(d_global_partial_m), raw_ptr(d_global_partial_l),
+          raw_ptr(d_global_partial_acc), raw_ptr(d_global_q), raw_ptr(d_global_cache_k), raw_ptr(d_global_cache_v),
+          raw_ptr(d_global_page_table), raw_ptr(d_seq_lengths), global_config, layer, batch_size,
           global_scale, global_split_size, global_splits, stream));
     };
     global_decode_attention();
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    CUDA_CHECK(cudaMemcpy(global_actual.data(), d_global_out,
+    CUDA_CHECK(cudaMemcpy(global_actual.data(), raw_ptr(d_global_out),
                           global_actual.size() * sizeof(global_actual[0]),
                           cudaMemcpyDeviceToHost));
     check_attention_correctness(global_actual, global_expected);

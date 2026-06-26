@@ -162,11 +162,11 @@ std::vector<float> time_samples(Fn &&fn,
   std::vector<float> values;
   values.reserve(samples);
   for (int sample = 0; sample < samples; ++sample) {
-    CHECK_CUDA(cudaEventRecord(start, stream));
+    CHECK_CUDA(cudaEventRecord(start));
     for (int i = 0; i < iters; ++i) {
       fn();
     }
-    CHECK_CUDA(cudaEventRecord(stop, stream));
+    CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
     float total_ms = 0.0f;
     CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
@@ -380,38 +380,38 @@ int main(int argc, char **argv) {
 
   constexpr size_t lm_head_elems =
       static_cast<size_t>(GEMMA4_VOCAB_SIZE) * GEMMA4_HIDDEN_SIZE;
-  DeviceBuffer<__nv_bfloat16> d_lm_head(lm_head_elems);
-  DeviceBuffer<__nv_bfloat16> d_final_hidden(GEMMA4_HIDDEN_SIZE);
-  DeviceBuffer<__nv_bfloat16> d_fused_hidden(GEMMA4_HIDDEN_SIZE);
-  DeviceBuffer<__nv_bfloat16> d_materialized_hidden(GEMMA4_HIDDEN_SIZE);
-  DeviceBuffer<__nv_bfloat16> d_materialized_logits(GEMMA4_VOCAB_SIZE);
-  DeviceBuffer<int32_t> d_fused_token(1);
-  DeviceBuffer<int32_t> d_materialized_token(1);
+  thrust::device_vector<__nv_bfloat16> d_lm_head(lm_head_elems);
+  thrust::device_vector<__nv_bfloat16> d_final_hidden(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_fused_hidden(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_materialized_hidden(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_materialized_logits(GEMMA4_VOCAB_SIZE);
+  thrust::device_vector<int32_t> d_fused_token(1);
+  thrust::device_vector<int32_t> d_materialized_token(1);
   constexpr size_t fused_scratch_bytes =
       static_cast<size_t>(GEMMA4_VOCAB_SIZE / kFinalLogitsColsPerBlock) *
       (sizeof(Gemma4SampleCandidate) + sizeof(uint32_t));
-  DeviceBuffer<unsigned char> d_fused_scratch(fused_scratch_bytes);
+  thrust::device_vector<unsigned char> d_fused_scratch(fused_scratch_bytes);
 
-  fill_random_bf16(d_lm_head.get(), lm_head_elems, 0x5678u, 0.05f, stream);
-  fill_random_bf16(d_final_hidden.get(), GEMMA4_HIDDEN_SIZE, 0x2468u, 0.05f,
-                   stream);
+  fill_random_bf16(raw_ptr(d_lm_head), lm_head_elems, 0x5678u, 0.05f, stream);
+  fill_random_bf16(
+      raw_ptr(d_final_hidden), GEMMA4_HIDDEN_SIZE, 0x2468u, 0.05f, stream);
   CHECK_CUDA(cudaStreamSynchronize(stream));
 
   auto fused_sample = [&]() {
     CHECK_CUDA(gemma4_sample_next_decode_bf16(
-        d_fused_hidden.get(), d_fused_token.get(),
-        d_fused_scratch.get(), fused_scratch_bytes, d_final_hidden.get(),
-        d_lm_head.get(), stream));
+        raw_ptr(d_fused_hidden), raw_ptr(d_fused_token),
+        raw_ptr(d_fused_scratch), fused_scratch_bytes, raw_ptr(d_final_hidden),
+        raw_ptr(d_lm_head), stream));
   };
   auto materialized_sample = [&]() {
     CHECK_CUDA(gemma4_projection_decode(
-        GEMMA4_PROJECTION_FINAL_LOGITS, d_final_hidden.get(),
-        d_lm_head.get(), d_materialized_logits.get(), stream));
+        GEMMA4_PROJECTION_FINAL_LOGITS, raw_ptr(d_final_hidden),
+        raw_ptr(d_lm_head), raw_ptr(d_materialized_logits), stream));
     materialized_logits_sample_embed_kernel<<<
         1, kMaterializedSampleThreads, 0, stream>>>(
-        d_materialized_hidden.get(),
-        d_materialized_token.get(), d_lm_head.get(),
-        d_materialized_logits.get());
+        raw_ptr(d_materialized_hidden),
+        raw_ptr(d_materialized_token), raw_ptr(d_lm_head),
+        raw_ptr(d_materialized_logits));
     CHECK_CUDA(cudaGetLastError());
   };
   fused_sample();
@@ -420,10 +420,10 @@ int main(int argc, char **argv) {
 
   int32_t fused_token = -1;
   int32_t materialized_token = -2;
-  CHECK_CUDA(cudaMemcpy(&fused_token, d_fused_token.get(),
+  CHECK_CUDA(cudaMemcpy(&fused_token, raw_ptr(d_fused_token),
                         sizeof(fused_token), cudaMemcpyDeviceToHost));
   CHECK_CUDA(cudaMemcpy(&materialized_token,
-                        d_materialized_token.get(),
+                        raw_ptr(d_materialized_token),
                         sizeof(materialized_token),
                         cudaMemcpyDeviceToHost));
   if (fused_token != materialized_token) {

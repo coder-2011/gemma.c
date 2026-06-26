@@ -5,6 +5,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -24,6 +27,18 @@ void check_cuda(cudaError_t status, const char *expr, const char *file, int line
 }
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+
+// Returns the raw CUDA pointer owned by a Thrust device vector.
+template <typename T>
+T *raw_ptr(thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
+
+// Returns the raw const CUDA pointer owned by a Thrust device vector.
+template <typename T>
+const T *raw_ptr(const thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
 
 // Convert BF16 test values back to float for comparisons.
 float bf16_to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
@@ -65,51 +80,24 @@ int64_t token_offset(int batch,
          dim;
 }
 
-// Own one device allocation for short CUDA tests.
 template <typename T>
-struct DeviceBuffer {
-  explicit DeviceBuffer(size_t count_) : count(count_) {
-    CHECK_CUDA(cudaMalloc(&ptr, count * sizeof(T)));
-  }
+void copy_to_device(thrust::device_vector<T> &dst, const std::vector<T> &src) {
+  CHECK_CUDA(cudaMemcpy(raw_ptr(dst), src.data(), src.size() * sizeof(T),
+                        cudaMemcpyHostToDevice));
+}
 
-  explicit DeviceBuffer(const std::vector<T> &src) : DeviceBuffer(src.size()) {
-    copy_from(src);
-  }
+template <typename T>
+std::vector<T> copy_to_host(const thrust::device_vector<T> &src) {
+  std::vector<T> dst(src.size());
+  CHECK_CUDA(cudaMemcpy(dst.data(), raw_ptr(src), dst.size() * sizeof(T),
+                        cudaMemcpyDeviceToHost));
+  return dst;
+}
 
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-  ~DeviceBuffer() {
-    if (ptr != nullptr) cudaFree(ptr);
-  }
-
-  T *get() const { return ptr; }
-
-  // Copy one host vector into this equally sized device buffer.
-  void copy_from(const std::vector<T> &src) const {
-    CHECK_CUDA(cudaMemcpy(ptr, src.data(), src.size() * sizeof(T),
-                          cudaMemcpyHostToDevice));
-  }
-
-  // Copy this full device buffer back into host memory.
-  std::vector<T> copy_to_host() const {
-    std::vector<T> dst(count);
-    CHECK_CUDA(cudaMemcpy(dst.data(), ptr, dst.size() * sizeof(T),
-                          cudaMemcpyDeviceToHost));
-    return dst;
-  }
-
-  // Clear the full device buffer.
-  void zero() const { memset_bytes(0); }
-
-  // Fill the device buffer with one byte value, matching cudaMemset semantics.
-  void memset_bytes(int value) const {
-    CHECK_CUDA(cudaMemset(ptr, value, count * sizeof(T)));
-  }
-
-  size_t count = 0;
-  T *ptr = nullptr;
-};
+template <typename T>
+void memset_device(thrust::device_vector<T> &dst, int value) {
+  CHECK_CUDA(cudaMemset(raw_ptr(dst), value, dst.size() * sizeof(T)));
+}
 
 // Compare BF16 vectors with an absolute tolerance.
 void compare_bf16(const std::vector<__nv_bfloat16> &actual,
@@ -159,11 +147,11 @@ void compare_float(const std::vector<float> &actual,
 }
 
 // Compare a full BF16 device buffer after copying it back to host memory.
-void compare_device_bf16(const DeviceBuffer<__nv_bfloat16> &actual,
+void compare_device_bf16(const thrust::device_vector<__nv_bfloat16> &actual,
                          const std::vector<__nv_bfloat16> &expected,
                          float tolerance,
                          const char *label) {
-  compare_bf16(actual.copy_to_host(), expected, tolerance, label);
+  compare_bf16(copy_to_host(actual), expected, tolerance, label);
 }
 
 // Return the scalar RMSNorm multiplier for one row.
@@ -191,11 +179,11 @@ __nv_bfloat16 reference_head_rms_scalar(float value, int head_dim) {
 }
 
 // Write one BF16 value into a large zeroed device matrix.
-void write_device_bf16(const DeviceBuffer<__nv_bfloat16> &dst,
+void write_device_bf16(thrust::device_vector<__nv_bfloat16> &dst,
                        int64_t index,
                        float value) {
   __nv_bfloat16 bf16 = __float2bfloat16_rn(value);
-  CHECK_CUDA(cudaMemcpy(dst.get() + index, &bf16, sizeof(bf16),
+  CHECK_CUDA(cudaMemcpy(raw_ptr(dst) + index, &bf16, sizeof(bf16),
                         cudaMemcpyHostToDevice));
 }
 
@@ -271,15 +259,18 @@ void run_sliding_prefill_reference_case(int seq_len,
     v[i] = make_prefill_value(3000 + i);
   }
 
-  DeviceBuffer<__nv_bfloat16> d_q(q);
-  DeviceBuffer<__nv_bfloat16> d_k(k);
-  DeviceBuffer<__nv_bfloat16> d_v(v);
-  DeviceBuffer<__nv_bfloat16> d_out(q_count);
-  DeviceBuffer<float> d_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
+  thrust::device_vector<__nv_bfloat16> d_q(q.size());
+  thrust::device_vector<__nv_bfloat16> d_k(k.size());
+  thrust::device_vector<__nv_bfloat16> d_v(v.size());
+  thrust::device_vector<__nv_bfloat16> d_out(q_count);
+  thrust::device_vector<float> d_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
+  copy_to_device(d_q, q);
+  copy_to_device(d_k, k);
+  copy_to_device(d_v, v);
 
   const float scale = 1.0f / std::sqrt(float(GEMMA4_SLIDING_HEAD_DIM));
   CHECK_CUDA(gemma4_flash_attention_sliding_fwd_bf16(
-      d_out.get(), d_lse.get(), d_q.get(), d_k.get(), d_v.get(), 1, seq_len,
+      raw_ptr(d_out), raw_ptr(d_lse), raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), 1, seq_len,
       seq_len, window_size, scale, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -289,7 +280,7 @@ void run_sliding_prefill_reference_case(int seq_len,
                       GEMMA4_SLIDING_KV_HEADS, GEMMA4_SLIDING_HEAD_DIM,
                       window_size, scale, &expected_lse);
   compare_device_bf16(d_out, expected, 0.03125f, label);
-  compare_float(d_lse.copy_to_host(), expected_lse, 0.03125f,
+  compare_float(copy_to_host(d_lse), expected_lse, 0.03125f,
                 "sliding prefill LSE");
 }
 
@@ -312,37 +303,45 @@ void run_global_prefill_reference_case() {
   for (int i = 0; i < kv_count; ++i) k[i] = make_prefill_value(5000 + i);
   for (int i = 0; i < seq_len; ++i) token_position[i] = i;
 
-  DeviceBuffer<__nv_bfloat16> d_q(q);
-  DeviceBuffer<__nv_bfloat16> d_k(k);
-  DeviceBuffer<__nv_bfloat16> d_q_prepared(q_count);
-  DeviceBuffer<__nv_bfloat16> d_k_prepared(kv_count);
-  DeviceBuffer<__nv_bfloat16> d_v_prepared(kv_count);
-  DeviceBuffer<__nv_bfloat16> d_out(q_count);
-  DeviceBuffer<float> d_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
-  DeviceBuffer<__nv_bfloat16> d_norm_weight(norm_weight);
-  DeviceBuffer<float> d_cos(cos);
-  DeviceBuffer<float> d_sin(sin);
-  DeviceBuffer<int32_t> d_token_position(token_position);
+  thrust::device_vector<__nv_bfloat16> d_q(q.size());
+  thrust::device_vector<__nv_bfloat16> d_k(k.size());
+  thrust::device_vector<__nv_bfloat16> d_q_prepared(q_count);
+  thrust::device_vector<__nv_bfloat16> d_k_prepared(kv_count);
+  thrust::device_vector<__nv_bfloat16> d_v_prepared(kv_count);
+  thrust::device_vector<__nv_bfloat16> d_out(q_count);
+  thrust::device_vector<float> d_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
+  thrust::device_vector<__nv_bfloat16> d_norm_weight(
+      norm_weight.size());
+  thrust::device_vector<float> d_cos(cos.size());
+  thrust::device_vector<float> d_sin(sin.size());
+  thrust::device_vector<int32_t> d_token_position(
+      token_position.size());
+  copy_to_device(d_q, q);
+  copy_to_device(d_k, k);
+  copy_to_device(d_norm_weight, norm_weight);
+  copy_to_device(d_cos, cos);
+  copy_to_device(d_sin, sin);
+  copy_to_device(d_token_position, token_position);
 
   const float scale = 1.0f / std::sqrt(float(GEMMA4_GLOBAL_HEAD_DIM));
   CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
-      d_out.get(), d_lse.get(), d_q_prepared.get(), d_k_prepared.get(),
-      d_v_prepared.get(), d_q.get(), d_k.get(), d_norm_weight.get(),
-      d_norm_weight.get(), d_cos.get(), d_sin.get(), d_token_position.get(),
+      raw_ptr(d_out), raw_ptr(d_lse), raw_ptr(d_q_prepared), raw_ptr(d_k_prepared),
+      raw_ptr(d_v_prepared), raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_norm_weight),
+      raw_ptr(d_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin), raw_ptr(d_token_position),
       batch_size, seq_len, seq_len, scale, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
   std::vector<__nv_bfloat16> expected(q_count);
-  std::vector<__nv_bfloat16> q_prepared = d_q_prepared.copy_to_host();
-  std::vector<__nv_bfloat16> k_prepared = d_k_prepared.copy_to_host();
-  std::vector<__nv_bfloat16> v_prepared = d_v_prepared.copy_to_host();
+  std::vector<__nv_bfloat16> q_prepared = copy_to_host(d_q_prepared);
+  std::vector<__nv_bfloat16> k_prepared = copy_to_host(d_k_prepared);
+  std::vector<__nv_bfloat16> v_prepared = copy_to_host(d_v_prepared);
   std::vector<float> expected_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
   reference_attention(expected, q_prepared, k_prepared, v_prepared, seq_len,
                       GEMMA4_NUM_QUERY_HEADS, GEMMA4_GLOBAL_KV_HEADS,
                       GEMMA4_GLOBAL_HEAD_DIM, 0, scale, &expected_lse);
   compare_device_bf16(d_out, expected, 0.03125f,
                       "global D512 prefill partial tile");
-  compare_float(d_lse.copy_to_host(), expected_lse, 0.03125f,
+  compare_float(copy_to_host(d_lse), expected_lse, 0.03125f,
                 "global D512 prefill LSE");
 }
 
@@ -361,19 +360,25 @@ void run_global_flash_decode_case() {
   std::vector<int32_t> page_table = {0};
   std::vector<int32_t> seq_lengths = {1};
 
-  DeviceBuffer<__nv_bfloat16> d_q(q_count);
-  DeviceBuffer<__nv_bfloat16> d_out(q_count);
-  DeviceBuffer<__nv_bfloat16> d_cache_k(cache_count);
-  DeviceBuffer<__nv_bfloat16> d_cache_v(cache_v);
-  DeviceBuffer<int32_t> d_page_table(page_table);
-  DeviceBuffer<int32_t> d_seq_lengths(seq_lengths);
-  d_q.zero();
-  d_cache_k.zero();
-  d_out.memset_bytes(0x5a);
+  thrust::device_vector<__nv_bfloat16> d_q(q_count);
+  thrust::device_vector<__nv_bfloat16> d_out(q_count);
+  thrust::device_vector<__nv_bfloat16> d_cache_k(cache_count);
+  thrust::device_vector<__nv_bfloat16> d_cache_v(
+      cache_v.size());
+  thrust::device_vector<int32_t> d_page_table(
+      page_table.size());
+  thrust::device_vector<int32_t> d_seq_lengths(
+      seq_lengths.size());
+  copy_to_device(d_cache_v, cache_v);
+  copy_to_device(d_page_table, page_table);
+  copy_to_device(d_seq_lengths, seq_lengths);
+  memset_device(d_q, 0);
+  memset_device(d_cache_k, 0);
+  memset_device(d_out, 0x5a);
 
   CHECK_CUDA(gemma4_flash_attention_decode_paged_bf16(
-      d_out.get(), nullptr, nullptr, nullptr, d_q.get(), d_cache_k.get(),
-      d_cache_v.get(), d_page_table.get(), d_seq_lengths.get(), config, 0, 1,
+      raw_ptr(d_out), nullptr, nullptr, nullptr, raw_ptr(d_q), raw_ptr(d_cache_k),
+      raw_ptr(d_cache_v), raw_ptr(d_page_table), raw_ptr(d_seq_lengths), config, 0, 1,
       1.0f, 1, 1, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -421,45 +426,56 @@ void run_sliding_norm_project_prepare_case() {
       static_cast<size_t>(kv_cols) * GEMMA4_HIDDEN_SIZE;
   const int64_t cache_count = cache_elements(config);
 
-  DeviceBuffer<__nv_bfloat16> d_x(x);
-  DeviceBuffer<__nv_bfloat16> d_input_norm_weight(input_norm_weight);
-  DeviceBuffer<__nv_bfloat16> d_head_norm(head_norm_weight);
-  DeviceBuffer<float> d_cos(cos);
-  DeviceBuffer<float> d_sin(sin);
-  DeviceBuffer<int32_t> d_page_table(page_table);
-  DeviceBuffer<int32_t> d_token_position(token_position);
-  DeviceBuffer<__nv_bfloat16> d_w_q(q_weight_count);
-  DeviceBuffer<__nv_bfloat16> d_w_k(kv_weight_count);
-  DeviceBuffer<__nv_bfloat16> d_w_v(kv_weight_count);
-  DeviceBuffer<__nv_bfloat16> d_q(q_cols);
-  DeviceBuffer<__nv_bfloat16> d_cache_k(cache_count);
-  DeviceBuffer<__nv_bfloat16> d_cache_v(cache_count);
+  thrust::device_vector<__nv_bfloat16> d_x(x.size());
+  thrust::device_vector<__nv_bfloat16> d_input_norm_weight(
+      input_norm_weight.size());
+  thrust::device_vector<__nv_bfloat16> d_head_norm(
+      head_norm_weight.size());
+  thrust::device_vector<float> d_cos(cos.size());
+  thrust::device_vector<float> d_sin(sin.size());
+  thrust::device_vector<int32_t> d_page_table(
+      page_table.size());
+  thrust::device_vector<int32_t> d_token_position(
+      token_position.size());
+  thrust::device_vector<__nv_bfloat16> d_w_q(q_weight_count);
+  thrust::device_vector<__nv_bfloat16> d_w_k(kv_weight_count);
+  thrust::device_vector<__nv_bfloat16> d_w_v(kv_weight_count);
+  thrust::device_vector<__nv_bfloat16> d_q(q_cols);
+  thrust::device_vector<__nv_bfloat16> d_cache_k(cache_count);
+  thrust::device_vector<__nv_bfloat16> d_cache_v(cache_count);
+  copy_to_device(d_x, x);
+  copy_to_device(d_input_norm_weight, input_norm_weight);
+  copy_to_device(d_head_norm, head_norm_weight);
+  copy_to_device(d_cos, cos);
+  copy_to_device(d_sin, sin);
+  copy_to_device(d_page_table, page_table);
+  copy_to_device(d_token_position, token_position);
 
-  d_w_q.zero();
-  d_w_k.zero();
-  d_w_v.zero();
-  d_q.zero();
-  d_cache_k.zero();
-  d_cache_v.zero();
+  memset_device(d_w_q, 0);
+  memset_device(d_w_k, 0);
+  memset_device(d_w_v, 0);
+  memset_device(d_q, 0);
+  memset_device(d_cache_k, 0);
+  memset_device(d_cache_v, 0);
 
   write_device_bf16(d_w_q, 0, q_weight);
   write_device_bf16(d_w_k, 0, k_weight);
   write_device_bf16(d_w_v, 0, v_weight);
 
   Gemma4AttentionProjectionWeights weights = {
-      d_w_q.get(),
-      d_w_k.get(),
-      d_w_v.get(),
+      raw_ptr(d_w_q),
+      raw_ptr(d_w_k),
+      raw_ptr(d_w_v),
       0,
       0,
       0,
   };
 
   CHECK_CUDA(gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16(
-      d_q.get(), d_cache_k.get(), d_cache_v.get(), config,
-      d_page_table.get(), d_token_position.get(), batch_size, cache_layer,
-      d_x.get(), d_input_norm_weight.get(), weights, d_head_norm.get(),
-      d_head_norm.get(), d_cos.get(), d_sin.get(), 0));
+      raw_ptr(d_q), raw_ptr(d_cache_k), raw_ptr(d_cache_v), config,
+      raw_ptr(d_page_table), raw_ptr(d_token_position), batch_size, cache_layer,
+      raw_ptr(d_x), raw_ptr(d_input_norm_weight), weights, raw_ptr(d_head_norm),
+      raw_ptr(d_head_norm), raw_ptr(d_cos), raw_ptr(d_sin), 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
   float q_value = reference_project_scalar(normed_x0, q_weight);
@@ -504,23 +520,30 @@ void run_global_prefill_norm_rope_case() {
   cos[token_position[1] * rotary_half] = 0.0f;
   sin[token_position[1] * rotary_half] = -1.0f;
 
-  DeviceBuffer<__nv_bfloat16> d_q(q_count);
-  DeviceBuffer<__nv_bfloat16> d_k(k);
-  DeviceBuffer<__nv_bfloat16> d_q_prepared(q_count);
-  DeviceBuffer<__nv_bfloat16> d_k_prepared(kv_count);
-  DeviceBuffer<__nv_bfloat16> d_v_prepared(kv_count);
-  DeviceBuffer<__nv_bfloat16> d_out(q_count);
-  DeviceBuffer<__nv_bfloat16> d_norm_weight(norm_weight);
-  DeviceBuffer<float> d_cos(cos);
-  DeviceBuffer<float> d_sin(sin);
-  DeviceBuffer<int32_t> d_token_position(token_position);
-  d_q.zero();
+  thrust::device_vector<__nv_bfloat16> d_q(q_count);
+  thrust::device_vector<__nv_bfloat16> d_k(k.size());
+  thrust::device_vector<__nv_bfloat16> d_q_prepared(q_count);
+  thrust::device_vector<__nv_bfloat16> d_k_prepared(kv_count);
+  thrust::device_vector<__nv_bfloat16> d_v_prepared(kv_count);
+  thrust::device_vector<__nv_bfloat16> d_out(q_count);
+  thrust::device_vector<__nv_bfloat16> d_norm_weight(
+      norm_weight.size());
+  thrust::device_vector<float> d_cos(cos.size());
+  thrust::device_vector<float> d_sin(sin.size());
+  thrust::device_vector<int32_t> d_token_position(
+      token_position.size());
+  copy_to_device(d_k, k);
+  copy_to_device(d_norm_weight, norm_weight);
+  copy_to_device(d_cos, cos);
+  copy_to_device(d_sin, sin);
+  copy_to_device(d_token_position, token_position);
+  memset_device(d_q, 0);
 
   const float scale = 1.0f / std::sqrt(float(GEMMA4_GLOBAL_HEAD_DIM));
   CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
-      d_out.get(), nullptr, d_q_prepared.get(), d_k_prepared.get(),
-      d_v_prepared.get(), d_q.get(), d_k.get(), d_norm_weight.get(),
-      d_norm_weight.get(), d_cos.get(), d_sin.get(), d_token_position.get(),
+      raw_ptr(d_out), nullptr, raw_ptr(d_q_prepared), raw_ptr(d_k_prepared),
+      raw_ptr(d_v_prepared), raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_norm_weight),
+      raw_ptr(d_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin), raw_ptr(d_token_position),
       batch_size, seq_len, seq_len, scale, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -539,12 +562,12 @@ void run_global_prefill_norm_rope_case() {
       expected_v[row_base + d] = __float2bfloat16_rn(value * row_inv_rms[row]);
     }
   }
-  std::vector<__nv_bfloat16> v_prepared = d_v_prepared.copy_to_host();
+  std::vector<__nv_bfloat16> v_prepared = copy_to_host(d_v_prepared);
   compare_bf16(v_prepared, expected_v, 0.00390625f,
                "global prefill K-derived V");
 
   // Check RoPE uses absolute token positions instead of local prefill rows.
-  std::vector<__nv_bfloat16> k_prepared = d_k_prepared.copy_to_host();
+  std::vector<__nv_bfloat16> k_prepared = copy_to_host(d_k_prepared);
   for (int row = 0; row < rows; ++row) {
     const int64_t row_base = int64_t(row) * GEMMA4_GLOBAL_HEAD_DIM;
     const int position = token_position[row];

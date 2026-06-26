@@ -171,9 +171,9 @@ SampleStats time_cuda_samples(Fn &&fn,
       float total_ms = 0.0f;
       for (int i = 0; i < iters_per_sample; ++i) {
         flush_l2(stream, d_l2_scratch, l2_flush_words);
-        CUDA_CHECK(cudaEventRecord(start, stream));
+        CUDA_CHECK(cudaEventRecord(start));
         fn();
-        CUDA_CHECK(cudaEventRecord(stop, stream));
+        CUDA_CHECK(cudaEventRecord(stop));
         CUDA_CHECK(cudaEventSynchronize(stop));
         float iter_ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&iter_ms, start, stop));
@@ -181,11 +181,11 @@ SampleStats time_cuda_samples(Fn &&fn,
       }
       values[sample] = total_ms / float(iters_per_sample);
     } else {
-      CUDA_CHECK(cudaEventRecord(start, stream));
+      CUDA_CHECK(cudaEventRecord(start));
       for (int i = 0; i < iters_per_sample; ++i) {
         fn();
       }
-      CUDA_CHECK(cudaEventRecord(stop, stream));
+      CUDA_CHECK(cudaEventRecord(stop));
       CUDA_CHECK(cudaEventSynchronize(stop));
       float total_ms = 0.0f;
       CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
@@ -531,38 +531,38 @@ void run_correctness(int batch_size, int seq_len, int window_size,
                              h_k_norm_weight, h_cos, h_sin,
                              batch_size, seq_len);
 
-  DeviceBuffer<__nv_bfloat16> d_q(h_q.size());
-  DeviceBuffer<__nv_bfloat16> d_k(h_k.size());
-  DeviceBuffer<__nv_bfloat16> d_v(h_v.size());
-  DeviceBuffer<__nv_bfloat16> d_q_prepared(h_q.size());
-  DeviceBuffer<__nv_bfloat16> d_k_prepared(h_k.size());
-  DeviceBuffer<__nv_bfloat16> d_v_prepared(h_v.size());
-  DeviceBuffer<__nv_bfloat16> d_q_norm_weight(h_q_norm_weight.size());
-  DeviceBuffer<__nv_bfloat16> d_k_norm_weight(h_k_norm_weight.size());
-  DeviceBuffer<__nv_bfloat16> d_out(h_q.size());
-  DeviceBuffer<float> d_cos(h_cos.size());
-  DeviceBuffer<float> d_sin(h_sin.size());
-  DeviceBuffer<float> d_lse(size_t(batch_size) * kQHeads * seq_len);
-  CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(__nv_bfloat16),
+  thrust::device_vector<__nv_bfloat16> d_q(h_q.size());
+  thrust::device_vector<__nv_bfloat16> d_k(h_k.size());
+  thrust::device_vector<__nv_bfloat16> d_v(h_v.size());
+  thrust::device_vector<__nv_bfloat16> d_q_prepared(h_q.size());
+  thrust::device_vector<__nv_bfloat16> d_k_prepared(h_k.size());
+  thrust::device_vector<__nv_bfloat16> d_v_prepared(h_v.size());
+  thrust::device_vector<__nv_bfloat16> d_q_norm_weight(h_q_norm_weight.size());
+  thrust::device_vector<__nv_bfloat16> d_k_norm_weight(h_k_norm_weight.size());
+  thrust::device_vector<__nv_bfloat16> d_out(h_q.size());
+  thrust::device_vector<float> d_cos(h_cos.size());
+  thrust::device_vector<float> d_sin(h_sin.size());
+  thrust::device_vector<float> d_lse(size_t(batch_size) * kQHeads * seq_len);
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_q), h_q.data(), h_q.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(__nv_bfloat16),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_k), h_k.data(), h_k.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), h_v.size() * sizeof(__nv_bfloat16),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_v), h_v.data(), h_v.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_q_norm_weight, h_q_norm_weight.data(),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_q_norm_weight), h_q_norm_weight.data(),
                         h_q_norm_weight.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_k_norm_weight, h_k_norm_weight.data(),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_k_norm_weight), h_k_norm_weight.data(),
                         h_k_norm_weight.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_cos, h_cos.data(), h_cos.size() * sizeof(float),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_cos), h_cos.data(), h_cos.size() * sizeof(float),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_sin, h_sin.data(), h_sin.size() * sizeof(float),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_sin), h_sin.data(), h_sin.size() * sizeof(float),
                         cudaMemcpyHostToDevice));
 
   CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
-      d_out, d_lse, d_q_prepared, d_k_prepared, d_v_prepared,
-      d_q, d_k, d_v, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin,
+      raw_ptr(d_out), raw_ptr(d_lse), raw_ptr(d_q_prepared), raw_ptr(d_k_prepared), raw_ptr(d_v_prepared),
+      raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), raw_ptr(d_q_norm_weight), raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin),
       nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -570,15 +570,15 @@ void run_correctness(int batch_size, int seq_len, int window_size,
   std::vector<__nv_bfloat16> h_q_gpu(h_q.size());
   std::vector<__nv_bfloat16> h_k_gpu(h_k.size());
   std::vector<__nv_bfloat16> h_v_gpu(h_v.size());
-  CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, h_out.size() * sizeof(__nv_bfloat16),
+  CUDA_CHECK(cudaMemcpy(h_out.data(), raw_ptr(d_out), h_out.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(h_q_gpu.data(), d_q_prepared,
+  CUDA_CHECK(cudaMemcpy(h_q_gpu.data(), raw_ptr(d_q_prepared),
                         h_q_gpu.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(h_k_gpu.data(), d_k_prepared,
+  CUDA_CHECK(cudaMemcpy(h_k_gpu.data(), raw_ptr(d_k_prepared),
                         h_k_gpu.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(h_v_gpu.data(), d_v_prepared,
+  CUDA_CHECK(cudaMemcpy(h_v_gpu.data(), raw_ptr(d_v_prepared),
                         h_v_gpu.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost));
   const std::vector<__nv_bfloat16> h_ref =
@@ -590,12 +590,12 @@ void run_correctness(int batch_size, int seq_len, int window_size,
   const DiffStats diff = diff_stats_host(h_out, h_ref);
 
   CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
-      d_out, nullptr, d_q_prepared, d_k_prepared, d_v_prepared,
-      d_q, d_k, d_v, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin,
+      raw_ptr(d_out), nullptr, raw_ptr(d_q_prepared), raw_ptr(d_k_prepared), raw_ptr(d_v_prepared),
+      raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), raw_ptr(d_q_norm_weight), raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin),
       nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
   std::vector<__nv_bfloat16> h_out_no_lse(h_q.size());
-  CUDA_CHECK(cudaMemcpy(h_out_no_lse.data(), d_out,
+  CUDA_CHECK(cudaMemcpy(h_out_no_lse.data(), raw_ptr(d_out),
                         h_out_no_lse.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyDeviceToHost));
   const DiffStats no_lse_diff = diff_stats_host(h_out_no_lse, h_ref);
@@ -678,72 +678,72 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
     flush_bytes = flush_bytes > 0 ? flush_bytes : int64_t(64) * 1024 * 1024;
     l2_flush_words = flush_bytes / int64_t(sizeof(uint32_t));
   }
-  DeviceBuffer<__nv_bfloat16> d_q(h_q.size());
-  DeviceBuffer<__nv_bfloat16> d_k(h_k.size());
-  DeviceBuffer<__nv_bfloat16> d_v(h_v.size());
-  DeviceBuffer<__nv_bfloat16> d_decode_q(h_decode_q.size());
-  DeviceBuffer<__nv_bfloat16> d_decode_k(h_decode_k.size());
-  DeviceBuffer<__nv_bfloat16> d_decode_v(h_decode_v.size());
-  DeviceBuffer<__nv_bfloat16> d_q_prepared(h_q.size());
-  DeviceBuffer<__nv_bfloat16> d_k_prepared(h_k.size());
-  DeviceBuffer<__nv_bfloat16> d_v_prepared(h_v.size());
-  DeviceBuffer<__nv_bfloat16> d_decode_q_prepared(h_decode_q.size());
-  DeviceBuffer<__nv_bfloat16> d_decode_cache_k(decode_cache_elems);
-  DeviceBuffer<__nv_bfloat16> d_decode_cache_v(decode_cache_elems);
-  DeviceBuffer<__nv_bfloat16> d_q_norm_weight(h_q_norm_weight.size());
-  DeviceBuffer<__nv_bfloat16> d_k_norm_weight(h_k_norm_weight.size());
-  DeviceBuffer<__nv_bfloat16> d_out(h_q.size());
-  DeviceBuffer<float> d_raw_lse(size_t(batch_size) * kQHeads * seq_len);
-  DeviceBuffer<int32_t> d_decode_page_table(h_decode_page_table.size());
-  DeviceBuffer<int32_t> d_decode_token_position(
+  thrust::device_vector<__nv_bfloat16> d_q(h_q.size());
+  thrust::device_vector<__nv_bfloat16> d_k(h_k.size());
+  thrust::device_vector<__nv_bfloat16> d_v(h_v.size());
+  thrust::device_vector<__nv_bfloat16> d_decode_q(h_decode_q.size());
+  thrust::device_vector<__nv_bfloat16> d_decode_k(h_decode_k.size());
+  thrust::device_vector<__nv_bfloat16> d_decode_v(h_decode_v.size());
+  thrust::device_vector<__nv_bfloat16> d_q_prepared(h_q.size());
+  thrust::device_vector<__nv_bfloat16> d_k_prepared(h_k.size());
+  thrust::device_vector<__nv_bfloat16> d_v_prepared(h_v.size());
+  thrust::device_vector<__nv_bfloat16> d_decode_q_prepared(h_decode_q.size());
+  thrust::device_vector<__nv_bfloat16> d_decode_cache_k(decode_cache_elems);
+  thrust::device_vector<__nv_bfloat16> d_decode_cache_v(decode_cache_elems);
+  thrust::device_vector<__nv_bfloat16> d_q_norm_weight(h_q_norm_weight.size());
+  thrust::device_vector<__nv_bfloat16> d_k_norm_weight(h_k_norm_weight.size());
+  thrust::device_vector<__nv_bfloat16> d_out(h_q.size());
+  thrust::device_vector<float> d_raw_lse(size_t(batch_size) * kQHeads * seq_len);
+  thrust::device_vector<int32_t> d_decode_page_table(h_decode_page_table.size());
+  thrust::device_vector<int32_t> d_decode_token_position(
       h_decode_token_position.size());
-  DeviceBuffer<float> d_cos(h_cos.size());
-  DeviceBuffer<float> d_sin(h_sin.size());
-  DeviceBuffer<uint32_t> d_l2_scratch(static_cast<size_t>(l2_flush_words));
+  thrust::device_vector<float> d_cos(h_cos.size());
+  thrust::device_vector<float> d_sin(h_sin.size());
+  thrust::device_vector<uint32_t> d_l2_scratch(static_cast<size_t>(l2_flush_words));
   if (cold_cache) {
-    CUDA_CHECK(cudaMemset(d_l2_scratch, 0,
-                          d_l2_scratch.count() * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(raw_ptr(d_l2_scratch), 0,
+                          d_l2_scratch.size() * sizeof(uint32_t)));
   }
-  CUDA_CHECK(cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(__nv_bfloat16),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_q), h_q.data(), h_q.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_k, h_k.data(), h_k.size() * sizeof(__nv_bfloat16),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_k), h_k.data(), h_k.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_v, h_v.data(), h_v.size() * sizeof(__nv_bfloat16),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_v), h_v.data(), h_v.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_decode_q, h_decode_q.data(),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_q), h_decode_q.data(),
                         h_decode_q.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_decode_k, h_decode_k.data(),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_k), h_decode_k.data(),
                         h_decode_k.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_decode_v, h_decode_v.data(),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_v), h_decode_v.data(),
                         h_decode_v.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_q_norm_weight, h_q_norm_weight.data(),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_q_norm_weight), h_q_norm_weight.data(),
                         h_q_norm_weight.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_k_norm_weight, h_k_norm_weight.data(),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_k_norm_weight), h_k_norm_weight.data(),
                         h_k_norm_weight.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_cos, h_cos.data(), h_cos.size() * sizeof(float),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_cos), h_cos.data(), h_cos.size() * sizeof(float),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_sin, h_sin.data(), h_sin.size() * sizeof(float),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_sin), h_sin.data(), h_sin.size() * sizeof(float),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_decode_page_table, h_decode_page_table.data(),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_page_table), h_decode_page_table.data(),
                         h_decode_page_table.size() * sizeof(int32_t),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_decode_token_position, h_decode_token_position.data(),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_token_position), h_decode_token_position.data(),
                         h_decode_token_position.size() * sizeof(int32_t),
                         cudaMemcpyHostToDevice));
 
   auto launch_raw_sliding_fa = [&]() {
     CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16(
-        d_out, d_raw_lse, d_q, d_k, d_v, batch_size, seq_len, seq_len,
+        raw_ptr(d_out), raw_ptr(d_raw_lse), raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), batch_size, seq_len, seq_len,
         window_size, scale, stream));
   };
   const SampleStats raw_sliding_timing =
       time_cuda_samples(launch_raw_sliding_fa, stream, warmup, iters, samples,
-                        cold_cache, d_l2_scratch, l2_flush_words);
+                        cold_cache, raw_ptr(d_l2_scratch), l2_flush_words);
 
   if (seq_len <= window_size) {
     c10::cuda::CUDAGuard torch_device_guard(0);
@@ -770,7 +770,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
     print_stats("prefill_torch_sdpa_graphless",
                 time_cuda_samples(launch_torch_prefill, torch_stream.stream(),
                                   warmup, iters, samples, cold_cache,
-                                  d_l2_scratch, l2_flush_words));
+                                  raw_ptr(d_l2_scratch), l2_flush_words));
   } else {
     std::cout << "prefill_torch_sdpa_graphless skipped=seq_exceeds_window\n";
   }
@@ -827,7 +827,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
     print_stats("torch_decode_norm_rope_paged_kv_write",
                 time_cuda_samples(launch_torch_decode_prep,
                                   torch_stream.stream(), warmup, iters,
-                                  samples, cold_cache, d_l2_scratch,
+                                  samples, cold_cache, raw_ptr(d_l2_scratch),
                                   l2_flush_words));
   }
 
@@ -937,37 +937,37 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
     print_stats("torch_project_prepare",
                 time_cuda_samples(launch_torch_project_prepare,
                                   torch_stream.stream(), warmup, iters,
-                                  samples, cold_cache, d_l2_scratch,
+                                  samples, cold_cache, raw_ptr(d_l2_scratch),
                                   l2_flush_words));
     print_stats("custom_project_prepare",
                 time_cuda_samples(launch_custom_project_prepare,
                                   torch_stream.stream(), warmup, iters,
-                                  samples, cold_cache, d_l2_scratch,
+                                  samples, cold_cache, raw_ptr(d_l2_scratch),
                                   l2_flush_words));
   }
 
   auto launch_norm_rope_fa = [&]() {
     CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
-        d_out, nullptr, d_q_prepared, d_k_prepared, d_v_prepared,
-        d_q, d_k, d_v, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin,
-        nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
+      raw_ptr(d_out), nullptr, raw_ptr(d_q_prepared), raw_ptr(d_k_prepared), raw_ptr(d_v_prepared),
+      raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), raw_ptr(d_q_norm_weight), raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin),
+      nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   };
   const SampleStats norm_rope_timing =
       time_cuda_samples(launch_norm_rope_fa, stream, warmup, iters, samples,
-                        cold_cache, d_l2_scratch, l2_flush_words);
+                        cold_cache, raw_ptr(d_l2_scratch), l2_flush_words);
   const double tflops = sliding_attention_flops(batch_size, seq_len, window_size) /
                         (double(norm_rope_timing.median_ms) * 1.0e-3) / 1.0e12;
 
   auto launch_decode_prep_cache = [&]() {
     CUDA_CHECK(gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_bf16(
-        d_decode_q_prepared, d_decode_cache_k, d_decode_cache_v,
-        decode_cache_config, d_decode_page_table, d_decode_token_position,
-        batch_size, 0, d_decode_q, d_decode_k, d_decode_v, d_q_norm_weight,
-        d_k_norm_weight, d_cos, d_sin, stream));
+        raw_ptr(d_decode_q_prepared), raw_ptr(d_decode_cache_k), raw_ptr(d_decode_cache_v),
+        decode_cache_config, raw_ptr(d_decode_page_table), raw_ptr(d_decode_token_position),
+        batch_size, 0, raw_ptr(d_decode_q), raw_ptr(d_decode_k), raw_ptr(d_decode_v), raw_ptr(d_q_norm_weight),
+        raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin), stream));
   };
   const SampleStats decode_prep_cache_timing =
       time_cuda_samples(launch_decode_prep_cache, stream, warmup, iters,
-                        samples, cold_cache, d_l2_scratch, l2_flush_words);
+                        samples, cold_cache, raw_ptr(d_l2_scratch), l2_flush_words);
 
   std::cout << "benchmark batch=" << batch_size
             << " seq=" << seq_len

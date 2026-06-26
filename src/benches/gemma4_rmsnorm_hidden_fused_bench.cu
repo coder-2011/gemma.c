@@ -49,15 +49,15 @@ int main(int argc, char **argv) {
   const size_t max_elems = static_cast<size_t>(max_rows) * width;
   const uint64_t seed = make_seed("GEMMA4_RMSNORM_BENCH_SEED");
 
-  DeviceBuffer<__nv_bfloat16> d_inp1(max_elems);
-  DeviceBuffer<__nv_bfloat16> d_inp2(max_elems);
-  DeviceBuffer<__nv_bfloat16> d_weight(width);
-  DeviceBuffer<__nv_bfloat16> d_residual(max_elems);
-  DeviceBuffer<__nv_bfloat16> d_normed(max_elems);
+  thrust::device_vector<__nv_bfloat16> d_inp1(max_elems);
+  thrust::device_vector<__nv_bfloat16> d_inp2(max_elems);
+  thrust::device_vector<__nv_bfloat16> d_weight(width);
+  thrust::device_vector<__nv_bfloat16> d_residual(max_elems);
+  thrust::device_vector<__nv_bfloat16> d_normed(max_elems);
 
-  fill_random_bf16(d_inp1, max_elems, seed ^ 0x1001u, 1.0f, stream);
-  fill_random_bf16(d_inp2, max_elems, seed ^ 0x2002u, 1.0f, stream);
-  fill_random_bf16(d_weight, width, seed ^ 0x3003u, 0.5f, stream);
+  fill_random_bf16(raw_ptr(d_inp1), max_elems, seed ^ 0x1001u, 1.0f, stream);
+  fill_random_bf16(raw_ptr(d_inp2), max_elems, seed ^ 0x2002u, 1.0f, stream);
+  fill_random_bf16(raw_ptr(d_weight), width, seed ^ 0x3003u, 0.5f, stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   int device = 0;
@@ -78,7 +78,7 @@ int main(int argc, char **argv) {
         double(rows) * width * sizeof(__nv_bfloat16) * 5.0;
     auto run_fused = [&]() {
       CUDA_CHECK(gemma4_residual_add_rmsnorm_bf16(
-          d_residual, d_normed, d_inp1, d_inp2, d_weight, rows, width,
+          raw_ptr(d_residual), raw_ptr(d_normed), raw_ptr(d_inp1), raw_ptr(d_inp2), raw_ptr(d_weight), rows, width,
           GEMMA4_RMS_NORM_EPS, stream));
     };
 
