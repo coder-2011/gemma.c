@@ -170,6 +170,7 @@ inline void gemma4_bench_warn_if_tiny(const char *label, float ms) {
   }
 }
 
+// Times repeated CUDA work with events on the same stream as the work.
 template <typename Fn>
 float time_ms_once(Fn &&fn, cudaStream_t stream, int warmup, int iters) {
   for (int i = 0; i < warmup; ++i) {
@@ -181,11 +182,11 @@ float time_ms_once(Fn &&fn, cudaStream_t stream, int warmup, int iters) {
   cudaEvent_t stop = nullptr;
   CUDA_CHECK(cudaEventCreate(&start));
   CUDA_CHECK(cudaEventCreate(&stop));
-  CUDA_CHECK(cudaEventRecord(start));
+  CUDA_CHECK(cudaEventRecord(start, stream));
   for (int i = 0; i < iters; ++i) {
     fn();
   }
-  CUDA_CHECK(cudaEventRecord(stop));
+  CUDA_CHECK(cudaEventRecord(stop, stream));
   CUDA_CHECK(cudaEventSynchronize(stop));
 
   float total_ms = 0.0f;

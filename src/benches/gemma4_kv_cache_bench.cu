@@ -156,9 +156,9 @@ SampleStats time_cuda_samples(Fn &&fn,
       float total_ms = 0.0f;
       for (int i = 0; i < iters_per_sample; ++i) {
         flush_l2(stream, d_l2_scratch, l2_flush_words);
-        CUDA_CHECK(cudaEventRecord(start));
+        CUDA_CHECK(cudaEventRecord(start, stream));
         fn();
-        CUDA_CHECK(cudaEventRecord(stop));
+        CUDA_CHECK(cudaEventRecord(stop, stream));
         CUDA_CHECK(cudaEventSynchronize(stop));
         float iter_ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&iter_ms, start, stop));
@@ -166,11 +166,11 @@ SampleStats time_cuda_samples(Fn &&fn,
       }
       values[sample] = total_ms / static_cast<float>(iters_per_sample);
     } else {
-      CUDA_CHECK(cudaEventRecord(start));
+      CUDA_CHECK(cudaEventRecord(start, stream));
       for (int i = 0; i < iters_per_sample; ++i) {
         fn();
       }
-      CUDA_CHECK(cudaEventRecord(stop));
+      CUDA_CHECK(cudaEventRecord(stop, stream));
       CUDA_CHECK(cudaEventSynchronize(stop));
       float total_ms = 0.0f;
       CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));

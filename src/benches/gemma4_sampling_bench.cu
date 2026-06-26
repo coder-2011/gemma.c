@@ -142,7 +142,7 @@ void materialized_logits_sample_embed_kernel(
       blockDim.x);
 }
 
-// Runs untimed warmup, then records per-iteration CUDA-event samples.
+// Runs untimed warmup, then records per-iteration CUDA-event samples on the work stream.
 template <typename Fn>
 std::vector<float> time_samples(Fn &&fn,
                                 cudaStream_t stream,
@@ -162,11 +162,11 @@ std::vector<float> time_samples(Fn &&fn,
   std::vector<float> values;
   values.reserve(samples);
   for (int sample = 0; sample < samples; ++sample) {
-    CHECK_CUDA(cudaEventRecord(start));
+    CHECK_CUDA(cudaEventRecord(start, stream));
     for (int i = 0; i < iters; ++i) {
       fn();
     }
-    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventRecord(stop, stream));
     CHECK_CUDA(cudaEventSynchronize(stop));
     float total_ms = 0.0f;
     CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
