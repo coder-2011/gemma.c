@@ -46,6 +46,7 @@ struct PromptOptions {
   std::string prompt = "Hello";
   int32_t max_new_tokens = kDefaultMaxNewTokens;
   int32_t page_size = kDefaultPageSize;
+  int32_t decode_split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
   PromptBenchmarkMode benchmark_mode = PromptBenchmarkMode::kNone;
   int32_t bench_warmup = kDefaultBenchWarmup;
   int32_t bench_iters = kDefaultBenchIters;
@@ -156,6 +157,8 @@ bool parse_args(int argc, char **argv, PromptOptions *options) {
       options->max_new_tokens = std::atoi(argv[++i]);
     } else if (arg == "--page-size" && i + 1 < argc) {
       options->page_size = std::atoi(argv[++i]);
+    } else if (arg == "--decode-split-size" && i + 1 < argc) {
+      options->decode_split_size = std::atoi(argv[++i]);
     } else if (arg == "--benchmark") {
       options->benchmark_mode = PromptBenchmarkMode::kDecodeStep;
     } else if (arg == "--benchmark-mode" && i + 1 < argc) {
@@ -172,6 +175,7 @@ bool parse_args(int argc, char **argv, PromptOptions *options) {
       std::fprintf(stderr,
                    "usage: %s [--checkpoint path] [--tokenizer path] "
                    "[--prompt text] [--max-new n] [--page-size n] "
+                   "[--decode-split-size n] "
                    "[--benchmark] [--benchmark-mode none|decode-step|"
                    "warm-serving|cold-start] [--bench-warmup n] "
                    "[--bench-iters n] [--bench-samples n]\n",
@@ -180,6 +184,7 @@ bool parse_args(int argc, char **argv, PromptOptions *options) {
     }
   }
   return options->max_new_tokens > 0 && options->page_size > 0 &&
+         options->decode_split_size > 0 &&
          options->bench_warmup >= 0 && options->bench_iters > 0 &&
          options->bench_samples > 0;
 }
@@ -397,7 +402,7 @@ int run_prompt(const PromptOptions &options,
   thrust::device_vector<__nv_bfloat16> d_attention_out(
       GEMMA4_GLOBAL_ATTENTION_OUT_SIZE);
 
-  const int32_t split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
+  const int32_t split_size = options.decode_split_size;
   const int32_t sliding_splits =
       (GEMMA4_SLIDING_WINDOW + split_size - 1) / split_size;
   const int32_t global_keys =
@@ -477,7 +482,10 @@ int run_prompt(const PromptOptions &options,
   auto run_serving_request = [&](PromptRequestTiming *timing) -> cudaError_t {
     const PromptClock::time_point request_start = PromptClock::now();
     std::vector<int32_t> request_prompt_tokens;
-    tokenizer.encode(options.prompt, &request_prompt_tokens);
+    if (!tokenizer.encode(options.prompt, &request_prompt_tokens) ||
+        request_prompt_tokens.empty()) {
+      return cudaErrorInvalidValue;
+    }
 
     GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
         raw_ptr(d_prompt_tokens), request_prompt_tokens.data(),
@@ -500,20 +508,20 @@ int run_prompt(const PromptOptions &options,
       previous_token_time = token_time;
     }
 
-    std::string decoded;
-    tokenizer.decode(generated, &decoded);
-
-    const PromptClock::time_point request_stop = PromptClock::now();
     timing->ttft_ms = host_elapsed_ms(request_start, first_token_time);
-    timing->e2e_ms = host_elapsed_ms(request_start, request_stop);
+    timing->e2e_ms = host_elapsed_ms(request_start, previous_token_time);
     if (generated.size() > 1) {
-      const float decode_ms =
-          host_elapsed_ms(first_token_time, previous_token_time);
+      const float decode_ms = timing->e2e_ms - timing->ttft_ms;
       timing->tpot_ms = decode_ms / static_cast<float>(generated.size() - 1);
       if (decode_ms > 0.0f) {
         timing->per_user_tps =
             1000.0f * static_cast<float>(generated.size() - 1) / decode_ms;
       }
+    }
+
+    std::string decoded;
+    if (!tokenizer.decode(generated, &decoded)) {
+      return cudaErrorInvalidValue;
     }
     return cudaSuccess;
   };
@@ -542,10 +550,12 @@ int run_prompt(const PromptOptions &options,
     }
     std::printf(
         "benchmark_mode=%s prompt_len=%d warmup_steps=%d timed_steps=%d "
+        "decode_split_size=%d "
         "timing=cuda_events_same_stream cache=stateful_decode "
         "setup_excluded=tokenizer,weight_load,allocation,prefill\n",
         benchmark_mode_name(options.benchmark_mode), prompt_len,
-        options.bench_warmup, options.bench_iters * options.bench_samples);
+        options.bench_warmup, options.bench_iters * options.bench_samples,
+        split_size);
     print_stats_line("decode_step_ms", decode_stats);
     if (decode_stats.p50_ms > 0.0f) {
       std::printf("decode_step_tps_p50=%.3f\n", 1000.0f / decode_stats.p50_ms);
@@ -572,6 +582,7 @@ int run_prompt(const PromptOptions &options,
     e2e_ms.reserve(measured_requests);
     tpot_ms.reserve(measured_requests);
     per_user_tps.reserve(measured_requests);
+    const PromptClock::time_point benchmark_start = PromptClock::now();
     for (int32_t request = 0; request < measured_requests; ++request) {
       PromptRequestTiming timing;
       status = run_serving_request(&timing);
@@ -586,6 +597,21 @@ int run_prompt(const PromptOptions &options,
         itl_ms.insert(itl_ms.end(), timing.itl_ms.begin(), timing.itl_ms.end());
       }
     }
+    const PromptClock::time_point benchmark_stop = PromptClock::now();
+    const float benchmark_duration_ms =
+        host_elapsed_ms(benchmark_start, benchmark_stop);
+    const float benchmark_duration_s = benchmark_duration_ms / 1000.0f;
+    const int64_t total_input_tokens =
+        int64_t(prompt_len) * measured_requests;
+    const int64_t total_output_tokens =
+        int64_t(options.max_new_tokens) * measured_requests;
+    const int64_t total_tokens = total_input_tokens + total_output_tokens;
+    const float request_throughput =
+        static_cast<float>(measured_requests) / benchmark_duration_s;
+    const float output_token_throughput =
+        static_cast<float>(total_output_tokens) / benchmark_duration_s;
+    const float total_token_throughput =
+        static_cast<float>(total_tokens) / benchmark_duration_s;
 
     status = print_cuda_environment();
     if (status != cudaSuccess) {
@@ -594,10 +620,21 @@ int run_prompt(const PromptOptions &options,
     std::printf(
         "benchmark_mode=%s prompt_len=%d output_tokens=%d concurrency=1 "
         "warmup_requests=%d measured_requests=%d timing=host_wall_clock "
+        "request_schedule=closed_loop_sequential http=excluded "
         "model_load=excluded cuda_context=excluded tokenization=included "
-        "prompt_h2d=included streaming=host_token_copy detokenization=e2e_only\n",
+        "prompt_h2d=included streaming=host_token_copy "
+        "detokenization=excluded\n",
         benchmark_mode_name(options.benchmark_mode), prompt_len,
         options.max_new_tokens, options.bench_warmup, measured_requests);
+    std::printf(
+        "benchmark_duration_ms=%.3f successful_requests=%d "
+        "total_input_tokens=%lld total_output_tokens=%lld "
+        "request_throughput=%.3f output_token_throughput=%.3f "
+        "total_token_throughput=%.3f\n",
+        benchmark_duration_ms, measured_requests,
+        static_cast<long long>(total_input_tokens),
+        static_cast<long long>(total_output_tokens), request_throughput,
+        output_token_throughput, total_token_throughput);
     print_stats_line("ttft_ms", summarize_benchmark_samples(ttft_ms));
     print_stats_line("tpot_ms", summarize_benchmark_samples(tpot_ms));
     print_stats_line("itl_ms", summarize_benchmark_samples(itl_ms));
