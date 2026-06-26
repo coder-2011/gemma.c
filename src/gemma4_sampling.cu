@@ -1,7 +1,3 @@
-#ifndef GEMMA4_WEIGHT_LOAD_POLICY
-#define GEMMA4_WEIGHT_LOAD_POLICY 0
-#endif
-
 #include "gemma4_sampling.cuh"
 #include "gemma4.h"
 #include "gemma4_cuda_utils.cuh"
@@ -30,11 +26,11 @@ __device__ inline bool better_candidate(float logit,
 template <int ColsPerBlock, int Threads>
 __device__ inline void reduce_lm_head_cols(
     int thread_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&warp_sums)[ColsPerBlock][Threads / 32],
     float (&sums)[ColsPerBlock]) {
-  constexpr int warps = Threads / WARP_SIZE;
-  const int lane = thread_idx & (WARP_SIZE - 1);
-  const int warp = thread_idx / WARP_SIZE;
+  constexpr int warps = Threads / 32;
+  const int lane = thread_idx & (warpSize - 1);
+  const int warp = thread_idx / warpSize;
 
   warp_reduce_sum_to_lane0(sums);
 
@@ -63,7 +59,7 @@ __device__ inline void lm_head_tile_logits(
     const __nv_bfloat16 *__restrict__ lm_head_col_major,
     int tile,
     int thread_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&warp_sums)[ColsPerBlock][Threads / 32],
     float (&sums)[ColsPerBlock]) {
   constexpr int packs_per_col =
       GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
@@ -72,7 +68,8 @@ __device__ inline void lm_head_tile_logits(
   for (int pack_idx = thread_idx; pack_idx < packs_per_col;
        pack_idx += Threads) {
     const int element_idx = pack_idx * kBf16Packed128Elements;
-    const Bf16Packed128 x_pack = load128g(final_hidden + element_idx);
+    const Bf16Packed128 x_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(final_hidden + element_idx)};
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
       const int token_id = token0 + col;
@@ -80,7 +77,8 @@ __device__ inline void lm_head_tile_logits(
           lm_head_col_major +
           static_cast<int64_t>(token_id) * GEMMA4_HIDDEN_SIZE +
           element_idx;
-      const Bf16Packed128 w_pack = load128weight(weight);
+      const Bf16Packed128 w_pack =
+          Bf16Packed128{*reinterpret_cast<const int4 *>(weight)};
       gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
     }
   }
@@ -97,7 +95,7 @@ __device__ Gemma4SampleCandidate lm_head_block_candidate(
     int block_idx,
     int grid_blocks,
     int thread_idx) {
-  constexpr int warps = Threads / WARP_SIZE;
+  constexpr int warps = Threads / 32;
   __shared__ float warp_sums[ColsPerBlock][warps];
 
   float best_logit = -INFINITY;
@@ -139,9 +137,9 @@ __device__ void consume_and_gather(
   __shared__ int32_t selected_token_id;
 
   Gemma4SampleCandidate best = {-INFINITY, GEMMA4_VOCAB_SIZE};
-  if (thread_idx < WARP_SIZE) {
+  if (thread_idx < warpSize) {
     const int lane = thread_idx;
-    for (int slot = lane; slot < producer_count; slot += WARP_SIZE) {
+    for (int slot = lane; slot < producer_count; slot += warpSize) {
       cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ready(
           ready_flags[slot]);
       while (ready.load(cuda::memory_order_acquire) == 0u) {
@@ -154,7 +152,7 @@ __device__ void consume_and_gather(
       }
     }
 
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
       const float other_logit =
           __shfl_down_sync(0xffffffffu, best.logit, offset);
       const int32_t other_token_id =

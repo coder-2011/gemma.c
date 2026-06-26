@@ -6,7 +6,7 @@
 
 namespace gemma4_embedding_gather {
 
-constexpr int kEmbeddingGatherThreads = WARP_SIZE;
+constexpr int kEmbeddingGatherThreads = 32;
 constexpr int kPacksPerEmbeddingRow =
     GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 
@@ -23,9 +23,9 @@ __device__ void copy_embedding_row_bf16(
   for (int pack_idx = lane; pack_idx < kPacksPerEmbeddingRow;
        pack_idx += thread_count) {
     const int offset = pack_idx * kBf16Packed128Elements;
-    Bf16Packed128 pack = load128g(embedding_row + offset);
+    Bf16Packed128 pack = Bf16Packed128{*reinterpret_cast<const int4 *>(embedding_row + offset)};
     pack = gemma4_bf16_pack_apply_scale(pack, GEMMA4_EMBEDDING_SCALE);
-    store128(out_row + offset, pack);
+    *reinterpret_cast<int4 *>(out_row + offset) = pack.bits();
   }
 }
 

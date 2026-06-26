@@ -3,10 +3,6 @@
 
 // Concrete Gemma projection kernels and host dispatch.
 
-#ifndef GEMMA4_WEIGHT_LOAD_POLICY
-#define GEMMA4_WEIGHT_LOAD_POLICY 0
-#endif
-
 #include "gemma4_cuda_utils.cuh"
 
 #include <cutlass/epilogue/thread/linear_combination.h>
@@ -41,18 +37,6 @@ __device__ inline int swizzle_col_block(int block_idx) {
   }
 }
 
-__device__ inline Bf16Packed128
-load_activation_pack(const __nv_bfloat16 *__restrict__ x, int element_idx) {
-  return load128g(x + element_idx);
-}
-
-template <int K>
-__device__ inline Bf16Packed128
-load_weight_pack(
-    const __nv_bfloat16 *__restrict__ w_col_major, int col, int element_idx) {
-  return load128weight(w_col_major + weight_offset<K>(col, element_idx));
-}
-
 template <int ColsPerBlock>
 __device__ inline void store_cols(
     __nv_bfloat16 *__restrict__ dst, const float (&sums)[ColsPerBlock]) {
@@ -62,7 +46,7 @@ __device__ inline void store_cols(
     for (int col = 0; col < ColsPerBlock; ++col) {
       out[col] = __float2bfloat16_rn(sums[col]);
     }
-    store128(dst, out);
+    *reinterpret_cast<int4 *>(dst) = out.bits();
   } else {
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
@@ -76,7 +60,7 @@ __device__ inline void dot_cols(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major, int col0, int thread_idx,
     float (&sums)[ColsPerBlock]) {
-  static_assert((Threads % WARP_SIZE) == 0,
+  static_assert((Threads % 32) == 0,
                 "decode thread count must be a whole number of warps");
 
   constexpr int packs_per_col = K / kBf16Packed128Elements;
@@ -85,11 +69,13 @@ __device__ inline void dot_cols(
 #pragma unroll
   for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
     const int element_idx = pack_offset(pack_idx);
-    const Bf16Packed128 x_pack = load_activation_pack(x, element_idx);
+    const Bf16Packed128 x_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element_idx)};
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      const Bf16Packed128 w_pack =
-          load_weight_pack<K>(w_col_major, col0 + col, element_idx);
+      const Bf16Packed128 w_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(
+              w_col_major + weight_offset<K>(col0 + col, element_idx))};
       gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
     }
   }
@@ -106,11 +92,13 @@ __device__ inline void dot_cols(
     const int stage_pack_idx = thread_idx + stage * Threads;
     if (stage_pack_idx < packs_per_col) {
       const int element_idx = pack_offset(stage_pack_idx);
-      x_stage[stage] = load_activation_pack(x, element_idx);
+      x_stage[stage] =
+          Bf16Packed128{*reinterpret_cast<const int4 *>(x + element_idx)};
 #pragma unroll
       for (int col = 0; col < ColsPerBlock; ++col) {
-        w_stage[stage][col] =
-            load_weight_pack<K>(w_col_major, col0 + col, element_idx);
+        w_stage[stage][col] = Bf16Packed128{
+            *reinterpret_cast<const int4 *>(
+                w_col_major + weight_offset<K>(col0 + col, element_idx))};
       }
     }
   }
@@ -127,11 +115,13 @@ __device__ inline void dot_cols(
     const int next_pack_idx = pack_idx + kStages * Threads;
     if (next_pack_idx < packs_per_col) {
       const int element_idx = pack_offset(next_pack_idx);
-      x_stage[stage] = load_activation_pack(x, element_idx);
+      x_stage[stage] =
+          Bf16Packed128{*reinterpret_cast<const int4 *>(x + element_idx)};
 #pragma unroll
       for (int col = 0; col < ColsPerBlock; ++col) {
-        w_stage[stage][col] =
-            load_weight_pack<K>(w_col_major, col0 + col, element_idx);
+        w_stage[stage][col] = Bf16Packed128{
+            *reinterpret_cast<const int4 *>(
+                w_col_major + weight_offset<K>(col0 + col, element_idx))};
       }
     }
 
@@ -153,7 +143,7 @@ __device__ inline void dot_cols_pair(
     int thread_idx,
     float (&a_sums)[ColsPerBlock],
     float (&b_sums)[ColsPerBlock]) {
-  static_assert((Threads % WARP_SIZE) == 0,
+  static_assert((Threads % 32) == 0,
                 "decode thread count must be a whole number of warps");
 
   constexpr int packs_per_col = K / kBf16Packed128Elements;
@@ -161,13 +151,16 @@ __device__ inline void dot_cols_pair(
 #pragma unroll
   for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
     const int element_idx = pack_offset(pack_idx);
-    const Bf16Packed128 x_pack = load_activation_pack(x, element_idx);
+    const Bf16Packed128 x_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element_idx)};
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      const Bf16Packed128 a_pack =
-          load_weight_pack<K>(w_a_col_major, col0_a + col, element_idx);
-      const Bf16Packed128 b_pack =
-          load_weight_pack<K>(w_b_col_major, col0_b + col, element_idx);
+      const Bf16Packed128 a_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(
+              w_a_col_major + weight_offset<K>(col0_a + col, element_idx))};
+      const Bf16Packed128 b_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(
+              w_b_col_major + weight_offset<K>(col0_b + col, element_idx))};
       gemma4_bf16_pack_accumulate_dot(x_pack, a_pack, a_sums[col]);
       gemma4_bf16_pack_accumulate_dot(x_pack, b_pack, b_sums[col]);
     }
@@ -196,7 +189,7 @@ __device__ inline void dot_cols_pair_shared_x(
     int thread_idx,
     float (&a_sums)[ColsPerBlock],
     float (&b_sums)[ColsPerBlock]) {
-  static_assert((Threads % WARP_SIZE) == 0,
+  static_assert((Threads % 32) == 0,
                 "decode thread count must be a whole number of warps");
 
   constexpr int packs_per_col = K / kBf16Packed128Elements;
@@ -209,12 +202,12 @@ __device__ inline void dot_cols_pair_shared_x(
     const Bf16Packed128 x_pack = s_x[swizzled_pack_idx];
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
-      const Bf16Packed128 a_pack =
-          load_weight_pack<K>(
-              w_a_col_major, col0_a + col, swizzled_element_idx);
-      const Bf16Packed128 b_pack =
-          load_weight_pack<K>(
-              w_b_col_major, col0_b + col, swizzled_element_idx);
+      const Bf16Packed128 a_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(
+              w_a_col_major + weight_offset<K>(col0_a + col, swizzled_element_idx))};
+      const Bf16Packed128 b_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(
+              w_b_col_major + weight_offset<K>(col0_b + col, swizzled_element_idx))};
       gemma4_bf16_pack_accumulate_dot(x_pack, a_pack, a_sums[col]);
       gemma4_bf16_pack_accumulate_dot(x_pack, b_pack, b_sums[col]);
     }
@@ -224,11 +217,11 @@ __device__ inline void dot_cols_pair_shared_x(
 template <int ColsPerBlock, int Threads>
 __device__ inline void reduce_cols(
     int thread_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&warp_sums)[ColsPerBlock][Threads / 32],
     float (&sums)[ColsPerBlock]) {
-  constexpr int warps = Threads / WARP_SIZE;
-  const int lane = thread_idx & (WARP_SIZE - 1);
-  const int warp = thread_idx / WARP_SIZE;
+  constexpr int warps = Threads / 32;
+  const int lane = thread_idx & (warpSize - 1);
+  const int warp = thread_idx / warpSize;
 
   warp_reduce_sum_to_lane0(sums);
 
@@ -253,13 +246,13 @@ __device__ inline void reduce_cols(
 template <int ColsPerBlock, int Threads>
 __device__ inline void reduce_cols_pair(
     int thread_idx,
-    float (&a_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
-    float (&b_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&a_warp_sums)[ColsPerBlock][Threads / 32],
+    float (&b_warp_sums)[ColsPerBlock][Threads / 32],
     float (&a_sums)[ColsPerBlock],
     float (&b_sums)[ColsPerBlock]) {
-  constexpr int warps = Threads / WARP_SIZE;
-  const int lane = thread_idx & (WARP_SIZE - 1);
-  const int warp = thread_idx / WARP_SIZE;
+  constexpr int warps = Threads / 32;
+  const int lane = thread_idx & (warpSize - 1);
+  const int warp = thread_idx / warpSize;
 
   warp_reduce_sum_to_lane0(a_sums);
   warp_reduce_sum_to_lane0(b_sums);
@@ -291,7 +284,7 @@ __device__ inline void dot_cols_reduce(
     const __nv_bfloat16 *__restrict__ w_col_major,
     int col0,
     int thread_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&warp_sums)[ColsPerBlock][Threads / 32],
     float (&sums)[ColsPerBlock]) {
   dot_cols<K, ColsPerBlock, Threads>(x, w_col_major, col0, thread_idx, sums);
   reduce_cols<ColsPerBlock, Threads>(thread_idx, warp_sums, sums);
@@ -305,8 +298,8 @@ __device__ inline void dot_cols_pair_reduce(
     int col0_a,
     int col0_b,
     int thread_idx,
-    float (&a_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
-    float (&b_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&a_warp_sums)[ColsPerBlock][Threads / 32],
+    float (&b_warp_sums)[ColsPerBlock][Threads / 32],
     float (&a_sums)[ColsPerBlock],
     float (&b_sums)[ColsPerBlock]) {
   dot_cols_pair<K, ColsPerBlock, Threads>(
@@ -324,8 +317,8 @@ __device__ inline void dot_cols_pair_shared_x_reduce(
     int col0_a,
     int col0_b,
     int thread_idx,
-    float (&a_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
-    float (&b_warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&a_warp_sums)[ColsPerBlock][Threads / 32],
+    float (&b_warp_sums)[ColsPerBlock][Threads / 32],
     float (&a_sums)[ColsPerBlock],
     float (&b_sums)[ColsPerBlock]) {
   dot_cols_pair_shared_x<K, ColsPerBlock, Threads, SwizzleX>(
@@ -346,7 +339,7 @@ __device__ inline void decode_gemv_cols_device(
     const __nv_bfloat16 *__restrict__ w_col_major,
     __nv_bfloat16 *__restrict__ y,
     int physical_block_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE],
+    float (&warp_sums)[ColsPerBlock][Threads / 32],
     float (&sums)[ColsPerBlock]) {
   constexpr int blocks = N / ColsPerBlock;
   const int logical_block =
@@ -374,7 +367,7 @@ __device__ inline void decode_gemv_cols_device(
     const __nv_bfloat16 *__restrict__ w_col_major,
     __nv_bfloat16 *__restrict__ y,
     int physical_block_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / WARP_SIZE]) {
+    float (&warp_sums)[ColsPerBlock][Threads / 32]) {
   float sums[ColsPerBlock] = {};
   decode_gemv_cols_device<K, N, ColsPerBlock, Threads, SwizzleTileBlocks,
                           StoreOutput>(
@@ -412,7 +405,7 @@ __global__ __launch_bounds__(Threads, MinBlocksPerSM) void
 gemma4_decode_gemv_cols_kernel(const __nv_bfloat16 *__restrict__ x,
                                const __nv_bfloat16 *__restrict__ w_col_major,
                                __nv_bfloat16 *__restrict__ y) {
-  constexpr int warps = Threads / WARP_SIZE;
+  constexpr int warps = Threads / 32;
   __shared__ float warp_sums[ColsPerBlock][warps];
 
   float sums[ColsPerBlock] = {};

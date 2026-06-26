@@ -9,7 +9,7 @@
 
 namespace {
 
-constexpr int kKvWriteVecThreads = WARP_SIZE;
+constexpr int kKvWriteVecThreads = 32;
 constexpr int kKvWritePackElements = kBf16Packed128Elements;
 
 // Copies the K/V packs assigned to one token/head for the kernel wrapper.
@@ -52,8 +52,12 @@ __device__ inline void kv_cache_write_vec_device(
   for (int i = vec; i < vecs_per_head; i += vec_stride) {
     const int64_t src = (src_base + i) * kKvWritePackElements;
     const int64_t dst = (dst_base + i) * kKvWritePackElements;
-    store128(cache_k + dst, load128g(k + src));
-    store128(cache_v + dst, load128g(v + src));
+    const Bf16Packed128 k_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(k + src)};
+    const Bf16Packed128 v_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(v + src)};
+    *reinterpret_cast<int4 *>(cache_k + dst) = k_pack.bits();
+    *reinterpret_cast<int4 *>(cache_v + dst) = v_pack.bits();
   }
 }
 
@@ -130,7 +134,7 @@ int32_t gemma4_kv_cache_ensure_page(
       cute::make_shape(batch_size, config.max_pages_per_seq),
       cute::make_stride(config.max_pages_per_seq, 1));
   const int64_t index = page_table_layout(batch, slot);
-  if (index < 0 || index >= static_cast<int64_t>(page_table.size()) ||
+  if (index >= static_cast<int64_t>(page_table.size()) ||
       index >= static_cast<int64_t>(slot_logical_pages.size())) {
     return -1;
   }
@@ -138,7 +142,7 @@ int32_t gemma4_kv_cache_ensure_page(
   if (slot_logical_pages[index] > logical_page) return -1;
 
   const int32_t physical_page = batch * config.max_pages_per_seq + slot;
-  if (physical_page < 0 || physical_page >= config.num_pages) return -1;
+  if (physical_page >= config.num_pages) return -1;
 
   page_table[index] = physical_page;
   slot_logical_pages[index] = logical_page;
@@ -188,7 +192,7 @@ extern "C" cudaError_t gemma4_kv_cache_write_bf16(
     cudaStream_t stream) {
   if (token_count == 0) return cudaSuccess;
   if (token_count < 0 || layer < 0 || layer >= config.num_layers ||
-      config.num_layers <= 0 || config.num_pages <= 0 ||
+      config.num_pages <= 0 ||
       config.page_size <= 0 || config.max_pages_per_seq <= 0 ||
       config.num_pages % config.max_pages_per_seq != 0 ||
       config.window_size < 0 || config.num_heads <= 0 || config.head_dim <= 0 ||

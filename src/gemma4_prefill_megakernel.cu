@@ -24,14 +24,15 @@ struct PrefillAttentionShape {
 
 // Scales one 128-bit BF16 pack for the local scale benchmark wrapper.
 __device__ inline void scale_hidden_pack_bf16(
-    floatX *__restrict__ out,
-    const floatX *__restrict__ in,
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ in,
     float scale,
     int pack) {
   const int offset = pack * kBf16Packed128Elements;
-  const Bf16Packed128 values = load128g(in + offset);
+  const Bf16Packed128 values =
+      Bf16Packed128{*reinterpret_cast<const int4 *>(in + offset)};
   const Bf16Packed128 result = gemma4_bf16_pack_apply_scale(values, scale);
-  store128(out + offset, result);
+  *reinterpret_cast<int4 *>(out + offset) = result.bits();
 }
 
 // Returns the fixed Gemma 4 attention dimensions for the selected layer type.
@@ -50,9 +51,9 @@ constexpr PrefillAttentionShape prefill_attention_shape(bool global) {
 
 // Multiplies one hidden tensor by the per-layer scalar after both sublayers.
 __global__ __launch_bounds__(kScaleThreads) void scale_hidden_bf16_kernel(
-    floatX *__restrict__ out,
-    const floatX *__restrict__ in,
-    const floatX *__restrict__ layer_scalar,
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ in,
+    const __nv_bfloat16 *__restrict__ layer_scalar,
     int packs) {
   const int pack = blockIdx.x * blockDim.x + threadIdx.x;
   if (pack >= packs) {
@@ -163,8 +164,7 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
   if (rows64 == 0) {
     return cudaSuccess;
   }
-  if (rows64 > INT_MAX ||
-      rows64 > INT_MAX / GEMMA4_HIDDEN_SIZE) {
+  if (rows64 > INT_MAX / GEMMA4_HIDDEN_SIZE) {
     return cudaErrorInvalidValue;
   }
 
@@ -172,24 +172,19 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
   const PrefillAttentionShape shape = prefill_attention_shape(global);
   const int32_t rows = static_cast<int32_t>(rows64);
   if (args.out == nullptr || args.hidden == nullptr ||
-      args.weights == nullptr || args.cos == nullptr || args.sin == nullptr ||
+      args.weights == nullptr ||
       args.softmax_scale <= 0.0f || !is_aligned_16(args.out)) {
     return cudaErrorInvalidValue;
   }
 
   const Gemma4TextLayerWeightsDevice *weights = args.weights;
-  // Cache writes happen after GEMMs; reject missing cache plumbing up front.
-  const bool missing_cache_args =
-      args.cache_k == nullptr || args.cache_v == nullptr ||
-      args.page_table == nullptr || args.token_batch == nullptr ||
-      args.token_position == nullptr;
+  // Token pointers are used by FA and long-sliding cache pointer arithmetic.
+  const bool missing_token_args =
+      args.token_batch == nullptr || args.token_position == nullptr;
   const bool missing_scratch =
-      scratch.hidden_work == nullptr || scratch.hidden_delta == nullptr ||
+      scratch.hidden_work == nullptr ||
       scratch.post_attention_residual == nullptr ||
-      scratch.pre_ffn_normed == nullptr || scratch.q == nullptr ||
-      scratch.k == nullptr || (!global && scratch.v == nullptr) ||
-      scratch.q_prepared == nullptr || scratch.k_prepared == nullptr ||
-      scratch.v_prepared == nullptr || scratch.attention_out == nullptr ||
+      scratch.pre_ffn_normed == nullptr ||
       scratch.ffn.act == nullptr || scratch.ffn.down == nullptr;
   const bool missing_weights =
       weights->layer_scalar == nullptr ||
@@ -197,15 +192,10 @@ cudaError_t gemma4_prefill_megakernel_layer_bf16(
       weights->post_attention_norm_weight == nullptr ||
       weights->pre_feedforward_norm_weight == nullptr ||
       weights->post_feedforward_norm_weight == nullptr ||
-      weights->q_norm_weight == nullptr || weights->k_norm_weight == nullptr ||
-      weights->q_proj_col_major == nullptr ||
-      weights->k_proj_col_major == nullptr ||
-      (!global && weights->v_proj_col_major == nullptr) ||
-      weights->o_proj_col_major == nullptr ||
       weights->ffn_gate_up_decode == nullptr ||
       weights->ffn_down_decode == nullptr;
-  if (missing_cache_args || missing_scratch || missing_weights ||
-      scratch.capacity_rows < rows || scratch.ffn.capacity_rows < rows ||
+  if (missing_token_args || missing_scratch || missing_weights ||
+      scratch.capacity_rows < rows ||
       scratch.global != global) {
     return cudaErrorInvalidValue;
   }

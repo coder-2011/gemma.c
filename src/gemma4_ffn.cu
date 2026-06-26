@@ -22,46 +22,22 @@ __device__ inline int4 ffn_load_int4(const __nv_bfloat16 *ptr) {
 #elif GEMMA4_FFN_VECTOR_LOAD_POLICY == 1
   return __ldg(address);
 #elif GEMMA4_FFN_VECTOR_LOAD_POLICY == 2
-  unsigned int x;
-  unsigned int y;
-  unsigned int z;
-  unsigned int w;
-  asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
-               : "l"(address));
   int4 value;
-  value.x = static_cast<int>(x);
-  value.y = static_cast<int>(y);
-  value.z = static_cast<int>(z);
-  value.w = static_cast<int>(w);
+  asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(address));
   return value;
 #elif GEMMA4_FFN_VECTOR_LOAD_POLICY == 3
-  unsigned int x;
-  unsigned int y;
-  unsigned int z;
-  unsigned int w;
-  asm volatile("ld.global.ca.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
-               : "l"(address));
   int4 value;
-  value.x = static_cast<int>(x);
-  value.y = static_cast<int>(y);
-  value.z = static_cast<int>(z);
-  value.w = static_cast<int>(w);
+  asm volatile("ld.global.ca.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(address));
   return value;
 #elif GEMMA4_FFN_VECTOR_LOAD_POLICY == 4
-  unsigned int x;
-  unsigned int y;
-  unsigned int z;
-  unsigned int w;
-  asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(x), "=r"(y), "=r"(z), "=r"(w)
-               : "l"(address));
   int4 value;
-  value.x = static_cast<int>(x);
-  value.y = static_cast<int>(y);
-  value.z = static_cast<int>(z);
-  value.w = static_cast<int>(w);
+  asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(address));
   return value;
 #else
 #error Unsupported GEMMA4_FFN_VECTOR_LOAD_POLICY
