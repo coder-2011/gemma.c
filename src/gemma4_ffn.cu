@@ -14,36 +14,6 @@
 
 namespace gemma4_ffn_decode_device {
 
-// Loads one BF16 pack with a build-selected cache policy for FFN load ablations.
-__device__ inline int4 ffn_load_int4(const __nv_bfloat16 *ptr) {
-  const int4 *address = reinterpret_cast<const int4 *>(ptr);
-#if !defined(GEMMA4_FFN_VECTOR_LOAD_POLICY) || GEMMA4_FFN_VECTOR_LOAD_POLICY == 0
-  return *address;
-#elif GEMMA4_FFN_VECTOR_LOAD_POLICY == 1
-  return __ldg(address);
-#elif GEMMA4_FFN_VECTOR_LOAD_POLICY == 2
-  int4 value;
-  asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
-               : "l"(address));
-  return value;
-#elif GEMMA4_FFN_VECTOR_LOAD_POLICY == 3
-  int4 value;
-  asm volatile("ld.global.ca.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
-               : "l"(address));
-  return value;
-#elif GEMMA4_FFN_VECTOR_LOAD_POLICY == 4
-  int4 value;
-  asm volatile("ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];"
-               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
-               : "l"(address));
-  return value;
-#else
-#error Unsupported GEMMA4_FFN_VECTOR_LOAD_POLICY
-#endif
-}
-
 // Swizzles one row of hidden-width BF16 packs for decode-friendly layout.
 __device__ inline void swizzle_hidden_packs(
     __nv_bfloat16 *__restrict__ dst,
@@ -70,8 +40,8 @@ __device__ inline void swizzle_hidden_packs(
     const int dst_col = hidden_layout(hidden_pack_swizzle_index(pack));
     const int64_t src_offset = row_layout(row, src_col);
     const int64_t dst_offset = row_layout(row, dst_col);
-    const FfnBf16Pack pack_value = FfnBf16Pack{
-        ffn_load_int4(src + src_offset)};
+    const FfnBf16Pack pack_value =
+        FfnBf16Pack{*reinterpret_cast<const int4 *>(src + src_offset)};
     *reinterpret_cast<int4 *>(dst + dst_offset) = pack_value.bits();
   }
 }
@@ -105,8 +75,9 @@ __device__ inline void rmsnorm_residual_from_swizzled_down(
   const int64_t down_offset = row_layout(row, swizzled_col);
   const int64_t natural_offset = row_layout(row, natural_col);
 
-  const FfnBf16Pack down_pack = FfnBf16Pack{
-      ffn_load_int4(down_swizzled + down_offset)};
+  const FfnBf16Pack down_pack =
+      FfnBf16Pack{*reinterpret_cast<const int4 *>(
+          down_swizzled + down_offset)};
   float sum_sq = 0.0f;
   gemma4_bf16_pack_accumulate_square(down_pack, sum_sq);
 
@@ -117,12 +88,14 @@ __device__ inline void rmsnorm_residual_from_swizzled_down(
   }
   __syncthreads();
 
-  const FfnBf16Pack gamma_pack = FfnBf16Pack{
-      ffn_load_int4(rms_weight + natural_col)};
+  const FfnBf16Pack gamma_pack =
+      FfnBf16Pack{*reinterpret_cast<const int4 *>(
+          rms_weight + natural_col)};
   const FfnBf16Pack normed_pack =
       gemma4_bf16_pack_apply_scale_weight(down_pack, gamma_pack, scale);
-  const FfnBf16Pack residual_pack = FfnBf16Pack{
-      ffn_load_int4(residual + natural_offset)};
+  const FfnBf16Pack residual_pack =
+      FfnBf16Pack{*reinterpret_cast<const int4 *>(
+          residual + natural_offset)};
   const FfnBf16Pack residual_out_pack =
       gemma4_bf16_pack_add(residual_pack, normed_pack);
   *reinterpret_cast<int4 *>(normed_out + natural_offset) = normed_pack.bits();
@@ -154,8 +127,8 @@ __device__ inline void unswizzle_hidden_packs(
         hidden_layout(hidden_pack_swizzle_index(hidden_pack));
     const int64_t src_offset = row_layout(row, swizzled_col);
     const int64_t dst_offset = row_layout(row, natural_col);
-    const FfnBf16Pack pack = FfnBf16Pack{
-        ffn_load_int4(src + src_offset)};
+    const FfnBf16Pack pack =
+        FfnBf16Pack{*reinterpret_cast<const int4 *>(src + src_offset)};
     *reinterpret_cast<int4 *>(dst + dst_offset) = pack.bits();
   }
 }
@@ -189,8 +162,8 @@ __device__ inline void swizzle_gate_up_interleaved(
     const int dst_col = hidden_layout(hidden_pack_swizzle_index(pack));
     const int64_t src_offset = row_layout(src_row, src_col);
     const int64_t dst_offset = row_layout(dst_row, dst_col);
-    const FfnBf16Pack pack_value = FfnBf16Pack{
-        ffn_load_int4(src + src_offset)};
+    const FfnBf16Pack pack_value =
+        FfnBf16Pack{*reinterpret_cast<const int4 *>(src + src_offset)};
     *reinterpret_cast<int4 *>(dst + dst_offset) = pack_value.bits();
   }
 }
@@ -209,32 +182,8 @@ static_assert(kFfnThreads == kHiddenPacks,
 constexpr int kSwizzleThreads = 96;
 constexpr int kActualSwizzleBlocksPerRow =
     div_up(kHiddenPacks, kSwizzleThreads);
-#ifndef GEMMA4_FFN_GATE_UP_STAGE_ROWS64
-static constexpr int GEMMA4_FFN_GATE_UP_STAGE_ROWS64 = 3;
-#endif
-#ifndef GEMMA4_FFN_GATE_UP_STAGE_ROWS128
-static constexpr int GEMMA4_FFN_GATE_UP_STAGE_ROWS128 = 5;
-#endif
-#ifndef GEMMA4_FFN_GATE_UP_STAGE_DEFAULT
-static constexpr int GEMMA4_FFN_GATE_UP_STAGE_DEFAULT = 3;
-#endif
-#ifndef GEMMA4_FFN_DOWN_STAGE_ROWS64
-static constexpr int GEMMA4_FFN_DOWN_STAGE_ROWS64 = 10;
-#endif
-#ifndef GEMMA4_FFN_DOWN_STAGE_ROWS128
-static constexpr int GEMMA4_FFN_DOWN_STAGE_ROWS128 = 6;
-#endif
-#ifndef GEMMA4_FFN_DOWN_STAGE_ROWS256
-static constexpr int GEMMA4_FFN_DOWN_STAGE_ROWS256 = 3;
-#endif
-#ifndef GEMMA4_FFN_DOWN_STAGE_ROWS512
-static constexpr int GEMMA4_FFN_DOWN_STAGE_ROWS512 = 3;
-#endif
-#ifndef GEMMA4_FFN_DOWN_STAGE_DEFAULT
-static constexpr int GEMMA4_FFN_DOWN_STAGE_DEFAULT = 5;
-#endif
 
-
+// Applies GeGLU in the DualGemm epilogue after gate/up fragments are materialized.
 template <typename ElementOutput_,
           int Count,
           typename ElementAccumulator_,
@@ -465,15 +414,15 @@ cudaError_t run_gate_up_geglu_decode_layout_dual_gemm(
   switch (rows <= 64 ? 64 : rows <= 128 ? 128 : 0) {
     case 64:
       return run_gate_up_geglu_decode_layout_dual_gemm_config<
-          64, 64, 32, 64, 32, GEMMA4_FFN_GATE_UP_STAGE_ROWS64>(
+          64, 64, 32, 64, 32, 3>(
           act, x_swizzled, w_gate_up_decode, rows, stream);
     case 128:
       return run_gate_up_geglu_decode_layout_dual_gemm_config<
-          128, 64, 32, 64, 32, GEMMA4_FFN_GATE_UP_STAGE_ROWS128>(
+          128, 64, 32, 64, 32, 5>(
           act, x_swizzled, w_gate_up_decode, rows, stream);
     default:
       return run_gate_up_geglu_decode_layout_dual_gemm_config<
-          256, 64, 32, 64, 32, GEMMA4_FFN_GATE_UP_STAGE_DEFAULT>(
+          256, 64, 32, 64, 32, 3>(
           act, x_swizzled, w_gate_up_decode, rows, stream);
   }
 }
@@ -492,28 +441,23 @@ cudaError_t launch_down_decode_layout_gemm(
                                    : rows <= 256 ? 256
                                                  : rows <= 512 ? 512 : 0) {
     case 64:
-      return launch_cutlass_bf16_gemm<
-          64, 64, 32, 32, 32, GEMMA4_FFN_DOWN_STAGE_ROWS64>(
+      return launch_cutlass_bf16_gemm<64, 64, 32, 32, 32, 10>(
           act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
           GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
     case 128:
-      return launch_cutlass_bf16_gemm<
-          64, 128, 32, 32, 64, GEMMA4_FFN_DOWN_STAGE_ROWS128>(
+      return launch_cutlass_bf16_gemm<64, 128, 32, 32, 64, 6>(
           act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
           GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
     case 256:
-      return launch_cutlass_bf16_gemm<
-          128, 128, 64, 64, 64, GEMMA4_FFN_DOWN_STAGE_ROWS256>(
+      return launch_cutlass_bf16_gemm<128, 128, 64, 64, 64, 3>(
           act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
           GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
     case 512:
-      return launch_cutlass_bf16_gemm<
-          256, 128, 32, 64, 64, GEMMA4_FFN_DOWN_STAGE_ROWS512>(
+      return launch_cutlass_bf16_gemm<256, 128, 32, 64, 64, 3>(
           act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
           GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
     default:
-      return launch_cutlass_bf16_gemm<
-          128, 128, 32, 64, 64, GEMMA4_FFN_DOWN_STAGE_DEFAULT>(
+      return launch_cutlass_bf16_gemm<128, 128, 32, 64, 64, 5>(
           act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
           GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
   }

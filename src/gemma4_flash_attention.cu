@@ -78,7 +78,6 @@ struct Gemma4FlashFwdKernelTraits {
   static constexpr int kBlockM = kBlockM_;
   static constexpr int kBlockN = kBlockN_;
   static constexpr int kHeadDim = kHeadDim_;
-  static_assert(kHeadDim % 32 == 0, "FA head dim must be a multiple of 32");
 
   // Global memory is loaded as 128-bit vectors. kBlockKSmem controls the
   using BlockKSmemInt = std::conditional_t<(kHeadDim % 64 == 0), Int<64>, Int<32>>;
@@ -86,8 +85,6 @@ struct Gemma4FlashFwdKernelTraits {
   static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
   static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
   using SmemSwizzle = std::conditional_t<(kBlockKSmem == 32), Swizzle<2, 3, 3>, Swizzle<3, 3, 3>>;
-  static_assert(kHeadDim % kGmemElemsPerLoad == 0, "FA head dim must be a multiple of vector load width");
-  static_assert(kNThreads % kGmemThreadsPerRow == 0, "FA thread count must divide row load layout");
 
   using TiledMmaQK = TiledMMA< // ablate layout and tile size/shape
       MMA_Atom_Arch,
@@ -1098,14 +1095,6 @@ cudaError_t launch_global(
   return launch_attention<Gemma4GlobalFa2KernelTraits, false>(params, batch_size, stream);
 }
 
-// Sum a per-lane value across one warp for the per-head RMSNorm denominator.
-__device__ __forceinline__ float prep_warp_sum(float value) {
-  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-    value += __shfl_xor_sync(0xffffffffu, value, offset);
-  }
-  return value;
-}
-
 template <typename Traits>
 __device__ __forceinline__ float prep_values_rms_scale(
     const float (&values)[Gemma4AttentionDerived<Traits>::kValuesPerLane]) {
@@ -1115,7 +1104,7 @@ __device__ __forceinline__ float prep_values_rms_scale(
   for (int i = 0; i < Derived::kValuesPerLane; ++i) {
     sum = fmaf(values[i], values[i], sum);
   }
-  sum = prep_warp_sum(sum);
+  sum = warp_reduce_sum(sum);
   return rsqrtf(sum / float(Traits::kHeadDim) + GEMMA4_RMS_NORM_EPS);
 }
 
@@ -1219,7 +1208,7 @@ __device__ __forceinline__ float hidden_rms_scale_bf16(
         Bf16Packed128{*reinterpret_cast<const int4 *>(x + element)};
     gemma4_bf16_pack_accumulate_square(x_pack, sum);
   }
-  sum = prep_warp_sum(sum);
+  sum = warp_reduce_sum(sum);
   return rsqrtf(sum / float(GEMMA4_HIDDEN_SIZE) + GEMMA4_RMS_NORM_EPS);
 }
 

@@ -4,6 +4,9 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -22,41 +25,29 @@ void check_cuda(cudaError_t status, const char *expr, const char *file, int line
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
 
+// Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
-class DeviceBuffer {
- public:
-  explicit DeviceBuffer(size_t count) : count_(count) {
-    if (count_ > 0) {
-      CHECK_CUDA(cudaMalloc(&ptr_, count_ * sizeof(T)));
-    }
-  }
+T *raw_ptr(thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
 
-  ~DeviceBuffer() {
-    if (ptr_ != nullptr) {
-      cudaFree(ptr_);
-    }
-  }
+// Returns the raw const CUDA pointer owned by a Thrust device vector.
+template <typename T>
+const T *raw_ptr(const thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
 
-  DeviceBuffer(const DeviceBuffer &) = delete;
-  DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+template <typename T>
+void copy_to_device(thrust::device_vector<T> &dst, const std::vector<T> &src) {
+  CHECK_CUDA(cudaMemcpy(raw_ptr(dst), src.data(), src.size() * sizeof(T),
+                        cudaMemcpyHostToDevice));
+}
 
-  T *get() { return ptr_; }
-  const T *get() const { return ptr_; }
-
-  void copy_from(const std::vector<T> &src) {
-    CHECK_CUDA(cudaMemcpy(ptr_, src.data(), src.size() * sizeof(T),
-                          cudaMemcpyHostToDevice));
-  }
-
-  void copy_to(std::vector<T> &dst) const {
-    CHECK_CUDA(cudaMemcpy(dst.data(), ptr_, dst.size() * sizeof(T),
-                          cudaMemcpyDeviceToHost));
-  }
-
- private:
-  T *ptr_ = nullptr;
-  size_t count_ = 0;
-};
+template <typename T>
+void copy_to_host(std::vector<T> &dst, const thrust::device_vector<T> &src) {
+  CHECK_CUDA(cudaMemcpy(dst.data(), raw_ptr(src), dst.size() * sizeof(T),
+                        cudaMemcpyDeviceToHost));
+}
 
 float bf16_to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
 
@@ -132,23 +123,24 @@ void run_sparse_case() {
     gamma[i] = __float2bfloat16(gamma_value);
   }
 
-  DeviceBuffer<__nv_bfloat16> d_x(GEMMA4_HIDDEN_SIZE);
-  DeviceBuffer<__nv_bfloat16> d_residual(GEMMA4_HIDDEN_SIZE);
-  DeviceBuffer<__nv_bfloat16> d_gamma(GEMMA4_HIDDEN_SIZE);
-  DeviceBuffer<__nv_bfloat16> d_residual_out(GEMMA4_HIDDEN_SIZE);
-  DeviceBuffer<__nv_bfloat16> d_normed_out(GEMMA4_HIDDEN_SIZE);
-  DeviceBuffer<__nv_bfloat16> d_gate_up_src(gate_up_count);
-  DeviceBuffer<__nv_bfloat16> d_gate_up(gate_up_count);
-  DeviceBuffer<__nv_bfloat16> d_down_src(down_count);
-  DeviceBuffer<__nv_bfloat16> d_down(down_count);
-  DeviceBuffer<Gemma4FfnDecodeScratch> d_scratch(1);
+  thrust::device_vector<__nv_bfloat16> d_x(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_residual(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_gamma(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_residual_out(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_normed_out(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_gate_up_src(gate_up_count);
+  thrust::device_vector<__nv_bfloat16> d_gate_up(gate_up_count);
+  thrust::device_vector<__nv_bfloat16> d_down_src(down_count);
+  thrust::device_vector<__nv_bfloat16> d_down(down_count);
+  thrust::device_vector<unsigned char> d_scratch(
+      sizeof(Gemma4FfnDecodeScratch));
 
-  d_x.copy_from(x);
-  d_residual.copy_from(residual);
-  d_gamma.copy_from(gamma);
-  CHECK_CUDA(cudaMemset(d_gate_up_src.get(), 0,
+  copy_to_device(d_x, x);
+  copy_to_device(d_residual, residual);
+  copy_to_device(d_gamma, gamma);
+  CHECK_CUDA(cudaMemset(raw_ptr(d_gate_up_src), 0,
                         gate_up_count * sizeof(__nv_bfloat16)));
-  CHECK_CUDA(cudaMemset(d_down_src.get(), 0,
+  CHECK_CUDA(cudaMemset(raw_ptr(d_down_src), 0,
                         down_count * sizeof(__nv_bfloat16)));
 
   std::vector<__nv_bfloat16> gate_col(GEMMA4_HIDDEN_SIZE);
@@ -170,12 +162,12 @@ void run_sparse_case() {
     up_col[x_index] = up_weight;
 
     CHECK_CUDA(cudaMemcpy(
-        d_gate_up_src.get() +
+        raw_ptr(d_gate_up_src) +
             static_cast<size_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE,
         gate_col.data(), gate_col.size() * sizeof(__nv_bfloat16),
         cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(
-        d_gate_up_src.get() +
+        raw_ptr(d_gate_up_src) +
             static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE + intermediate_col) *
                 GEMMA4_HIDDEN_SIZE,
         up_col.data(), up_col.size() * sizeof(__nv_bfloat16),
@@ -185,7 +177,7 @@ void run_sparse_case() {
       down_row[col] = make_down_value(tile, col);
     }
     CHECK_CUDA(cudaMemcpy(
-        d_down_src.get() +
+        raw_ptr(d_down_src) +
             static_cast<size_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE,
         down_row.data(), down_row.size() * sizeof(__nv_bfloat16),
         cudaMemcpyHostToDevice));
@@ -218,14 +210,15 @@ void run_sparse_case() {
   }
 
   CHECK_CUDA(gemma4_ffn_decode_swizzle_weights_bf16(
-      d_gate_up.get(), d_gate_up_src.get(), d_down.get(), d_down_src.get(),
+      raw_ptr(d_gate_up), raw_ptr(d_gate_up_src), raw_ptr(d_down), raw_ptr(d_down_src),
       0));
   CHECK_CUDA(gemma4_ffn_decode_fused_bf16(
-      d_residual_out.get(), d_normed_out.get(), d_x.get(), d_residual.get(),
-      d_gamma.get(), d_gate_up.get(), d_down.get(), d_scratch.get(),
+      raw_ptr(d_residual_out), raw_ptr(d_normed_out), raw_ptr(d_x), raw_ptr(d_residual),
+      raw_ptr(d_gamma), raw_ptr(d_gate_up), raw_ptr(d_down),
+      reinterpret_cast<Gemma4FfnDecodeScratch *>(raw_ptr(d_scratch)),
       GEMMA4_RMS_NORM_EPS, 0));
-  d_residual_out.copy_to(actual_residual);
-  d_normed_out.copy_to(actual_normed);
+  copy_to_host(actual_residual, d_residual_out);
+  copy_to_host(actual_normed, d_normed_out);
 
   compare_bf16(actual_residual, expected_residual, 0.03125f,
                "fused FFN residual");
@@ -289,31 +282,31 @@ void run_sparse_case() {
     }
   }
 
-  DeviceBuffer<__nv_bfloat16> d_x_prefill(x_prefill.size());
-  DeviceBuffer<__nv_bfloat16> d_residual_prefill(residual_prefill.size());
-  DeviceBuffer<__nv_bfloat16> d_prefill_residual_out(x_prefill.size());
-  DeviceBuffer<__nv_bfloat16> d_prefill_normed_out(x_prefill.size());
-  DeviceBuffer<__nv_bfloat16> d_prefill_scratch(
+  thrust::device_vector<__nv_bfloat16> d_x_prefill(x_prefill.size());
+  thrust::device_vector<__nv_bfloat16> d_residual_prefill(residual_prefill.size());
+  thrust::device_vector<__nv_bfloat16> d_prefill_residual_out(x_prefill.size());
+  thrust::device_vector<__nv_bfloat16> d_prefill_normed_out(x_prefill.size());
+  thrust::device_vector<__nv_bfloat16> d_prefill_scratch(
       gemma4_ffn_prefill_scratch_elements(prefill_rows));
-  d_x_prefill.copy_from(x_prefill);
-  d_residual_prefill.copy_from(residual_prefill);
+  copy_to_device(d_x_prefill, x_prefill);
+  copy_to_device(d_residual_prefill, residual_prefill);
 
   Gemma4FfnBf16Args prefill_args = {};
-  prefill_args.residual_out = d_prefill_residual_out.get();
-  prefill_args.normed_out = d_prefill_normed_out.get();
-  prefill_args.x = d_x_prefill.get();
-  prefill_args.residual = d_residual_prefill.get();
-  prefill_args.rms_weight = d_gamma.get();
-  prefill_args.w_gate_up_decode = d_gate_up.get();
-  prefill_args.w_down_decode = d_down.get();
+  prefill_args.residual_out = raw_ptr(d_prefill_residual_out);
+  prefill_args.normed_out = raw_ptr(d_prefill_normed_out);
+  prefill_args.x = raw_ptr(d_x_prefill);
+  prefill_args.residual = raw_ptr(d_residual_prefill);
+  prefill_args.rms_weight = raw_ptr(d_gamma);
+  prefill_args.w_gate_up_decode = raw_ptr(d_gate_up);
+  prefill_args.w_down_decode = raw_ptr(d_down);
   prefill_args.prefill_scratch =
       gemma4_ffn_prefill_scratch_from_buffer(
-          d_prefill_scratch.get(), prefill_rows);
+          raw_ptr(d_prefill_scratch), prefill_rows);
   prefill_args.rows = prefill_rows;
   prefill_args.eps = GEMMA4_RMS_NORM_EPS;
   CHECK_CUDA(gemma4_ffn_bf16(prefill_args));
-  d_prefill_residual_out.copy_to(actual_prefill_residual);
-  d_prefill_normed_out.copy_to(actual_prefill_normed);
+  copy_to_host(actual_prefill_residual, d_prefill_residual_out);
+  copy_to_host(actual_prefill_normed, d_prefill_normed_out);
 
   compare_bf16(actual_prefill_residual, expected_prefill_residual, 0.03125f,
                "prefill FFN residual");

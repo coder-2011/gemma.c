@@ -37,9 +37,6 @@ constexpr int kFfnHiddenPacks = ffn_dev::kHiddenPacks;
 static_assert((sizeof(Gemma4FfnDecodeScratch) %
                alignof(Gemma4SampleCandidate)) == 0,
               "FFN scratch must preserve candidate alignment");
-static_assert(((kMegaCandidateCount * sizeof(Gemma4SampleCandidate)) % 16) ==
-                  0,
-              "candidate scratch must preserve 16-byte hidden-row alignment");
 
 struct Gemma4DecodeSpineScratch {
   Gemma4SampleCandidate *candidates = nullptr;
@@ -52,29 +49,31 @@ struct Gemma4DecodeFfnTailScratch {
   __nv_bfloat16 *normed_hidden = nullptr;
 };
 
-// Returns scratch for all per-block candidates plus the normalized hidden row.
-constexpr size_t spine_scratch_bytes(void) {
-  constexpr size_t candidates =
-      static_cast<size_t>(kMegaCandidateCount) * sizeof(Gemma4SampleCandidate);
+// Returns scratch for the resident CTA candidates plus the normalized hidden row.
+constexpr size_t spine_scratch_bytes(int32_t active_candidate_count) {
+  const size_t candidates =
+      static_cast<size_t>(active_candidate_count) * sizeof(Gemma4SampleCandidate);
   constexpr size_t normed_hidden =
       static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
-  return candidates + normed_hidden + 16;
+  return candidates + normed_hidden + 15;
 }
 
 // Returns scratch for CUTLASS FFN decode plus the final sampling-tail scratch.
-constexpr size_t ffn_tail_scratch_bytes(void) {
-  constexpr size_t candidates =
-      static_cast<size_t>(kMegaCandidateCount) * sizeof(Gemma4SampleCandidate);
+constexpr size_t ffn_tail_scratch_bytes(int32_t active_candidate_count) {
+  const size_t candidates =
+      static_cast<size_t>(active_candidate_count) * sizeof(Gemma4SampleCandidate);
   constexpr size_t normed_hidden =
       static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
-  return sizeof(Gemma4FfnDecodeScratch) + candidates + normed_hidden;
+  return sizeof(Gemma4FfnDecodeScratch) + candidates + normed_hidden + 15;
 }
 
 // Splits the caller scratch buffer for the final decode spine.
-inline Gemma4DecodeSpineScratch spine_scratch_from_buffer(void *scratch) {
+inline Gemma4DecodeSpineScratch spine_scratch_from_buffer(
+    void *scratch,
+    int32_t active_candidate_count) {
   char *ptr = reinterpret_cast<char *>(scratch);
   auto *candidates = reinterpret_cast<Gemma4SampleCandidate *>(ptr);
-  ptr += static_cast<size_t>(kMegaCandidateCount) *
+  ptr += static_cast<size_t>(active_candidate_count) *
          sizeof(Gemma4SampleCandidate);
 
   ptr = align_ptr_up<16>(ptr);
@@ -83,21 +82,18 @@ inline Gemma4DecodeSpineScratch spine_scratch_from_buffer(void *scratch) {
 }
 
 // Splits the caller scratch buffer for the FFN phase and final decode spine.
-inline Gemma4DecodeFfnTailScratch ffn_tail_scratch_from_buffer(void *scratch) {
+inline Gemma4DecodeFfnTailScratch ffn_tail_scratch_from_buffer(
+    void *scratch,
+    int32_t active_candidate_count) {
   auto *ffn_scratch = reinterpret_cast<Gemma4FfnDecodeScratch *>(scratch);
   char *ptr = reinterpret_cast<char *>(ffn_scratch + 1);
   auto *candidates = reinterpret_cast<Gemma4SampleCandidate *>(ptr);
-  ptr += static_cast<size_t>(kMegaCandidateCount) *
+  ptr += static_cast<size_t>(active_candidate_count) *
          sizeof(Gemma4SampleCandidate);
 
+  ptr = align_ptr_up<16>(ptr);
   auto *normed_hidden = reinterpret_cast<__nv_bfloat16 *>(ptr);
   return {ffn_scratch, candidates, normed_hidden};
-}
-
-// Returns true when the caller requested the optional FlashAttention phase.
-inline bool ffn_tail_uses_flash_attention(
-    const Gemma4DecodeMegakernelFfnTailArgs &args) {
-  return (args.flags & GEMMA4_DECODE_MEGAKERNEL_FLAG_FLASH_ATTENTION) != 0;
 }
 
 // Projects attention output to hidden width inside the cooperative prep grid.
@@ -106,27 +102,34 @@ __device__ inline void phase_attention_o_projection(
     const Gemma4DecodeMegakernelFfnTailArgs &args) {
   constexpr int kColsPerBlock = 8;
   constexpr int kHiddenBlocks = GEMMA4_HIDDEN_SIZE / kColsPerBlock;
-  static_assert((AttentionWidth % kBf16Packed128Elements) == 0,
-                "attention width must divide bf16 pack width");
+  constexpr int packs = AttentionWidth / kBf16Packed128Elements;
 
   __shared__ float s_warp_sums[kColsPerBlock][kMegaWarps];
+
+  const auto attention_pack_layout = cute::make_layout(
+      cute::make_shape(packs),
+      cute::make_stride(kBf16Packed128Elements));
+  const auto hidden_tile_layout = cute::make_layout(
+      cute::make_shape(kHiddenBlocks, kColsPerBlock),
+      cute::make_stride(kColsPerBlock, 1));
+  const auto weight_layout = cute::make_layout(
+      cute::make_shape(kHiddenBlocks, kColsPerBlock, packs),
+      cute::make_stride(int64_t(kColsPerBlock) * AttentionWidth, AttentionWidth, kBf16Packed128Elements));
 
   for (int col_block = int(blockIdx.x); col_block < kHiddenBlocks;
        col_block += int(gridDim.x)) {
     float sums[kColsPerBlock] = {};
-    const int col0 = col_block * kColsPerBlock;
-    constexpr int packs = AttentionWidth / kBf16Packed128Elements;
+    const int col0 = hidden_tile_layout(col_block, 0);
 
     for (int pack = int(threadIdx.x); pack < packs; pack += kMegaThreads) {
-      const int element = pack * kBf16Packed128Elements;
-      const Bf16Packed128 x_pack =
-          Bf16Packed128{*reinterpret_cast<const int4 *>(
-              args.attention_out + element)};
+      const int element = attention_pack_layout(pack);
+      const Bf16Packed128 x_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(args.attention_out + element)};
 #pragma unroll
       for (int col = 0; col < kColsPerBlock; ++col) {
+        const int64_t weight_offset = weight_layout(col_block, col, pack);
         const __nv_bfloat16 *weight =
-            args.attention_o_proj_col_major +
-            int64_t(col0 + col) * AttentionWidth + element;
+            args.attention_o_proj_col_major + weight_offset;
         const Bf16Packed128 w_pack =
             Bf16Packed128{*reinterpret_cast<const int4 *>(weight)};
         gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
@@ -283,20 +286,25 @@ __device__ inline void phase_lm_head_tile_logits(
     float (&sums)[kMegaColsPerBlock]) {
   constexpr int packs_per_col =
       GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+  const auto hidden_pack_layout = cute::make_layout(
+      cute::make_shape(packs_per_col),
+      cute::make_stride(kBf16Packed128Elements));
+  const auto weight_layout = cute::make_layout(
+      cute::make_shape(kMegaCandidateCount, kMegaColsPerBlock, packs_per_col),
+      cute::make_stride(int64_t(kMegaColsPerBlock) * GEMMA4_HIDDEN_SIZE,
+                        GEMMA4_HIDDEN_SIZE,
+                        kBf16Packed128Elements));
 
-  const int token0 = tile * kMegaColsPerBlock;
   for (int pack = int(threadIdx.x); pack < packs_per_col;
        pack += kMegaThreads) {
-    const int element = pack * kBf16Packed128Elements;
+    const int element = hidden_pack_layout(pack);
     const Bf16Packed128 x_pack =
         Bf16Packed128{*reinterpret_cast<const int4 *>(
             normed_hidden + element)};
 #pragma unroll
     for (int col = 0; col < kMegaColsPerBlock; ++col) {
-      const int token_id = token0 + col;
-      const __nv_bfloat16 *weight =
-          lm_head_col_major +
-          int64_t(token_id) * GEMMA4_HIDDEN_SIZE + element;
+      const int64_t weight_offset = weight_layout(tile, col, pack);
+      const __nv_bfloat16 *weight = lm_head_col_major + weight_offset;
       const Bf16Packed128 w_pack =
           Bf16Packed128{*reinterpret_cast<const int4 *>(weight)};
       gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
@@ -314,6 +322,9 @@ __device__ inline Gemma4SampleCandidate phase_final_logits_block_candidate(
 
   float best_logit = -INFINITY;
   int32_t best_token_id = GEMMA4_VOCAB_SIZE;
+  const auto vocab_tile_layout = cute::make_layout(
+      cute::make_shape(kMegaCandidateCount, kMegaColsPerBlock),
+      cute::make_stride(kMegaColsPerBlock, 1));
 
   for (int tile = int(blockIdx.x); tile < kMegaCandidateCount;
        tile += int(gridDim.x)) {
@@ -322,11 +333,10 @@ __device__ inline Gemma4SampleCandidate phase_final_logits_block_candidate(
         normed_hidden, lm_head_col_major, tile, warp_sums, sums);
 
     if (threadIdx.x == 0) {
-      const int32_t token0 = tile * kMegaColsPerBlock;
 #pragma unroll
       for (int col = 0; col < kMegaColsPerBlock; ++col) {
         const float logit = __bfloat162float(__float2bfloat16_rn(sums[col]));
-        const int32_t token_id = token0 + col;
+        const int32_t token_id = vocab_tile_layout(tile, col);
         if (phase_better_candidate(
                 logit, token_id, best_logit, best_token_id)) {
           best_logit = logit;
@@ -438,19 +448,18 @@ inline cudaError_t launch_spine(
     size_t scratch_bytes,
     cudaStream_t stream,
     Kernel kernel) {
-  if (scratch_bytes < spine_scratch_bytes()) {
-    return cudaErrorInvalidValue;
-  }
-
   int32_t active_candidate_count = 0;
   cudaError_t status =
       active_candidate_count_for_kernel(kernel, &active_candidate_count);
   if (status != cudaSuccess) {
     return status;
   }
+  if (scratch_bytes < spine_scratch_bytes(active_candidate_count)) {
+    return cudaErrorInvalidValue;
+  }
 
   const Gemma4DecodeSpineScratch scratch_parts =
-      spine_scratch_from_buffer(scratch);
+      spine_scratch_from_buffer(scratch, active_candidate_count);
   Gemma4DecodeMegakernelSpineArgs kernel_args_value = args;
   Gemma4SampleCandidate *candidates_arg = scratch_parts.candidates;
   __nv_bfloat16 *normed_hidden_arg = scratch_parts.normed_hidden;
