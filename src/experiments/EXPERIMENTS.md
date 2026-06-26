@@ -14407,3 +14407,177 @@ Conclusion:
   `1.02-1.07x` for most smaller/mid shapes, and `1.11x` at `1024` rows.
 - This matches the implementation: custom prefill fuses gate/up + GeGLU, but
   still writes the activation to HBM before the separate down GEMM.
+
+## 2026-06-26 - FFN Decode Stage and Cache-Load Ablation
+
+Question: check whether steady-state FFN decode benefits from changing the
+CUTLASS buffering stages or explicit cache-policy vector loads. The cache-load
+variants only touched the handwritten FFN pack loads in swizzle/finalize; the
+CUTLASS GEMM internal loads stayed on their library path.
+
+Commands:
+
+```bash
+make -B build/benches/gemma4_ffn_libtorch_bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=0x12345678 \
+  ./build/benches/gemma4_ffn_libtorch_bench 50 10 5 1
+
+make -B build/benches/gemma4_ffn_libtorch_bench \
+  CPPFLAGS='-Isrc -DGEMMA4_FFN_DOWN_STAGE_ROWS64=2'
+make -B build/benches/gemma4_ffn_libtorch_bench \
+  CPPFLAGS='-Isrc -DGEMMA4_FFN_DOWN_STAGE_ROWS64=12'
+make -B build/benches/gemma4_ffn_libtorch_bench \
+  CPPFLAGS='-Isrc -DGEMMA4_FFN_GATE_UP_STAGE_ROWS128=3 -DGEMMA4_FFN_DOWN_STAGE_ROWS128=2'
+make -B build/benches/gemma4_ffn_libtorch_bench \
+  CPPFLAGS='-Isrc -DGEMMA4_FFN_VECTOR_LOAD_POLICY=N'
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, power limit `300 W`.
+- Toolchain: CUDA `13.0.48`, PyTorch `2.11.0+cu130`.
+- Timing: CUDA events on the benchmark stream; graph rows time replay only and
+  exclude capture. `10` warmups, `50` iterations, `5` trials, `tokens=1`.
+- Cache policy: warm repeated buffers for graph rows; cold rows use the
+  benchmark's L2 flush. Clocks were not locked.
+- Correctness: custom prefill vs LibTorch full FFN max abs was `9.53674e-07`
+  in every measured variant.
+
+Result:
+
+```text
+variant              graph ms  graph-clear ms  cold-flush-clear ms
+default direct         0.520710       0.519597             0.523085
+down stages=2          0.623961       0.622887             0.626543
+down stages=12         0.521533       0.520452             0.524011
+load __ldg             0.520214       0.519139             0.522956
+load ld.global.cg      0.520431       0.519351             0.523465
+load ld.global.ca      0.520799       0.519624             0.523666
+load ld.global.cs      0.520404       0.519312             0.523331
+```
+
+Rows-128 prefill stage check:
+
+```text
+variant                   custom prefill graph ms  libtorch full graph ms
+default gate/down 5/6                    0.554886              0.597487
+reduced gate/down 3/2                    0.722149              0.597111
+```
+
+Notes:
+
+- For the single-token path, `rows <= 64` is the active stage branch. Default
+  stages are gate/up `3` and down `10`.
+- At `tokens=128`, the active prefill branch uses gate/up `5` and down `6`.
+- Gate/up `Stages=2` did not compile because the CUTLASS DualGemm example path
+  asserts `Stages >= 3`.
+
+Conclusion:
+
+- Keep the current down `Stages=10` default. Reducing it to `2` regressed
+  decode by about `20%`; increasing it to `12` was slightly slower than
+  default. The `tokens=128` reduced-stage check also regressed badly, so the
+  existing deeper prefill staging should stay.
+- Keep direct/default FFN vector loads. `__ldg`, `cg`, `ca`, and `cs` were all
+  within noise on this benchmark, and the tiny `__ldg` win was not large enough
+  to justify changing the default.
+- Follow-up cleanup removed the live ablation knobs after this result; rerunning
+  the sweep requires reintroducing temporary compile-time hooks.
+
+## 2026-06-26 - Prompt Runner Warm Serving vs vLLM
+
+Question: compare the local `gemma4_prompt` warm serving path against vLLM on
+the same A6000 for single-user TTFT and decode TPS.
+
+Commands:
+
+```bash
+make prompt
+./build/gemma4_prompt --benchmark-mode warm-serving --bench-warmup 3 \
+  --bench-iters 5 --bench-samples 3 --max-new 16 --prompt Hello \
+  | tee build/bench_results/gemma4_prompt_warm_equal_hello_out16_c1.txt
+
+python3 - <<'PY'
+from pathlib import Path
+path = Path("build/bench_results/hello_prompt_15x.jsonl")
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text('{"prompt":"Hello","output_tokens":16}\n' * 15)
+PY
+
+uv run vllm serve models/gemma-4-12B --host 127.0.0.1 --port 8000 \
+  --served-model-name gemma4-12b --dtype bfloat16 --max-model-len 64 \
+  --gpu-memory-utilization 0.99 --language-model-only --trust-remote-code \
+  --disable-log-stats --max-num-seqs 1 --max-num-batched-tokens 64 \
+  -cc.cudagraph_mode=NONE
+
+uv run vllm bench serve --backend openai \
+  --base-url http://127.0.0.1:8000 --model gemma4-12b \
+  --tokenizer models/gemma-4-12B --trust-remote-code \
+  --dataset-name custom --dataset-path build/bench_results/hello_prompt_15x.jsonl \
+  --skip-chat-template --output-len 16 --num-prompts 15 --num-warmups 3 \
+  --request-rate inf --max-concurrency 1 --temperature 0 \
+  --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,95,99 \
+  --save-result --result-dir build/bench_results \
+  --result-filename vllm_warm_equal_hello_out16_c1_compiled_nocg_warm2.json \
+  --disable-tqdm
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, MIG disabled, power limit `300 W`.
+- Software: local runner reported CUDA driver/runtime `13000`; vLLM `0.23.0`
+  on PyTorch `2.11.0+cu130`. `nvcc` was not on the shell path for this run.
+- Shape: literal prompt text `Hello`, prompt length `1` token for both paths,
+  output length `16`, concurrency `1`, `3` warmup requests, `15` measured
+  requests.
+- Local timing: host wall clock; model load, CUDA context, and allocation
+  excluded; tokenization, prompt H2D copy, prefill, per-token host sync, and
+  decode included. Detokenization is included only in end-to-end latency.
+- vLLM timing: `vllm bench serve` through the OpenAI completions endpoint;
+  tokenizer, HTTP/server overhead, scheduler, prefill, decode, and streaming
+  are included.
+- vLLM caveat: the unconstrained compiled vLLM server failed KV-cache
+  initialization on this A6000. The measured vLLM baseline kept compile enabled
+  but required `max_num_seqs=1`, `max_num_batched_tokens=64`,
+  `gpu_memory_utilization=0.99`, and disabled CUDA graph capture with
+  `-cc.cudagraph_mode=NONE`. Startup only succeeded after the compile cache was
+  warm.
+- Cache/clock policy: serving benchmark uses warm steady-state requests after
+  warmup. Clocks were not locked.
+- Equality caveat: the request shape and token counts are matched exactly, but
+  the interfaces are still different. The local runner is in-process, while
+  vLLM is measured as an HTTP serving stack. A perfectly identical comparison
+  would require either wrapping the local runner in the same serving protocol or
+  adding a vLLM in-process TTFT/TPOT harness with the same streaming semantics.
+- Run note: the first vLLM pass JIT-compiled three Triton kernels during
+  initial/warmup traffic. The charted result is the second pass on the same
+  already-warmed server; no new JIT warnings appeared during that pass.
+
+Result:
+
+```text
+runner                         p50 TTFT ms   p50 TPOT ms   p50 decode TPS
+gemma4_prompt local                 38.878        75.120            13.312
+vLLM serve compiled no CG          208.512        96.762            10.335
+```
+
+Artifacts:
+
+- `build/bench_results/gemma4_prompt_warm_equal_hello_out16_c1.txt`
+- `build/bench_results/hello_prompt_15x.jsonl`
+- `build/bench_results/vllm_warm_equal_hello_out16_c1_compiled_nocg_warm2.json`
+- `build/bench_results/gemma4_vs_vllm_summary.json`
+- `build/bench_results/ttft_p50_gemma4_vs_vllm.png`
+- `build/bench_results/tps_p50_gemma4_vs_vllm.png`
+
+Conclusion:
+
+- Under the compiled/no-CUDA-graph vLLM baseline that fits on this machine, the
+  local runner wins on both requested P50 metrics: lower TTFT and higher decode
+  TPS.
+- Do not generalize this as a production vLLM win yet. The comparison is not
+  perfectly apples-to-apples because the local path is an in-process runner,
+  while vLLM is serving through an HTTP-compatible API and had to disable CUDA
+  graph capture due memory pressure.

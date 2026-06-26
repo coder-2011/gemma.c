@@ -8,8 +8,11 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <thrust/device_ptr.h>
+#include <thrust/device_vector.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,11 +22,32 @@
 
 namespace {
 
+// Returns the raw CUDA pointer owned by a Thrust device vector.
+template <typename T>
+T *raw_ptr(thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
+
+// Returns the raw const CUDA pointer owned by a Thrust device vector.
+template <typename T>
+const T *raw_ptr(const thrust::device_vector<T> &v) {
+  return thrust::raw_pointer_cast(v.data());
+}
+
 constexpr int32_t kDefaultMaxNewTokens = 1;
 constexpr int32_t kDefaultPageSize = 64;
 constexpr int32_t kDefaultBenchWarmup = 1;
 constexpr int32_t kDefaultBenchIters = 3;
 constexpr int32_t kDefaultBenchSamples = 3;
+
+using PromptClock = std::chrono::steady_clock;
+
+enum class PromptBenchmarkMode {
+  kNone,
+  kDecodeStep,
+  kWarmServing,
+  kColdStart,
+};
 
 struct PromptOptions {
   std::string checkpoint_path = "models/gemma-4-12B/model.safetensors";
@@ -31,42 +55,29 @@ struct PromptOptions {
   std::string prompt = "Hello";
   int32_t max_new_tokens = kDefaultMaxNewTokens;
   int32_t page_size = kDefaultPageSize;
-  bool benchmark = false;
+  PromptBenchmarkMode benchmark_mode = PromptBenchmarkMode::kNone;
   int32_t bench_warmup = kDefaultBenchWarmup;
   int32_t bench_iters = kDefaultBenchIters;
   int32_t bench_samples = kDefaultBenchSamples;
 };
 
 struct PromptBenchmarkStats {
-  float median_ms = 0.0f;
+  int32_t count = 0;
+  float mean_ms = 0.0f;
+  float p50_ms = 0.0f;
+  float p90_ms = 0.0f;
+  float p95_ms = 0.0f;
+  float p99_ms = 0.0f;
   float min_ms = 0.0f;
   float max_ms = 0.0f;
 };
 
-// Owns a CUDA allocation used by the prompt runner.
-template <typename T>
-struct DeviceBuffer {
-  T *ptr = nullptr;
-  size_t count = 0;
-
-  // Releases the device buffer owned by this wrapper.
-  ~DeviceBuffer() {
-    cudaFree(ptr);
-  }
-
-  // Allocates `n` elements and frees any previous allocation first.
-  cudaError_t allocate(size_t n) {
-    cudaFree(ptr);
-    ptr = nullptr;
-    count = n;
-    if (n == 0) {
-      return cudaSuccess;
-    }
-    return cudaMalloc(&ptr, n * sizeof(T));
-  }
-
-  // Returns the mutable device pointer.
-  T *get() { return ptr; }
+struct PromptRequestTiming {
+  float ttft_ms = 0.0f;
+  float e2e_ms = 0.0f;
+  float tpot_ms = 0.0f;
+  float per_user_tps = 0.0f;
+  std::vector<float> itl_ms;
 };
 
 // Releases loaded device weights when leaving the prompt runner.
@@ -104,6 +115,42 @@ int fail_cuda(cudaError_t status, const char *where) {
   return 1;
 }
 
+// Converts a benchmark mode to the stable CLI/reporting name.
+const char *benchmark_mode_name(PromptBenchmarkMode mode) {
+  switch (mode) {
+    case PromptBenchmarkMode::kNone:
+      return "none";
+    case PromptBenchmarkMode::kDecodeStep:
+      return "decode-step";
+    case PromptBenchmarkMode::kWarmServing:
+      return "warm-serving";
+    case PromptBenchmarkMode::kColdStart:
+      return "cold-start";
+  }
+  return "unknown";
+}
+
+// Parses the explicit benchmark regime requested by the CLI.
+bool parse_benchmark_mode(const std::string &value, PromptBenchmarkMode *mode) {
+  if (value == "decode-step") {
+    *mode = PromptBenchmarkMode::kDecodeStep;
+    return true;
+  }
+  if (value == "warm-serving") {
+    *mode = PromptBenchmarkMode::kWarmServing;
+    return true;
+  }
+  if (value == "cold-start") {
+    *mode = PromptBenchmarkMode::kColdStart;
+    return true;
+  }
+  if (value == "none") {
+    *mode = PromptBenchmarkMode::kNone;
+    return true;
+  }
+  return false;
+}
+
 // Parses the tiny prompt-runner CLI.
 bool parse_args(int argc, char **argv, PromptOptions *options) {
   for (int i = 1; i < argc; ++i) {
@@ -119,7 +166,11 @@ bool parse_args(int argc, char **argv, PromptOptions *options) {
     } else if (arg == "--page-size" && i + 1 < argc) {
       options->page_size = std::atoi(argv[++i]);
     } else if (arg == "--benchmark") {
-      options->benchmark = true;
+      options->benchmark_mode = PromptBenchmarkMode::kDecodeStep;
+    } else if (arg == "--benchmark-mode" && i + 1 < argc) {
+      if (!parse_benchmark_mode(argv[++i], &options->benchmark_mode)) {
+        return false;
+      }
     } else if (arg == "--bench-warmup" && i + 1 < argc) {
       options->bench_warmup = std::atoi(argv[++i]);
     } else if (arg == "--bench-iters" && i + 1 < argc) {
@@ -130,8 +181,9 @@ bool parse_args(int argc, char **argv, PromptOptions *options) {
       std::fprintf(stderr,
                    "usage: %s [--checkpoint path] [--tokenizer path] "
                    "[--prompt text] [--max-new n] [--page-size n] "
-                   "[--benchmark] [--bench-warmup n] [--bench-iters n] "
-                   "[--bench-samples n]\n",
+                   "[--benchmark] [--benchmark-mode none|decode-step|"
+                   "warm-serving|cold-start] [--bench-warmup n] "
+                   "[--bench-iters n] [--bench-samples n]\n",
                    argv[0]);
       return false;
     }
@@ -141,67 +193,150 @@ bool parse_args(int argc, char **argv, PromptOptions *options) {
          options->bench_samples > 0;
 }
 
-// Summarizes per-sample milliseconds as median/min/max.
+// Returns the nearest-rank percentile from sorted millisecond samples.
+float percentile_ms(const std::vector<float> &sorted, float pct) {
+  if (sorted.empty()) {
+    return 0.0f;
+  }
+  const float scaled = (pct / 100.0f) * static_cast<float>(sorted.size() - 1);
+  size_t index = static_cast<size_t>(scaled + 0.5f);
+  if (index >= sorted.size()) {
+    index = sorted.size() - 1;
+  }
+  return sorted[index];
+}
+
+// Summarizes raw milliseconds as mean, percentiles, min, and max.
 PromptBenchmarkStats summarize_benchmark_samples(std::vector<float> samples) {
+  if (samples.empty()) {
+    return {};
+  }
+
+  float total_ms = 0.0f;
+  for (float sample : samples) {
+    total_ms += sample;
+  }
   std::sort(samples.begin(), samples.end());
   PromptBenchmarkStats stats = {};
+  stats.count = static_cast<int32_t>(samples.size());
+  stats.mean_ms = total_ms / static_cast<float>(samples.size());
   stats.min_ms = samples.front();
-  stats.median_ms = samples[samples.size() / 2];
+  stats.p50_ms = percentile_ms(samples, 50.0f);
+  stats.p90_ms = percentile_ms(samples, 90.0f);
+  stats.p95_ms = percentile_ms(samples, 95.0f);
+  stats.p99_ms = percentile_ms(samples, 99.0f);
   stats.max_ms = samples.back();
   return stats;
 }
 
-// Times one stream-ordered hot-path region with CUDA events.
+// Prints a one-line latency distribution with stable field names.
+void print_stats_line(const char *name, const PromptBenchmarkStats &stats) {
+  std::printf(
+      "%s n=%d mean_ms=%.3f p50_ms=%.3f p90_ms=%.3f p95_ms=%.3f "
+      "p99_ms=%.3f min_ms=%.3f max_ms=%.3f\n",
+      name, stats.count, stats.mean_ms, stats.p50_ms, stats.p90_ms,
+      stats.p95_ms, stats.p99_ms, stats.min_ms, stats.max_ms);
+}
+
+// Prints a one-line throughput distribution with stable field names.
+void print_rate_stats_line(const char *name, const PromptBenchmarkStats &stats) {
+  std::printf(
+      "%s n=%d mean=%.3f p50=%.3f p90=%.3f p95=%.3f p99=%.3f "
+      "min=%.3f max=%.3f\n",
+      name, stats.count, stats.mean_ms, stats.p50_ms, stats.p90_ms,
+      stats.p95_ms, stats.p99_ms, stats.min_ms, stats.max_ms);
+}
+
+// Returns elapsed host-visible milliseconds between two steady-clock timestamps.
+float host_elapsed_ms(PromptClock::time_point start,
+                      PromptClock::time_point stop) {
+  return std::chrono::duration<float, std::milli>(stop - start).count();
+}
+
+// Prints the CUDA environment fields this executable can query directly.
+cudaError_t print_cuda_environment() {
+  int device = 0;
+  cudaError_t status = cudaGetDevice(&device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  cudaDeviceProp prop = {};
+  status = cudaGetDeviceProperties(&prop, device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  int driver = 0;
+  status = cudaDriverGetVersion(&driver);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  int runtime = 0;
+  status = cudaRuntimeGetVersion(&runtime);
+  if (status != cudaSuccess) {
+    return status;
+  }
+
+  std::printf(
+      "environment gpu=\"%s\" sm=%d.%d memory_bytes=%zu cuda_driver=%d "
+      "cuda_runtime=%d\n",
+      prop.name, prop.major, prop.minor, prop.totalGlobalMem, driver, runtime);
+  return cudaSuccess;
+}
+
+// Times stateful decode steps with CUDA events on the measured stream.
 template <typename Fn>
-cudaError_t measure_region_ms(
+cudaError_t measure_cuda_event_steps_ms(
     PromptBenchmarkStats *stats,
     int32_t warmup,
     int32_t iters,
     int32_t samples,
     cudaStream_t stream,
     Fn fn) {
-  std::vector<float> sample_ms;
-  sample_ms.reserve(samples);
+  const int32_t timed_steps = iters * samples;
+  std::vector<float> step_ms;
+  step_ms.reserve(timed_steps);
 
-  for (int32_t sample = 0; sample < samples; ++sample) {
-    for (int32_t i = 0; i < warmup; ++i) {
-      cudaError_t status = fn();
-      if (status != cudaSuccess) {
-        return status;
-      }
-    }
-    cudaError_t status = cudaStreamSynchronize(stream);
+  for (int32_t i = 0; i < warmup; ++i) {
+    cudaError_t status = fn();
     if (status != cudaSuccess) {
       return status;
     }
+  }
 
-    cudaEvent_t start = nullptr;
-    cudaEvent_t stop = nullptr;
-    status = cudaEventCreate(&start);
-    if (status != cudaSuccess) {
-      return status;
-    }
-    status = cudaEventCreate(&stop);
-    if (status != cudaSuccess) {
-      cudaEventDestroy(start);
-      return status;
-    }
+  cudaError_t status = cudaStreamSynchronize(stream);
+  if (status != cudaSuccess) {
+    return status;
+  }
 
-    status = cudaEventRecord(start, stream);
+  cudaEvent_t start = nullptr;
+  cudaEvent_t stop = nullptr;
+  status = cudaEventCreate(&start);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  status = cudaEventCreate(&stop);
+  if (status != cudaSuccess) {
+    cudaEventDestroy(start);
+    return status;
+  }
+
+  for (int32_t i = 0; i < timed_steps; ++i) {
+    status = cudaEventRecord(start);
     if (status != cudaSuccess) {
       cudaEventDestroy(start);
       cudaEventDestroy(stop);
       return status;
     }
-    for (int32_t i = 0; i < iters; ++i) {
-      status = fn();
-      if (status != cudaSuccess) {
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
-        return status;
-      }
+    status = fn();
+    if (status != cudaSuccess) {
+      cudaEventDestroy(start);
+      cudaEventDestroy(stop);
+      return status;
     }
-    status = cudaEventRecord(stop, stream);
+    status = cudaEventRecord(stop);
     if (status != cudaSuccess) {
       cudaEventDestroy(start);
       cudaEventDestroy(stop);
@@ -216,15 +351,17 @@ cudaError_t measure_region_ms(
 
     float total_ms = 0.0f;
     status = cudaEventElapsedTime(&total_ms, start, stop);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
     if (status != cudaSuccess) {
+      cudaEventDestroy(start);
+      cudaEventDestroy(stop);
       return status;
     }
-    sample_ms.push_back(total_ms / static_cast<float>(iters));
+    step_ms.push_back(total_ms);
   }
 
-  *stats = summarize_benchmark_samples(sample_ms);
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  *stats = summarize_benchmark_samples(step_ms);
   return cudaSuccess;
 }
 
@@ -435,7 +572,7 @@ cudaError_t copy_next_token(
   int32_t token = -1;
   cudaError_t status =
       cudaMemcpyAsync(&token, d_next_token, sizeof(token),
-                      cudaMemcpyDeviceToHost, stream);
+                      cudaMemcpyDeviceToHost);
   if (status != cudaSuccess) {
     return status;
   }
@@ -448,7 +585,8 @@ cudaError_t copy_next_token(
 }
 
 // Runs tokenization, prefill, decode, and detokenization for one prompt.
-int run_prompt(const PromptOptions &options) {
+int run_prompt(const PromptOptions &options,
+               PromptClock::time_point process_start) {
   Gemma4Tokenizer tokenizer;
   std::string tokenizer_error;
   if (!tokenizer.load(options.tokenizer_path, &tokenizer_error)) {
@@ -464,10 +602,12 @@ int run_prompt(const PromptOptions &options) {
     return 1;
   }
   const int32_t prompt_len = static_cast<int32_t>(prompt_tokens.size());
+  const bool benchmark_decode =
+      options.benchmark_mode == PromptBenchmarkMode::kDecodeStep;
   const int32_t benchmark_decode_steps =
-      options.benchmark
-          ? options.bench_samples * (options.bench_warmup + options.bench_iters)
-          : 0;
+      benchmark_decode ? options.bench_warmup +
+                             options.bench_samples * options.bench_iters
+                       : 0;
   const int32_t max_seq_len =
       prompt_len + std::max(options.max_new_tokens, benchmark_decode_steps);
   std::printf("prompt tokens: %d\n", prompt_len);
@@ -489,53 +629,26 @@ int run_prompt(const PromptOptions &options) {
   if (status != cudaSuccess) {
     return fail_cuda(status, "runtime init");
   }
-
-  DeviceBuffer<int32_t> d_prompt_tokens;
-  DeviceBuffer<int32_t> d_next_token;
-  DeviceBuffer<__nv_bfloat16> d_prefill_a;
-  DeviceBuffer<__nv_bfloat16> d_prefill_b;
-  DeviceBuffer<__nv_bfloat16> d_prefill_scratch;
-  DeviceBuffer<__nv_bfloat16> d_decode_a;
-  DeviceBuffer<__nv_bfloat16> d_decode_b;
-  DeviceBuffer<__nv_bfloat16> d_normed;
-  DeviceBuffer<__nv_bfloat16> d_sampled;
-  DeviceBuffer<__nv_bfloat16> d_attention_q;
-  DeviceBuffer<__nv_bfloat16> d_attention_out;
-  DeviceBuffer<float> d_partial_m;
-  DeviceBuffer<float> d_partial_l;
-  DeviceBuffer<float> d_partial_acc;
-  DeviceBuffer<unsigned char> d_spine_scratch;
-  DeviceBuffer<unsigned char> d_decode_scratch;
-
-  status = d_prompt_tokens.allocate(prompt_tokens.size());
-  if (status != cudaSuccess) return fail_cuda(status, "alloc prompt tokens");
-  status = d_next_token.allocate(1);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc next token");
+  thrust::device_vector<int32_t> d_prompt_tokens(prompt_tokens.size());
+  thrust::device_vector<int32_t> d_next_token(1);
 
   const size_t prompt_hidden_elements =
       static_cast<size_t>(prompt_len) * GEMMA4_HIDDEN_SIZE;
-  status = d_prefill_a.allocate(prompt_hidden_elements);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc prefill a");
-  status = d_prefill_b.allocate(prompt_hidden_elements);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc prefill b");
+  thrust::device_vector<__nv_bfloat16> d_prefill_a(prompt_hidden_elements);
+  thrust::device_vector<__nv_bfloat16> d_prefill_b(prompt_hidden_elements);
   const size_t prefill_scratch_elements = std::max(
       gemma4_prefill_megakernel_layer_scratch_elements(false, prompt_len),
       gemma4_prefill_megakernel_layer_scratch_elements(true, prompt_len));
-  status = d_prefill_scratch.allocate(prefill_scratch_elements);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc prefill scratch");
-
-  status = d_decode_a.allocate(GEMMA4_HIDDEN_SIZE);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc decode a");
-  status = d_decode_b.allocate(GEMMA4_HIDDEN_SIZE);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc decode b");
-  status = d_normed.allocate(GEMMA4_HIDDEN_SIZE);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc normed");
-  status = d_sampled.allocate(GEMMA4_HIDDEN_SIZE);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc sampled");
-  status = d_attention_q.allocate(GEMMA4_GLOBAL_Q_PROJ_SIZE);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc attention q");
-  status = d_attention_out.allocate(GEMMA4_GLOBAL_ATTENTION_OUT_SIZE);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc attention out");
+  thrust::device_vector<__nv_bfloat16> d_prefill_scratch(
+      prefill_scratch_elements);
+  thrust::device_vector<__nv_bfloat16> d_decode_a(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_decode_b(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_normed(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_sampled(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_attention_q(
+      GEMMA4_GLOBAL_Q_PROJ_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_attention_out(
+      GEMMA4_GLOBAL_ATTENTION_OUT_SIZE);
 
   const int32_t split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
   const int32_t sliding_splits =
@@ -545,26 +658,30 @@ int run_prompt(const PromptOptions &options) {
       runtime.value.global_cache_config.page_size;
   const int32_t global_splits = (global_keys + split_size - 1) / split_size;
   const int32_t max_splits = std::max(sliding_splits, global_splits);
-  status = d_partial_m.allocate(GEMMA4_NUM_QUERY_HEADS * max_splits);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc partial m");
-  status = d_partial_l.allocate(GEMMA4_NUM_QUERY_HEADS * max_splits);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc partial l");
-  status = d_partial_acc.allocate(
+  thrust::device_vector<float> d_partial_m(
+      GEMMA4_NUM_QUERY_HEADS * max_splits);
+  thrust::device_vector<float> d_partial_l(
+      GEMMA4_NUM_QUERY_HEADS * max_splits);
+  thrust::device_vector<float> d_partial_acc(
       static_cast<size_t>(GEMMA4_NUM_QUERY_HEADS) * max_splits *
       GEMMA4_GLOBAL_HEAD_DIM);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc partial acc");
   const size_t spine_scratch_bytes =
       gemma4_decode_megakernel_spine_scratch_bytes();
   const size_t decode_scratch_bytes =
       gemma4_decode_megakernel_ffn_tail_scratch_bytes();
-  status = d_spine_scratch.allocate(spine_scratch_bytes);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc spine scratch");
-  status = d_decode_scratch.allocate(decode_scratch_bytes);
-  if (status != cudaSuccess) return fail_cuda(status, "alloc decode scratch");
+  thrust::device_vector<unsigned char> d_spine_scratch(
+      spine_scratch_bytes);
+  thrust::device_vector<unsigned char> d_decode_scratch(
+      decode_scratch_bytes);
 
-  status = cudaMemcpyAsync(
-      d_prompt_tokens.get(), prompt_tokens.data(),
-      prompt_tokens.size() * sizeof(int32_t), cudaMemcpyHostToDevice, 0);
+  auto copy_prompt_tokens_to_device =
+      [&](const std::vector<int32_t> &tokens) -> cudaError_t {
+    return cudaMemcpyAsync(
+        raw_ptr(d_prompt_tokens), tokens.data(),
+        tokens.size() * sizeof(int32_t), cudaMemcpyHostToDevice, 0);
+  };
+
+  status = copy_prompt_tokens_to_device(prompt_tokens);
   if (status != cudaSuccess) return fail_cuda(status, "copy prompt tokens");
 
   auto run_prefill_once = [&]() -> cudaError_t {
@@ -574,7 +691,7 @@ int run_prompt(const PromptOptions &options) {
       return inner_status;
     }
     inner_status = gemma4_embedding_gather_bf16(
-        d_prefill_a.get(), d_prompt_tokens.get(), weights.value.token_embedding,
+        raw_ptr(d_prefill_a), raw_ptr(d_prompt_tokens), weights.value.token_embedding,
         prompt_len, 0);
     if (inner_status != cudaSuccess) {
       return inner_status;
@@ -582,25 +699,86 @@ int run_prompt(const PromptOptions &options) {
 
     __nv_bfloat16 *prefill_final_row = nullptr;
     inner_status = run_prefill_layers(
-        weights.value, &runtime.value, d_prefill_a.get(), d_prefill_b.get(),
-        d_prefill_scratch.get(), prompt_len, 0, &prefill_final_row);
+        weights.value, &runtime.value, raw_ptr(d_prefill_a), raw_ptr(d_prefill_b),
+        raw_ptr(d_prefill_scratch), prompt_len, 0, &prefill_final_row);
     if (inner_status != cudaSuccess) {
       return inner_status;
     }
     return sample_from_prefill(
-        weights.value, prefill_final_row, prompt_len, d_decode_a.get(),
-        d_next_token.get(), d_spine_scratch.get(), spine_scratch_bytes, 0);
+        weights.value, prefill_final_row, prompt_len, raw_ptr(d_decode_a),
+        raw_ptr(d_next_token), raw_ptr(d_spine_scratch), spine_scratch_bytes, 0);
   };
 
-  if (options.benchmark) {
-    PromptBenchmarkStats prefill_stats;
-    status = measure_region_ms(
-        &prefill_stats, options.bench_warmup, options.bench_iters,
-        options.bench_samples, 0, run_prefill_once);
-    if (status != cudaSuccess) {
-      return fail_cuda(status, "benchmark prefill");
+  auto run_decode_once = [&]() -> cudaError_t {
+    return run_decode_step(
+        weights.value, &runtime.value, raw_ptr(d_decode_a), raw_ptr(d_decode_b),
+        raw_ptr(d_normed), raw_ptr(d_sampled), raw_ptr(d_next_token),
+        raw_ptr(d_attention_q), raw_ptr(d_attention_out), raw_ptr(d_partial_m),
+        raw_ptr(d_partial_l), raw_ptr(d_partial_acc), raw_ptr(d_decode_scratch),
+        decode_scratch_bytes, split_size, sliding_splits, global_splits, 0);
+  };
+
+  auto run_serving_request = [&](PromptRequestTiming *timing) -> cudaError_t {
+    const PromptClock::time_point request_start = PromptClock::now();
+    std::vector<int32_t> request_prompt_tokens;
+    if (!tokenizer.encode(options.prompt, &request_prompt_tokens) ||
+        static_cast<int32_t>(request_prompt_tokens.size()) != prompt_len) {
+      return cudaErrorInvalidValue;
     }
 
+    cudaError_t inner_status =
+        copy_prompt_tokens_to_device(request_prompt_tokens);
+    if (inner_status != cudaSuccess) {
+      return inner_status;
+    }
+    inner_status = run_prefill_once();
+    if (inner_status != cudaSuccess) {
+      return inner_status;
+    }
+
+    std::vector<int32_t> generated;
+    inner_status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
+    if (inner_status != cudaSuccess) {
+      return inner_status;
+    }
+    const PromptClock::time_point first_token_time = PromptClock::now();
+    PromptClock::time_point previous_token_time = first_token_time;
+
+    while (static_cast<int32_t>(generated.size()) < options.max_new_tokens) {
+      inner_status = run_decode_once();
+      if (inner_status != cudaSuccess) {
+        return inner_status;
+      }
+      inner_status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
+      if (inner_status != cudaSuccess) {
+        return inner_status;
+      }
+      const PromptClock::time_point token_time = PromptClock::now();
+      timing->itl_ms.push_back(host_elapsed_ms(previous_token_time, token_time));
+      previous_token_time = token_time;
+    }
+
+    std::string decoded;
+    if (!tokenizer.decode(generated, &decoded)) {
+      return cudaErrorInvalidValue;
+    }
+
+    const PromptClock::time_point request_stop = PromptClock::now();
+    timing->ttft_ms = host_elapsed_ms(request_start, first_token_time);
+    timing->e2e_ms = host_elapsed_ms(request_start, request_stop);
+    if (generated.size() > 1) {
+      const float decode_ms =
+          host_elapsed_ms(first_token_time, previous_token_time);
+      timing->tpot_ms = decode_ms / static_cast<float>(generated.size() - 1);
+      if (decode_ms > 0.0f) {
+        timing->per_user_tps =
+            1000.0f * static_cast<float>(generated.size() - 1) / decode_ms;
+      }
+    }
+    return cudaSuccess;
+  };
+
+  if (options.benchmark_mode == PromptBenchmarkMode::kDecodeStep) {
     status = run_prefill_once();
     if (status != cudaSuccess) {
       return fail_cuda(status, "benchmark decode setup");
@@ -610,34 +788,110 @@ int run_prompt(const PromptOptions &options) {
       return fail_cuda(status, "benchmark decode setup sync");
     }
 
-    auto run_decode_once = [&]() -> cudaError_t {
-      return run_decode_step(
-          weights.value, &runtime.value, d_decode_a.get(), d_decode_b.get(),
-          d_normed.get(), d_sampled.get(), d_next_token.get(),
-          d_attention_q.get(), d_attention_out.get(), d_partial_m.get(),
-          d_partial_l.get(), d_partial_acc.get(), d_decode_scratch.get(),
-          decode_scratch_bytes, split_size, sliding_splits, global_splits, 0);
-    };
-
     PromptBenchmarkStats decode_stats;
-    status = measure_region_ms(
+    status = measure_cuda_event_steps_ms(
         &decode_stats, options.bench_warmup, options.bench_iters,
         options.bench_samples, 0, run_decode_once);
     if (status != cudaSuccess) {
-      return fail_cuda(status, "benchmark decode");
+      return fail_cuda(status, "benchmark decode step");
     }
 
+    status = print_cuda_environment();
+    if (status != cudaSuccess) {
+      return fail_cuda(status, "benchmark environment");
+    }
     std::printf(
-        "benchmark prompt_len=%d warmup=%d iters=%d samples=%d "
-        "cache=prefill_repeated_decode_stateful timing=cuda_events_same_stream\n",
-        prompt_len, options.bench_warmup, options.bench_iters,
-        options.bench_samples);
-    std::printf("prefill_ms median=%.3f min=%.3f max=%.3f\n",
-                prefill_stats.median_ms, prefill_stats.min_ms,
-                prefill_stats.max_ms);
-    std::printf("decode_ms median=%.3f min=%.3f max=%.3f\n",
-                decode_stats.median_ms, decode_stats.min_ms,
-                decode_stats.max_ms);
+        "benchmark_mode=%s prompt_len=%d warmup_steps=%d timed_steps=%d "
+        "timing=cuda_events_same_stream cache=stateful_decode "
+        "setup_excluded=tokenizer,weight_load,allocation,prefill\n",
+        benchmark_mode_name(options.benchmark_mode), prompt_len,
+        options.bench_warmup, options.bench_iters * options.bench_samples);
+    print_stats_line("decode_step_ms", decode_stats);
+    if (decode_stats.p50_ms > 0.0f) {
+      std::printf("decode_step_tps_p50=%.3f\n", 1000.0f / decode_stats.p50_ms);
+    }
+    return 0;
+  }
+
+  if (options.benchmark_mode == PromptBenchmarkMode::kWarmServing) {
+    const int32_t measured_requests = options.bench_iters * options.bench_samples;
+    for (int32_t request = 0; request < options.bench_warmup; ++request) {
+      PromptRequestTiming timing;
+      status = run_serving_request(&timing);
+      if (status != cudaSuccess) {
+        return fail_cuda(status, "warm serving warmup");
+      }
+    }
+
+    std::vector<float> ttft_ms;
+    std::vector<float> e2e_ms;
+    std::vector<float> tpot_ms;
+    std::vector<float> itl_ms;
+    std::vector<float> per_user_tps;
+    ttft_ms.reserve(measured_requests);
+    e2e_ms.reserve(measured_requests);
+    tpot_ms.reserve(measured_requests);
+    per_user_tps.reserve(measured_requests);
+    for (int32_t request = 0; request < measured_requests; ++request) {
+      PromptRequestTiming timing;
+      status = run_serving_request(&timing);
+      if (status != cudaSuccess) {
+        return fail_cuda(status, "warm serving request");
+      }
+      ttft_ms.push_back(timing.ttft_ms);
+      e2e_ms.push_back(timing.e2e_ms);
+      if (options.max_new_tokens > 1) {
+        tpot_ms.push_back(timing.tpot_ms);
+        per_user_tps.push_back(timing.per_user_tps);
+        itl_ms.insert(itl_ms.end(), timing.itl_ms.begin(), timing.itl_ms.end());
+      }
+    }
+
+    status = print_cuda_environment();
+    if (status != cudaSuccess) {
+      return fail_cuda(status, "benchmark environment");
+    }
+    std::printf(
+        "benchmark_mode=%s prompt_len=%d output_tokens=%d concurrency=1 "
+        "warmup_requests=%d measured_requests=%d timing=host_wall_clock "
+        "model_load=excluded cuda_context=excluded tokenization=included "
+        "prompt_h2d=included streaming=host_token_copy detokenization=e2e_only\n",
+        benchmark_mode_name(options.benchmark_mode), prompt_len,
+        options.max_new_tokens, options.bench_warmup, measured_requests);
+    print_stats_line("ttft_ms", summarize_benchmark_samples(ttft_ms));
+    print_stats_line("tpot_ms", summarize_benchmark_samples(tpot_ms));
+    print_stats_line("itl_ms", summarize_benchmark_samples(itl_ms));
+    print_stats_line("e2e_ms", summarize_benchmark_samples(e2e_ms));
+    print_rate_stats_line("per_user_tps",
+                          summarize_benchmark_samples(per_user_tps));
+    return 0;
+  }
+
+  if (options.benchmark_mode == PromptBenchmarkMode::kColdStart) {
+    status = run_prefill_once();
+    if (status != cudaSuccess) {
+      return fail_cuda(status, "cold-start prefill");
+    }
+
+    std::vector<int32_t> generated;
+    status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
+    if (status != cudaSuccess) {
+      return fail_cuda(status, "cold-start first token");
+    }
+
+    const float process_to_first_token_ms =
+        host_elapsed_ms(process_start, PromptClock::now());
+    status = print_cuda_environment();
+    if (status != cudaSuccess) {
+      return fail_cuda(status, "benchmark environment");
+    }
+    std::printf(
+        "benchmark_mode=%s prompt_len=%d output_tokens=1 "
+        "timing=host_wall_clock includes=cli_parse,tokenizer_load,"
+        "tokenization,weight_load,allocation,runtime_init,prefill,first_token "
+        "process_to_first_token_ms=%.3f cold_start_scope=current_process\n",
+        benchmark_mode_name(options.benchmark_mode), prompt_len,
+        process_to_first_token_ms);
     return 0;
   }
 
@@ -647,22 +901,22 @@ int run_prompt(const PromptOptions &options) {
   }
 
   std::vector<int32_t> generated;
-  status = copy_next_token(d_next_token.get(), &generated, 0);
+  status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
   if (status != cudaSuccess) {
     return fail_cuda(status, "copy first token");
   }
 
   while (static_cast<int32_t>(generated.size()) < options.max_new_tokens) {
     status = run_decode_step(
-        weights.value, &runtime.value, d_decode_a.get(), d_decode_b.get(),
-        d_normed.get(), d_sampled.get(), d_next_token.get(),
-        d_attention_q.get(), d_attention_out.get(), d_partial_m.get(),
-        d_partial_l.get(), d_partial_acc.get(), d_decode_scratch.get(),
+        weights.value, &runtime.value, raw_ptr(d_decode_a), raw_ptr(d_decode_b),
+        raw_ptr(d_normed), raw_ptr(d_sampled), raw_ptr(d_next_token),
+        raw_ptr(d_attention_q), raw_ptr(d_attention_out), raw_ptr(d_partial_m),
+        raw_ptr(d_partial_l), raw_ptr(d_partial_acc), raw_ptr(d_decode_scratch),
         decode_scratch_bytes, split_size, sliding_splits, global_splits, 0);
     if (status != cudaSuccess) {
       return fail_cuda(status, "decode step");
     }
-    status = copy_next_token(d_next_token.get(), &generated, 0);
+    status = copy_next_token(raw_ptr(d_next_token), &generated, 0);
     if (status != cudaSuccess) {
       return fail_cuda(status, "copy decode token");
     }
@@ -685,9 +939,10 @@ int run_prompt(const PromptOptions &options) {
 
 // Runs the local Gemma 4 text prompt path.
 int main(int argc, char **argv) {
+  const PromptClock::time_point process_start = PromptClock::now();
   PromptOptions options;
   if (!parse_args(argc, argv, &options)) {
     return 1;
   }
-  return run_prompt(options);
+  return run_prompt(options, process_start);
 }
