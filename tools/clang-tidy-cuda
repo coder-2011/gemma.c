@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+CUTLASS_INCLUDE="${CUTLASS_INCLUDE:-/tmp/cutlass/include}"
+CUTLASS_DUAL_GEMM_INCLUDE="${CUTLASS_DUAL_GEMM_INCLUDE:-/tmp/cutlass/examples/45_dual_gemm}"
+
+compat_dir="$(mktemp -d)"
+trap 'rm -rf "$compat_dir"' EXIT
+
+cat >"$compat_dir/texture_fetch_functions.h" <<'EOF'
+#pragma once
+
+#if CUDA_VERSION >= 12000
+template <class T, int texType, enum cudaTextureReadMode mode>
+struct texture {};
+#endif
+EOF
+
+if [ "$#" -eq 0 ]; then
+  set -- src/gemma4_decode_megakernel_phases.cu
+fi
+
+cd "$ROOT"
+clang-tidy --checks='clang-diagnostic-*,clang-analyzer-*' "$@" -- \
+  -std=c++17 \
+  -x cuda \
+  --cuda-gpu-arch=sm_86 \
+  --cuda-path="$CUDA_HOME" \
+  -Wno-unknown-cuda-version \
+  -Wno-pragma-once-outside-header \
+  -I"$compat_dir" \
+  -isystem "$CUDA_HOME/include/cccl" \
+  -Isrc \
+  -I"$CUTLASS_INCLUDE" \
+  -I"$CUTLASS_DUAL_GEMM_INCLUDE" \
+  -D_GLIBCXX_USE_CXX11_ABI=1
