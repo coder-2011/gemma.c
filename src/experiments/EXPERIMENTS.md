@@ -3045,7 +3045,7 @@ Cache-order follow-up:
 - Changed the RoPE grid from `(rows, heads)` to `(heads, rows)` so heads are the fastest
   grid dimension, attempting to improve temporal locality for each position's cos/sin
   row.
-- Changed packed Q/K input loads from normal `load128` to streaming `load128cs`, while
+- Changed packed Q/K input loads from direct pack loads to streaming pack loads, while
   keeping output stores normal.
 - PTX confirmed the intended lowering:
   - row now uses `%ctaid.y`
@@ -3092,7 +3092,7 @@ Split A/B follow-up:
 
 - Added compile-time controls:
   - `GEMMA4_ROPE_HEAD_FAST_GRID`
-  - `GEMMA4_ROPE_QK_LOAD_CS`
+  - `GEMMA4_ROPE_QK_STREAMING_PACK`
 - Built four variants from the same source:
   - baseline: row-fast grid, normal Q/K loads
   - headfast: head-fast grid, normal Q/K loads
@@ -3104,7 +3104,7 @@ Build pattern:
 ```bash
 nvcc -std=c++17 -O3 -arch=sm_86 -Isrc \
   -DGEMMA4_ROPE_HEAD_FAST_GRID=<0|1> \
-  -DGEMMA4_ROPE_QK_LOAD_CS=<0|1> \
+  -DGEMMA4_ROPE_QK_STREAMING_PACK=<0|1> \
   src/experiments/gemma4_rope_bench.cu src/gemma4_rope.cu -lcudnn \
   -o build/experiments/rope_variants/<variant>
 ```
@@ -3118,28 +3118,28 @@ GEMMA4_ROPE_BENCH_SEED=0x20260521 \
 
 Custom CUDA graph timings:
 
-| Case | Seq | Baseline | Head-fast only | `load128cs` only | Both | Best |
+| Case | Seq | Baseline | Head-fast only | streaming-pack only | Both | Best |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Sliding | 1 | 0.001666 | 0.001707 | 0.001553 | 0.001646 | `load128cs` |
-| Sliding | 4 | 0.001672 | 0.001959 | 0.001639 | 0.001901 | `load128cs` |
+| Sliding | 1 | 0.001666 | 0.001707 | 0.001553 | 0.001646 | streaming-pack |
+| Sliding | 4 | 0.001672 | 0.001959 | 0.001639 | 0.001901 | streaming-pack |
 | Sliding | 16 | 0.002134 | 0.002122 | 0.002083 | 0.002015 | both |
 | Sliding | 64 | 0.003097 | 0.003188 | 0.003091 | 0.003065 | both |
 | Sliding | 256 | 0.016482 | 0.016036 | 0.015215 | 0.014943 | both |
-| Sliding | 1024 | 0.076787 | 0.076737 | 0.075305 | 0.076946 | `load128cs` |
+| Sliding | 1024 | 0.076787 | 0.076737 | 0.075305 | 0.076946 | streaming-pack |
 | Global | 1 | 0.001496 | 0.001556 | 0.001711 | 0.001563 | baseline |
 | Global | 4 | 0.001565 | 0.001646 | 0.001601 | 0.001651 | baseline |
-| Global | 16 | 0.001658 | 0.001820 | 0.001638 | 0.001956 | `load128cs` |
-| Global | 64 | 0.002805 | 0.002773 | 0.002658 | 0.002917 | `load128cs` |
-| Global | 256 | 0.006691 | 0.006674 | 0.006654 | 0.006777 | `load128cs` |
+| Global | 16 | 0.001658 | 0.001820 | 0.001638 | 0.001956 | streaming-pack |
+| Global | 64 | 0.002805 | 0.002773 | 0.002658 | 0.002917 | streaming-pack |
+| Global | 256 | 0.006691 | 0.006674 | 0.006654 | 0.006777 | streaming-pack |
 | Global | 1024 | 0.029790 | 0.031470 | 0.029804 | 0.031625 | baseline |
 
 Conclusion:
 
 - Head-fast grid order alone was not a clear win and hurt several small/large cases.
-- `load128cs` alone was the best isolated change overall: it improved sliding
+- The streaming-pack load variant was the best isolated change overall: it improved sliding
   `seq=1024` by about `2%`, improved several mid-size sliding/global cases, and was
   essentially tied with baseline at global `seq=1024`.
-- The retained default is row-fast grid with `load128cs` enabled. Head-fast grid remains
+- The retained default is row-fast grid with streaming pack loads enabled. Head-fast grid remains
   available behind `GEMMA4_ROPE_HEAD_FAST_GRID=1` for future experiments.
 
 ## 2026-05-21 - RoPE FP32 accumulation numerical consistency
@@ -5514,14 +5514,14 @@ Reason:
 
 - The decode GEMV kernels were still loading one BF16 pair per instruction through `__nv_bfloat162`.
 - The input vector is small and reused by every CTA, while projection weights are large one-pass streams.
-- This pass keeps normal cached loads for the reused input vector and marks the weight stream with the existing `Packed128` + `load128cs` helper.
+- This pass keeps normal cached loads for the reused input vector and marks the weight stream with an explicit streaming pack load.
 
 Implementation:
 
 - Changed the fixed-four decode dot helper from half2-style 32-bit loads to `Packed128<__nv_bfloat16>` loads.
 - Each load now covers 8 BF16 values per thread.
-- Weight row loads use `load128cs`, which SASS emits as `LDG.E.EF.128` on this build.
-- Input-vector loads use `load128`, which SASS emits as `LDG.E.128.CONSTANT` on this build.
+- Weight row loads use streaming 128-bit pack loads, which SASS emits as `LDG.E.EF.128` on this build.
+- Input-vector loads use direct 128-bit pack loads, which SASS emits as `LDG.E.128.CONSTANT` on this build.
 - Packed the four BF16 outputs into one 64-bit store in the fixed-four path.
 - Templated the dot helper on `Threads` so the packed loop can use the compile-time stride.
 - Added `__restrict__` on kernel/device pointer parameters.
@@ -6009,7 +6009,7 @@ Decode GEMV implementation conclusions:
 - Prefill dense GEMMs should use cuBLAS or cuBLASLt. Those library GEMMs can use tensor cores automatically for BF16 tensor-op math when the library selects a tensor-core algorithm.
 - cuBLAS and cuDNN are host APIs. They cannot be called from inside a device-side fused kernel.
 - `Packed128` is already implemented and retained. Decode GEMV uses 128-bit BF16 packed loads instead of the older 32-bit half2-style BF16 pair load pattern.
-- The useful retained cache hint is streaming global load for weights through `load128cs`, because weights are streamed through the decode GEMV.
+- The useful retained cache hint is streaming global load for weights, because weights are streamed through the decode GEMV.
 - The input vector load remains normally cached, because the same input row is reused across output columns.
 - Broad L2 persisting-cache windows or persisting hints for the B/weight matrix were tried and removed because they hurt performance.
 - There is no broad persisting L2 policy currently retained for decode GEMV.
@@ -6099,7 +6099,7 @@ Follow-up work:
 Change:
 
 - Updated the generic decode GEMV route from `cols_per_block=2` to `cols_per_block=8`.
-- Added an eight-BF16 output store helper so an eight-column block writes its result with one 128-bit store.
+- Changed the eight-column block to write its eight BF16 outputs with one 128-bit store.
 - Changed the fixed decode output paths for `ffn_down`, `global_o`, and `final_logits` from the old four-column store path to the same eight-column kernel route.
 - Removed the now-unused fixed4 helper/kernel code so the matmul source no longer has a 64-bit BF16 output-store path.
 
@@ -6438,10 +6438,10 @@ GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 1
 
 Variants tested:
 
-- Baseline: current `load128cs` streaming weight loads.
+- Baseline: current streaming 128-bit weight loads.
 - `prefetch_next_iter`: inline `prefetch.global.L2` for the next K-stride `x` pack and all eight next K-stride weight packs.
 - `prefetch_next_col`: inline `prefetch.global.L2` for the next output column's weight pack before loading/computing the current column.
-- `normal_weight_load`: replace streaming `load128cs` weight loads with normal `load128` weight loads.
+- `normal_weight_load`: replace streaming 128-bit weight loads with normal direct 128-bit weight loads.
 
 Resource result:
 
@@ -6477,7 +6477,7 @@ Weighted decode projection total:
 Conclusion:
 
 - Do not keep explicit L2 prefetching in this kernel.
-- Do not switch the weight loads from streaming `load128cs` to normal `load128`.
+- Do not switch the weight loads from streaming 128-bit loads to normal direct 128-bit loads.
 - The current access pattern already has coalesced 128-bit streaming weight loads and enough resident warps to hide latency; extra prefetch instructions mostly add overhead.
 - Shared-memory double buffering is not attractive for this mapping because the weight packs are one-use data with no cross-thread reuse, and `x` is already loaded once per thread and reused across all eight columns.
 - A useful async-copy/double-buffer design likely needs a different tile mapping where staged data is reused by multiple consumers.
@@ -6598,9 +6598,9 @@ Question:
 
 Implementation:
 
-- Added inlined decode load helpers:
-  - `gemma4_load_activation_pack(...)` uses `load128(...)`.
-  - `gemma4_load_streaming_weight_pack<K>(...)` uses `load128cs(...)`.
+- Added inlined decode pack-load helpers:
+  - activation packs use direct 128-bit loads.
+  - weight packs use streaming 128-bit loads.
 - Added a compile-time contract that `Gemma4Bf16Pack` maps to one aligned `int4` load.
 - Added a host-side decode pointer guard for non-null, 16-byte-aligned `x`, `w_col_major`, and `y`.
 - Kept the runtime path as global memory -> registers -> ALUs; no shared-memory staging.
@@ -6659,7 +6659,7 @@ Conclusion:
 
 - Keep this shape. The helper split makes the intended memory policy explicit without changing the generated load instructions.
 - The tiny timing delta is noise-level against the prior direct-load baseline.
-- This reinforces the current decision: use `load128` for reused activation packs, `load128cs` for streaming weight packs, and avoid shared-memory async copy until the GEMV mapping has real staged-data reuse.
+- This reinforces the current decision: use direct loads for reused activation packs, streaming loads for weight packs, and avoid shared-memory async copy until the GEMV mapping has real staged-data reuse.
 
 ## 2026-05-19 - Decode GEMV register double-buffer cleanup and bench
 
@@ -6816,7 +6816,7 @@ Conclusion:
 
 - The cp.async path is correct and actually emits cp.async instructions, but it is slower for this GEMV mapping.
 - The slowdown is expected: each weight pack is still one-use data, so shared-memory staging adds async-copy, commit/wait, and shared-load overhead without reducing DRAM traffic.
-- Keep cp.async as a compile-time experiment path only. The runtime default should remain the direct `load128`/`load128cs` path.
+- Keep cp.async as a compile-time experiment path only. The runtime default should remain the direct 128-bit pack-load path.
 
 ## 2026-05-19 - Nsight Compute counter profiling attempt for decode GEMV
 
@@ -6911,7 +6911,7 @@ Conclusion:
 - This is not a benchmark-code or cuBLAS/cuDNN issue; it reproduces with a CUDA-only harness.
 - No reliable hardware-counter conclusion can be drawn from this environment. To answer the bandwidth-vs-latency question properly, rerun the same `ncu` commands on a production instance or another host where CUPTI/Nsight Compute profiling is supported.
 
-## 2026-05-19 - Decode GEMV cp.async debug with load128/load128cs staging
+## 2026-05-19 - Decode GEMV cp.async debug with direct/streaming staging
 
 Runtime file tested: `src/gemma4_matmul_kernels.cu`
 
@@ -6924,8 +6924,8 @@ Implementation:
 - Kept the same two-stage shared-memory layout used by the cp.async path:
   `Gemma4Bf16Pack weight_stages[2][Threads]`.
 - Added two compile-time sibling variants:
-  - `GEMMA4_DECODE_SHARED_STAGE_LOAD128`
-  - `GEMMA4_DECODE_SHARED_STAGE_LOAD128CS`
+  - `GEMMA4_DECODE_SHARED_STAGE_DIRECT_PACK`
+  - `GEMMA4_DECODE_SHARED_STAGE_STREAMING_PACK`
 - Both variants use the same shared-stage consume path as cp.async, but stage data with normal global loads instead of `__pipeline_memcpy_async`.
 - The direct default path remains unchanged.
 
@@ -6938,16 +6938,16 @@ GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 1
 make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_CP_ASYNC_DOUBLE_BUFFER"
 GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
 
-make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_LOAD128"
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_DIRECT_PACK"
 GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
 
-make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_LOAD128CS"
+make -B decode-bench NVCCFLAGS="-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_SHARED_STAGE_STREAMING_PACK"
 GEMMA4_DECODE_BENCH_SEED=0x1234 ./build/experiments/gemma4_decode_bench all 50 10 3
 ```
 
 Timing, seeded `all 50 10 3`:
 
-| Op | Direct | cp.async | Shared `load128` | Shared `load128cs` |
+| Op | Direct | cp.async | Shared direct pack | Shared streaming pack |
 | --- | ---: | ---: | ---: | ---: |
 | `ffn_gate_up` | 0.651158 | 0.654705 | 0.652065 | 0.651222 |
 | `ffn_down` | 0.328492 | 0.329076 | 0.329271 | 0.328312 |
@@ -6964,8 +6964,8 @@ Weighted decode projection total:
 | --- | ---: |
 | Direct | 86.988 |
 | cp.async | 87.481 |
-| Shared `load128` | 87.105 |
-| Shared `load128cs` | 86.983 |
+| Shared direct pack | 87.105 |
+| Shared streaming pack | 86.983 |
 
 PTX/resource check:
 
@@ -6973,13 +6973,13 @@ PTX/resource check:
 | --- | --- | --- | --- | --- |
 | Direct | `63`, `72` | `512B`, `1024B` | `0/0` | `ld.global.cs=56`, `ld.global.nc=7` |
 | cp.async | `54`, `55` | `16896B`, `33792B` | `0/0` | `cp.async.cg.shared.global=56`, `commit_group=56`, `wait_group=56` |
-| Shared `load128` | `59`, `60` | `16896B`, `33792B` | `0/0` | `ld.global.nc=63`, no cp.async |
-| Shared `load128cs` | `64` | `16896B`, `33792B` | `0/0` | `ld.global.cs=56`, `ld.global.nc=7`, no cp.async |
+| Shared direct pack | `59`, `60` | `16896B`, `33792B` | `0/0` | `ld.global.nc=63`, no cp.async |
+| Shared streaming pack | `64` | `16896B`, `33792B` | `0/0` | `ld.global.cs=56`, `ld.global.nc=7`, no cp.async |
 
 Interpretation:
 
-- Shared-memory staging itself is not the issue. Shared `load128cs` is essentially tied with direct.
-- The weight load policy matters: shared `load128cs` beats shared `load128`, matching the direct path's streaming-weight policy.
+- Shared-memory staging itself is not the issue. Shared streaming pack loads are essentially tied with direct.
+- The weight load policy matters: shared streaming pack loads beat shared direct pack loads, matching the direct path's streaming-weight policy.
 - The cp.async-specific overhead is the likely issue in this mapping: the compiler emits one `cp.async`, one commit, and one wait group per staged weight pack group in the unrolled column loop.
 - The work between issuing the next stage and waiting for it is only one 16-byte-pack BF16 dot contribution, so there is not enough independent compute to amortize commit/wait overhead.
 
@@ -7420,15 +7420,15 @@ Tuning sweep:
 | Late weight load, min-blocks 1 | 0.090030 | 0.090300 | -0.21% |
 | Late weight load, min-blocks 2 | 0.089957 | 0.090114 | -0.29% |
 | Late weight load, min-blocks 2, cached input loads | 0.089807 | 0.090009 | -0.46% |
-| Same plus streaming stores | 0.089786 | 0.089957 | -0.48% |
+| Same plus alternate write variant | 0.089786 | 0.089957 | -0.48% |
 | Final simplified kept code | 0.089864 | 0.090050 | -0.39% |
 
-The streaming-store candidate moved the aggregate by only about `0.023%` versus the
+The alternate-store candidate moved the aggregate by only about `0.023%` versus the
 previous candidate, below the requested `0.05%` stopping threshold, so tuning stopped
 there. The final kept code uses the meaningful settings only:
 
 - `__launch_bounds__(Threads, 2)` for the hidden prefill kernel
-- cached `load128g` input loads for `inp1` and `inp2`
+- cached input pack loads for `inp1` and `inp2`
 - no early gamma/weight prefetch; load the weight at output application time
 - ordinary global stores for residual and normed outputs
 
@@ -10028,9 +10028,9 @@ Implementation:
   - `accum_hi[672][4]`
 - This keeps scratch float storage unchanged while making each lo/hi vector
   instruction contiguous across warp lanes.
-- Changed FFN decode's default weight load policy in this translation unit to
-  streaming `.cs` (`GEMMA4_WEIGHT_LOAD_POLICY=0`) so the enormous one-use FFN
-  weights do not compete as aggressively for cache.
+- Changed FFN decode's default weight loads in this translation unit to
+  streaming `.cs` so the enormous one-use FFN weights do not compete as
+  aggressively for cache.
 - Changed the default intermediate tile from `512` to `672`, reducing scratch
   reduction turns from `42` to `32`.
 
@@ -12964,7 +12964,7 @@ Scope:
   compile-time specialization through `softmax_rescale_impl`.
 - Folded causal and local block-visibility helpers into the single templated
   `gemma4_score_block_fully_visible<IsLocal>` helper.
-- Reused one O-store helper and one LSE-row writer for the empty-block path and
+- Reused one O-output path and one LSE-row writer for the empty-block path and
   normal epilogue.
 - Removed dead FA helper generality: `ScaleMax`, `AInRegs`/`BInRegs`, and the
   unpredicated `gemma4_fa_copy` wrapper.
@@ -13483,8 +13483,8 @@ Change:
 - Replaced the local projection decode GEMV body in
   `src/gemma4_matmul_kernels.cu` with
   `gemma4_matmul_device::decode_gemv_cols_device`.
-- Kept `GEMMA4_WEIGHT_LOAD_POLICY=0` for the projection decode translation unit,
-  preserving the previous `.cs` streaming weight-load behavior.
+- Kept streaming weight loads for the projection decode translation unit,
+  preserving the previous `.cs` behavior.
 - Added `src/gemma4_matmul_device.cuh` to the projection object dependencies.
 - Removed a tracked empty `src/src/gemma4_ffn_decode.cu` file and a tracked
   Python bytecode cache file.

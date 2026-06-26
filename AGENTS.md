@@ -187,8 +187,8 @@ Approximate model memory footprints:
   allocation ownership obvious; use RAII in host/test/benchmark code when it reduces
   cleanup risk without hiding important CUDA behavior.
 - Keep launch constants such as block sizes, tile sizes, and warp counts in named
-  `constexpr` values. Thread block sizes should be multiples of `WARP_SIZE` unless there
-  is a measured reason not to.
+  `constexpr` values. Thread block sizes should be multiples of the CUDA warp size unless
+  there is a measured reason not to.
 - Avoid warp-divergent control flow in hot paths, and never put `__syncthreads()` behind
   divergent branches.
 - Choose data layouts for coalesced global memory access, then profile shared-memory bank
@@ -207,8 +207,8 @@ Approximate model memory footprints:
 
 ```cpp
 __device__ inline void gather_token(
-    floatX *dst,
-    const floatX *wte,
+    __nv_bfloat16 *dst,
+    const __nv_bfloat16 *wte,
     int ix,
     int token_idx,
     int lane,

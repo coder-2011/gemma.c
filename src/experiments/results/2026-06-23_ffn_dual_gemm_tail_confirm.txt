@@ -1,5 +1,5 @@
 benchmark_env name=ffn_dual_gemm_bench cuda_device=0 gpu="NVIDIA RTX A6000" pci_bus_id=0000:07:00.0 compute_capability=sm_86 global_mem_bytes=50897289216 l2_cache_bytes=6291456 driver_cuda=13000 runtime_cuda=13000
-benchmark_compile nvcc=13.0.48 arch_flags=compile_command weight_load_policy=-1
+benchmark_compile nvcc=13.0.48 arch_flags=compile_command pack_load_mode=direct
 benchmark_nvidia_smi fields=name,bus_id,driver,persistence,ecc,mig,power_limit_w,sm_clock_mhz,mem_clock_mhz,temp_c,power_draw_w,gpu_util_pct values="NVIDIA RTX A6000, 00000000:07:00.0, 580.126.16, Enabled, Disabled, [N/A], 300.00, 1800, 7601, 31, 43.74, 0"
 benchmark_contract name=ffn_dual_gemm_bench measurement=ffn_gate_up_dual_gemm_only timing=cuda_events_same_stream_repeated_launches cache=warm_repeated_buffers launch_overhead=excluded_from_gpu_elapsed_time aggregation=best_and_average correctness=candidate_vs_current_dualgemm clock_policy=unlocked_boost warmup=20 iters=50 samples=5 graph_inner_iters=0 no_sleep_between_trials=true ncu_clock_control=use_--clock-control_none notes="12B FFN gate/up DualGemm tile sweep"
 config,rows,best_ms,avg_ms,max_abs,mean_abs,max_rel,status
