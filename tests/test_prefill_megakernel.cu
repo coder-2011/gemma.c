@@ -293,8 +293,8 @@ void run_prefill_layer_case(bool global) {
                       : "sliding prefill scaled output");
 
   const int32_t cache_layer = gemma4_kv_cache_layer_index(layer_index, global);
-  auto cache_layout = gemma4_kv_cache_layout(cache_config);
-  const int64_t first_cache_value = cache_layout(cache_layer, 0, 0, 0, 0);
+  const int64_t first_cache_value =
+      gemma4_kv_cache_offset(cache_config, cache_layer, 0, 0, 0, 0);
   if (bf16_to_float(d_cache_k.copy_to_host()[first_cache_value]) == 0.0f ||
       bf16_to_float(d_cache_v.copy_to_host()[first_cache_value]) == 0.0f) {
     std::fprintf(stderr, "prefill KV cache write missed page zero offset zero\n");

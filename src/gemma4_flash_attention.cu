@@ -433,7 +433,8 @@ struct Gemma4FlashSoftmax {
       for (int mi = 0; mi < size(row_max); ++mi) {
         float scores_max_cur = row_max(mi);
         if constexpr (CheckInf) scores_max_cur = scores_max_cur == -INFINITY ? 0.0f : scores_max_cur;
-        float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+        const float scores_scale =
+            exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
         // Bring the old denominator and O accumulator into the new max frame.
         row_sum(mi) *= scores_scale;
 #pragma unroll
@@ -486,10 +487,10 @@ struct Gemma4FlashSoftmax {
     Tensor acc_o_rowcol = make_tensor(acc_o.data(), gemma4_fa_acc_rowcol(acc_o.layout()));
 #pragma unroll
     for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
-      float sum = row_sum(mi);
+      const float sum = row_sum(mi);
       // Empty or fully masked rows produce a harmless scale.
       const bool invalid_sum = sum == 0.0f || sum != sum;
-      float inv_sum = invalid_sum ? 1.0f : 1.0f / sum;
+      const float inv_sum = invalid_sum ? 1.0f : 1.0f / sum;
 #pragma unroll
       for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) {
         acc_o_rowcol(mi, ni) *= inv_sum;
@@ -827,10 +828,11 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     n_block_min = std::max(
         0, (q_tile_start + seqlen_delta - params.window_size + 1) / kBlockN);
   }
-  int n_block_max = cute::ceil_div(params.seqlen_k, kBlockN);
   // The right edge is causal: queries in this tile never need blocks wholly in
   // the future, even when seqlen_q != seqlen_k during decode.
-  n_block_max = std::min(n_block_max, cute::ceil_div(q_tile_start + kBlockM + seqlen_delta, kBlockN));
+  const int n_block_max = std::min(
+      cute::ceil_div(params.seqlen_k, kBlockN),
+      cute::ceil_div(q_tile_start + kBlockM + seqlen_delta, kBlockN));
 
   typename KernelTraits::TiledMmaPV tiled_mma_pv;
   auto thr_mma_pv = tiled_mma_pv.get_thread_slice(tidx);
@@ -977,7 +979,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
     Tensor lse = make_fragment_like(softmax.row_sum);
 #pragma unroll
     for (int mi = 0; mi < size(lse); ++mi) {
-      float sum = softmax.row_sum(mi);
+      const float sum = softmax.row_sum(mi);
       lse(mi) = sum == 0.0f
                     ? -INFINITY
                     : softmax.row_max(mi) * params.scale_softmax + __logf(sum);
@@ -1049,7 +1051,7 @@ cudaError_t set_kernel_smem() {
   static bool initialized = false;
   if (initialized) return cudaSuccess;
   auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal>;
-  cudaError_t status = cudaFuncSetAttribute(
+  const cudaError_t status = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
       KernelTraits::kSmemSize);
   if (status == cudaSuccess) initialized = true;
@@ -1060,10 +1062,10 @@ cudaError_t set_kernel_smem() {
 //   x = query row block, y = batch, z = query head.
 template <typename KernelTraits, bool IsLocal>
 cudaError_t launch_attention(
-    Gemma4FlashFwdParams &params,
+    const Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
-  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal>();
+  const cudaError_t status = set_kernel_smem<KernelTraits, IsLocal>();
   GEMMA4_RETURN_IF_CUDA_ERROR(status);
   const dim3 grid_dim(cute::ceil_div(params.seqlen_q, KernelTraits::kBlockM),
                       batch_size,
@@ -1076,7 +1078,7 @@ cudaError_t launch_attention(
 
 // Gemma 4 sliding layers: head_dim=256, block 64x64, local causal window.
 cudaError_t launch_sliding(
-    Gemma4FlashFwdParams &params,
+    const Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
   return launch_attention<Gemma4SlidingFa2KernelTraits, true>(params, batch_size, stream);
@@ -1084,7 +1086,7 @@ cudaError_t launch_sliding(
 
 // Gemma 4 global layers: head_dim=512, block 32x32, full causal attention.
 cudaError_t launch_global(
-    Gemma4FlashFwdParams &params,
+    const Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
   return launch_attention<Gemma4GlobalFa2KernelTraits, false>(params, batch_size, stream);
@@ -1352,8 +1354,8 @@ __device__ __forceinline__ int64_t decode_cache_head_offset(
       page_table + page_table_layout(batch, slot), lane);
   if (physical_page < 0 || physical_page >= config.num_pages) return -1;
   const int page_offset = position - logical_page * config.page_size;
-  auto cache_layout = gemma4_kv_cache_layout(config);
-  return cache_layout(cache_layer, physical_page, page_offset, head, 0);
+  return gemma4_kv_cache_offset(config, cache_layer, physical_page, page_offset,
+                                head, 0);
 }
 
 // Prepare one decode token's Q and paged K/V cache entry for one KV head.
@@ -1869,7 +1871,6 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
   auto page_table_layout = make_layout(
       make_shape(batch_count, config.max_pages_per_seq),
       make_stride(config.max_pages_per_seq, 1));
-  auto cache_layout = gemma4_kv_cache_layout(config);
 
   for (int32_t page_pos = split_begin; page_pos < split_end;) {
     // Resolve one logical page span at a time. This keeps page-table loads
@@ -1890,9 +1891,10 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
     // Cache layout is [layer, page, page_offset, kv_head, dim]. Threads read
     // consecutive BF16 lanes, so K and V stay direct read-only global loads.
     // Advancing one token inside a page is a fixed stride over all KV heads.
-    int64_t kv_base =
-        cache_layout(layer, physical_page, page_offset0, kv_head, 0);
-    const int64_t kv_token_stride = cache_layout.stride<2>();
+    int64_t kv_base = gemma4_kv_cache_offset(
+        config, layer, physical_page, page_offset0, kv_head, 0);
+    const int64_t kv_token_stride =
+        int64_t(config.num_heads) * config.head_dim;
     for (; page_pos < span_end; ++page_pos, kv_base += kv_token_stride) {
       const float k_value =
           active_dim ? __bfloat162float(loadg(cache_k + kv_base + dim)) : 0.0f;
@@ -2292,7 +2294,7 @@ cudaError_t launch_decode_paged_impl(
       d_partial_acc, d_q_prepared, d_cache_k, d_cache_v, d_page_table,
       d_seq_lengths, cache_config, cache_layer, softmax_scale, split_size,
       num_splits);
-  cudaError_t status = cudaGetLastError();
+  const cudaError_t status = cudaGetLastError();
   GEMMA4_RETURN_IF_CUDA_ERROR(status);
   if (num_splits == 1) return cudaSuccess;
 
@@ -2449,7 +2451,7 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
     return cudaErrorInvalidValue;
   }
 
-  gemma4_flash_attention::Gemma4FlashFwdParams params =
+  const gemma4_flash_attention::Gemma4FlashFwdParams params =
       gemma4_flash_attention::make_params(d_out, d_softmax_lse, d_q, d_k, d_v,
                                           seqlen_q, seqlen_k, window_size,
                                           softmax_scale);
@@ -2495,14 +2497,14 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
     return cudaErrorInvalidValue;
   }
 
-  cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
+  const cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
       gemma4_flash_attention::SlidingAttentionTraits>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, d_token_position,
       batch_size, seqlen_q, stream);
   GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
-  gemma4_flash_attention::Gemma4FlashFwdParams params =
+  const gemma4_flash_attention::Gemma4FlashFwdParams params =
       gemma4_flash_attention::make_params(
           d_out, d_softmax_lse, d_q_prepared, d_k_prepared, d_v_prepared,
           seqlen_q, seqlen_k, window_size, softmax_scale);
@@ -2537,14 +2539,14 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
     return cudaErrorInvalidValue;
   }
 
-  cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
+  const cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
       gemma4_flash_attention::Gemma4AttentionTraits<true>>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, nullptr,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, d_token_position,
       batch_size, seqlen_q, stream);
   GEMMA4_RETURN_IF_CUDA_ERROR(status);
 
-  gemma4_flash_attention::Gemma4FlashFwdParams params =
+  const gemma4_flash_attention::Gemma4FlashFwdParams params =
       gemma4_flash_attention::make_params(
           d_out, d_softmax_lse, d_q_prepared, d_k_prepared, d_v_prepared,
           seqlen_q, seqlen_k, 0, softmax_scale);

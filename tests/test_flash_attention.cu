@@ -354,8 +354,7 @@ void run_global_flash_decode_case() {
   const int q_count = q_heads * config.head_dim;
   const int64_t cache_count = cache_elements(config);
   std::vector<__nv_bfloat16> cache_v(cache_count);
-  auto cache_layout = gemma4_kv_cache_layout(config);
-  const int64_t v_row = cache_layout(0, 0, 0, 0, 0);
+  const int64_t v_row = gemma4_kv_cache_offset(config, 0, 0, 0, 0, 0);
   for (int d = 0; d < config.head_dim; ++d) {
     cache_v[v_row + d] = make_value(51000 + d);
   }

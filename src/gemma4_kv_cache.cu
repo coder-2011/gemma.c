@@ -3,6 +3,8 @@
 #include "gemma4.h"
 #include "gemma4_cuda_utils.cuh"
 
+#include <cute/layout.hpp>
+
 #include <limits.h>
 
 namespace {
@@ -39,17 +41,17 @@ __device__ inline void kv_cache_write_vec_device(
   if (physical_page < 0 || physical_page >= config.num_pages) return;
   const int page_offset = position - logical_page * config.page_size;
 
-  int vecs_per_head = config.head_dim / kBf16Packed128Elements;
-  int64_t src_base =
+  const int vecs_per_head = config.head_dim / kBf16Packed128Elements;
+  const int64_t src_base =
       ((int64_t)token * config.num_heads + head) * vecs_per_head;
-  int64_t dst_base =
+  const int64_t dst_base =
       ((((int64_t)layer * config.num_pages + physical_page) *
         config.page_size + page_offset) *
        config.num_heads + head) * vecs_per_head;
 
   for (int i = vec; i < vecs_per_head; i += vec_stride) {
-    int64_t src = (src_base + i) * kKvWritePackElements;
-    int64_t dst = (dst_base + i) * kKvWritePackElements;
+    const int64_t src = (src_base + i) * kKvWritePackElements;
+    const int64_t dst = (dst_base + i) * kKvWritePackElements;
     store128(cache_k + dst, load128g(k + src));
     store128(cache_v + dst, load128g(v + src));
   }
@@ -79,7 +81,7 @@ Gemma4KvCacheConfig gemma4_kv_cache_make_config(bool global,
                                                 int32_t num_pages,
                                                 int32_t page_size,
                                                 int32_t max_pages_per_seq) {
-  Gemma4KvCacheConfig config = {
+  const Gemma4KvCacheConfig config = {
       global ? GEMMA4_GLOBAL_LAYER_COUNT : GEMMA4_SLIDING_LAYER_COUNT,
       num_pages,
       page_size,
@@ -119,15 +121,15 @@ int32_t gemma4_kv_cache_ensure_page(
     return -1;
   }
 
-  int32_t logical_page = position / config.page_size;
+  const int32_t logical_page = position / config.page_size;
   if (config.window_size == 0 && logical_page >= config.max_pages_per_seq) {
     return -1;
   }
-  int32_t slot = logical_page % config.max_pages_per_seq;
-  auto page_table_layout = cute::make_layout(
+  const int32_t slot = logical_page % config.max_pages_per_seq;
+  const auto page_table_layout = cute::make_layout(
       cute::make_shape(batch_size, config.max_pages_per_seq),
       cute::make_stride(config.max_pages_per_seq, 1));
-  int64_t index = page_table_layout(batch, slot);
+  const int64_t index = page_table_layout(batch, slot);
   if (index < 0 || index >= static_cast<int64_t>(page_table.size()) ||
       index >= static_cast<int64_t>(slot_logical_pages.size())) {
     return -1;
@@ -135,7 +137,7 @@ int32_t gemma4_kv_cache_ensure_page(
 
   if (slot_logical_pages[index] > logical_page) return -1;
 
-  int32_t physical_page = batch * config.max_pages_per_seq + slot;
+  const int32_t physical_page = batch * config.max_pages_per_seq + slot;
   if (physical_page < 0 || physical_page >= config.num_pages) return -1;
 
   page_table[index] = physical_page;
@@ -163,7 +165,7 @@ int32_t gemma4_kv_cache_ensure_range(
   const int32_t last_page = last_position / config.page_size;
   for (int32_t page = first_page; page <= last_page; ++page) {
     const int32_t position = page * config.page_size;
-    int32_t ensured_page = gemma4_kv_cache_ensure_page(
+    const int32_t ensured_page = gemma4_kv_cache_ensure_page(
         page_table, slot_logical_pages, config, batch_size, batch,
         position);
     if (ensured_page < 0) return -1;
@@ -198,7 +200,7 @@ extern "C" cudaError_t gemma4_kv_cache_write_bf16(
     return cudaErrorInvalidValue;
   }
 
-  dim3 grid_dim(token_count, config.num_heads);
+  const dim3 grid_dim(token_count, config.num_heads);
   kv_cache_write_vec_kernel<<<grid_dim, kKvWriteVecThreads, 0, stream>>>(
       d_cache_k, d_cache_v, config, d_token_batch, d_token_position, d_page_table,
       token_count, layer, d_k, d_v);
