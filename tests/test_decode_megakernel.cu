@@ -163,8 +163,6 @@ int32_t run_ffn_tail_once(
   args.layer_scalar = d_layer_scalar.get();
   args.final_norm_weight = d_final_norm.get();
   args.lm_head_col_major = d_lm_head.get();
-  args.eps = GEMMA4_RMS_NORM_EPS;
-
   CHECK_CUDA(gemma4_decode_megakernel_ffn_tail_bf16(
       args, d_scratch.get(), gemma4_decode_megakernel_ffn_tail_scratch_bytes(),
       0));
@@ -407,8 +405,6 @@ void run_flash_attention_flag_case() {
   args.attention_k_norm_weight = d_k_norm.get();
   args.attention_cos = d_cos.get();
   args.attention_sin = d_sin.get();
-  args.eps = GEMMA4_RMS_NORM_EPS;
-
   CHECK_CUDA(gemma4_decode_megakernel_ffn_tail_bf16(
       args, d_scratch.get(), gemma4_decode_megakernel_ffn_tail_scratch_bytes(),
       0));

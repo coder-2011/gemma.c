@@ -20,11 +20,19 @@
 
 #include "gemma4_flash_attention.cuh"
 #include "gemma4_cuda_utils.cuh"
-#include "gemma4_decode_megakernel_phases.cuh"
+#include "gemma4_decode_megakernel_phases.cu"
 #include "gemma4_rope.cuh"
 #include "gemma4.h"
 
 #include <cooperative_groups.h>
+
+// Completes the split decode FFN tail after FlashAttention prepares FFN inputs.
+cudaError_t gemma4_decode_megakernel_finish_ffn_tail_bf16(
+    const Gemma4DecodeMegakernelFfnTailArgs &args,
+    void *__restrict__ scratch,
+    size_t scratch_bytes,
+    bool run_final_spine,
+    cudaStream_t stream);
 
 namespace gemma4_flash_attention {
 
@@ -551,7 +559,6 @@ __device__ __forceinline__ bool gemma4_score_block_fully_visible(
     int seqlen_delta,
     int max_seqlen_k,
     int window_size) {
-  if (valid_rows <= 0) return false;
   // Partial K tiles still need masks for columns beyond seqlen_k.
   if (col_idx_offset + block_n > max_seqlen_k) return false;
 
@@ -814,7 +821,6 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   const index_t batch = index_t(bidb);
   const int q_tile_start = m_block * kBlockM;
   const int q_tile_remaining = params.seqlen_q - q_tile_start;
-  if (q_tile_remaining <= 0) return;
   const int valid_q_rows = std::min(kBlockM, q_tile_remaining);
 
   const int seqlen_delta = params.seqlen_k - params.seqlen_q;
@@ -1209,7 +1215,8 @@ __device__ __forceinline__ float hidden_rms_scale_bf16(
   float sum = 0.0f;
   for (int pack = lane; pack < kPacks; pack += kWarpSize) {
     const int element = pack * kBf16Packed128Elements;
-    const Bf16Packed128 x_pack = load128g(x + element);
+    const Bf16Packed128 x_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element)};
     gemma4_bf16_pack_accumulate_square(x_pack, sum);
   }
   sum = prep_warp_sum(sum);
@@ -1235,8 +1242,10 @@ __device__ __forceinline__ void project_normed_head_values_bf16(
 
   for (int pack = 0; pack < kPacks; ++pack) {
     const int element = pack * kBf16Packed128Elements;
-    const Bf16Packed128 x_pack = load128g(x + element);
-    const Bf16Packed128 gamma_pack = load128g(input_norm_weight + element);
+    const Bf16Packed128 x_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element)};
+    const Bf16Packed128 gamma_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(input_norm_weight + element)};
     const Bf16Packed128 normed_pack =
         gemma4_bf16_pack_apply_scale_weight(x_pack, gamma_pack, hidden_scale);
 #pragma unroll
@@ -1244,7 +1253,8 @@ __device__ __forceinline__ void project_normed_head_values_bf16(
       const int dim = lane + i * kWarpSize;
       const int col = col_base + dim;
       const int64_t weight_offset = int64_t(col) * GEMMA4_HIDDEN_SIZE + element;
-      const Bf16Packed128 w_pack = load128weight(w_col_major + weight_offset);
+      const Bf16Packed128 w_pack =
+          Bf16Packed128{*reinterpret_cast<const int4 *>(w_col_major + weight_offset)};
       gemma4_bf16_pack_accumulate_dot(normed_pack, w_pack, values[i]);
     }
   }
@@ -1282,7 +1292,6 @@ __device__ __forceinline__ void phase_qkv_norm_rope(
   const int lane = thread_idx & (kWarpSize - 1);
   const int warp = thread_idx / kWarpSize;
   const int head = head_group * Derived::kHeadsPerBlock + warp;
-  if (head >= kQHeads) return;
   const int64_t row = int64_t(batch) * seq_len + seq;
   const int position =
       token_position == nullptr ? seq
@@ -1566,8 +1575,8 @@ bool gemma4_fa_valid_cache_config(
   const int64_t token_capacity =
       int64_t(config.max_pages_per_seq) * config.page_size;
   return cache_layer >= 0 && cache_layer < config.num_layers &&
-         config.num_layers > 0 && config.num_pages > 0 &&
-         config.page_size > 0 && config.max_pages_per_seq > 0 &&
+         config.num_pages > 0 && config.page_size > 0 &&
+         config.max_pages_per_seq > 0 &&
          config.num_pages % config.max_pages_per_seq == 0 &&
          config.num_heads == Traits::kKvHeads &&
          config.head_dim == Traits::kHeadDim &&
@@ -2140,43 +2149,11 @@ __device__ inline void phase_megakernel_flash_attention(
   }
 }
 
-// Runs the final decode spine schedule after the FFN tail writes residual_out.
-__device__ inline void phase_megakernel_final_spine(
-    cg::grid_group grid,
-    __nv_bfloat16 *__restrict__ next_hidden,
-    int32_t *__restrict__ next_token,
-    Gemma4SampleCandidate *__restrict__ candidates,
-    __nv_bfloat16 *__restrict__ normed_hidden,
-    const __nv_bfloat16 *__restrict__ state,
-    const __nv_bfloat16 *__restrict__ final_norm_weight,
-    const __nv_bfloat16 *__restrict__ lm_head_col_major,
-    int32_t active_candidate_count) {
-  mega_phase::phase_final_rmsnorm_hidden(
-      normed_hidden, state, final_norm_weight);
-  grid.sync();
-
-  const Gemma4SampleCandidate candidate =
-      mega_phase::phase_final_logits_block_candidate(
-          normed_hidden, lm_head_col_major);
-  if (threadIdx.x == 0) {
-    candidates[blockIdx.x] = candidate;
-  }
-  grid.sync();
-
-  mega_phase::phase_reduce_candidates_and_gather(
-      next_hidden, next_token, lm_head_col_major, candidates,
-      active_candidate_count);
-}
-
-// Runs FlashAttention, then the existing resident FFN tail.
-template <typename Traits, bool RunFinalSpine>
+// Runs FlashAttention and prepares the post-attention FFN input rows.
+template <typename Traits>
 __global__ __launch_bounds__(mega_phase::kMegaThreads, 1)
-void decode_megakernel_flash_attention_ffn_tail_kernel(
-    Gemma4DecodeMegakernelFfnTailArgs args,
-    Gemma4FfnDecodeScratch *__restrict__ ffn_scratch,
-    Gemma4SampleCandidate *__restrict__ candidates,
-    __nv_bfloat16 *__restrict__ normed_hidden,
-    int32_t active_candidate_count) {
+void decode_megakernel_flash_attention_prepare_ffn_kernel(
+    Gemma4DecodeMegakernelFfnTailArgs args) {
   cg::grid_group grid = cg::this_grid();
 
   phase_megakernel_flash_attention<Traits>(args, grid);
@@ -2188,29 +2165,6 @@ void decode_megakernel_flash_attention_ffn_tail_kernel(
 
   mega_phase::phase_attention_to_ffn(args);
   grid.sync();
-
-  mega_phase::phase_ffn_zero_accum(ffn_scratch);
-  grid.sync();
-
-  mega_phase::phase_ffn_accumulate(args, ffn_scratch);
-  grid.sync();
-
-  mega_phase::phase_ffn_finalize_rmsnorm_residual(args, ffn_scratch);
-  grid.sync();
-
-  mega_phase::phase_scale_layer_hidden(args.residual_out, args.layer_scalar);
-  grid.sync();
-
-  if constexpr (RunFinalSpine) {
-    phase_megakernel_final_spine(
-        grid, args.next_hidden, args.next_token, candidates, normed_hidden,
-        args.residual_out, args.final_norm_weight, args.lm_head_col_major,
-        active_candidate_count);
-  } else {
-    (void)candidates;
-    (void)normed_hidden;
-    (void)active_candidate_count;
-  }
 }
 
 using SlidingAttentionTraits = Gemma4AttentionTraits<false>;
@@ -2243,6 +2197,9 @@ bool valid_decode_paged_args(
     int32_t batch_size,
     int32_t split_size,
     int32_t num_splits) {
+  if (!gemma4_fa_valid_cache_config<Traits>(cache_config, cache_layer)) {
+    return false;
+  }
   const int64_t split_capacity = int64_t(split_size) * num_splits;
   const int64_t required_keys =
       Traits::kIsGlobal
@@ -2250,9 +2207,7 @@ bool valid_decode_paged_args(
          : cache_config.window_size;
   const bool needs_partials = num_splits > 1;
   const int32_t batch_capacity =
-      cache_config.max_pages_per_seq > 0
-          ? cache_config.num_pages / cache_config.max_pages_per_seq
-          : 0;
+      cache_config.num_pages / cache_config.max_pages_per_seq;
   return d_out != nullptr &&
          (!needs_partials ||
           (d_partial_m != nullptr && d_partial_l != nullptr &&
@@ -2261,8 +2216,7 @@ bool valid_decode_paged_args(
          d_page_table != nullptr && d_seq_lengths != nullptr &&
          batch_size > 0 && split_size > 0 && num_splits > 0 &&
          batch_size <= batch_capacity &&
-         split_capacity >= required_keys &&
-         gemma4_fa_valid_cache_config<Traits>(cache_config, cache_layer);
+         split_capacity >= required_keys;
 }
 
 template <typename Traits>
@@ -2388,25 +2342,27 @@ cudaError_t launch_decode_megakernel_flash_attention_ffn(
     size_t scratch_bytes,
     cudaStream_t stream) {
   const Gemma4KvCacheConfig &config = args.attention_cache_config;
+  cudaError_t status = cudaErrorInvalidValue;
   if (config.head_dim == GEMMA4_SLIDING_HEAD_DIM &&
       config.num_heads == GEMMA4_SLIDING_KV_HEADS) {
-    return gemma4_decode_megakernel_phases::launch_ffn_tail(
-        args, scratch, scratch_bytes, stream,
+    status = gemma4_decode_megakernel_phases::launch_prepare(
+        args, stream,
         gemma4_flash_attention::
-            decode_megakernel_flash_attention_ffn_tail_kernel<
-                gemma4_flash_attention::Gemma4AttentionTraits<false>,
-                RunFinalSpine>);
-  }
-  if (config.head_dim == GEMMA4_GLOBAL_HEAD_DIM &&
-      config.num_heads == GEMMA4_GLOBAL_KV_HEADS) {
-    return gemma4_decode_megakernel_phases::launch_ffn_tail(
-        args, scratch, scratch_bytes, stream,
+            decode_megakernel_flash_attention_prepare_ffn_kernel<
+                gemma4_flash_attention::Gemma4AttentionTraits<false>>);
+  } else if (config.head_dim == GEMMA4_GLOBAL_HEAD_DIM &&
+             config.num_heads == GEMMA4_GLOBAL_KV_HEADS) {
+    status = gemma4_decode_megakernel_phases::launch_prepare(
+        args, stream,
         gemma4_flash_attention::
-            decode_megakernel_flash_attention_ffn_tail_kernel<
-                gemma4_flash_attention::Gemma4AttentionTraits<true>,
-                RunFinalSpine>);
+            decode_megakernel_flash_attention_prepare_ffn_kernel<
+                gemma4_flash_attention::Gemma4AttentionTraits<true>>);
   }
-  return cudaErrorInvalidValue;
+  if (status != cudaSuccess) {
+    return status;
+  }
+  return gemma4_decode_megakernel_finish_ffn_tail_bf16(
+      args, scratch, scratch_bytes, RunFinalSpine, stream);
 }
 
 // Launches the FlashAttention + FFN variant without final sampling.

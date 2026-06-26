@@ -373,7 +373,6 @@ Gemma4DecodeMegakernelFfnTailArgs make_decode_args(
   args.attention_k_norm_weight = w.k_norm_weight;
   args.attention_cos = global ? runtime->global_cos : runtime->sliding_cos;
   args.attention_sin = global ? runtime->global_sin : runtime->sliding_sin;
-  args.eps = GEMMA4_RMS_NORM_EPS;
   return args;
 }
 
