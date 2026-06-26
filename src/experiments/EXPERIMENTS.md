@@ -14652,3 +14652,222 @@ Conclusion:
 - Today’s vLLM serving baseline was much slower than the prior vLLM run despite
   repeated warm passes, so the README reports today’s measured number rather
   than carrying forward the older external baseline.
+
+## 2026-06-26 - Full Decode Mechanism Tuning Sweep
+
+Question: after the prompt-runner rewrite, do any remaining decode mechanism
+knobs produce a large enough win to keep?
+
+Changes kept:
+
+- Fixed benchmark timing helpers that were recording CUDA events on the default
+  stream while launching work on a passed nonblocking stream:
+  `gemma4_bench_utils.cuh`, `gemma4_sampling_bench.cu`,
+  `gemma4_flash_attention_bench.cu`, and `gemma4_kv_cache_bench.cu`.
+- Added `gemma4_prompt --decode-split-size` so decode split-size checks can be
+  run from the end-to-end prompt benchmark without changing constants.
+
+Changes rejected:
+
+- Sampling producer-count cache: no material sampler or full decode-step win
+  above noise, so the core sampler code was restored.
+- Prompt decode split sizes other than the default `20`.
+- Sliding attention split sizes `16` and `64`.
+- Global attention split sizes `32` and `128`.
+- FFN decode swizzle-off and final-logits/sampling retunes; existing defaults
+  stayed best or tied within noise.
+
+Commands:
+
+```bash
+make prompt decode-bench sampling-bench flash-attn-bench kv-cache-bench \
+  rmsnorm-bench rmsnorm-hidden-fused-bench embedding-gather-bench \
+  ffn-libtorch-bench test-sampling
+
+./build/gemma4_prompt --benchmark-mode decode-step --bench-warmup 5 \
+  --bench-iters 10 --bench-samples 5 --prompt Hello
+
+./build/gemma4_prompt --benchmark-mode decode-step --bench-warmup 5 \
+  --bench-iters 10 --bench-samples 5 --prompt Hello --decode-split-size 64
+
+GEMMA4_DECODE_BENCH_SEED=20260626 \
+  ./build/benches/gemma4_decode_bench all 50 10 3
+
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260626 \
+  ./build/benches/gemma4_ffn_libtorch_bench 50 10 3 1
+
+./build/benches/gemma4_sampling_bench 25 100 9
+
+./build/benches/gemma4_kv_cache_bench --seq-len 4096 --page-size 64 \
+  --split-size 20 --global-split-size 64 --warmup 20 --iters 80 \
+  --samples 5 --cache warm
+
+./build/benches/gemma4_kv_cache_bench --seq-len 4096 --page-size 64 \
+  --split-size 16 --global-split-size 64 --warmup 20 --iters 80 \
+  --samples 5 --cache warm
+
+./build/benches/gemma4_kv_cache_bench --seq-len 4096 --page-size 64 \
+  --split-size 64 --global-split-size 64 --warmup 20 --iters 80 \
+  --samples 5 --cache warm
+
+./build/benches/gemma4_kv_cache_bench --seq-len 4096 --page-size 64 \
+  --split-size 20 --global-split-size 32 --warmup 20 --iters 80 \
+  --samples 5 --cache warm
+
+./build/benches/gemma4_kv_cache_bench --seq-len 4096 --page-size 64 \
+  --split-size 20 --global-split-size 128 --warmup 20 --iters 80 \
+  --samples 5 --cache warm
+
+./build/benches/gemma4_flash_attention_bench 4096 50 20 5 1 64 warm 64
+./build/benches/gemma4_rmsnorm_bench 100 20 5 4096 3840
+./build/benches/gemma4_rmsnorm_hidden_fused_bench 100 20 5 1024
+./build/benches/gemma4_embedding_gather_bench 100 20 5 4096
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, persistence enabled, ECC
+  disabled, MIG not applicable, power limit `300 W`.
+- CUDA: driver/runtime reported as `13000`; `/usr/local/cuda/bin/nvcc`
+  reported CUDA compilation tools `13.0`, `V13.0.48`.
+- PyTorch/LibTorch: `2.11.0`.
+- Timing: CUDA events on the measured stream for microbenchmarks. Prompt
+  decode-step timing records one event window per stateful decode step.
+- Cache policy: warm repeated buffers unless a benchmark row states otherwise.
+- Clock policy: clocks were not locked. Idle checks after runs showed
+  `210 MHz` SM and `405 MHz` memory; boost state during timing was not pinned.
+- Profiling: `ncu` was not available on `PATH`.
+- Correctness: sampling benchmark and `test-sampling` passed. KV-cache and
+  flash-attention benchmark correctness rows reported `max_abs=0` for the
+  refreshed decode attention rows and sub-BF16-rounding differences for prep.
+
+Key results:
+
+```text
+Main decode-step, prompt Hello, split 20:
+  baseline before sweep p50=73.581 ms, 13.590 tok/s
+  final clean-source rerun p50=73.861 ms, 13.539 tok/s
+  one noisy discarded rerun p50=78.914 ms, max=127.016 ms
+
+Prompt decode split-size sweep:
+  split 20 p50=73.581 ms baseline
+  split 64 confirmation p50=75.048 ms, rejected
+  split 16/20/32/64 short checks did not beat split 20
+
+Projection decode bench after stream-timing fix:
+  ffn_gate_up custom=0.334930 ms, swizzle16=0.335302 ms
+  ffn_down custom=0.170955 ms, swizzle16=0.170703 ms
+  sliding_qkv custom=0.092177 ms
+  sliding_o custom=0.047699 ms
+  global_q custom=0.092042 ms
+  global_k custom=0.009842 ms
+  global_o custom=0.092320 ms
+  final_logits custom=2.827119 ms
+
+FFN fused decode:
+  custom_fused_decode graph=0.520573 ms
+  swizzle-off graph=0.520601 ms, rejected
+  LibTorch full FFN graph=0.515985 ms
+
+Sampling after stream-timing fix:
+  native_pytorch_cuda_graph median=2850.747 us
+  fused_lm_head_sample_full_vocab median=2837.319 us
+  materialized_lm_head_sample_full_vocab median=2915.143 us
+  retained existing fused sampler; no new sampler code change
+
+KV-cache / decode attention after stream-timing fix:
+  split 20 sliding direct median=0.044968 ms, global split 64=0.333912 ms
+  split 16 sliding direct median=0.050586 ms, rejected
+  split 64 sliding direct median=0.059744 ms, rejected
+  global split 32 median=0.345219 ms, rejected
+  global split 128 median=0.650244 ms, rejected
+
+Flash-attention / norm-RoPE prep:
+  custom_project_prepare median=0.597396 ms for the full bench shape
+  norm_rope_plus_fa median=0.921530 ms
+  decode_norm_rope_paged_kv_write median=0.022906 ms
+
+RMSNorm / residual:
+  rows=1 fused_graph_kernel_ms=0.002541, split_graph_kernel_ms=0.003511
+  rows=4096 fused_ms=0.187128, split_ms=0.234915
+  hidden fused graph rows=1024 best_ms=0.047958
+
+Embedding gather:
+  tokens=1 best_ms=0.010527
+  tokens=4096 best_ms=0.097854, best_effective_gib_s=598.789
+```
+
+Conclusion:
+
+- No mechanism retune produced a repeatable end-to-end decode speedup above
+  noise on this A6000 run. The retained performance-affecting code defaults
+  remain the pre-sweep defaults.
+- The important kept work is measurement correctness: several benchmark helpers
+  now record events on the actual work stream, which fixed impossible rows such
+  as final logits timing and makes the current tuning decisions defensible.
+- The prompt split-size knob stays because it is a low-risk measurement affordance
+  and it confirmed that the default split size `20` should remain.
+
+## 2026-06-26 - Prompt Warm-Serving vLLM-Style Metrics Smoke
+
+Question:
+
+- Does `gemma4_prompt --benchmark-mode warm-serving` report the same class of
+  client-observed metrics as vLLM's online serving benchmark for the local
+  batch-1 path?
+
+Change:
+
+- Stopped warm-serving E2E timing at the last copied token instead of including
+  local detokenization.
+- Added measured-window duration plus request, output-token, and total-token
+  throughput rows.
+- Labeled the local request contract as sequential, concurrency-1, HTTP-free,
+  model-load-excluded serving timing.
+
+Commands:
+
+```bash
+make prompt
+./build/gemma4_prompt --benchmark-mode warm-serving --bench-warmup 0 \
+  --bench-iters 1 --bench-samples 1 --max-new 2 --prompt Hello
+git diff --check
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:0E:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`; CUDA driver/runtime
+  reported as `13000`.
+- Model/input: `models/gemma-4-12B/model.safetensors`, prompt `Hello`,
+  prompt length `1`, output tokens `2`.
+- Timing: host wall clock around each local request. The request timer includes
+  tokenization, prompt H2D, prefill, decode, and host token copies; it excludes
+  model load, CUDA context creation, allocation, and local detokenization.
+- Traffic shape: closed-loop sequential, concurrency `1`, no HTTP server/client
+  overhead and no queueing layer.
+- Warmup/iterations: `0` warmup requests, `1` measured request. This is a
+  functionality smoke, not a stable benchmark run.
+- Cache policy: warm allocated runtime buffers inside one process.
+- Clock policy: clocks not locked; post-run idle snapshot showed `210 MHz` SM
+  and `405 MHz` memory.
+
+Result:
+
+```text
+benchmark_duration_ms=162.938 successful_requests=1 total_input_tokens=1 total_output_tokens=2 request_throughput=6.137 output_token_throughput=12.275 total_token_throughput=18.412
+ttft_ms n=1 mean_ms=79.355 p50_ms=79.355 p90_ms=79.355 p95_ms=79.355 p99_ms=79.355 min_ms=79.355 max_ms=79.355
+tpot_ms n=1 mean_ms=83.526 p50_ms=83.526 p90_ms=83.526 p95_ms=83.526 p99_ms=83.526 min_ms=83.526 max_ms=83.526
+itl_ms n=1 mean_ms=83.526 p50_ms=83.526 p90_ms=83.526 p95_ms=83.526 p99_ms=83.526 min_ms=83.526 max_ms=83.526
+e2e_ms n=1 mean_ms=162.880 p50_ms=162.880 p90_ms=162.880 p95_ms=162.880 p99_ms=162.880 min_ms=162.880 max_ms=162.880
+per_user_tps n=1 mean=11.972 p50=11.972 p90=11.972 p95=11.972 p99=11.972 min=11.972 max=11.972
+```
+
+Conclusion:
+
+- The custom path now has a vLLM-serving-equivalent local benchmark mode for
+  single-user batch-1 prompt timing.
+- This is not an HTTP load-generator benchmark. It intentionally measures the
+  local serving path without network, HTTP parsing, request queueing, or
+  concurrency effects.
