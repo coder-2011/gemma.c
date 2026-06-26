@@ -1,9 +1,0 @@
-{
-  "name": "praxis",
-  "version": "0.1.0",
-  "description": "Hooks for cleaner code in Codex.",
-  "license": "MIT",
-  "scripts": {
-    "test": "node --test tests/*.test.js"
-  }
-}

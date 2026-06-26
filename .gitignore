@@ -7,6 +7,7 @@
 skills-lock.json
 models/
 /build/
+/docs/
 tools/clang_cuda_compat/
 experiments/flash-attention/
 experiments/marlin/
@@ -14,3 +15,6 @@ experiments/sgemm.cu/
 experiments/tuna/
 __pycache__/
 *.py[cod]
+*.sass
+*.sass.*
+*sass*.md

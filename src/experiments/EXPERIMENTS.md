@@ -14641,8 +14641,8 @@ Artifacts:
 - `build/bench_results/vllm_warm_equal_hello_out16_c1_compiled_nocg_20260626.json`
 - `build/bench_results/vllm_warm_equal_hello_out16_c1_compiled_nocg_warm3_20260626.json`
 - `build/bench_results/gemma4_vs_vllm_summary_20260626.json`
-- `docs/benchmarks/ttft_p50_gemma4_vs_vllm.png`
-- `docs/benchmarks/tps_p50_gemma4_vs_vllm.png`
+- `public/benchmarks/ttft_p50_gemma4_vs_vllm.png`
+- `public/benchmarks/tps_p50_gemma4_vs_vllm.png`
 
 Conclusion:
 

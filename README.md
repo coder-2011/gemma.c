@@ -20,9 +20,9 @@ The local runner is slightly faster than the previous Jun 25 run
 baseline was slower after repeated warm passes; the first pass also emitted
 Triton JIT warnings during inference.
 
-![p50 TTFT benchmark](docs/benchmarks/ttft_p50_gemma4_vs_vllm.png)
+![p50 TTFT benchmark](public/benchmarks/ttft_p50_gemma4_vs_vllm.png)
 
-![p50 decode TPS benchmark](docs/benchmarks/tps_p50_gemma4_vs_vllm.png)
+![p50 decode TPS benchmark](public/benchmarks/tps_p50_gemma4_vs_vllm.png)
 
 
 My agents tell me they love working in this repo. It is built heavily w/ them in mind!
