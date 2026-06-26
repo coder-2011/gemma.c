@@ -8,12 +8,17 @@ The current work is to implement kernels individually, assemble a correct unfuse
 
 ## Benchmark
 
-Single-user Gemma 4 12B prompt benchmark on an NVIDIA RTX A6000 (Jun 25):
+Single-user Gemma 4 12B prompt benchmark on an NVIDIA RTX A6000 (Jun 26):
 
 | Runner | p50 TTFT | p50 TPOT | p50 decode TPS |
 | --- | ---: | ---: | ---: |
-| `gemma4_prompt` local | 38.878 ms | 75.120 ms | 13.312 tok/s |
-| vLLM serve, compiled, no CUDA graph | 208.512 ms | 96.762 ms | 10.335 tok/s |
+| `gemma4_prompt` local | 38.469 ms | 73.707 ms | 13.567 tok/s |
+| vLLM serve, compiled, no CUDA graph | 422.551 ms | 181.401 ms | 5.513 tok/s |
+
+The local runner is slightly faster than the previous Jun 25 run
+(`38.878 ms` TTFT, `75.120 ms` TPOT, `13.312 tok/s`). Today's vLLM serving
+baseline was slower after repeated warm passes; the first pass also emitted
+Triton JIT warnings during inference.
 
 ![p50 TTFT benchmark](docs/benchmarks/ttft_p50_gemma4_vs_vllm.png)
 

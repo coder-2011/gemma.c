@@ -153,6 +153,7 @@ int main(int argc, char **argv) {
   expect_text(tokenizer, {26352}, " Hello");
   expect_text(tokenizer, {0, 3, 4}, "");
   expect_text(tokenizer, {242398}, grinning_face);
+  expect_text(tokenizer, {464, 368, 410}, "\xE2\x82\xAC");
 
   puts("tokenizer tests passed");
   return 0;

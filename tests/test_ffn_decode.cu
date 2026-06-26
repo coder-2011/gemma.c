@@ -112,6 +112,7 @@ void run_sparse_case() {
   std::vector<__nv_bfloat16> actual_residual(GEMMA4_HIDDEN_SIZE);
   std::vector<__nv_bfloat16> actual_normed(GEMMA4_HIDDEN_SIZE);
   std::vector<__nv_bfloat16> expected_residual(GEMMA4_HIDDEN_SIZE);
+  std::vector<__nv_bfloat16> expected_scaled_residual(GEMMA4_HIDDEN_SIZE);
   std::vector<__nv_bfloat16> expected_normed(GEMMA4_HIDDEN_SIZE);
   std::vector<float> ffn_out(GEMMA4_HIDDEN_SIZE, 0.0f);
 
@@ -134,10 +135,12 @@ void run_sparse_case() {
   thrust::device_vector<__nv_bfloat16> d_down(down_count);
   thrust::device_vector<unsigned char> d_scratch(
       sizeof(Gemma4FfnDecodeScratch));
+  thrust::device_vector<__nv_bfloat16> d_layer_scalar(1);
 
   copy_to_device(d_x, x);
   copy_to_device(d_residual, residual);
   copy_to_device(d_gamma, gamma);
+  d_layer_scalar[0] = __float2bfloat16(0.5f);
   CHECK_CUDA(cudaMemset(raw_ptr(d_gate_up_src), 0,
                         gate_up_count * sizeof(__nv_bfloat16)));
   CHECK_CUDA(cudaMemset(raw_ptr(d_down_src), 0,
@@ -216,7 +219,7 @@ void run_sparse_case() {
       raw_ptr(d_residual_out), raw_ptr(d_normed_out), raw_ptr(d_x), raw_ptr(d_residual),
       raw_ptr(d_gamma), raw_ptr(d_gate_up), raw_ptr(d_down),
       reinterpret_cast<Gemma4FfnDecodeScratch *>(raw_ptr(d_scratch)),
-      GEMMA4_RMS_NORM_EPS, 0));
+      nullptr, GEMMA4_RMS_NORM_EPS, 0));
   copy_to_host(actual_residual, d_residual_out);
   copy_to_host(actual_normed, d_normed_out);
 
@@ -224,6 +227,18 @@ void run_sparse_case() {
                "fused FFN residual");
   compare_bf16(actual_normed, expected_normed, 0.03125f,
                "fused FFN normed");
+  for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
+    expected_scaled_residual[col] =
+        __float2bfloat16_rn(bf16_to_float(expected_residual[col]) * 0.5f);
+  }
+  CHECK_CUDA(gemma4_ffn_decode_fused_bf16(
+      raw_ptr(d_residual_out), raw_ptr(d_normed_out), raw_ptr(d_x), raw_ptr(d_residual),
+      raw_ptr(d_gamma), raw_ptr(d_gate_up), raw_ptr(d_down),
+      reinterpret_cast<Gemma4FfnDecodeScratch *>(raw_ptr(d_scratch)),
+      raw_ptr(d_layer_scalar), GEMMA4_RMS_NORM_EPS, 0));
+  copy_to_host(actual_residual, d_residual_out);
+  compare_bf16(actual_residual, expected_scaled_residual, 0.03125f,
+               "fused FFN scaled residual");
 
   constexpr int prefill_rows = 3;
   std::vector<__nv_bfloat16> x_prefill(

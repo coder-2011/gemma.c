@@ -59,9 +59,11 @@ int main(int argc, char **argv) {
   const char *path = argc > 1 ? argv[1] :
       "models/gemma-4-12B/model.safetensors";
 
-  std::string error;
   Gemma4CheckpointHost checkpoint;
-  gemma4_checkpoint_open_text_bf16(&checkpoint, path);
+  if (!gemma4_checkpoint_open_text_bf16(&checkpoint, path)) {
+    fprintf(stderr, "checkpoint open failed\n");
+    return 1;
+  }
 
   if (checkpoint.layers[0].v_proj_col_major == nullptr ||
       checkpoint.layers[5].v_proj_col_major != nullptr) {
@@ -70,7 +72,7 @@ int main(int argc, char **argv) {
   }
 
   Gemma4TextWeightsDevice weights;
-  CHECK_CUDA(gemma4_load_text_weights_device_bf16(&weights, path, &error));
+  CHECK_CUDA(gemma4_load_text_weights_device_bf16(&weights, path, nullptr));
 
   expect_device_value(weights.token_embedding, 0,
                       checkpoint.token_embedding[0], "embedding");

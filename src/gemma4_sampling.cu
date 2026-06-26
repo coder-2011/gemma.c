@@ -14,6 +14,13 @@ constexpr int kFinalLogitsColsPerBlock = 8;
 constexpr int kFinalLogitsMinBlocksPerSm = 1;
 constexpr int kCandidateCount = GEMMA4_VOCAB_SIZE / kFinalLogitsColsPerBlock;
 
+// Applies the Gemma final logit softcap for either first-token or decode sampling.
+__device__ inline float softcapped_logit(float logit, Gemma4SamplingStage stage) {
+  (void)stage;
+  return tanhf(logit / GEMMA4_FINAL_LOGIT_SOFTCAPPING) *
+         GEMMA4_FINAL_LOGIT_SOFTCAPPING;
+}
+
 // Chooses the higher logit, breaking exact ties by the lower token id.
 __device__ inline bool better_candidate(float logit,
                                         int32_t token_id,
@@ -94,6 +101,7 @@ __device__ Gemma4SampleCandidate lm_head_block_candidate(
     const __nv_bfloat16 *__restrict__ lm_head_col_major,
     int block_idx,
     int grid_blocks,
+    Gemma4SamplingStage stage,
     int thread_idx) {
   constexpr int warps = Threads / 32;
   __shared__ float warp_sums[ColsPerBlock][warps];
@@ -110,7 +118,8 @@ __device__ Gemma4SampleCandidate lm_head_block_candidate(
       const int32_t token0 = tile * ColsPerBlock;
 #pragma unroll
       for (int col = 0; col < ColsPerBlock; ++col) {
-        const float logit = __bfloat162float(__float2bfloat16_rn(sums[col]));
+        const float raw_logit = __bfloat162float(__float2bfloat16_rn(sums[col]));
+        const float logit = softcapped_logit(raw_logit, stage);
         const int32_t token_id = token0 + col;
         if (better_candidate(logit, token_id, best_logit, best_token_id)) {
           best_logit = logit;
@@ -186,6 +195,7 @@ void final_logits_sample_kernel(
     const __nv_bfloat16 *__restrict__ d_lm_head_col_major,
     Gemma4SampleCandidate *__restrict__ d_candidates,
     uint32_t *__restrict__ d_ready_flags,
+    Gemma4SamplingStage stage,
     int producer_count) {
   if (blockIdx.x == 0) {
     consume_and_gather<kFinalLogitsThreads>(
@@ -201,7 +211,7 @@ void final_logits_sample_kernel(
           kFinalLogitsThreads,
           kCandidateCount>(
           d_final_hidden, d_lm_head_col_major, producer_idx,
-          producer_count, int(threadIdx.x));
+          producer_count, stage, int(threadIdx.x));
 
   if (threadIdx.x == 0) {
     d_candidates[producer_idx] = candidate;
@@ -243,21 +253,28 @@ cudaError_t producer_count_for_kernel(const void *kernel, int *producer_count) {
 
 }  // namespace
 
-// Launches fused decode-token selection from final hidden to next embedding.
-cudaError_t gemma4_sample_next_decode_bf16(
+// Returns the caller-owned scratch bytes needed by the fused sampling kernel.
+size_t gemma4_sample_next_scratch_bytes(void) {
+  const size_t candidate_bytes =
+      static_cast<size_t>(kCandidateCount) * sizeof(Gemma4SampleCandidate);
+  const size_t ready_bytes =
+      static_cast<size_t>(kCandidateCount) * sizeof(uint32_t);
+  return candidate_bytes + ready_bytes;
+}
+
+// Launches fused token selection from final hidden to next embedding.
+cudaError_t gemma4_sample_next_bf16(
     __nv_bfloat16 *__restrict__ d_next_hidden,
     int32_t *__restrict__ d_next_token,
     void *__restrict__ d_scratch,
     size_t scratch_bytes,
     const __nv_bfloat16 *__restrict__ d_final_hidden,
     const __nv_bfloat16 *__restrict__ d_lm_head_col_major,
+    Gemma4SamplingStage stage,
     cudaStream_t stream) {
   const size_t candidate_bytes =
       static_cast<size_t>(kCandidateCount) * sizeof(Gemma4SampleCandidate);
-  const size_t ready_bytes =
-      static_cast<size_t>(kCandidateCount) * sizeof(uint32_t);
-  const size_t required_scratch = candidate_bytes + ready_bytes;
-  if (scratch_bytes < required_scratch) {
+  if (scratch_bytes < gemma4_sample_next_scratch_bytes()) {
     return cudaErrorInvalidValue;
   }
 
@@ -282,6 +299,20 @@ cudaError_t gemma4_sample_next_decode_bf16(
   const dim3 block_dim(kFinalLogitsThreads);
   final_logits_sample_kernel<<<grid_dim, block_dim, 0, stream>>>(
       d_next_hidden, d_next_token, d_final_hidden, d_lm_head_col_major,
-      d_candidates, d_ready_flags, producer_count);
+      d_candidates, d_ready_flags, stage, producer_count);
   return cudaGetLastError();
+}
+
+// Launches fused decode-token selection from final hidden to next embedding.
+cudaError_t gemma4_sample_next_decode_bf16(
+    __nv_bfloat16 *__restrict__ d_next_hidden,
+    int32_t *__restrict__ d_next_token,
+    void *__restrict__ d_scratch,
+    size_t scratch_bytes,
+    const __nv_bfloat16 *__restrict__ d_final_hidden,
+    const __nv_bfloat16 *__restrict__ d_lm_head_col_major,
+    cudaStream_t stream) {
+  return gemma4_sample_next_bf16(
+      d_next_hidden, d_next_token, d_scratch, scratch_bytes, d_final_hidden,
+      d_lm_head_col_major, Gemma4SamplingStage::kDecode, stream);
 }

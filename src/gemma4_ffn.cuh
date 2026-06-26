@@ -79,6 +79,7 @@ cudaError_t gemma4_ffn_decode_fused_bf16(
     const __nv_bfloat16 *__restrict__ w_gate_up_decode,
     const __nv_bfloat16 *__restrict__ w_down_decode,
     Gemma4FfnDecodeScratch *__restrict__ scratch,
+    const __nv_bfloat16 *__restrict__ layer_scalar,
     float eps,
     cudaStream_t stream);
 

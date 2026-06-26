@@ -6,8 +6,7 @@
 .agents/
 skills-lock.json
 models/
-build/benches/
-build/experiments/
+/build/
 tools/clang_cuda_compat/
 experiments/flash-attention/
 experiments/marlin/

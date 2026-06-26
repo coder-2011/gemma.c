@@ -727,6 +727,21 @@ std::string byte_fallback_token(unsigned char byte) {
   return token;
 }
 
+// Decodes one tokenizer byte-fallback token such as <0xE2>.
+bool decode_byte_fallback_token(const std::string &token, char *byte) {
+  if (token.size() != 6 || token[0] != '<' || token[1] != '0' ||
+      token[2] != 'x' || token[5] != '>') {
+    return false;
+  }
+  uint32_t high = 0;
+  uint32_t low = 0;
+  if (!hex_digit(token[3], &high) || !hex_digit(token[4], &low)) {
+    return false;
+  }
+  *byte = static_cast<char>((high << 4) | low);
+  return true;
+}
+
 // Appends one BPE symbol while keeping the adjacent-symbol chain linked.
 void append_bpe_symbol(
     std::vector<BpeSymbol> *symbols,
@@ -957,7 +972,8 @@ bool Gemma4Tokenizer::encode(
 bool Gemma4Tokenizer::decode(
     const std::vector<int32_t> &ids,
     std::string *text) const {
-  text->clear();
+  std::string raw;
+  raw.reserve(ids.size());
   for (int32_t id : ids) {
     if (id < 0 || static_cast<size_t>(id) >= id_to_token_.size()) {
       return false;
@@ -965,8 +981,14 @@ bool Gemma4Tokenizer::decode(
     if (skip_decode_[id]) {
       continue;
     }
-    const std::string token = decode_replace_space_marker(id_to_token_[id]);
-    *text += token;
+    char byte = 0;
+    const std::string &token = id_to_token_[id];
+    if (decode_byte_fallback_token(token, &byte)) {
+      raw.push_back(byte);
+    } else {
+      raw += token;
+    }
   }
+  *text = decode_replace_space_marker(raw);
   return true;
 }

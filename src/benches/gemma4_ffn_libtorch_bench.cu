@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
         bf16_ptr(residual), bf16_ptr(rms_weight), bf16_ptr(w_gate_up_swizzled),
         bf16_ptr(w_down_swizzled),
         reinterpret_cast<Gemma4FfnDecodeScratch *>(raw_ptr(d_custom_scratch)),
-        GEMMA4_RMS_NORM_EPS, stream));
+        nullptr, GEMMA4_RMS_NORM_EPS, stream));
   };
   auto run_custom_clear = [&]() {
     CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_custom_scratch), 0, sizeof(Gemma4FfnDecodeScratch)));

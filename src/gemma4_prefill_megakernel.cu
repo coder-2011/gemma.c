@@ -1,15 +1,14 @@
-#include "gemma4_prefill_megakernel.cuh"
+#include "gemma4_decode_megakernel.cuh"
 
-#include "gemma4.h"
 #include "gemma4_cuda_utils.cuh"
-#include "gemma4_flash_attention.cuh"
+#include "gemma4_ffn.cuh"
 #include "gemma4_matmul_kernels.cuh"
 #include "gemma4_rmsnorm.cuh"
 
-#include <cute/layout.hpp>
-
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
+#include <utility>
 
 namespace {
 
@@ -22,20 +21,22 @@ struct PrefillAttentionShape {
   int32_t window_size;
 };
 
-// Scales one 128-bit BF16 pack for the local scale benchmark wrapper.
-__device__ inline void scale_hidden_pack_bf16(
-    __nv_bfloat16 *__restrict__ out,
-    const __nv_bfloat16 *__restrict__ in,
-    float scale,
-    int pack) {
-  const int offset = pack * kBf16Packed128Elements;
-  const Bf16Packed128 values =
-      Bf16Packed128{*reinterpret_cast<const int4 *>(in + offset)};
-  const Bf16Packed128 result = gemma4_bf16_pack_apply_scale(values, scale);
-  *reinterpret_cast<int4 *>(out + offset) = result.bits();
-}
+struct PrefillScratch {
+  __nv_bfloat16 *hidden_work = nullptr;
+  __nv_bfloat16 *hidden_delta = nullptr;
+  __nv_bfloat16 *post_attention_residual = nullptr;
+  __nv_bfloat16 *pre_ffn_normed = nullptr;
+  __nv_bfloat16 *q = nullptr;
+  __nv_bfloat16 *k = nullptr;
+  __nv_bfloat16 *v = nullptr;
+  __nv_bfloat16 *q_prepared = nullptr;
+  __nv_bfloat16 *k_prepared = nullptr;
+  __nv_bfloat16 *v_prepared = nullptr;
+  __nv_bfloat16 *attention_out = nullptr;
+  Gemma4FfnPrefillScratch ffn = {};
+};
 
-// Returns the fixed Gemma 4 attention dimensions for the selected layer type.
+// Returns the fixed attention widths for a sliding or global layer.
 constexpr PrefillAttentionShape prefill_attention_shape(bool global) {
   if (global) {
     return {GEMMA4_GLOBAL_Q_PROJ_SIZE,
@@ -49,80 +50,37 @@ constexpr PrefillAttentionShape prefill_attention_shape(bool global) {
           GEMMA4_SLIDING_WINDOW};
 }
 
-// Multiplies one hidden tensor by the per-layer scalar after both sublayers.
-__global__ __launch_bounds__(kScaleThreads) void scale_hidden_bf16_kernel(
-    __nv_bfloat16 *__restrict__ out,
-    const __nv_bfloat16 *__restrict__ in,
-    const __nv_bfloat16 *__restrict__ layer_scalar,
-    int packs) {
-  const int pack = blockIdx.x * blockDim.x + threadIdx.x;
-  if (pack >= packs) {
-    return;
-  }
-
-  const float scale = __bfloat162float(__ldg(layer_scalar));
-  scale_hidden_pack_bf16(out, in, scale, pack);
-}
-
-}  // namespace
-
-// Returns the BF16 scratch elements needed for one prefill layer runner call.
-size_t gemma4_prefill_megakernel_layer_scratch_elements(bool global,
-                                                        int32_t rows) {
+// Returns the BF16 scratch elements needed by one layer of this attention type.
+size_t prefill_layer_scratch_elements(bool global, int32_t rows) {
   if (rows <= 0) {
     return 0;
   }
 
   const PrefillAttentionShape shape = prefill_attention_shape(global);
-  const size_t hidden = static_cast<size_t>(GEMMA4_HIDDEN_SIZE);
-  const size_t q_width = static_cast<size_t>(shape.q_width);
-  const size_t kv_width = static_cast<size_t>(shape.kv_width);
-  const size_t attention_width = static_cast<size_t>(shape.attention_width);
-  const auto hidden_layout = cute::make_layout(cute::make_shape(rows, hidden));
-  const auto q_layout = cute::make_layout(cute::make_shape(rows, q_width));
-  const auto kv_layout = cute::make_layout(cute::make_shape(rows, kv_width));
-  const auto attention_layout =
-      cute::make_layout(cute::make_shape(rows, attention_width));
-  const size_t hidden_elements = cute::size(hidden_layout);
-  const size_t q_elements = cute::size(q_layout);
-  const size_t kv_elements = cute::size(kv_layout);
-  const size_t attention_elements = cute::size(attention_layout);
-  size_t total = 4 * hidden_elements + 2 * q_elements + 3 * kv_elements;
+  const size_t hidden = static_cast<size_t>(rows) * GEMMA4_HIDDEN_SIZE;
+  const size_t q = static_cast<size_t>(rows) * shape.q_width;
+  const size_t kv = static_cast<size_t>(rows) * shape.kv_width;
+  const size_t attention = static_cast<size_t>(rows) * shape.attention_width;
+  size_t total = 4 * hidden + 2 * q + 3 * kv + attention;
   if (!global) {
-    total += kv_elements;
+    total += kv;
   }
-  return total + attention_elements + gemma4_ffn_prefill_scratch_elements(rows);
+  return total + gemma4_ffn_prefill_scratch_elements(rows);
 }
 
-// Splits one aligned BF16 scratch buffer into the layer runner work tensors.
-Gemma4PrefillMegakernelLayerScratch
-gemma4_prefill_megakernel_layer_scratch_from_buffer(
+// Splits one caller-owned BF16 buffer into the tensors reused by a prefill layer.
+PrefillScratch prefill_scratch_from_buffer(
     __nv_bfloat16 *buffer,
     bool global,
     int32_t rows) {
-  Gemma4PrefillMegakernelLayerScratch scratch = {};
-  if (buffer == nullptr || rows <= 0) {
-    return scratch;
-  }
-
-  scratch.capacity_rows = rows;
-  scratch.global = global;
-
   const PrefillAttentionShape shape = prefill_attention_shape(global);
-  __nv_bfloat16 *ptr = buffer;
-  const auto hidden_layout =
-      cute::make_layout(cute::make_shape(rows, GEMMA4_HIDDEN_SIZE));
-  const auto q_layout =
-      cute::make_layout(cute::make_shape(rows, shape.q_width));
-  const auto kv_layout =
-      cute::make_layout(cute::make_shape(rows, shape.kv_width));
-  const auto attention_layout =
-      cute::make_layout(cute::make_shape(rows, shape.attention_width));
-  const size_t hidden = cute::size(hidden_layout);
-  const size_t q = cute::size(q_layout);
-  const size_t kv = cute::size(kv_layout);
-  const size_t attention = cute::size(attention_layout);
+  const size_t hidden = static_cast<size_t>(rows) * GEMMA4_HIDDEN_SIZE;
+  const size_t q = static_cast<size_t>(rows) * shape.q_width;
+  const size_t kv = static_cast<size_t>(rows) * shape.kv_width;
+  const size_t attention = static_cast<size_t>(rows) * shape.attention_width;
 
+  PrefillScratch scratch = {};
+  __nv_bfloat16 *ptr = buffer;
   scratch.hidden_work = ptr;
   ptr += hidden;
   scratch.hidden_delta = ptr;
@@ -151,225 +109,180 @@ gemma4_prefill_megakernel_layer_scratch_from_buffer(
   return scratch;
 }
 
-// Runs one Gemma 4 prefill transformer layer using the existing host APIs.
-cudaError_t gemma4_prefill_megakernel_layer_bf16(
-    const Gemma4PrefillMegakernelLayerArgs &args,
-    const Gemma4PrefillMegakernelLayerScratch &scratch) {
-  if (args.batch_size < 0 || args.seq_len < 0 ||
-      args.layer_index < 0 || args.layer_index >= GEMMA4_NUM_LAYERS) {
-    return cudaErrorInvalidValue;
+// Scales 128-bit BF16 packs by the checkpoint layer scalar.
+__global__ __launch_bounds__(kScaleThreads) void scale_hidden_bf16_kernel(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ in,
+    const __nv_bfloat16 *__restrict__ layer_scalar,
+    int packs) {
+  const int pack = blockIdx.x * blockDim.x + threadIdx.x;
+  if (pack >= packs) {
+    return;
   }
 
-  const int64_t rows64 = int64_t(args.batch_size) * args.seq_len;
-  if (rows64 == 0) {
-    return cudaSuccess;
-  }
-  if (rows64 > INT_MAX / GEMMA4_HIDDEN_SIZE) {
-    return cudaErrorInvalidValue;
-  }
+  const float scale = __bfloat162float(__ldg(layer_scalar));
+  const int offset = pack * kBf16Packed128Elements;
+  const Bf16Packed128 values =
+      Bf16Packed128{*reinterpret_cast<const int4 *>(in + offset)};
+  const Bf16Packed128 scaled = gemma4_bf16_pack_apply_scale(values, scale);
+  *reinterpret_cast<int4 *>(out + offset) = scaled.bits();
+}
 
-  const bool global = gemma4_is_global_layer(args.layer_index);
-  const PrefillAttentionShape shape = prefill_attention_shape(global);
-  const int32_t rows = static_cast<int32_t>(rows64);
-  if (args.out == nullptr || args.hidden == nullptr ||
-      args.weights == nullptr ||
-      args.softmax_scale <= 0.0f || !is_aligned_16(args.out)) {
-    return cudaErrorInvalidValue;
-  }
-
-  const Gemma4TextLayerWeightsDevice *weights = args.weights;
-  // Token pointers are used by FA and long-sliding cache pointer arithmetic.
-  const bool missing_token_args =
-      args.token_batch == nullptr || args.token_position == nullptr;
-  const bool missing_scratch =
-      scratch.hidden_work == nullptr ||
-      scratch.post_attention_residual == nullptr ||
-      scratch.pre_ffn_normed == nullptr ||
-      scratch.ffn.act == nullptr || scratch.ffn.down == nullptr;
-  const bool missing_weights =
-      weights->layer_scalar == nullptr ||
-      weights->input_norm_weight == nullptr ||
-      weights->post_attention_norm_weight == nullptr ||
-      weights->pre_feedforward_norm_weight == nullptr ||
-      weights->post_feedforward_norm_weight == nullptr ||
-      weights->ffn_gate_up_decode == nullptr ||
-      weights->ffn_down_decode == nullptr;
-  if (missing_token_args || missing_scratch || missing_weights ||
-      scratch.capacity_rows < rows ||
-      scratch.global != global) {
-    return cudaErrorInvalidValue;
-  }
-
-  const int32_t expected_cache_layers =
-      global ? GEMMA4_GLOBAL_LAYER_COUNT : GEMMA4_SLIDING_LAYER_COUNT;
-  const int32_t expected_cache_heads =
-      global ? GEMMA4_GLOBAL_KV_HEADS : GEMMA4_SLIDING_KV_HEADS;
-  const int32_t expected_cache_head_dim =
+// Runs one full prefill layer using the existing unfused kernels in model order.
+cudaError_t run_prefill_layer(
+    __nv_bfloat16 *out,
+    const __nv_bfloat16 *hidden,
+    const Gemma4TextLayerWeightsDevice &weights,
+    Gemma4RuntimeState *runtime,
+    const PrefillScratch &scratch,
+    int32_t layer,
+    int32_t rows,
+    int32_t seq_len,
+    cudaStream_t stream) {
+  const bool global = gemma4_is_global_layer(layer);
+  const int32_t batch_size = runtime->batch_size;
+  const int32_t head_dim =
       global ? GEMMA4_GLOBAL_HEAD_DIM : GEMMA4_SLIDING_HEAD_DIM;
-  const bool valid_cache_window =
-      global ? args.cache_config.window_size == 0
-             : args.cache_config.window_size > 0 &&
-                   args.cache_config.window_size <= GEMMA4_SLIDING_WINDOW;
-  if (args.cache_config.num_layers != expected_cache_layers ||
-      args.cache_config.num_pages <= 0 || args.cache_config.page_size <= 0 ||
-      args.cache_config.max_pages_per_seq <= 0 ||
-      args.cache_config.num_pages % args.cache_config.max_pages_per_seq != 0 ||
-      args.cache_config.num_heads != expected_cache_heads ||
-      args.cache_config.head_dim != expected_cache_head_dim ||
-      !valid_cache_window) {
-    return cudaErrorInvalidValue;
-  }
-  const int32_t cache_batch_capacity =
-      args.cache_config.num_pages / args.cache_config.max_pages_per_seq;
-  if (cache_batch_capacity < args.batch_size) {
-    return cudaErrorInvalidValue;
-  }
-  // Sliding prefill keeps only the live tail, which can straddle an extra page.
-  const int32_t first_cached_pos =
-      (!global && args.seq_len > GEMMA4_SLIDING_WINDOW)
-          ? args.seq_len - GEMMA4_SLIDING_WINDOW
-          : 0;
-  const int32_t required_cache_pages =
-      (args.seq_len - 1) / args.cache_config.page_size -
-      first_cached_pos / args.cache_config.page_size + 1;
-  if (required_cache_pages > args.cache_config.max_pages_per_seq) {
-    return cudaErrorInvalidValue;
-  }
+  const PrefillAttentionShape shape = prefill_attention_shape(global);
+  const int32_t cache_layer = gemma4_kv_cache_layer_index(layer, global);
+  const float softmax_scale = 1.0f / sqrtf(float(head_dim));
+  Gemma4KvCacheConfig cache_config =
+      global ? runtime->global_cache_config : runtime->sliding_cache_config;
+  __nv_bfloat16 *cache_k =
+      global ? runtime->global_cache_k : runtime->sliding_cache_k;
+  __nv_bfloat16 *cache_v =
+      global ? runtime->global_cache_v : runtime->sliding_cache_v;
+  const int32_t *page_table =
+      global ? runtime->global_page_table : runtime->sliding_page_table;
+  const float *cos = global ? runtime->global_cos : runtime->sliding_cos;
+  const float *sin = global ? runtime->global_sin : runtime->sliding_sin;
 
-  const int32_t cache_layer =
-      gemma4_kv_cache_layer_index(args.layer_index, global);
-
-  cudaError_t status = gemma4_rmsnorm_bf16(
-      scratch.hidden_work, args.hidden, weights->input_norm_weight, rows,
-      GEMMA4_HIDDEN_SIZE, args.eps, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  status = gemma4_prefill_gemm_bf16(
-      scratch.hidden_work, weights->q_proj_col_major, scratch.q, rows,
-      GEMMA4_HIDDEN_SIZE, shape.q_width, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  status = gemma4_prefill_gemm_bf16(
-      scratch.hidden_work, weights->k_proj_col_major, scratch.k, rows,
-      GEMMA4_HIDDEN_SIZE, shape.kv_width, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_rmsnorm_bf16(
+      scratch.hidden_work, hidden, weights.input_norm_weight, rows,
+      GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_NORM_EPS, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_prefill_gemm_bf16(
+      scratch.hidden_work, weights.q_proj_col_major, scratch.q, rows,
+      GEMMA4_HIDDEN_SIZE, shape.q_width, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_prefill_gemm_bf16(
+      scratch.hidden_work, weights.k_proj_col_major, scratch.k, rows,
+      GEMMA4_HIDDEN_SIZE, shape.kv_width, stream));
 
   if (!global) {
-    status = gemma4_prefill_gemm_bf16(
-        scratch.hidden_work, weights->v_proj_col_major, scratch.v, rows,
-        GEMMA4_HIDDEN_SIZE, shape.kv_width, args.stream);
-    if (status != cudaSuccess) {
-      return status;
-    }
-
-    status = gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
+    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_prefill_gemm_bf16(
+        scratch.hidden_work, weights.v_proj_col_major, scratch.v, rows,
+        GEMMA4_HIDDEN_SIZE, shape.kv_width, stream));
+    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
         scratch.attention_out, nullptr, scratch.q_prepared,
         scratch.k_prepared, scratch.v_prepared, scratch.q, scratch.k,
-        scratch.v, weights->q_norm_weight, weights->k_norm_weight, args.cos,
-        args.sin, args.token_position, args.batch_size, args.seq_len, args.seq_len,
-        shape.window_size, args.softmax_scale, args.stream);
+        scratch.v, weights.q_norm_weight, weights.k_norm_weight, cos, sin,
+        runtime->token_position, batch_size, seq_len, seq_len,
+        shape.window_size, softmax_scale, stream));
   } else {
-    status = gemma4_flash_attention_global_fwd_bf16_norm_rope(
+    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_flash_attention_global_fwd_bf16_norm_rope(
         scratch.attention_out, nullptr, scratch.q_prepared,
         scratch.k_prepared, scratch.v_prepared, scratch.q, scratch.k,
-        weights->q_norm_weight, weights->k_norm_weight, args.cos, args.sin,
-        args.token_position, args.batch_size, args.seq_len, args.seq_len,
-        args.softmax_scale, args.stream);
-  }
-  if (status != cudaSuccess) {
-    return status;
+        weights.q_norm_weight, weights.k_norm_weight, cos, sin,
+        runtime->token_position, batch_size, seq_len, seq_len,
+        softmax_scale, stream));
   }
 
-  if (global || args.seq_len <= GEMMA4_SLIDING_WINDOW) {
-    status = gemma4_kv_cache_write_bf16(
-        args.cache_k, args.cache_v, args.cache_config, args.page_table,
-        args.token_batch, args.token_position, rows, cache_layer,
-        scratch.k_prepared, scratch.v_prepared, args.stream);
-    if (status != cudaSuccess) {
-      return status;
-    }
+  if (global || seq_len <= GEMMA4_SLIDING_WINDOW) {
+    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_kv_cache_write_bf16(
+        cache_k, cache_v, cache_config, page_table, runtime->token_batch,
+        runtime->token_position, rows, cache_layer, scratch.k_prepared,
+        scratch.v_prepared, stream));
   } else {
-    // Sliding layers keep only the live tail of each batch in the ring cache.
-    const int32_t first_live_seq = args.seq_len - GEMMA4_SLIDING_WINDOW;
-    for (int32_t batch = 0; batch < args.batch_size; ++batch) {
-      const int32_t row_offset = batch * args.seq_len + first_live_seq;
+    // Long sliding prefill writes only the live ring-cache tail.
+    const int32_t first_live_seq = seq_len - GEMMA4_SLIDING_WINDOW;
+    for (int32_t batch = 0; batch < batch_size; ++batch) {
+      const int32_t row_offset = batch * seq_len + first_live_seq;
       const int64_t source_offset = int64_t(row_offset) * shape.kv_width;
-      status = gemma4_kv_cache_write_bf16(
-          args.cache_k, args.cache_v, args.cache_config, args.page_table,
-          args.token_batch + row_offset, args.token_position + row_offset,
-          GEMMA4_SLIDING_WINDOW, cache_layer,
-          scratch.k_prepared + source_offset, scratch.v_prepared + source_offset,
-          args.stream);
-      if (status != cudaSuccess) {
-        return status;
-      }
+      GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_kv_cache_write_bf16(
+          cache_k, cache_v, cache_config, page_table,
+          runtime->token_batch + row_offset,
+          runtime->token_position + row_offset, GEMMA4_SLIDING_WINDOW,
+          cache_layer, scratch.k_prepared + source_offset,
+          scratch.v_prepared + source_offset, stream));
     }
   }
 
-  status = gemma4_prefill_gemm_bf16(
-      scratch.attention_out, weights->o_proj_col_major,
-      scratch.hidden_delta, rows, shape.attention_width, GEMMA4_HIDDEN_SIZE,
-      args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  status = gemma4_rmsnorm_bf16(
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_prefill_gemm_bf16(
+      scratch.attention_out, weights.o_proj_col_major, scratch.hidden_delta,
+      rows, shape.attention_width, GEMMA4_HIDDEN_SIZE, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_rmsnorm_bf16(
       scratch.hidden_work, scratch.hidden_delta,
-      weights->post_attention_norm_weight, rows, GEMMA4_HIDDEN_SIZE,
-      args.eps, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  status = gemma4_residual_add_bf16(
-      scratch.post_attention_residual, args.hidden, scratch.hidden_work,
-      rows * GEMMA4_HIDDEN_SIZE, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  status = gemma4_rmsnorm_bf16(
+      weights.post_attention_norm_weight, rows, GEMMA4_HIDDEN_SIZE,
+      GEMMA4_RMS_NORM_EPS, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_residual_add_bf16(
+      scratch.post_attention_residual, hidden, scratch.hidden_work,
+      rows * GEMMA4_HIDDEN_SIZE, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_rmsnorm_bf16(
       scratch.pre_ffn_normed, scratch.post_attention_residual,
-      weights->pre_feedforward_norm_weight, rows, GEMMA4_HIDDEN_SIZE,
-      args.eps, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  status = gemma4_ffn_prefill_mlp_bf16(
-      scratch.hidden_delta, scratch.pre_ffn_normed,
-      weights->ffn_gate_up_decode, weights->ffn_down_decode, scratch.ffn,
-      rows, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  status = gemma4_rmsnorm_bf16(
+      weights.pre_feedforward_norm_weight, rows, GEMMA4_HIDDEN_SIZE,
+      GEMMA4_RMS_NORM_EPS, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_ffn_prefill_mlp_bf16(
+      scratch.hidden_delta, scratch.pre_ffn_normed, weights.ffn_gate_up_decode,
+      weights.ffn_down_decode, scratch.ffn, rows, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_rmsnorm_bf16(
       scratch.hidden_work, scratch.hidden_delta,
-      weights->post_feedforward_norm_weight, rows, GEMMA4_HIDDEN_SIZE,
-      args.eps, args.stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
-
-  status = gemma4_residual_add_bf16(
+      weights.post_feedforward_norm_weight, rows, GEMMA4_HIDDEN_SIZE,
+      GEMMA4_RMS_NORM_EPS, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_residual_add_bf16(
       scratch.hidden_delta, scratch.post_attention_residual,
-      scratch.hidden_work, rows * GEMMA4_HIDDEN_SIZE, args.stream);
-  if (status != cudaSuccess) {
-    return status;
+      scratch.hidden_work, rows * GEMMA4_HIDDEN_SIZE, stream));
+
+  const int packs = rows * GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+  const dim3 grid_dim((packs + kScaleThreads - 1) / kScaleThreads);
+  const dim3 block_dim(kScaleThreads);
+  scale_hidden_bf16_kernel<<<grid_dim, block_dim, 0, stream>>>(
+      out, scratch.hidden_delta, weights.layer_scalar, packs);
+  return cudaGetLastError();
+}
+
+}  // namespace
+
+// Returns caller-owned BF16 scratch elements needed by the full prefill path.
+size_t gemma4_prefill_megakernel_scratch_elements(int32_t rows) {
+  const size_t sliding = prefill_layer_scratch_elements(false, rows);
+  const size_t global = prefill_layer_scratch_elements(true, rows);
+  return sliding > global ? sliding : global;
+}
+
+// Runs all 48 prefill layers over caller-provided prompt embeddings.
+cudaError_t gemma4_prefill_megakernel(const Gemma4PrefillMegakernelArgs &args) {
+  if (args.hidden_a == nullptr || args.hidden_b == nullptr ||
+      args.scratch == nullptr || args.weights == nullptr ||
+      args.runtime == nullptr || args.seq_len <= 0) {
+    return cudaErrorInvalidValue;
   }
 
-  const int scale_packs =
-      rows * GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-  const int scale_grid = cute::ceil_div(scale_packs, kScaleThreads);
-  scale_hidden_bf16_kernel<<<scale_grid, kScaleThreads, 0, args.stream>>>(
-      args.out, scratch.hidden_delta, weights->layer_scalar, scale_packs);
-  return cudaGetLastError();
+  const int64_t rows64 = int64_t(args.runtime->batch_size) * args.seq_len;
+  if (rows64 <= 0 || rows64 > INT32_MAX) {
+    return cudaErrorInvalidValue;
+  }
+  const int32_t rows = static_cast<int32_t>(rows64);
+  if (args.scratch_elements < gemma4_prefill_megakernel_scratch_elements(rows)) {
+    return cudaErrorInvalidValue;
+  }
+
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_megakernel_prepare_runtime(
+      args.runtime, Gemma4MegakernelPrepMode::kPrefill, args.seq_len,
+      args.stream));
+
+  __nv_bfloat16 *hidden_in = args.hidden_a;
+  __nv_bfloat16 *hidden_out = args.hidden_b;
+  for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
+    const bool global = gemma4_is_global_layer(layer);
+    const PrefillScratch scratch =
+        prefill_scratch_from_buffer(args.scratch, global, rows);
+    GEMMA4_RETURN_IF_CUDA_ERROR(run_prefill_layer(
+        hidden_out, hidden_in, args.weights->layers[layer], args.runtime,
+        scratch, layer, rows, args.seq_len, args.stream));
+    std::swap(hidden_in, hidden_out);
+  }
+
+  if (args.final_hidden != nullptr) {
+    *args.final_hidden = hidden_in;
+  }
+  return cudaSuccess;
 }
