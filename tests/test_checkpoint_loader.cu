@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <initializer_list>
 #include <string>
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
@@ -59,10 +61,7 @@ int main(int argc, char **argv) {
 
   std::string error;
   Gemma4CheckpointHost checkpoint;
-  if (!gemma4_checkpoint_open_text_bf16(&checkpoint, path, &error)) {
-    fprintf(stderr, "checkpoint open failed: %s\n", error.c_str());
-    return 1;
-  }
+  gemma4_checkpoint_open_text_bf16(&checkpoint, path);
 
   if (checkpoint.layers[0].v_proj_col_major == nullptr ||
       checkpoint.layers[5].v_proj_col_major != nullptr) {
@@ -93,8 +92,21 @@ int main(int argc, char **argv) {
                       checkpoint.layers[0].down_proj_checkpoint[down_src],
                       "down transpose");
 
-  gemma4_text_weights_device_free(&weights);
-  gemma4_checkpoint_close(&checkpoint);
+  for (__nv_bfloat16 *ptr : {weights.token_embedding, weights.final_norm_weight}) cudaFree(ptr);
+  for (int layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
+    Gemma4TextLayerWeightsDevice &w = weights.layers[layer];
+    for (__nv_bfloat16 *ptr : {
+        w.input_norm_weight, w.post_attention_norm_weight,
+        w.pre_feedforward_norm_weight, w.post_feedforward_norm_weight,
+        w.layer_scalar, w.q_norm_weight, w.k_norm_weight, w.q_proj_col_major,
+        w.k_proj_col_major, w.v_proj_col_major, w.o_proj_col_major,
+        w.ffn_gate_up_decode, w.ffn_down_decode}) {
+      cudaFree(ptr);
+    }
+  }
+  weights = Gemma4TextWeightsDevice();
+  munmap(checkpoint.mapping, checkpoint.mapping_bytes);
+  checkpoint = Gemma4CheckpointHost();
   puts("checkpoint loader tests passed");
   return 0;
 }

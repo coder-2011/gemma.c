@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -73,7 +74,20 @@ struct WeightOwner {
   Gemma4TextWeightsDevice value = {};
 
   // Frees all weight allocations owned by the checkpoint loader.
-  ~WeightOwner() { gemma4_text_weights_device_free(&value); }
+  ~WeightOwner() {
+    for (__nv_bfloat16 *ptr : {value.token_embedding, value.final_norm_weight}) cudaFree(ptr);
+    for (int layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
+      Gemma4TextLayerWeightsDevice &w = value.layers[layer];
+      for (__nv_bfloat16 *ptr : {
+          w.input_norm_weight, w.post_attention_norm_weight,
+          w.pre_feedforward_norm_weight, w.post_feedforward_norm_weight,
+          w.layer_scalar, w.q_norm_weight, w.k_norm_weight, w.q_proj_col_major,
+          w.k_proj_col_major, w.v_proj_col_major, w.o_proj_col_major,
+          w.ffn_gate_up_decode, w.ffn_down_decode}) {
+        cudaFree(ptr);
+      }
+    }
+  }
 };
 
 // Releases runtime KV/cache metadata when leaving the prompt runner.
@@ -228,7 +242,7 @@ cudaError_t run_prefill_layers(
   __nv_bfloat16 *hidden_out = hidden_b;
   for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
     const bool global = gemma4_is_global_layer(layer);
-    Gemma4PrefillMegakernelLayerScratch scratch =
+    const Gemma4PrefillMegakernelLayerScratch scratch =
         gemma4_prefill_megakernel_layer_scratch_from_buffer(
             scratch_buffer, global, seq_len);
 
@@ -391,7 +405,7 @@ cudaError_t run_decode_step(
   __nv_bfloat16 *hidden_in = decode_hidden_a;
   __nv_bfloat16 *hidden_out = decode_hidden_b;
   for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
-    Gemma4DecodeMegakernelFfnTailArgs args = make_decode_args(
+    const Gemma4DecodeMegakernelFfnTailArgs args = make_decode_args(
         weights, runtime, layer, hidden_in, hidden_out, normed,
         sampled_hidden, next_token, attention_q, attention_out, partial_m,
         partial_l, partial_acc, split_size, sliding_splits, global_splits);
@@ -540,11 +554,13 @@ int run_prompt(const PromptOptions &options) {
       static_cast<size_t>(GEMMA4_NUM_QUERY_HEADS) * max_splits *
       GEMMA4_GLOBAL_HEAD_DIM);
   if (status != cudaSuccess) return fail_cuda(status, "alloc partial acc");
-  status = d_spine_scratch.allocate(
-      gemma4_decode_megakernel_spine_scratch_bytes());
+  const size_t spine_scratch_bytes =
+      gemma4_decode_megakernel_spine_scratch_bytes();
+  const size_t decode_scratch_bytes =
+      gemma4_decode_megakernel_ffn_tail_scratch_bytes();
+  status = d_spine_scratch.allocate(spine_scratch_bytes);
   if (status != cudaSuccess) return fail_cuda(status, "alloc spine scratch");
-  status = d_decode_scratch.allocate(
-      gemma4_decode_megakernel_ffn_tail_scratch_bytes());
+  status = d_decode_scratch.allocate(decode_scratch_bytes);
   if (status != cudaSuccess) return fail_cuda(status, "alloc decode scratch");
 
   status = cudaMemcpyAsync(
@@ -574,8 +590,7 @@ int run_prompt(const PromptOptions &options) {
     }
     return sample_from_prefill(
         weights.value, prefill_final_row, prompt_len, d_decode_a.get(),
-        d_next_token.get(), d_spine_scratch.get(),
-        gemma4_decode_megakernel_spine_scratch_bytes(), 0);
+        d_next_token.get(), d_spine_scratch.get(), spine_scratch_bytes, 0);
   };
 
   if (options.benchmark) {
@@ -602,8 +617,7 @@ int run_prompt(const PromptOptions &options) {
           d_normed.get(), d_sampled.get(), d_next_token.get(),
           d_attention_q.get(), d_attention_out.get(), d_partial_m.get(),
           d_partial_l.get(), d_partial_acc.get(), d_decode_scratch.get(),
-          gemma4_decode_megakernel_ffn_tail_scratch_bytes(), split_size,
-          sliding_splits, global_splits, 0);
+          decode_scratch_bytes, split_size, sliding_splits, global_splits, 0);
     };
 
     PromptBenchmarkStats decode_stats;
@@ -645,8 +659,7 @@ int run_prompt(const PromptOptions &options) {
         d_normed.get(), d_sampled.get(), d_next_token.get(),
         d_attention_q.get(), d_attention_out.get(), d_partial_m.get(),
         d_partial_l.get(), d_partial_acc.get(), d_decode_scratch.get(),
-        gemma4_decode_megakernel_ffn_tail_scratch_bytes(), split_size,
-        sliding_splits, global_splits, 0);
+        decode_scratch_bytes, split_size, sliding_splits, global_splits, 0);
     if (status != cudaSuccess) {
       return fail_cuda(status, "decode step");
     }
