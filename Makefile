@@ -12,8 +12,9 @@ CUDNN_LIB ?= /usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib
 CUDNN_LIBS ?= -l:libcudnn.so.9
 CUDNN_LDFLAGS ?= -L$(CUDNN_LIB) -Xlinker -rpath -Xlinker $(CUDNN_LIB) $(CUDNN_LIBS)
 CUDNN_FRONTEND_INCLUDE ?= .venv/lib/python3.12/site-packages/include
-CUTLASS_INCLUDE ?= /tmp/cutlass/include
-CUTLASS_DUAL_GEMM_INCLUDE ?= /tmp/cutlass/examples/45_dual_gemm
+CUTLASS_ROOT ?= third_party/cutlass
+CUTLASS_INCLUDE ?= $(CUTLASS_ROOT)/include
+CUTLASS_DUAL_GEMM_INCLUDE ?= $(CUTLASS_ROOT)/examples/45_dual_gemm
 FFN_CUTLASS_CPPFLAGS ?= -I$(CUTLASS_INCLUDE) -I$(CUTLASS_DUAL_GEMM_INCLUDE) -I$(FLASH_ATTN_CUTLASS_INCLUDE)
 FFN_CUTLASS_NVCCFLAGS ?= --expt-relaxed-constexpr
 
