@@ -15768,6 +15768,12 @@ Follow-up correction:
 - The experimental V-cache global decode entry point remains isolated for
   benchmarking.
 
+Cleanup correction:
+
+- The experimental V-cache global decode entry point was later removed from the
+  live tree during the cleanup pass. The measured slower result and the template
+  regression made it useful as an experiment note only, not as parked API.
+
 ## 2026-06-27 - Decode Megakernel V-Cache Template Regression Fix
 
 Question:
