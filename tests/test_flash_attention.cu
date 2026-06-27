@@ -65,7 +65,7 @@ int64_t cache_elements(const Gemma4KvCacheConfig &config) {
 Gemma4KvCacheConfig single_page_cache_config(int heads,
                                              int head_dim,
                                              int window_size) {
-  return {1, 1, 1, 1, heads, head_dim, window_size};
+  return {1, 1, 1, 1, 1, heads, head_dim, window_size};
 }
 
 // Return the row-major packed-token offset used by CPU references.

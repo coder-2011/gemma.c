@@ -588,6 +588,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
       batch_size * decode_pages_per_seq,
       decode_page_size,
       decode_pages_per_seq,
+      batch_size,
       kKvHeads,
       kHeadDim,
       GEMMA4_SLIDING_WINDOW,
@@ -775,7 +776,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
         at::TensorOptions().device(at::kCUDA).dtype(at::kInt);
     const Gemma4KvCacheConfig project_config = {
         1, batch_size * decode_pages_per_seq, decode_page_size,
-        decode_pages_per_seq, kKvHeads, kHeadDim,
+        decode_pages_per_seq, batch_size, kKvHeads, kHeadDim,
         std::min(seq_len, GEMMA4_SLIDING_WINDOW)};
     at::Tensor project_x =
         at::randn({batch_size, GEMMA4_HIDDEN_SIZE}, torch_options);

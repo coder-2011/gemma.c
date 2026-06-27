@@ -8,12 +8,6 @@
 
 #include <math.h>
 
-enum Gemma4RmsnormMode {
-  kLearnedWeightRmsnorm = 0,
-  kScaleFreeRmsnorm = 1,
-  kResidualAddLearnedRmsnorm = 2,
-};
-
 struct Gemma4RmsnormRowArgs {
   __nv_bfloat16 *out = nullptr;
   __nv_bfloat16 *residual_out = nullptr;
@@ -24,7 +18,7 @@ struct Gemma4RmsnormRowArgs {
   int width = 0;
   int packs_per_row = 0;
   float eps = 0.0f;
-  Gemma4RmsnormMode mode = kLearnedWeightRmsnorm;
+  bool add_residual = false;
 };
 
 namespace {
@@ -43,7 +37,7 @@ __host__ __device__ inline Gemma4RmsnormRowArgs gemma4_rmsnorm_make_args(
     int rows,
     int width,
     float eps,
-    Gemma4RmsnormMode mode) {
+    bool add_residual) {
   Gemma4RmsnormRowArgs args = {};
   args.out = out;
   args.residual_out = residual_out;
@@ -54,7 +48,7 @@ __host__ __device__ inline Gemma4RmsnormRowArgs gemma4_rmsnorm_make_args(
   args.width = width;
   args.packs_per_row = width / (sizeof(Bf16Packed128) / sizeof(__nv_bfloat16));
   args.eps = eps;
-  args.mode = mode;
+  args.add_residual = add_residual;
   return args;
 }
 
@@ -77,7 +71,7 @@ __device__ void gemma4_rmsnorm_row_bf16(
     const int offset = row_layout(row, pack);
     Bf16Packed128 values =
         Bf16Packed128{*reinterpret_cast<const int4 *>(args.input + offset)};
-    if (args.mode == kResidualAddLearnedRmsnorm) {
+    if (args.add_residual) {
       const Bf16Packed128 residual = Bf16Packed128{
           *reinterpret_cast<const int4 *>(args.residual_in + offset)};
       values = gemma4_bf16_pack_add(values, residual);
@@ -113,14 +107,10 @@ __device__ void gemma4_rmsnorm_row_bf16(
   for (int pack = thread_idx; pack < args.packs_per_row; pack += thread_count) {
     const int offset = row_layout(row, pack);
     const Bf16Packed128 values = cached_row[pack];
-    Bf16Packed128 result;
-    if (args.mode == kScaleFreeRmsnorm) {
-      result = gemma4_bf16_pack_apply_scale(values, scale);
-    } else {
-      const Bf16Packed128 gamma = Bf16Packed128{
-          *reinterpret_cast<const int4 *>(args.weight + pack_layout(pack))};
-      result = gemma4_bf16_pack_apply_scale_weight(values, gamma, scale);
-    }
+    const Bf16Packed128 gamma = Bf16Packed128{
+        *reinterpret_cast<const int4 *>(args.weight + pack_layout(pack))};
+    const Bf16Packed128 result =
+        gemma4_bf16_pack_apply_scale_weight(values, gamma, scale);
     *reinterpret_cast<int4 *>(args.out + offset) = result.bits();
   }
 }
@@ -213,7 +203,7 @@ extern "C" __device__ void gemma4_rmsnorm_hidden_row_512_bf16_device(
     int thread_idx) {
   const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
       out, nullptr, in, nullptr, weight, 1, GEMMA4_HIDDEN_SIZE, eps,
-      kLearnedWeightRmsnorm);
+      false);
   gemma4_rmsnorm_row_bf16(
       args, 0, cached_row, warp_sums, *scale, thread_idx, kMaxRmsnormThreads);
 }
@@ -232,24 +222,7 @@ cudaError_t gemma4_rmsnorm_bf16(__nv_bfloat16 *out,
 
   const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
       out, nullptr, inp, nullptr, weight, rows, width, eps,
-      kLearnedWeightRmsnorm);
-  return gemma4_rmsnorm_launch_bf16(args, stream);
-}
-
-// Launches scale-free RMSNorm for row-major BF16 tensors.
-cudaError_t gemma4_rmsnorm_scale_free_bf16(__nv_bfloat16 *out,
-                                           const __nv_bfloat16 *inp,
-                                           int rows,
-                                           int width,
-                                           float eps,
-                                           cudaStream_t stream) {
-  if ((width % (sizeof(Bf16Packed128) / sizeof(__nv_bfloat16))) != 0) {
-    return cudaErrorInvalidValue;
-  }
-
-  const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
-      out, nullptr, inp, nullptr, nullptr, rows, width, eps,
-      kScaleFreeRmsnorm);
+      false);
   return gemma4_rmsnorm_launch_bf16(args, stream);
 }
 
@@ -287,6 +260,6 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16(__nv_bfloat16 *residual,
 
   const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
       normed, residual, inp1, inp2, weight, rows, width, eps,
-      kResidualAddLearnedRmsnorm);
+      true);
   return gemma4_rmsnorm_launch_bf16(args, stream);
 }

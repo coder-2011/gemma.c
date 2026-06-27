@@ -11,6 +11,7 @@ struct Gemma4KvCacheConfig {
   int32_t num_pages;
   int32_t page_size;
   int32_t max_pages_per_seq;
+  int32_t batch_size;
   int32_t num_heads;
   int32_t head_dim;
   int32_t window_size;
@@ -40,7 +41,6 @@ int32_t gemma4_kv_cache_ensure_page(
     std::vector<int32_t> &page_table,
     std::vector<int32_t> &slot_logical_pages,
     const Gemma4KvCacheConfig &config,
-    int32_t batch_size,
     int32_t batch,
     int32_t position);
 
@@ -48,7 +48,6 @@ int32_t gemma4_kv_cache_ensure_range(
     std::vector<int32_t> &page_table,
     std::vector<int32_t> &slot_logical_pages,
     const Gemma4KvCacheConfig &config,
-    int32_t batch_size,
     int32_t batch,
     int32_t first_position,
     int32_t token_count);

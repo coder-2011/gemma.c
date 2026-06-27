@@ -10,21 +10,24 @@ The current work is to implement kernels individually, assemble a correct unfuse
 
 ## Benchmark
 
-Single-user Gemma 4 12B prompt benchmark on an NVIDIA RTX A6000 (Jun 26):
+Single-user Gemma 4 12B BF16 prompt benchmark on an NVIDIA RTX A6000 (Jun 27).
+Each measured run used 391 closed-loop requests, one `Hello` prompt token, 256
+requested output tokens per request, `100,096` measured output tokens total,
+and max request concurrency `1`.
 
-| Runner | p50 TTFT | p50 TPOT | p50 decode TPS |
-| --- | ---: | ---: | ---: |
-| `gemma4_prompt` local | 38.469 ms | 73.707 ms | 13.567 tok/s |
-| vLLM serve, compiled, no CUDA graph | 422.551 ms | 181.401 ms | 5.513 tok/s |
+| Runner | p50 TTFT | p50 TPOT | Output TPS | Measured time |
+| --- | ---: | ---: | ---: | ---: |
+| vLLM serve | 85.414 ms | 38.191 ms | 26.057 tok/s | 3841.4 s |
+| SGLang serve | unsupported | unsupported | unsupported | unsupported |
+| `gemma4_prompt` local | 37.607 ms | 73.418 ms | 13.647 tok/s | 7334.9 s |
 
-The local runner is slightly faster than the previous Jun 25 run
-(`38.878 ms` TTFT, `75.120 ms` TPOT, `13.312 tok/s`). Today's vLLM serving
-baseline was slower after repeated warm passes; the first pass also emitted
-Triton JIT warnings during inference.
+SGLang 0.5.9 was installed and upgraded to Transformers 5.12.1 so it could
+parse `Gemma4UnifiedConfig`, but its generic Transformers backend failed during
+generation on Gemma 4 Unified's heterogeneous sliding/global KV shapes.
 
-![p50 TTFT benchmark](docs/benchmarks/ttft_p50_gemma4_vs_vllm.png)
+![p50 TTFT benchmark](docs/benchmarks/ttft_p50_gemma4_vllm_sglang_long.png)
 
-![p50 decode TPS benchmark](docs/benchmarks/tps_p50_gemma4_vs_vllm.png)
+![decode throughput benchmark](docs/benchmarks/tps_gemma4_vllm_sglang_long.png)
 
 
 My agents tell me they love working in this repo. It is built heavily w/ them in mind!

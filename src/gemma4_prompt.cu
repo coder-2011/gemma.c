@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -210,8 +211,8 @@ int run_prompt(const PromptOptions &options) {
   const bool benchmark_decode =
       options.benchmark_mode == PromptBenchmarkMode::kDecodeStep;
   const int32_t benchmark_decode_steps =
-      benchmark_decode ? options.bench_warmup +
-                             options.bench_samples * options.bench_iters
+      benchmark_decode ? options.bench_samples *
+                             (options.bench_warmup + options.bench_iters)
                        : 0;
   const int32_t max_seq_len =
       prompt_len + std::max(options.max_new_tokens, benchmark_decode_steps);
@@ -389,7 +390,8 @@ int run_prompt(const PromptOptions &options) {
       decode_stats = time_ms(
           checked_decode, 0, options.bench_warmup, options.bench_iters,
           options.bench_samples);
-    } catch (...) {
+    } catch (const std::exception &e) {
+      std::fprintf(stderr, "%s\n", e.what());
       return 1;
     }
     std::printf(

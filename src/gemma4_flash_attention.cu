@@ -22,6 +22,7 @@
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_megakernel.cuh"
 #include "gemma4_ffn.cuh"
+#include "gemma4_rmsnorm.cuh"
 #include "gemma4_rope.cuh"
 #include "gemma4.h"
 
@@ -33,16 +34,6 @@ cudaError_t gemma4_decode_megakernel_finish_layer_bf16(
     void *__restrict__ scratch,
     size_t scratch_bytes,
     cudaStream_t stream);
-
-extern "C" __device__ void gemma4_rmsnorm_hidden_row_512_bf16_device(
-    __nv_bfloat16 *__restrict__ out,
-    const __nv_bfloat16 *__restrict__ in,
-    const __nv_bfloat16 *__restrict__ weight,
-    float eps,
-    Bf16Packed128 *__restrict__ cached_row,
-    float *__restrict__ warp_sums,
-    float *__restrict__ scale,
-    int thread_idx);
 
 namespace gemma4_flash_attention {
 
@@ -1669,7 +1660,7 @@ bool gemma4_fa_valid_cache_config(
   return cache_layer >= 0 && cache_layer < config.num_layers &&
          config.num_pages > 0 && config.page_size > 0 &&
          config.max_pages_per_seq > 0 &&
-         config.num_pages % config.max_pages_per_seq == 0 &&
+         config.batch_size > 0 &&
          config.num_heads == Traits::kKvHeads &&
          config.head_dim == Traits::kHeadDim &&
          (Traits::kIsGlobal ? config.window_size == 0
@@ -1754,9 +1745,7 @@ cudaError_t prepare_decode_q_paged_kv_norm_rope(
       !gemma4_fa_valid_cache_config<Traits>(cache_config, cache_layer)) {
     return cudaErrorInvalidValue;
   }
-  const int32_t batch_capacity =
-      cache_config.num_pages / cache_config.max_pages_per_seq;
-  if (batch_size > batch_capacity) {
+  if (batch_size > cache_config.batch_size) {
     return cudaErrorInvalidValue;
   }
 
@@ -1804,9 +1793,7 @@ cudaError_t norm_project_prepare_decode_paged_kv_impl(
       !gemma4_fa_valid_cache_config<Traits>(cache_config, cache_layer)) {
     return cudaErrorInvalidValue;
   }
-  const int32_t batch_capacity =
-      cache_config.num_pages / cache_config.max_pages_per_seq;
-  if (batch_size > batch_capacity) {
+  if (batch_size > cache_config.batch_size) {
     return cudaErrorInvalidValue;
   }
 
@@ -2298,8 +2285,6 @@ bool valid_decode_paged_args(
           ? int64_t(cache_config.max_pages_per_seq) * cache_config.page_size
          : cache_config.window_size;
   const bool needs_partials = num_splits > 1;
-  const int32_t batch_capacity =
-      cache_config.num_pages / cache_config.max_pages_per_seq;
   return d_out != nullptr &&
          (!needs_partials ||
           (d_partial_m != nullptr && d_partial_l != nullptr &&
@@ -2307,7 +2292,7 @@ bool valid_decode_paged_args(
          d_q != nullptr && d_cache_k != nullptr && d_cache_v != nullptr &&
          d_page_table != nullptr && d_seq_lengths != nullptr &&
          batch_size > 0 && split_size > 0 && num_splits > 0 &&
-         batch_size <= batch_capacity &&
+         batch_size <= cache_config.batch_size &&
          split_capacity >= required_keys;
 }
 

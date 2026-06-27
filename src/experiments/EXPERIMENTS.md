@@ -15429,3 +15429,552 @@ Conclusion:
 - The remaining gap to the attached final design is architectural: replace the
   direct accumulator bridge with the CUTLASS B2B gated fragment iterator and
   schedule once that can be done without regressing the measured path.
+
+## 2026-06-27 - Corrected Decode-Step Benchmark Capacity
+
+Question:
+
+- Does the current direct no-activation-spill FFN path still benchmark cleanly
+  when the full prompt decode-step runner allocates enough KV/runtime capacity
+  for every per-sample warmup and timed iteration?
+
+Change:
+
+- Fixed the prompt decode-step benchmark capacity accounting from
+  `warmup + samples * iters` to `samples * (warmup + iters)`, matching the
+  `time_ms` helper's per-sample warmup behavior.
+- Made the decode-step benchmark catch print the thrown CUDA error before
+  returning failure.
+
+Commands:
+
+```bash
+make prompt
+make test-ffn-decode
+make test-decode-megakernel
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260627 \
+  ./build/benches/gemma4_ffn_libtorch_bench 100 20 3 1
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+git diff --check
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `0000:05:00`, driver `580.159.03`,
+  CUDA runtime `13000`.
+- FFN microbench: BF16, one decode row, seed `0x1352713`, warm repeated
+  buffers, `20` warmup iterations, `100` timed iterations, `3` trials,
+  CUDA-event timing on the benchmark stream.
+- Decode-step benchmark: local `models/gemma-4-12B-it` checkpoint, prompt
+  `Hello`, prompt length `1`, `5` warmup decode steps per sample, `10` timed
+  decode steps per sample, `5` samples. Setup and checkpoint load excluded.
+- Cache policy: warm repeated buffers for FFN; stateful repeated decode for
+  prompt bench. Clocks were not locked.
+
+Results:
+
+```text
+Correctness:
+  test_ffn_decode passed
+  test_decode_megakernel passed
+  git diff --check clean
+  custom_decode_normed_vs_libtorch max_abs=0.000488281
+  custom_decode_residual_vs_libtorch max_abs=0.000976562
+
+FFN microbench:
+  custom_fused_decode_events best_ms=0.503521 avg_ms=0.503528
+  custom_fused_decode_wall best_ms=0.503473 avg_ms=0.503485
+  tier2_decode_full best_ms=0.525906 avg_ms=0.526008
+  libtorch_full_ffn best_ms=0.526582 avg_ms=0.526606
+
+Full decode-step:
+  decode_step_ms n=5 mean_ms=72.289 p50_ms=72.400
+  p95_ms=72.493 p99_ms=72.504 min_ms=71.718 max_ms=72.507
+  decode_step_tps_p50=13.812
+```
+
+Conclusion:
+
+- The corrected decode-step harness runs the full megakernel path without
+  exhausting runtime sequence capacity.
+- Current custom FFN decode is about `1.0458x` faster than libtorch full FFN
+  and about `1.0447x` faster than `tier2_decode_full` in the warm-cache
+  microbench.
+- Full decode-step remains essentially unchanged versus the previous successful
+  direct-path run: `72.400 ms` p50 now versus `72.414 ms` p50 before.
+
+## 2026-06-27 - Decode Scratch No-Spill Cleanup
+
+Question:
+
+- Can the main decode FFN scratch stop reserving obsolete activation/down
+  buffers now that the decode path accumulates the MLP row directly?
+
+Change:
+
+- Removed the stale `act[15360]` and `down[3840]` BF16 arrays from
+  `Gemma4FfnDecodeScratch`.
+- Left the direct accumulator path unchanged; decode scratch now only contains
+  the float final-row accumulator used by the current no-activation-spill path.
+
+Commands:
+
+```bash
+make test-ffn-decode
+make test-decode-megakernel
+make ffn-libtorch-bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260627 \
+  ./build/benches/gemma4_ffn_libtorch_bench 100 20 3 1
+make prompt
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+git diff --check
+```
+
+Results:
+
+```text
+Correctness:
+  test_ffn_decode passed
+  test_decode_megakernel passed
+  prompt decode-step path completed
+  custom_decode_normed_vs_libtorch max_abs=0.000488281
+  custom_decode_residual_vs_libtorch max_abs=0.000976562
+
+FFN microbench:
+  custom_fused_decode_events best_ms=0.503583 avg_ms=0.503613
+  custom_fused_decode_wall best_ms=0.503532 avg_ms=0.503553
+  tier2_decode_full best_ms=0.526008 avg_ms=0.526189
+  libtorch_full_ffn best_ms=0.525691 avg_ms=0.525933
+
+Full decode-step:
+  decode_step_ms n=5 mean_ms=72.281 p50_ms=72.416
+  p95_ms=72.421 p99_ms=72.421 min_ms=71.742 max_ms=72.422
+  decode_step_tps_p50=13.809
+```
+
+Conclusion:
+
+- The decode scratch shrink preserves correctness and full-path execution.
+- FFN timing is unchanged within noise; the cleanup is architectural, not a
+  speed win.
+- The current path is still the direct/Tier-3-style no-activation-spill path,
+  not the final CUTLASS `GatedFragmentIteratorA1` B2B schedule.
+
+## 2026-06-27 - Gated B2B FFN Plan Check
+
+Question:
+
+- Is the attached gated B2B plan the right target for eliminating FFN
+  activation HBM traffic?
+- Does the current WMMA proof-of-concept deserve promotion into the hot decode
+  path?
+
+Change:
+
+- Added an opt-in WMMA gated-B2B decode prototype and benchmark hook behind
+  `GEMMA4_FFN_BENCH_WMMA_B2B=1`.
+- Left the production decode FFN path unchanged because the prototype is
+  correct but far too slow.
+
+Commands:
+
+```bash
+make test-ffn-decode
+make ffn-libtorch-bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260627 \
+  ./build/benches/gemma4_ffn_libtorch_bench 100 20 3 1
+GEMMA4_FFN_BENCH_WMMA_B2B=1 GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260627 \
+  ./build/benches/gemma4_ffn_libtorch_bench 1 0 1 1
+make test-decode-megakernel
+make prompt
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+```
+
+Results:
+
+```text
+Correctness:
+  test_ffn_decode passed
+  test_decode_megakernel passed
+  wmma_b2b_decode_normed_vs_libtorch max_abs=0.000976562
+  wmma_b2b_decode_residual_vs_libtorch max_abs=0.000976562
+
+Default FFN microbench:
+  custom_fused_decode_events best_ms=0.503593 avg_ms=0.503631
+  custom_fused_decode_wall best_ms=0.503745 avg_ms=0.503756
+  tier2_decode_full best_ms=0.529930 avg_ms=0.530012
+  libtorch_full_ffn best_ms=0.526961 avg_ms=0.527046
+
+Opt-in WMMA B2B prototype:
+  wmma_b2b_decode_full best_ms=180.686844 avg_ms=180.686844
+
+Full decode-step:
+  decode_step_ms n=5 mean_ms=72.780 p50_ms=72.919
+  p95_ms=72.925 p99_ms=72.926 min_ms=72.227 max_ms=72.927
+  decode_step_tps_p50=13.714
+```
+
+Conclusion:
+
+- The attached plan is the right target: compute gate/up, apply GeGLU, and feed
+  the down GEMM without writing the `[1, 30720]` temporary or `[1, 15360]`
+  activation to HBM.
+- The current production path already avoids the large activation HBM spill via
+  direct accumulation, but it is not the final CUTLASS B2B fragment-iterator
+  schedule.
+- The WMMA prototype proves the math but is not promotable. Its naive schedule
+  uses too little tensor-core parallelism and too much recomputation, so the
+  next useful implementation step is a real CUTLASS B2B fork with a gated
+  `FragmentIteratorA1` where `GEMM0_N_tile == 2 * GEMM1_K_tile`.
+
+## 2026-06-27 - FFN Slow-Path Cleanup
+
+Question:
+
+- Can the live FFN code drop old slower paths and stale benchmark plumbing
+  while preserving the current direct no-activation-spill decode path?
+
+Change:
+
+- Deleted the non-promotable WMMA gated-B2B prototype API and benchmark/test
+  hooks.
+- Deleted `src/gemma4_ffn_tier2.cu` and `src/gemma4_ffn_tier2.cuh`.
+- Replaced `gemma4_ffn_libtorch_bench` with a current-path-only benchmark:
+  libtorch full FFN reference versus `gemma4_ffn_decode_fused_bf16`.
+- Removed the test-only `gemma4_ffn_bf16` wrapper and its private prefill
+  RMSNorm/residual kernel. The test now exercises the explicit production
+  prefill sequence: FFN MLP, RMSNorm, residual add.
+
+Commands:
+
+```bash
+make test-ffn-decode ffn-libtorch-bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260627 \
+  ./build/benches/gemma4_ffn_libtorch_bench 100 20 3
+make test-decode-megakernel
+git diff --check
+```
+
+Results:
+
+```text
+Correctness:
+  test_ffn_decode passed
+  test_decode_megakernel passed
+
+FFN microbench:
+  libtorch_full_ffn best_ms=0.528302 avg_ms=0.528411
+  custom_fused_decode best_ms=0.503716 avg_ms=0.503859
+  custom_decode_normed_vs_libtorch max_abs=0.000488281
+  custom_decode_residual_vs_libtorch max_abs=0.000976562
+  custom_decode_vs_libtorch_full_speedup=1.048810x
+
+Cleanup size:
+  src/gemma4_ffn.cu: 1075 lines before cleanup, 754 after
+  live FFN cleanup diff: 607 deletions, 130 insertions
+```
+
+Follow-up:
+
+- The prompt decode-step benchmark currently fails in the unrelated dirty
+  flash-attention/runtime path with an illegal memory access during the first
+  decode warmup. The standalone megakernel API smoke test still passes, but
+  that prompt-level failure must be fixed before using full decode-step timing
+  as completion evidence.
+
+## 2026-06-27 - Lazy Global Pages and V-Cache Global Decode Check
+
+Question:
+
+- Can the runtime avoid allocating full max-context global KV storage upfront?
+- Is reconstructing global K from the cached normalized source numerically sane,
+  and what is the first decode-timing signal?
+
+Change:
+
+- Runtime global cache storage now starts at zero physical pages and grows to
+  the pages reached by prefill/decode metadata.
+- Added an experimental global decode entry point that reads only cached
+  scale-free V/source and reconstructs K with `k_norm_weight` plus p-RoPE inside
+  the attention loop.
+- Left the production global decode/runtime path on stored K/V until the
+  one-cache path has stronger benchmark coverage.
+
+Commands:
+
+```bash
+make test-runtime-state
+make test-kv-cache
+make test-flash-attention-cpp
+make flash-attn-bench
+./build/benches/gemma4_flash_attention_bench 1024 3 1 2 1 0 warm 64
+```
+
+Results:
+
+```text
+Correctness:
+  runtime state tests passed
+  kv cache tests passed
+  flash attention tests passed
+
+Benchmark environment:
+  GPU: NVIDIA RTX A6000, sm_86, CUDA runtime 13.0, driver 580.159.03
+  Timing: CUDA events on the benchmark stream, warm cache
+  Warmup: 1
+  Iters/sample: 3
+  Samples: 2
+  Seq: 1024
+  Batch: 1
+
+Global decode:
+  global_decode_stored_kv median_ms=5.150037 min_ms=5.145600 max_ms=5.154475
+  global_decode_vcache_reconstruct median_ms=5.243733 min_ms=5.242198 max_ms=5.245269
+```
+
+Conclusion:
+
+- Lazy global physical pages are correct in the focused runtime tests and avoid
+  reserving max-context global cache storage during runtime initialization.
+- The V-cache reconstruction path is numerically covered against a CPU reference
+  for the proposed BF16-cached-source semantics.
+- In this quick warm-cache check, reconstructing K is about 2% slower than
+  reading stored global K/V at seq 1024, despite halving global cache storage.
+  Keep it experimental until longer-context and cold-cache runs show whether the
+  bandwidth savings overcome the extra reconstruction math.
+
+Follow-up correction:
+
+- The lazy global physical-page change was backed out of the production runtime
+  path after the full prompt decode-step runner exposed an illegal memory
+  access. The existing cache offset math uses `num_pages` as the per-layer
+  stride, so physical allocation cannot shrink independently without a real
+  layout change.
+- The experimental V-cache global decode entry point remains isolated for
+  benchmarking.
+
+## 2026-06-27 - Decode Megakernel V-Cache Template Regression Fix
+
+Question:
+
+- Why did the full prompt decode-step benchmark fault even though the focused
+  runtime, KV-cache, flash-attention, and decode-megakernel tests passed?
+
+Change:
+
+- Fixed the cooperative decode megakernel call to
+  `phase_decode_paged_grouped_split` after the experimental V-cache path added
+  a new boolean template parameter. The megakernel now passes
+  `false, kDecodeMegaThreads` explicitly instead of accidentally treating
+  `kDecodeMegaThreads` as `ReconstructGlobalK=true`.
+- Updated the Python flash-attention ctypes `Gemma4KvCacheConfig` mirror for
+  the new `batch_size` field.
+- Restored the production runtime to capacity-sized global KV allocation. The
+  lazy physical-page experiment needs a different cache layout before it can be
+  safe in the full path.
+
+Commands:
+
+```bash
+make test-runtime-state test-kv-cache test-flash-attention-cpp test-decode-megakernel prompt
+make test-flash-attention-pytorch
+compute-sanitizer --tool memcheck --print-limit 5 \
+  ./build/gemma4_prompt \
+    --checkpoint models/gemma-4-12B-it/model.safetensors \
+    --tokenizer models/gemma-4-12B-it/tokenizer.json \
+    --benchmark-mode decode-step \
+    --bench-warmup 0 --bench-iters 1 --bench-samples 1 \
+    --prompt Hello
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+```
+
+Results:
+
+```text
+Correctness:
+  runtime state tests passed
+  kv cache tests passed
+  flash attention tests passed
+  test_decode_megakernel passed
+  flash attention PyTorch decode parity passed
+  compute-sanitizer ERROR SUMMARY: 0 errors
+
+Full decode-step:
+  decode_step_ms n=5 mean_ms=72.263 p50_ms=72.388
+  p95_ms=72.407 p99_ms=72.410 min_ms=71.744 max_ms=72.411
+  decode_step_tps_p50=13.814
+```
+
+Conclusion:
+
+- The illegal access was a template-argument regression from the V-cache
+  experiment, not a math issue in the attention kernel.
+- The current branch has a clean repeatable main decode-step baseline again:
+  `72.388 ms` p50, or `13.814 tok/s`, for the local one-token prompt
+  decode-step benchmark.
+
+## 2026-06-27 - Long Single-User Serving Benchmark vs vLLM and SGLang Setup
+
+Question:
+
+- What is the current long closed-loop single-user benchmark result for the
+  local runner against `vllm bench serve`, and can SGLang run the same Gemma 4
+  Unified checkpoint on this host?
+
+Setup:
+
+- Installed SGLang `0.5.9` in `/tmp/sglang-bench-venv`.
+- Upgraded only that venv's Transformers package from `4.57.1` to `5.12.1`
+  after the first SGLang launch failed to recognize `model_type:
+  gemma4_unified`.
+- Reused the existing vLLM `0.23.0` environment in `/tmp/vllm-bench-venv`.
+
+Commands:
+
+```bash
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode warm-serving \
+  --bench-warmup 3 --bench-iters 391 --bench-samples 1 \
+  --max-new 256 --prompt Hello \
+  | tee build/bench_results/gemma4_prompt_warm_hello_out256_c1_391req_20260627.txt
+
+PATH=/tmp/vllm-bench-venv/bin:$PATH /tmp/vllm-bench-venv/bin/vllm serve \
+  models/gemma-4-12B-it \
+  --host 127.0.0.1 --port 8000 \
+  --served-model-name gemma4-local \
+  --dtype bfloat16 \
+  --max-model-len 512 \
+  --gpu-memory-utilization 0.90 \
+  --tensor-parallel-size 1 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 4096 \
+  --no-enable-log-requests \
+  --trust-remote-code
+
+PATH=/tmp/vllm-bench-venv/bin:$PATH /tmp/vllm-bench-venv/bin/vllm bench serve \
+  --backend openai \
+  --base-url http://127.0.0.1:8000 \
+  --endpoint /v1/completions \
+  --model gemma4-local \
+  --tokenizer models/gemma-4-12B-it \
+  --trust-remote-code \
+  --dataset-name custom \
+  --dataset-path build/bench_results/hello_prompt_out256_391x.jsonl \
+  --skip-chat-template \
+  --output-len 256 \
+  --num-warmups 5 \
+  --num-prompts 391 \
+  --request-rate inf \
+  --max-concurrency 1 \
+  --ignore-eos \
+  --temperature 0.0 \
+  --top-p 1.0 \
+  --percentile-metrics ttft,tpot,itl,e2el \
+  --metric-percentiles 50,90,95,99 \
+  --save-result \
+  --result-dir build/bench_results \
+  --result-filename vllm_gemma4_12b_it_online_hello_1in_256out_391_20260627.json \
+  --disable-tqdm
+
+PATH=/tmp/sglang-bench-venv/bin:$PATH /tmp/sglang-bench-venv/bin/python \
+  -m sglang.launch_server \
+  --model-path models/gemma-4-12B-it \
+  --host 127.0.0.1 --port 30000 \
+  --served-model-name gemma4-local \
+  --dtype bfloat16 \
+  --context-length 128 \
+  --mem-fraction-static 0.80 \
+  --max-running-requests 1 \
+  --max-total-tokens 4096 \
+  --trust-remote-code \
+  --attention-backend torch_native \
+  --disable-cuda-graph \
+  --log-level info
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.159.03`, power limit `300 W`.
+- Local runner: in-process host wall-clock `warm-serving` timing; model load,
+  CUDA context, and allocation excluded.
+- vLLM: HTTP `/v1/completions` serving path; server startup, model load,
+  `torch.compile`, CUDA graph capture, and benchmark warmups excluded.
+- Shape: prompt `Hello`, prompt length `1`, output length `256`, measured
+  requests `391`, measured output tokens `100,096`, closed-loop single user
+  with requested max concurrency `1`.
+- Clock policy: clocks were not locked.
+- vLLM caveat: `vllm bench serve` reported `Maximum request concurrency: 1`
+  but `Peak concurrent requests: 2.00`; server logs showed one running request
+  and no queue through the sampled run. One Triton JIT warning for
+  `_compute_slot_mapping_kernel` appeared during warmup/initial traffic.
+
+Results:
+
+```text
+gemma4_prompt local:
+  benchmark_duration_ms=7334893.000
+  total_output_tokens=100096
+  output_token_throughput=13.647 tok/s
+  p50 TTFT=37.607 ms
+  p50 TPOT=73.418 ms
+  p50 E2E=18759.113 ms
+  p50 per_user_tps=13.621
+
+vLLM serve:
+  benchmark_duration_s=3841.36
+  total_output_tokens=100096
+  output_token_throughput=26.057 tok/s
+  p50 TTFT=85.414 ms
+  p50 TPOT=38.191 ms
+  p50 E2E=9823.893 ms
+```
+
+SGLang outcome:
+
+- SGLang `0.5.9` plus Transformers `5.12.1` could parse
+  `Gemma4UnifiedConfig`, load weights, and start its server.
+- Generation failed in the generic Transformers wrapper:
+  `RuntimeError: shape '[-1, 8, 256]' is invalid for input of size 9216`.
+- The failure is consistent with SGLang's generic `RadixAttention` wrapper
+  assuming homogeneous KV geometry, while Gemma 4 Unified alternates sliding
+  layers and global layers with different KV/head shapes.
+- SGLang is therefore recorded as unsupported for this exact checkpoint/version
+  instead of charting a fake number.
+
+Artifacts:
+
+- `build/bench_results/gemma4_prompt_warm_hello_out256_c1_391req_20260627.txt`
+- `build/bench_results/hello_prompt_out256_391x.jsonl`
+- `build/bench_results/vllm_gemma4_12b_it_online_hello_1in_256out_391_20260627.json`
+- `build/bench_results/gemma4_vllm_sglang_long_summary_20260627.json`
+- `docs/benchmarks/ttft_p50_gemma4_vllm_sglang_long.png`
+- `docs/benchmarks/tps_gemma4_vllm_sglang_long.png`
+
+Conclusion:
+
+- The local runner wins TTFT on this long single-user benchmark, but vLLM
+  produces tokens about `1.91x` faster end-to-end (`26.057 / 13.647`).
+- The README now reports the long closed-loop comparison rather than the old
+  short 16-token comparison.

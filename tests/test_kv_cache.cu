@@ -94,7 +94,7 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
 
 // Exercise out-of-range batch rows for the vector writer.
 void run_invalid_page_write_case() {
-  Gemma4KvCacheConfig config = {1, 2, 4, 2, 2, 16, 0};
+  Gemma4KvCacheConfig config = {1, 2, 4, 2, 1, 2, 16, 0};
   std::vector<int32_t> page_table(config.max_pages_per_seq, -1);
   std::vector<int32_t> token_batch = {1};
   std::vector<int32_t> token_position = {0};

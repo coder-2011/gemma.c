@@ -30,6 +30,7 @@ void copy_i32(std::vector<int32_t> &dst, const int32_t *src) {
 void run_prefill_decode_metadata_case() {
   Gemma4RuntimeState state = {};
   CHECK_CUDA(gemma4_runtime_state_init(&state, 2, 66, 64, 0));
+
   CHECK_CUDA(gemma4_runtime_prepare_prefill(&state, 65, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -49,10 +50,12 @@ void run_prefill_decode_metadata_case() {
     std::fprintf(stderr, "prefill token rows are not batch-major\n");
     std::exit(1);
   }
+  const int32_t sliding_stride = state.sliding_cache_config.max_pages_per_seq;
+  const int32_t global_stride = state.global_cache_config.max_pages_per_seq;
   if (state.h_sliding_page_table[0] < 0 ||
-      state.h_sliding_page_table[1] < 0 ||
+      state.h_sliding_page_table[sliding_stride] < 0 ||
       state.h_global_page_table[0] < 0 ||
-      state.h_global_page_table[1] < 0) {
+      state.h_global_page_table[global_stride] < 0) {
     std::fprintf(stderr, "prefill did not allocate expected cache pages\n");
     std::exit(1);
   }

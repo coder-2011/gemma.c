@@ -48,11 +48,6 @@ void copy_to_host(std::vector<T> &dst, const thrust::device_vector<T> &src) {
                         cudaMemcpyDeviceToHost));
 }
 
-enum class RmsnormMode {
-  LearnedWeight,
-  ScaleFreeWrapper,
-};
-
 float bf16_to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
 
 __nv_bfloat16 make_input_value(int index) {
@@ -79,7 +74,7 @@ void fill_values(std::vector<__nv_bfloat16> &values,
 
 void reference_rmsnorm(std::vector<__nv_bfloat16> &out,
                        const std::vector<__nv_bfloat16> &inp,
-                       const std::vector<__nv_bfloat16> *weight,
+                       const std::vector<__nv_bfloat16> &weight,
                        int rows,
                        int width,
                        float eps) {
@@ -93,7 +88,7 @@ void reference_rmsnorm(std::vector<__nv_bfloat16> &out,
     float scale = 1.0f / std::sqrt(static_cast<float>(sum_sq / width) + eps);
     for (int c = 0; c < width; ++c) {
       size_t index = static_cast<size_t>(row) * width + c;
-      float gamma = weight != nullptr ? bf16_to_float((*weight)[c]) : 1.0f;
+      float gamma = bf16_to_float(weight[c]);
       out[index] = __float2bfloat16(bf16_to_float(inp[index]) * scale * gamma);
     }
   }
@@ -120,9 +115,8 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
   }
 }
 
-void run_rmsnorm_case(int rows, int width, RmsnormMode mode) {
+void run_rmsnorm_case(int rows, int width) {
   const int elems = rows * width;
-  const bool has_weight = mode == RmsnormMode::LearnedWeight;
 
   std::vector<__nv_bfloat16> inp(elems);
   std::vector<__nv_bfloat16> weight(width);
@@ -132,30 +126,20 @@ void run_rmsnorm_case(int rows, int width, RmsnormMode mode) {
   fill_values(inp, make_input_value);
   fill_values(weight, make_weight_value);
   reference_rmsnorm(
-      expected, inp, has_weight ? &weight : nullptr, rows, width,
+      expected, inp, weight, rows, width,
       GEMMA4_RMS_NORM_EPS);
 
   thrust::device_vector<__nv_bfloat16> d_inp(elems);
-  thrust::device_vector<__nv_bfloat16> d_weight(has_weight ? width : 0);
+  thrust::device_vector<__nv_bfloat16> d_weight(width);
   thrust::device_vector<__nv_bfloat16> d_out(elems);
   copy_to_device(d_inp, inp);
-  if (has_weight) {
-    copy_to_device(d_weight, weight);
-  }
-
-  if (mode == RmsnormMode::ScaleFreeWrapper) {
-    CHECK_CUDA(gemma4_rmsnorm_scale_free_bf16(
-        raw_ptr(d_out), raw_ptr(d_inp), rows, width, GEMMA4_RMS_NORM_EPS, 0));
-  } else {
-    CHECK_CUDA(gemma4_rmsnorm_bf16(
-        raw_ptr(d_out), raw_ptr(d_inp), raw_ptr(d_weight), rows, width,
-        GEMMA4_RMS_NORM_EPS, 0));
-  }
+  copy_to_device(d_weight, weight);
+  CHECK_CUDA(gemma4_rmsnorm_bf16(
+      raw_ptr(d_out), raw_ptr(d_inp), raw_ptr(d_weight), rows, width,
+      GEMMA4_RMS_NORM_EPS, 0));
 
   copy_to_host(actual, d_out);
-
-  const char *label = has_weight ? "rmsnorm" : "scale-free rmsnorm";
-  compare_bf16(actual, expected, 0.03125f, label);
+  compare_bf16(actual, expected, 0.03125f, "rmsnorm");
 }
 
 void fill_residual_inputs(std::vector<__nv_bfloat16> &inp1,
@@ -202,7 +186,7 @@ void run_fused_case(int rows, int width) {
   fill_residual_inputs(inp1, inp2, expected_residual);
   fill_values(weight, make_weight_value);
   reference_rmsnorm(
-      expected_normed, expected_residual, &weight, rows, width,
+      expected_normed, expected_residual, weight, rows, width,
       GEMMA4_RMS_NORM_EPS);
 
   thrust::device_vector<__nv_bfloat16> d_inp1(elems);
@@ -228,9 +212,8 @@ void run_fused_case(int rows, int width) {
 }  // namespace
 
 int main() {
-  run_rmsnorm_case(1, 256, RmsnormMode::LearnedWeight);
-  run_rmsnorm_case(17, GEMMA4_HIDDEN_SIZE, RmsnormMode::LearnedWeight);
-  run_rmsnorm_case(7, 512, RmsnormMode::ScaleFreeWrapper);
+  run_rmsnorm_case(1, 256);
+  run_rmsnorm_case(17, GEMMA4_HIDDEN_SIZE);
   run_residual_add_case(9, GEMMA4_HIDDEN_SIZE);
   run_fused_case(1, GEMMA4_HIDDEN_SIZE);
   run_fused_case(19, GEMMA4_HIDDEN_SIZE);

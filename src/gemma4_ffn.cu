@@ -46,68 +46,6 @@ __device__ inline void swizzle_hidden_packs(
   }
 }
 
-// RMS-normalizes a swizzled down row, adds the residual, then optionally scales it.
-template <int Threads>
-__device__ inline void rmsnorm_residual_from_swizzled_down(
-    __nv_bfloat16 *__restrict__ residual_out,
-    __nv_bfloat16 *__restrict__ normed_out,
-    const __nv_bfloat16 *__restrict__ down_swizzled,
-    const __nv_bfloat16 *__restrict__ residual,
-    const __nv_bfloat16 *__restrict__ rms_weight,
-    float eps,
-    float output_scale,
-    float *__restrict__ warp_sums,
-    float &rms_scale,
-    int row_count,
-    int row,
-    int thread_idx) {
-  const int hidden_pack = thread_idx;
-  constexpr int hidden_size = kHiddenPacks * kBf16Packed128Elements;
-  const auto row_layout = cute::make_layout(
-      cute::make_shape(row_count, hidden_size),
-      cute::make_stride(
-          static_cast<int64_t>(hidden_size),
-          static_cast<int64_t>(1)));
-  const auto hidden_layout = cute::make_layout(
-      cute::make_shape(kHiddenPacks),
-      cute::make_stride(kBf16Packed128Elements));
-  const int natural_col = hidden_layout(hidden_pack);
-  const int swizzled_col = hidden_layout(hidden_pack_swizzle_index(hidden_pack));
-  const int64_t down_offset = row_layout(row, swizzled_col);
-  const int64_t natural_offset = row_layout(row, natural_col);
-
-  const FfnBf16Pack down_pack =
-      FfnBf16Pack{*reinterpret_cast<const int4 *>(
-          down_swizzled + down_offset)};
-  float sum_sq = 0.0f;
-  gemma4_bf16_pack_accumulate_square(down_pack, sum_sq);
-
-  const float total =
-      gemma4_block_reduce_sum<Threads>(sum_sq, warp_sums, thread_idx);
-  if (thread_idx == 0) {
-    rms_scale = rsqrtf(total / static_cast<float>(GEMMA4_HIDDEN_SIZE) + eps);
-  }
-  __syncthreads();
-
-  const FfnBf16Pack gamma_pack =
-      FfnBf16Pack{*reinterpret_cast<const int4 *>(
-          rms_weight + natural_col)};
-  const FfnBf16Pack normed_pack =
-      gemma4_bf16_pack_apply_scale_weight(down_pack, gamma_pack, rms_scale);
-  const FfnBf16Pack residual_pack =
-      FfnBf16Pack{*reinterpret_cast<const int4 *>(
-          residual + natural_offset)};
-  const FfnBf16Pack residual_out_pack =
-      gemma4_bf16_pack_add(residual_pack, normed_pack);
-  const FfnBf16Pack scaled_residual_out_pack =
-      output_scale == 1.0f
-          ? residual_out_pack
-          : gemma4_bf16_pack_apply_scale(residual_out_pack, output_scale);
-  *reinterpret_cast<int4 *>(normed_out + natural_offset) = normed_pack.bits();
-  *reinterpret_cast<int4 *>(residual_out + natural_offset) =
-      scaled_residual_out_pack.bits();
-}
-
 // Restores swizzled hidden packs to natural hidden-column order.
 __device__ inline void unswizzle_hidden_packs(
     __nv_bfloat16 *__restrict__ dst,
@@ -362,28 +300,6 @@ __global__ void swizzle_hidden_packs_kernel(
   ffn_dev::swizzle_hidden_packs(
       dst, src, rows, int(blockIdx.y), int(blockIdx.x),
       int(gridDim.x), int(blockDim.x), int(threadIdx.x));
-}
-
-// RMS-normalizes swizzled down rows, adds residuals, then optionally scales them.
-__global__ __launch_bounds__(kFfnThreads, 1) void
-rmsnorm_residual_from_swizzled_down_kernel(
-    __nv_bfloat16 *__restrict__ residual_out,
-    __nv_bfloat16 *__restrict__ normed_out,
-    const __nv_bfloat16 *__restrict__ down_swizzled,
-    const __nv_bfloat16 *__restrict__ residual,
-    const __nv_bfloat16 *__restrict__ rms_weight,
-    const __nv_bfloat16 *__restrict__ layer_scalar,
-    float eps) {
-  __shared__ float s_rms_warp_sums[kFfnWarps];
-  __shared__ float s_rms_scale;
-  const float output_scale =
-      layer_scalar == nullptr ? 1.0f : __bfloat162float(__ldg(layer_scalar));
-
-  ffn_dev::rmsnorm_residual_from_swizzled_down<kFfnThreads>(
-      residual_out, normed_out, down_swizzled, residual, rms_weight, eps,
-      output_scale,
-      s_rms_warp_sums, s_rms_scale, int(gridDim.x), int(blockIdx.x),
-      int(threadIdx.x));
 }
 
 // Reorders the swizzled hidden packs produced by the prefill down GEMM back to
@@ -731,36 +647,6 @@ cudaError_t gemma4_ffn_decode_fused_bf16_impl(
   return cudaGetLastError();
 }
 
-// Runs multi-row FFN through the decode-swizzled weight layout.
-cudaError_t gemma4_ffn_prefill_bf16_impl(const Gemma4FfnBf16Args &args) {
-  if (args.prefill_scratch.capacity_rows < args.rows) {
-    return cudaErrorInvalidValue;
-  }
-
-  const dim3 block_dim(kSwizzleThreads);
-  const dim3 swizzle_grid_dim(kActualSwizzleBlocksPerRow, args.rows);
-  swizzle_hidden_packs_kernel<<<swizzle_grid_dim, block_dim, 0, args.stream>>>(
-      args.prefill_scratch.down, args.x, args.rows);
-  cudaError_t status = cudaGetLastError();
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
-
-  status = run_gate_up_geglu_decode_layout_dual_gemm(
-      args.prefill_scratch.act, args.prefill_scratch.down,
-      args.w_gate_up_decode, args.rows, args.stream);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
-
-  status = launch_down_decode_layout_gemm(
-      args.prefill_scratch.act, args.w_down_decode,
-      args.prefill_scratch.down, args.rows, args.stream);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
-
-  rmsnorm_residual_from_swizzled_down_kernel<<<
-      args.rows, kFfnThreads, 0, args.stream>>>(
-      args.residual_out, args.normed_out, args.prefill_scratch.down,
-      args.residual, args.rms_weight, nullptr, args.eps);
-  return cudaGetLastError();
-}
-
 }  // namespace
 
 cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
@@ -811,19 +697,6 @@ Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
   scratch.act = buffer;
   scratch.down = scratch.act + act_elements;
   return scratch;
-}
-
-cudaError_t gemma4_ffn_bf16(const Gemma4FfnBf16Args &args) {
-  if (args.rows <= 0) {
-    return args.rows == 0 ? cudaSuccess : cudaErrorInvalidValue;
-  }
-  if (args.rows == 1) {
-    return gemma4_ffn_decode_fused_bf16_impl(
-        args.residual_out, args.normed_out, args.x, args.residual,
-        args.rms_weight, args.w_gate_up_decode, args.w_down_decode,
-        args.decode_scratch, nullptr, args.eps, args.stream);
-  }
-  return gemma4_ffn_prefill_bf16_impl(args);
 }
 
 // Runs the prefill GeGLU MLP and leaves the down-projection in natural order.
