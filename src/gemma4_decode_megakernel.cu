@@ -1,4 +1,4 @@
-#include "gemma4_decode_megakernel.cuh"
+#include "gemma4_megakernel.cuh"
 
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_ffn.cuh"

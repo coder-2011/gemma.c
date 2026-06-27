@@ -13,8 +13,7 @@ static constexpr int GEMMA4_GLOBAL_LAYER_PERIOD = 6;
 static constexpr int GEMMA4_GLOBAL_LAYER_COUNT =
     (GEMMA4_NUM_LAYERS / GEMMA4_GLOBAL_LAYER_PERIOD) +
     ((GEMMA4_NUM_LAYERS % GEMMA4_GLOBAL_LAYER_PERIOD) != 0 ? 1 : 0);
-static constexpr int GEMMA4_SLIDING_LAYER_COUNT =
-    GEMMA4_NUM_LAYERS - GEMMA4_GLOBAL_LAYER_COUNT;
+static constexpr int GEMMA4_SLIDING_LAYER_COUNT = GEMMA4_NUM_LAYERS - GEMMA4_GLOBAL_LAYER_COUNT;
 
 static constexpr int GEMMA4_NUM_QUERY_HEADS = 16;
 static constexpr int GEMMA4_SLIDING_KV_HEADS = 8;
@@ -110,10 +109,8 @@ constexpr bool gemma4_is_global_layer(int32_t layer_index) {
 // Builds the attention shape constants for one model layer.
 constexpr Gemma4AttentionSpec gemma4_attention_spec(int32_t layer_index) {
   const bool global = gemma4_is_global_layer(layer_index);
-  const int32_t head_dim =
-      global ? gemma4_config.global_head_dim : gemma4_config.sliding_head_dim;
-  const int32_t kv_heads =
-      global ? gemma4_config.global_kv_heads : gemma4_config.sliding_kv_heads;
+  const int32_t head_dim = global ? gemma4_config.global_head_dim : gemma4_config.sliding_head_dim;
+  const int32_t kv_heads = global ? gemma4_config.global_kv_heads : gemma4_config.sliding_kv_heads;
 
   return {
       global,
@@ -121,8 +118,7 @@ constexpr Gemma4AttentionSpec gemma4_attention_spec(int32_t layer_index) {
       kv_heads,
       head_dim,
       global ? 0 : gemma4_config.sliding_window,
-      global ? static_cast<int32_t>(
-                   head_dim * gemma4_config.partial_rotary_factor_global)
+      global ? static_cast<int32_t>(head_dim * gemma4_config.partial_rotary_factor_global)
              : head_dim,
       global ? gemma4_config.rope_theta_global
              : gemma4_config.rope_theta_sliding,

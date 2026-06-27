@@ -143,6 +143,8 @@ void run_sparse_case() {
   thrust::device_vector<__nv_bfloat16> d_down(down_count);
   thrust::device_vector<unsigned char> d_scratch(
       sizeof(Gemma4FfnDecodeScratch));
+  thrust::device_vector<__nv_bfloat16> d_tier2_scratch(
+      gemma4_ffn_prefill_scratch_elements(1));
   thrust::device_vector<__nv_bfloat16> d_layer_scalar(1);
 
   copy_to_device(d_x, x);
@@ -241,6 +243,7 @@ void run_sparse_case() {
       raw_ptr(d_tier2_residual), raw_ptr(d_tier2_normed),
       raw_ptr(d_tier2_mlp), raw_ptr(d_x), raw_ptr(d_residual),
       raw_ptr(d_gamma), raw_ptr(d_gate_up), raw_ptr(d_down),
+      gemma4_ffn_prefill_scratch_from_buffer(raw_ptr(d_tier2_scratch), 1),
       GEMMA4_RMS_NORM_EPS, 0));
   copy_to_host(actual_tier2_mlp, d_tier2_mlp);
   copy_to_host(actual_tier2_residual, d_tier2_residual);

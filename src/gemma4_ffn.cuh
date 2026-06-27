@@ -24,6 +24,9 @@ struct alignas(128) Gemma4FfnDecodeScratch {
   __nv_bfloat16 act[GEMMA4_INTERMEDIATE_SIZE];
   // Reused as swizzled hidden input before gate/up and swizzled down output.
   __nv_bfloat16 down[GEMMA4_HIDDEN_SIZE];
+  // Direct decode accumulates the final MLP row without a GeGLU activation spill.
+  float accum[GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS]
+             [GEMMA4_FFN_DECODE_HIDDEN_PACKS];
 };
 
 struct Gemma4FfnPrefillScratch {
