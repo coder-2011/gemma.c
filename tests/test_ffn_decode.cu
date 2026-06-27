@@ -1,4 +1,5 @@
 #include "gemma4_ffn.cuh"
+#include "gemma4_ffn_tier2.cuh"
 #include "gemma4.h"
 
 #include <cuda_bf16.h>
@@ -111,6 +112,10 @@ void run_sparse_case() {
   std::vector<__nv_bfloat16> gamma(GEMMA4_HIDDEN_SIZE);
   std::vector<__nv_bfloat16> actual_residual(GEMMA4_HIDDEN_SIZE);
   std::vector<__nv_bfloat16> actual_normed(GEMMA4_HIDDEN_SIZE);
+  std::vector<__nv_bfloat16> actual_tier2_mlp(GEMMA4_HIDDEN_SIZE);
+  std::vector<__nv_bfloat16> actual_tier2_residual(GEMMA4_HIDDEN_SIZE);
+  std::vector<__nv_bfloat16> actual_tier2_normed(GEMMA4_HIDDEN_SIZE);
+  std::vector<__nv_bfloat16> expected_mlp(GEMMA4_HIDDEN_SIZE);
   std::vector<__nv_bfloat16> expected_residual(GEMMA4_HIDDEN_SIZE);
   std::vector<__nv_bfloat16> expected_scaled_residual(GEMMA4_HIDDEN_SIZE);
   std::vector<__nv_bfloat16> expected_normed(GEMMA4_HIDDEN_SIZE);
@@ -129,6 +134,9 @@ void run_sparse_case() {
   thrust::device_vector<__nv_bfloat16> d_gamma(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_residual_out(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_normed_out(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_tier2_mlp(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_tier2_residual(GEMMA4_HIDDEN_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_tier2_normed(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_gate_up_src(gate_up_count);
   thrust::device_vector<__nv_bfloat16> d_gate_up(gate_up_count);
   thrust::device_vector<__nv_bfloat16> d_down_src(down_count);
@@ -198,6 +206,7 @@ void run_sparse_case() {
   std::vector<float> ffn_float(GEMMA4_HIDDEN_SIZE);
   for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
     const __nv_bfloat16 ffn_bf16 = __float2bfloat16_rn(ffn_out[col]);
+    expected_mlp[col] = ffn_bf16;
     const float value = bf16_to_float(ffn_bf16);
     ffn_float[col] = value;
     sum_sq += static_cast<double>(value) * value;
@@ -227,6 +236,22 @@ void run_sparse_case() {
                "fused FFN residual");
   compare_bf16(actual_normed, expected_normed, 0.03125f,
                "fused FFN normed");
+
+  CHECK_CUDA(gemma4_ffn_tier2_decode_full_bf16(
+      raw_ptr(d_tier2_residual), raw_ptr(d_tier2_normed),
+      raw_ptr(d_tier2_mlp), raw_ptr(d_x), raw_ptr(d_residual),
+      raw_ptr(d_gamma), raw_ptr(d_gate_up), raw_ptr(d_down),
+      GEMMA4_RMS_NORM_EPS, 0));
+  copy_to_host(actual_tier2_mlp, d_tier2_mlp);
+  copy_to_host(actual_tier2_residual, d_tier2_residual);
+  copy_to_host(actual_tier2_normed, d_tier2_normed);
+  compare_bf16(actual_tier2_mlp, expected_mlp, 0.03125f,
+               "tier2 FFN MLP");
+  compare_bf16(actual_tier2_residual, expected_residual, 0.03125f,
+               "tier2 FFN residual");
+  compare_bf16(actual_tier2_normed, expected_normed, 0.03125f,
+               "tier2 FFN normed");
+
   for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
     expected_scaled_residual[col] =
         __float2bfloat16_rn(bf16_to_float(expected_residual[col]) * 0.5f);

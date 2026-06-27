@@ -175,8 +175,8 @@ $(BUILD_DIR)/tests/test_tokenizer: tests/test_tokenizer.cpp $(BUILD_DIR)/gemma4_
 $(BUILD_DIR)/tests/test_rmsnorm: tests/test_rmsnorm.cu src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUTLASS_INCLUDE) tests/test_rmsnorm.cu src/gemma4_rmsnorm.cu -o $@
 
-$(BUILD_DIR)/tests/test_ffn_decode: tests/test_ffn_decode.cu src/gemma4_ffn.cu src/gemma4_ffn.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
-	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) tests/test_ffn_decode.cu src/gemma4_ffn.cu src/gemma4_rmsnorm.cu -o $@
+$(BUILD_DIR)/tests/test_ffn_decode: tests/test_ffn_decode.cu src/gemma4_ffn.cu src/gemma4_ffn.cuh src/gemma4_ffn_tier2.cu src/gemma4_ffn_tier2.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
+	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) tests/test_ffn_decode.cu src/gemma4_ffn.cu src/gemma4_ffn_tier2.cu src/gemma4_rmsnorm.cu -o $@
 
 $(BUILD_DIR)/tests/test_prefill_gemm: tests/test_prefill_gemm.cu src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/tests
 	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) tests/test_prefill_gemm.cu src/gemma4_matmul_kernels.cu -o $@
