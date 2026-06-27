@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -44,6 +45,7 @@ int main(int argc, char **argv) {
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  gemma4_bench_print_common_metadata("rmsnorm_hidden_fused_bench");
 
   constexpr int width = GEMMA4_HIDDEN_SIZE;
   const size_t max_elems = static_cast<size_t>(max_rows) * width;
@@ -54,22 +56,21 @@ int main(int argc, char **argv) {
   thrust::device_vector<__nv_bfloat16> d_weight(width);
   thrust::device_vector<__nv_bfloat16> d_residual(max_elems);
   thrust::device_vector<__nv_bfloat16> d_normed(max_elems);
+  thrust::device_vector<__nv_bfloat16> d_ref_residual(max_elems);
+  thrust::device_vector<__nv_bfloat16> d_ref_normed(max_elems);
 
   fill_random_bf16(raw_ptr(d_inp1), max_elems, seed ^ 0x1001u, 1.0f, stream);
   fill_random_bf16(raw_ptr(d_inp2), max_elems, seed ^ 0x2002u, 1.0f, stream);
   fill_random_bf16(raw_ptr(d_weight), width, seed ^ 0x3003u, 0.5f, stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  int device = 0;
-  cudaDeviceProp prop{};
-  CUDA_CHECK(cudaGetDevice(&device));
-  CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-
-  std::printf("device=%s\n", prop.name);
-  std::printf("shape=width%d,max_rows=%d,seed=0x%llx\n", width, max_rows,
-              static_cast<unsigned long long>(seed));
-  std::printf("iters=%d,warmup_graph_launches=%d,trials=%d\n", iters, warmup,
-              trials);
+  std::printf("benchmark_contract name=rmsnorm_hidden_fused measurement=graph_replayed_fused_kernel "
+              "timing=cuda_events_same_stream cache=warm_repeated_buffers "
+              "launch_overhead=cuda_graph_replay aggregation=raw_trial_samples "
+              "correctness=fused_vs_split_residual_then_rmsnorm warmup_graph_launches=%d "
+              "iters=%d trials=%d dtype=bf16 seed=0x%llx\n",
+              warmup, iters, trials, static_cast<unsigned long long>(seed));
+  std::printf("shape=width%d,max_rows=%d\n", width, max_rows);
   std::printf("rows,fused_graph_best_ms,fused_graph_avg_ms,"
               "fused_graph_gib_s\n");
 
@@ -81,15 +82,36 @@ int main(int argc, char **argv) {
           raw_ptr(d_residual), raw_ptr(d_normed), raw_ptr(d_inp1), raw_ptr(d_inp2), raw_ptr(d_weight), rows, width,
           GEMMA4_RMS_NORM_EPS, stream));
     };
+    auto run_split = [&]() {
+      CUDA_CHECK(gemma4_residual_add_bf16(
+          raw_ptr(d_ref_residual), raw_ptr(d_inp1), raw_ptr(d_inp2),
+          rows * width, stream));
+      CUDA_CHECK(gemma4_rmsnorm_bf16(
+          raw_ptr(d_ref_normed), raw_ptr(d_ref_residual), raw_ptr(d_weight),
+          rows, width, GEMMA4_RMS_NORM_EPS, stream));
+    };
 
     run_fused();
+    run_split();
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int elems = rows * width;
+    const DiffStats residual_diff =
+        diff_stats_bf16(raw_ptr(d_residual), raw_ptr(d_ref_residual), elems);
+    const DiffStats normed_diff =
+        diff_stats_bf16(raw_ptr(d_normed), raw_ptr(d_ref_normed), elems);
+    if (residual_diff.max_abs > 0.0f || normed_diff.max_abs > 0.015625f) {
+      throw std::runtime_error("fused residual+rmsnorm correctness failed");
+    }
 
     const TimingStats graph_stats =
         time_ms_graph(run_fused, stream, warmup, iters, trials);
     std::printf("%d,%.6f,%.6f,%.3f\n", rows, graph_stats.best_ms,
                 graph_stats.avg_ms,
                 gib_per_second(bytes, graph_stats.best_ms));
+    char context[64];
+    std::snprintf(context, sizeof(context), "rows=%d", rows);
+    gemma4_bench_print_timing_stats("rmsnorm_hidden_fused_graph", context,
+                                    graph_stats);
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));

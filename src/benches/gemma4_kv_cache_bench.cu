@@ -17,26 +17,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace {
-
-struct SampleStats {
-  float median_ms = 0.0f;
-  float mean_ms = 0.0f;
-  float trimmed_mean_ms = 0.0f;
-  float min_ms = 0.0f;
-  float max_ms = 0.0f;
-  float p95_ms = 0.0f;
-  float p99_ms = 0.0f;
-  float stddev_ms = 0.0f;
-  float iqr_ms = 0.0f;
-  std::vector<float> samples_ms;
-};
 
 struct BenchOptions {
   int seq_len = 4096;
@@ -85,53 +71,8 @@ void flush_l2(cudaStream_t stream,
   CUDA_CHECK(cudaGetLastError());
 }
 
-float percentile(const std::vector<float> &sorted, float pct) {
-  if (sorted.empty()) return 0.0f;
-  if (sorted.size() == 1) return sorted.front();
-  const float index = pct * 0.01f * static_cast<float>(sorted.size() - 1);
-  const int lo = static_cast<int>(std::floor(index));
-  const int hi = static_cast<int>(std::ceil(index));
-  const float frac = index - static_cast<float>(lo);
-  return sorted[lo] * (1.0f - frac) + sorted[hi] * frac;
-}
-
-float trimmed_mean(const std::vector<float> &sorted, float trim_fraction) {
-  if (sorted.empty()) return 0.0f;
-  const int trim = static_cast<int>(std::floor(sorted.size() * trim_fraction));
-  const int begin = std::min<int>(trim, sorted.size() - 1);
-  const int end = std::max<int>(begin + 1, sorted.size() - trim);
-  const float sum =
-      std::accumulate(sorted.begin() + begin, sorted.begin() + end, 0.0f);
-  return sum / static_cast<float>(end - begin);
-}
-
-SampleStats summarize_samples(std::vector<float> values) {
-  std::vector<float> sorted = values;
-  std::sort(sorted.begin(), sorted.end());
-  SampleStats stats;
-  stats.samples_ms = std::move(values);
-  stats.median_ms = percentile(sorted, 50.0f);
-  stats.min_ms = sorted.front();
-  stats.max_ms = sorted.back();
-  stats.p95_ms = percentile(sorted, 95.0f);
-  stats.p99_ms = percentile(sorted, 99.0f);
-  stats.iqr_ms = percentile(sorted, 75.0f) - percentile(sorted, 25.0f);
-  stats.mean_ms = std::accumulate(stats.samples_ms.begin(),
-                                  stats.samples_ms.end(), 0.0f) /
-                  static_cast<float>(stats.samples_ms.size());
-  stats.trimmed_mean_ms = trimmed_mean(sorted, 0.1f);
-  float variance = 0.0f;
-  for (float sample : stats.samples_ms) {
-    const float diff = sample - stats.mean_ms;
-    variance += diff * diff;
-  }
-  variance /= static_cast<float>(stats.samples_ms.size());
-  stats.stddev_ms = std::sqrt(variance);
-  return stats;
-}
-
 template <typename Fn>
-SampleStats time_cuda_samples(Fn &&fn,
+TimingStats time_cuda_samples(Fn &&fn,
                               cudaStream_t stream,
                               int warmup,
                               int iters_per_sample,
@@ -181,21 +122,11 @@ SampleStats time_cuda_samples(Fn &&fn,
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
 
-  return summarize_samples(std::move(values));
+  return summarize_timing_samples(std::move(values));
 }
 
-void print_stats(const char *name, const SampleStats &stats) {
-  std::printf(
-      "%s median_ms=%.6f mean_ms=%.6f trimmed_mean_ms=%.6f min_ms=%.6f "
-      "max_ms=%.6f p95_ms=%.6f p99_ms=%.6f stddev_ms=%.6f iqr_ms=%.6f "
-      "samples_ms=[",
-      name, stats.median_ms, stats.mean_ms, stats.trimmed_mean_ms,
-      stats.min_ms, stats.max_ms, stats.p95_ms, stats.p99_ms,
-      stats.stddev_ms, stats.iqr_ms);
-  for (size_t i = 0; i < stats.samples_ms.size(); ++i) {
-    std::printf("%s%.6f", i == 0 ? "" : ",", stats.samples_ms[i]);
-  }
-  std::printf("]\n");
+void print_stats(const char *name, const TimingStats &stats) {
+  gemma4_bench_print_timing_stats(name, stats);
 }
 
 void cpu_decode_reference(std::vector<__nv_bfloat16> &expected,
@@ -363,6 +294,7 @@ int main(int argc, char **argv) {
 
   int device = 0;
   CUDA_CHECK(cudaGetDevice(&device));
+  gemma4_bench_print_common_metadata("kv_cache_bench");
 
   const int seq_len = options.seq_len;
   const int page_size = options.page_size;
@@ -408,7 +340,7 @@ int main(int argc, char **argv) {
   const float scale = 1.0f / std::sqrt(float(config.head_dim));
 
   std::printf(
-      "contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline "
+      "benchmark_contract name=kv_cache_bench contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline "
       "cache_mode=%s l2_flush_bytes=%lld launch_overhead=queued_launches_only "
       "host_wall_time=excluded stability_scope=single_process "
       "min_effect_for_claim_pct=5 seq_len=%d page_size=%d split_size=%d "

@@ -14,7 +14,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
-#include <numeric>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -35,19 +34,6 @@ constexpr int kRotaryHalf = kHeadDim / 2;
 constexpr int kQElements = kQHeads * kHeadDim;
 constexpr int kKvElements = kKvHeads * kHeadDim;
 constexpr int kQkvElements = kQElements + 2 * kKvElements;
-
-struct SampleStats {
-  float median_ms = 0.0f;
-  float mean_ms = 0.0f;
-  float trimmed_mean_ms = 0.0f;
-  float min_ms = 0.0f;
-  float max_ms = 0.0f;
-  float p95_ms = 0.0f;
-  float p99_ms = 0.0f;
-  float stddev_ms = 0.0f;
-  float iqr_ms = 0.0f;
-  std::vector<float> samples_ms;
-};
 
 int parse_arg(char **argv, int argc, int index, int default_value) {
   return index < argc ? std::atoi(argv[index]) : default_value;
@@ -100,53 +86,8 @@ void flush_l2(cudaStream_t stream,
   CUDA_CHECK(cudaGetLastError());
 }
 
-float percentile(const std::vector<float> &sorted, float pct) {
-  if (sorted.empty()) return 0.0f;
-  if (sorted.size() == 1) return sorted.front();
-  const float index = pct * 0.01f * float(sorted.size() - 1);
-  const int lo = int(std::floor(index));
-  const int hi = int(std::ceil(index));
-  const float frac = index - float(lo);
-  return sorted[lo] * (1.0f - frac) + sorted[hi] * frac;
-}
-
-float trimmed_mean(const std::vector<float> &sorted, float trim_fraction) {
-  if (sorted.empty()) return 0.0f;
-  const int trim = int(std::floor(sorted.size() * trim_fraction));
-  const int begin = std::min<int>(trim, sorted.size() - 1);
-  const int end = std::max<int>(begin + 1, sorted.size() - trim);
-  const float sum =
-      std::accumulate(sorted.begin() + begin, sorted.begin() + end, 0.0f);
-  return sum / float(end - begin);
-}
-
-SampleStats summarize_samples(std::vector<float> values) {
-  std::vector<float> sorted = values;
-  std::sort(sorted.begin(), sorted.end());
-  SampleStats stats;
-  stats.samples_ms = std::move(values);
-  stats.median_ms = percentile(sorted, 50.0f);
-  stats.mean_ms = std::accumulate(stats.samples_ms.begin(),
-                                  stats.samples_ms.end(), 0.0f) /
-                  float(stats.samples_ms.size());
-  stats.trimmed_mean_ms = trimmed_mean(sorted, 0.1f);
-  stats.min_ms = sorted.front();
-  stats.max_ms = sorted.back();
-  stats.p95_ms = percentile(sorted, 95.0f);
-  stats.p99_ms = percentile(sorted, 99.0f);
-  stats.iqr_ms = percentile(sorted, 75.0f) - percentile(sorted, 25.0f);
-  float variance = 0.0f;
-  for (float sample : stats.samples_ms) {
-    const float diff = sample - stats.mean_ms;
-    variance += diff * diff;
-  }
-  variance /= float(stats.samples_ms.size());
-  stats.stddev_ms = std::sqrt(variance);
-  return stats;
-}
-
 template <typename Fn>
-SampleStats time_cuda_samples(Fn &&fn,
+TimingStats time_cuda_samples(Fn &&fn,
                               cudaStream_t stream,
                               int warmup,
                               int iters_per_sample,
@@ -195,24 +136,11 @@ SampleStats time_cuda_samples(Fn &&fn,
 
   CUDA_CHECK(cudaEventDestroy(start));
   CUDA_CHECK(cudaEventDestroy(stop));
-  return summarize_samples(std::move(values));
+  return summarize_timing_samples(std::move(values));
 }
 
-void print_stats(const char *name, const SampleStats &stats) {
-  std::cout << name << " median_ms=" << stats.median_ms
-            << " mean_ms=" << stats.mean_ms
-            << " trimmed_mean_ms=" << stats.trimmed_mean_ms
-            << " min_ms=" << stats.min_ms
-            << " max_ms=" << stats.max_ms
-            << " p95_ms=" << stats.p95_ms
-            << " p99_ms=" << stats.p99_ms
-            << " stddev_ms=" << stats.stddev_ms
-            << " iqr_ms=" << stats.iqr_ms
-            << " samples_ms=[";
-  for (size_t i = 0; i < stats.samples_ms.size(); ++i) {
-    std::cout << (i == 0 ? "" : ",") << stats.samples_ms[i];
-  }
-  std::cout << "]\n";
+void print_stats(const char *name, const TimingStats &stats) {
+  gemma4_bench_print_timing_stats(name, stats);
 }
 
 // Runs the LibTorch SDPA baseline for raw sliding prefill tensors.
@@ -626,6 +554,10 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   if (cache_mode != "warm" && cache_mode != "cold") {
     throw std::runtime_error("cache mode must be warm or cold");
   }
+  if (batch_size <= 0 || seq_len <= 0 || window_size <= 0 || warmup < 0 ||
+      iters <= 0 || samples <= 0) {
+    throw std::runtime_error("benchmark dimensions/counts must be positive");
+  }
   const bool cold_cache = cache_mode == "cold";
   const float scale = 1.0f / std::sqrt(float(kHeadDim));
   std::vector<__nv_bfloat16> h_q(q_elements(batch_size, seq_len));
@@ -741,7 +673,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
         raw_ptr(d_out), raw_ptr(d_raw_lse), raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), batch_size, seq_len, seq_len,
         window_size, scale, stream));
   };
-  const SampleStats raw_sliding_timing =
+  const TimingStats raw_sliding_timing =
       time_cuda_samples(launch_raw_sliding_fa, stream, warmup, iters, samples,
                         cold_cache, raw_ptr(d_l2_scratch), l2_flush_words);
 
@@ -952,7 +884,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
       raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), raw_ptr(d_q_norm_weight), raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin),
       nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
   };
-  const SampleStats norm_rope_timing =
+  const TimingStats norm_rope_timing =
       time_cuda_samples(launch_norm_rope_fa, stream, warmup, iters, samples,
                         cold_cache, raw_ptr(d_l2_scratch), l2_flush_words);
   const double tflops = sliding_attention_flops(batch_size, seq_len, window_size) /
@@ -965,10 +897,23 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
         batch_size, 0, raw_ptr(d_decode_q), raw_ptr(d_decode_k), raw_ptr(d_decode_v), raw_ptr(d_q_norm_weight),
         raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin), stream));
   };
-  const SampleStats decode_prep_cache_timing =
+  const TimingStats decode_prep_cache_timing =
       time_cuda_samples(launch_decode_prep_cache, stream, warmup, iters,
                         samples, cold_cache, raw_ptr(d_l2_scratch), l2_flush_words);
 
+  std::cout << "benchmark_contract name=flash_attention_bench"
+            << " measurement=sliding_prefill_and_decode_prepare"
+            << " timing=cuda_events_same_stream"
+            << " cache_mode=" << cache_mode
+            << " l2_flush_bytes=" << (cold_cache ? flush_bytes : 0)
+            << " launch_overhead=queued_launches_only"
+            << " host_wall_time=excluded"
+            << " aggregation=raw_samples"
+            << " correctness=cpp_reference_and_torch_project_prepare"
+            << " warmup=" << warmup
+            << " iters_per_sample=" << iters
+            << " samples=" << samples
+            << "\n";
   std::cout << "benchmark batch=" << batch_size
             << " seq=" << seq_len
             << " window_size=" << window_size
@@ -998,7 +943,7 @@ int main(int argc, char **argv) {
     const int seq_len = parse_arg(argv, argc, 1, 1024);
     const int iters = parse_arg(argv, argc, 2, 100);
     const int warmup = parse_arg(argv, argc, 3, 20);
-    const int samples = parse_arg(argv, argc, 4, 3);
+    const int samples = parse_arg(argv, argc, 4, 15);
     const int batch_size = parse_arg(argv, argc, 5, 1);
     const int check_seq = parse_arg(argv, argc, 6, 64);
     const std::string cache_mode = parse_string_arg(argv, argc, 7, "warm");
@@ -1007,6 +952,7 @@ int main(int argc, char **argv) {
 
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreate(&stream));
+    gemma4_bench_print_common_metadata("flash_attention_bench");
     if (check_seq > 0) {
       run_correctness(batch_size, check_seq, window_size, stream);
     }

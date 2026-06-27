@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <optional>
 #include <tuple>
+#include <vector>
 
 namespace {
 
@@ -30,8 +31,8 @@ __nv_bfloat16 *bf16_ptr(at::Tensor &tensor) {
 // Times work with a device-wide sync so escaped-stream library work is included.
 template <typename Fn>
 TimingStats time_ms_device_sync(Fn &&fn, int warmup, int iters, int trials) {
-  TimingStats stats;
-  stats.best_ms = INFINITY;
+  std::vector<float> samples;
+  samples.reserve(static_cast<size_t>(trials));
   for (int trial = 0; trial < trials; ++trial) {
     for (int i = 0; i < warmup; ++i) {
       fn();
@@ -48,11 +49,9 @@ TimingStats time_ms_device_sync(Fn &&fn, int warmup, int iters, int trials) {
     const std::chrono::duration<double, std::milli> elapsed = stop - start;
     const float ms = static_cast<float>(elapsed.count()) /
                      static_cast<float>(iters);
-    stats.best_ms = std::min(stats.best_ms, ms);
-    stats.avg_ms += ms;
+    samples.push_back(ms);
   }
-  stats.avg_ms /= static_cast<float>(trials);
-  return stats;
+  return summarize_timing_samples(std::move(samples));
 }
 
 }  // namespace
@@ -72,6 +71,7 @@ int main(int argc, char **argv) {
   const c10::cuda::CUDAStream torch_stream = c10::cuda::getStreamFromPool(false, 0);
   c10::cuda::CUDAStreamGuard torch_guard(torch_stream);
   const cudaStream_t stream = torch_stream.stream();
+  gemma4_bench_print_common_metadata("ffn_libtorch_bench");
   const auto bf16_options = at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
 
   const size_t x_elems = static_cast<size_t>(tokens) * GEMMA4_HIDDEN_SIZE;
@@ -184,14 +184,15 @@ int main(int argc, char **argv) {
   auto run_tier2_decode_mlp = [&]() {
     CUDA_CHECK(gemma4_ffn_tier2_decode_mlp_bf16(
         bf16_ptr(tier2_out), bf16_ptr(x), bf16_ptr(w_gate_up_swizzled),
-        bf16_ptr(w_down_swizzled), stream));
+        bf16_ptr(w_down_swizzled), prefill_scratch, stream));
   };
   auto run_tier2_decode_full = [&]() {
     CUDA_CHECK(gemma4_ffn_tier2_decode_full_bf16(
         bf16_ptr(tier2_residual_out), bf16_ptr(tier2_normed_out),
         bf16_ptr(tier2_out), bf16_ptr(x), bf16_ptr(residual),
         bf16_ptr(rms_weight), bf16_ptr(w_gate_up_swizzled),
-        bf16_ptr(w_down_swizzled), GEMMA4_RMS_NORM_EPS, stream));
+        bf16_ptr(w_down_swizzled), prefill_scratch, GEMMA4_RMS_NORM_EPS,
+        stream));
   };
   auto run_custom_clear = [&]() {
     CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_custom_scratch), 0, sizeof(Gemma4FfnDecodeScratch)));
@@ -289,8 +290,8 @@ int main(int argc, char **argv) {
       },
       stream, warmup, iters, trials);
 
-  std::printf("benchmark_contract name=ffn_libtorch_bench timing=cuda_events_same_stream_decode_uses_device_sync_wall cache=warm_repeated_buffers_and_flush_hint launch_overhead=events_exclude_host_enqueue_decode_sync_includes_host_overhead warmup=%d iters=%d trials=%d prefill_rows=%d decode_rows=%d dtype=bf16 libtorch_full=mlp_fused_rmsnorm_residual\n", warmup, iters, trials, tokens, kDecodeRows);
-  std::printf("benchmark_env gpu=\"%s\" l2_cache_bytes=%d torch_version=%s seed=0x%llx\n", prop.name, prop.l2CacheSize, TORCH_VERSION, static_cast<unsigned long long>(seed));
+  std::printf("benchmark_contract name=ffn_libtorch_bench timing=cuda_events_same_stream_decode_uses_device_sync_wall cache=warm_repeated_buffers_and_flush_hint launch_overhead=events_exclude_host_enqueue_decode_sync_includes_host_overhead aggregation=raw_trial_samples correctness=hard_gated_custom_and_tier2_vs_libtorch warmup=%d iters=%d trials=%d prefill_rows=%d decode_rows=%d dtype=bf16 libtorch_full=mlp_fused_rmsnorm_residual\n", warmup, iters, trials, tokens, kDecodeRows);
+  std::printf("benchmark_env torch_version=%s seed=0x%llx\n", TORCH_VERSION, static_cast<unsigned long long>(seed));
   std::printf("benchmark_roofline ffn_weight_mib=%.3f dram_peak_gib_s=%.3f ffn_weight_stream_floor_ms=%.6f\n", ffn_weight_bytes / (1024.0 * 1024.0), peak_dram_gib_per_s, ffn_weight_stream_floor_ms);
   std::printf("benchmark_correctness path=custom_prefill_mlp_vs_libtorch_mlp max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n", custom_prefill_vs_libtorch.max_abs, custom_prefill_vs_libtorch.mean_abs, custom_prefill_vs_libtorch.max_rel);
   std::printf("benchmark_correctness path=tier2_decode_mlp_vs_libtorch_row max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n", tier2_vs_libtorch.max_abs, tier2_vs_libtorch.mean_abs, tier2_vs_libtorch.max_rel);
@@ -299,6 +300,25 @@ int main(int argc, char **argv) {
   std::printf("benchmark_correctness path=tier2_decode_residual_vs_libtorch max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n", tier2_residual_vs_libtorch.max_abs, tier2_residual_vs_libtorch.mean_abs, tier2_residual_vs_libtorch.max_rel);
   std::printf("benchmark_correctness path=custom_decode_normed_vs_libtorch max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n", custom_decode_normed_vs_libtorch.max_abs, custom_decode_normed_vs_libtorch.mean_abs, custom_decode_normed_vs_libtorch.max_rel);
   std::printf("benchmark_correctness path=custom_decode_residual_vs_libtorch max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n", custom_decode_residual_vs_libtorch.max_abs, custom_decode_residual_vs_libtorch.mean_abs, custom_decode_residual_vs_libtorch.max_rel);
+  auto print_timing = [](const char *path, const TimingStats &stats) {
+    char context[128];
+    std::snprintf(context, sizeof(context), "path=%s", path);
+    gemma4_bench_print_timing_stats("ffn_libtorch_bench", context, stats);
+  };
+  print_timing("libtorch_geglu", torch_geglu_stats);
+  print_timing("libtorch_down", torch_down_stats);
+  print_timing("libtorch_mlp", torch_mlp_stats);
+  print_timing("libtorch_full_ffn", torch_full_stats);
+  print_timing("tier2_decode_mlp", tier2_stats);
+  print_timing("tier2_decode_full", tier2_full_stats);
+  print_timing("custom_fused_decode_events", custom_decode_event_stats);
+  print_timing("custom_fused_decode_wall", custom_decode_wall_stats);
+  print_timing("custom_prefill_mlp", custom_prefill_stats);
+  print_timing("custom_scratch_clear", custom_clear_stats);
+  print_timing("custom_fused_decode_after_flush_hint", cold_custom_decode_stats);
+  print_timing("tier2_decode_mlp_after_flush_hint", cold_tier2_stats);
+  print_timing("custom_scratch_clear_after_flush_hint", cold_custom_clear_stats);
+  print_timing("cache_flush_hint_only", cold_flush_stats);
   std::printf("mode,rows,hidden,intermediate,path,best_ms,avg_ms,max_abs_vs_libtorch\n");
   std::printf("prefill,%d,%d,%d,libtorch_geglu,%.6f,%.6f,0\n", tokens, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE, torch_geglu_stats.best_ms, torch_geglu_stats.avg_ms);
   std::printf("prefill,%d,%d,%d,libtorch_down,%.6f,%.6f,0\n", tokens, GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE, torch_down_stats.best_ms, torch_down_stats.avg_ms);

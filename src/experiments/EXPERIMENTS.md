@@ -15060,3 +15060,372 @@ Conclusion:
 - This is not an HTTP load-generator benchmark. It intentionally measures the
   local serving path without network, HTTP parsing, request queueing, or
   concurrency effects.
+
+## 2026-06-27 - vLLM Online Serve Baseline For Local Gemma 4 12B-it
+
+Question:
+
+- What does vLLM's online serving benchmark report for the same local Gemma 4
+  12B-it checkpoint on this A6000, using the OpenAI-compatible server path?
+
+Setup notes:
+
+- Installed vLLM `0.23.0` into `/tmp/vllm-bench-venv` to avoid changing the
+  repository Python/Torch environment.
+- `vllm serve` accepts the local Hugging Face-style model directory
+  `models/gemma-4-12B-it` and resolves `Gemma4UnifiedForConditionalGeneration`.
+- Startup required `--max-num-batched-tokens 4096` because the unified model's
+  multimodal budget gate rejected the default text-only-sized budget.
+- Startup required `PATH=/tmp/vllm-bench-venv/bin:$PATH` so FlashInfer's
+  sampler JIT could find the `ninja` executable installed in the venv.
+- vLLM forced the Triton attention backend for Gemma 4's heterogeneous head
+  dimensions and used FlashInfer for top-k/top-p sampling.
+
+Server command:
+
+```bash
+PATH=/tmp/vllm-bench-venv/bin:$PATH /tmp/vllm-bench-venv/bin/vllm serve \
+  models/gemma-4-12B-it \
+  --host 127.0.0.1 --port 8000 \
+  --served-model-name gemma4-local \
+  --dtype bfloat16 \
+  --max-model-len 128 \
+  --gpu-memory-utilization 0.90 \
+  --tensor-parallel-size 1 \
+  --max-num-seqs 32 \
+  --max-num-batched-tokens 4096 \
+  --no-enable-log-requests \
+  --trust-remote-code
+```
+
+Benchmark commands:
+
+```bash
+PATH=/tmp/vllm-bench-venv/bin:$PATH /tmp/vllm-bench-venv/bin/vllm bench serve \
+  --backend openai --base-url http://127.0.0.1:8000 \
+  --endpoint /v1/completions --model gemma4-local \
+  --tokenizer models/gemma-4-12B-it --trust-remote-code \
+  --dataset-name random --random-input-len 1 --random-output-len 1 \
+  --num-warmups 5 --num-prompts 50 \
+  --request-rate inf --max-concurrency 1 \
+  --ignore-eos --temperature 0.0 --top-p 1.0 \
+  --percentile-metrics ttft,tpot,itl,e2el \
+  --metric-percentiles 50,90,95,99 \
+  --save-result --result-dir build/bench_results \
+  --result-filename vllm_gemma4_12b_it_online_random_1in_1out_50.json
+
+PATH=/tmp/vllm-bench-venv/bin:$PATH /tmp/vllm-bench-venv/bin/vllm bench serve \
+  --backend openai --base-url http://127.0.0.1:8000 \
+  --endpoint /v1/completions --model gemma4-local \
+  --tokenizer models/gemma-4-12B-it --trust-remote-code \
+  --dataset-name random --random-input-len 1 --random-output-len 16 \
+  --num-warmups 5 --num-prompts 30 \
+  --request-rate inf --max-concurrency 1 \
+  --ignore-eos --temperature 0.0 --top-p 1.0 \
+  --percentile-metrics ttft,tpot,itl,e2el \
+  --metric-percentiles 50,90,95,99 \
+  --save-result --result-dir build/bench_results \
+  --result-filename vllm_gemma4_12b_it_online_random_1in_16out_30.json
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:05:00.0`, driver
+  `580.159.03`, persistence disabled, ECC disabled, power limit `300 W`.
+- Server: vLLM `0.23.0`, BF16, tensor parallel size `1`, max model length
+  `128`, max concurrency in benchmark `1`.
+- Model/input: `models/gemma-4-12B-it`, random synthetic prompt tokens from
+  vLLM's random dataset, `ignore_eos`, greedy temperature `0.0`.
+- Timing: vLLM online benchmark over HTTP `/v1/completions`; includes server,
+  scheduler, HTTP/client, tokenizer-client setup for request generation, and
+  model execution. Excludes vLLM server startup, model load, compile, CUDA graph
+  capture, and benchmark warmup requests.
+- Warmup: `5` online warmup requests per measured run.
+- Cache policy: warm server process with CUDA graphs captured; prefix cache hit
+  rate reported as `0.0%`.
+- Clock policy: clocks not locked. Idle snapshots before/after showed no other
+  GPU allocation; post-run snapshot showed `0 MiB` used after shutdown.
+
+Results:
+
+```text
+random 1 input / 1 output, 50 measured requests:
+  request_throughput=21.13 req/s
+  output_token_throughput=21.13 tok/s
+  total_token_throughput=42.26 tok/s
+  median_ttft_ms=46.99 p90_ttft_ms=48.23
+  median_e2e_ms=46.99 p90_e2e_ms=48.23
+
+random 1 input / 16 output, 30 measured requests:
+  request_throughput=1.61 req/s
+  output_token_throughput=25.75 tok/s
+  total_token_throughput=27.36 tok/s
+  median_ttft_ms=84.37 p90_ttft_ms=85.80
+  median_tpot_ms=35.66 p90_tpot_ms=36.15
+  median_itl_ms=38.18 p90_itl_ms=38.90
+  median_e2e_ms=619.32 p90_e2e_ms=628.28
+```
+
+Conclusion:
+
+- vLLM online serving is faster than the current local custom warm-serving
+  smoke for short generated outputs on this machine, but it is not the same
+  measurement contract as CUDA-event decode-step timing.
+- For the 16-token online run, the useful decode-ish number is median TPOT
+  `35.66 ms`, roughly `28 tok/s` per active request from the TPOT view, while
+  measured aggregate output throughput was `25.75 tok/s`.
+- The first measured online run logged one Triton JIT warning for
+  `_compute_slot_mapping_kernel`, so future formal runs should add a shape-
+  covering warmup or repeat a second process after caches are populated.
+
+## 2026-06-27 - Promote Tier-2 FFN Shape To Main Decode Path
+
+Question:
+
+- If the main FFN decode entrypoint uses the Tier-2 scratch-backed MLP plus
+  natural-order post-FFN RMSNorm, do the custom FFN microbench and full decode
+  path keep correctness and move into the Tier-2 timing band?
+
+Change:
+
+- Added one natural-order MLP row to `Gemma4FfnDecodeScratch`.
+- Routed `gemma4_ffn_decode_fused_bf16` through `gemma4_ffn_prefill_mlp_bf16`
+  with a one-row scratch view, then a natural-order post-FFN RMSNorm/residual
+  kernel.
+- Preserved the decode `layer_scalar` behavior in the promoted main path.
+- Left `src/gemma4_ffn_tier2.cu` and `src/gemma4_ffn_tier2.cuh` untouched.
+
+Commands:
+
+```bash
+make test-ffn-decode
+make ffn-libtorch-bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260627 \
+  ./build/benches/gemma4_ffn_libtorch_bench 100 20 3 1
+make test-decode-megakernel
+make prompt
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `0000:05:00`, driver/runtime reported by
+  CUDA as `13000`, CUDA events on the same stream for the microbench and real
+  decode-step timing.
+- FFN microbench: BF16, one decode row, fixed seed `0x1352713`, warm repeated
+  buffers, `20` warmup iterations, `100` timed iterations, `3` trials.
+- Decode-step benchmark: local `models/gemma-4-12B-it` checkpoint, prompt
+  `Hello`, prompt length `1`, `5` warmup decode steps, `50` timed decode steps,
+  stateful decode cache, setup excluded.
+- Clock policy: clocks were not locked.
+
+Results:
+
+```text
+FFN microbench:
+  tier2_decode_full best_ms=0.529592 avg_ms=0.529667
+  custom_fused_decode_events best_ms=0.527913 avg_ms=0.528138
+  custom_decode_normed_vs_libtorch max_abs=0.000976562
+  custom_decode_residual_vs_libtorch max_abs=0.000976562
+
+Full decode-step:
+  decode_step_ms n=50 mean_ms=73.303 p50_ms=73.435
+  p90_ms=73.478 p95_ms=73.484 p99_ms=73.504
+  min_ms=72.412 max_ms=73.504
+  decode_step_tps_p50=13.617
+```
+
+Conclusion:
+
+- The promoted main custom FFN decode path now runs in the Tier-2 full-FFN
+  timing band and passes the existing FFN and decode-megakernel correctness
+  tests.
+- The full decode-step path improved modestly versus the previous local run
+  (`73.832 ms` p50 before, `73.435 ms` p50 after). This is directionally good,
+  but not a large end-to-end change because FFN was already near the Tier-2
+  microbench timing before this promotion.
+
+## 2026-06-27 - True B2B FFN Plan Audit And Current Path Rerun
+
+Question:
+
+- Is the current main FFN path the attached true fused gated B2B plan, and if
+  not, should it be promoted before benchmarking?
+
+Audit:
+
+- Current main decode FFN still runs the measured decode-layout chain:
+  swizzle hidden input, CUTLASS DualGemm gate/up with GeGLU epilogue, CUTLASS
+  down GEMM, then post-FFN RMSNorm/residual. It no longer writes the packed
+  gate/up output, but it still writes and rereads the `[15360]` GeGLU
+  activation.
+- The attached plan requires the GeGLU result to be produced by a custom
+  GEMM1 A-fragment iterator from GEMM0 accumulators. CUTLASS example 13 has
+  the register-resident handoff hook, but its stock kernel schedule ties the
+  GEMM0 intermediate tile index to the GEMM1 output tile index. For the full
+  FFN, a faithful efficient schedule would need a new kernel schedule that
+  loops over all intermediate tiles for each output tile without turning
+  gate/up into repeated work across output tiles.
+- Back-of-the-envelope for one decode row:
+  - gate/up weights: `225.0 MiB`
+  - down weights: `112.5 MiB`
+  - total FFN weight stream: `337.5 MiB`
+  - GeGLU activation spill read+write: `60.0 KiB`
+  - naive B2B with 128 output columns per CTA: `30` output groups, about
+    `6862.5 MiB` of gate/up+down weight traffic, `20.33x` the current stream.
+
+Commands:
+
+```bash
+make test-ffn-decode
+make ffn-libtorch-bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260627 \
+  ./build/benches/gemma4_ffn_libtorch_bench 100 20 3 1
+make test-decode-megakernel
+make prompt
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `0000:05:00`, driver/runtime reported by
+  CUDA as `13000`, CUDA event timing on the measured stream.
+- FFN microbench: BF16, one decode row, seed `0x1352713`, warm repeated
+  buffers, `20` warmup iterations, `100` timed iterations, `3` trials,
+  correctness checked against libtorch.
+- Decode-step benchmark: local `models/gemma-4-12B-it` checkpoint, prompt
+  `Hello`, prompt length `1`, `5` warmup steps, `50` timed decode steps,
+  setup excluded.
+- Clock policy: clocks were not locked.
+
+Results:
+
+```text
+Correctness:
+  test_ffn_decode passed
+  test_decode_megakernel passed
+  custom_decode_normed_vs_libtorch max_abs=0.000976562
+  custom_decode_residual_vs_libtorch max_abs=0.000976562
+
+FFN microbench:
+  custom_fused_decode_events best_ms=0.527688 avg_ms=0.527953
+  tier2_decode_full best_ms=0.529366 avg_ms=0.529384
+  libtorch_full_ffn best_ms=0.526531 avg_ms=0.526664
+
+Full decode-step:
+  decode_step_ms n=50 mean_ms=73.271 p50_ms=73.399
+  p90_ms=73.442 p95_ms=73.454 p99_ms=73.473
+  min_ms=72.382 max_ms=73.473
+  decode_step_tps_p50=13.624
+```
+
+Conclusion:
+
+- The pasted true B2B plan is not the current path.
+- Promoting a stock/example-13-shaped B2B path would be misleading unless the
+  kernel schedule is also changed; the iterator alone does not provide the
+  full FFN accumulation schedule.
+- The current correct path remains in the same timing band as the Tier-2
+  benchmark and the full decode-step path remains about `73.4 ms` p50.
+
+## 2026-06-27 - Direct No-Activation-Spill FFN Decode Main Path
+
+Question:
+
+- Can the main decode FFN path move closer to the attached gated B2B plan by
+  eliminating the GeGLU activation spill, while preserving correctness and
+  benchmarkability?
+
+Change:
+
+- Added a small float accumulator to `Gemma4FfnDecodeScratch`.
+- Replaced the one-token main decode MLP path with a direct no-hidden-spill
+  accumulator:
+  - each intermediate tile computes gate/up dot products;
+  - GeGLU is computed in shared/register state;
+  - the activated value is immediately folded into the down-projection row;
+  - only the final natural-order MLP row is written for the existing BF16
+    post-FFN RMSNorm/residual kernel.
+- Left the prefill FFN path and `src/gemma4_ffn_tier2.*` unchanged.
+
+Important caveat:
+
+- This is not yet the final CUTLASS `GatedFragmentIteratorA1` B2B
+  implementation from the plan. It matches the central dataflow goal, avoiding
+  the `[15360]` GeGLU activation HBM write/read in the main decode path, but it
+  uses the repo's direct decode accumulator shape rather than CUTLASS B2B
+  fragments.
+
+Commands:
+
+```bash
+make test-ffn-decode
+make ffn-libtorch-bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260627 \
+  ./build/benches/gemma4_ffn_libtorch_bench 100 20 3 1
+make test-decode-megakernel
+make prompt
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+git diff --check
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `0000:05:00`, driver/runtime reported by
+  CUDA as `13000`.
+- FFN microbench: BF16, one decode row, seed `0x1352713`, warm repeated
+  buffers, `20` warmup iterations, `100` timed iterations, `3` trials,
+  CUDA-event timing on the measured stream, libtorch correctness reference.
+- Decode-step benchmark: local `models/gemma-4-12B-it` checkpoint, prompt
+  `Hello`, prompt length `1`, `5` warmup steps, `50` timed decode steps,
+  setup excluded.
+- Clock policy: clocks were not locked.
+
+Results:
+
+```text
+Correctness:
+  test_ffn_decode passed
+  test_decode_megakernel passed
+  git diff --check clean
+  custom_decode_normed_vs_libtorch max_abs=0.000488281
+  custom_decode_residual_vs_libtorch max_abs=0.000976562
+
+FFN microbench:
+  custom_fused_decode_events best_ms=0.505764 avg_ms=0.505863
+  custom_fused_decode_wall best_ms=0.505979 avg_ms=0.506019
+  tier2_decode_full best_ms=0.529407 avg_ms=0.529431
+  libtorch_full_ffn best_ms=0.526633 avg_ms=0.526810
+
+Full decode-step:
+  decode_step_ms n=50 mean_ms=72.280 p50_ms=72.414
+  p90_ms=72.453 p95_ms=72.461 p99_ms=72.472
+  min_ms=71.442 max_ms=72.474
+  decode_step_tps_p50=13.810
+```
+
+Conclusion:
+
+- The main decode FFN no longer spills the GeGLU activation to HBM.
+- FFN decode improved versus the prior main-path microbench
+  (`0.527688 ms` best to `0.505764 ms` best, about `4.2%` faster).
+- Full decode-step improved versus the prior rerun (`73.399 ms` p50 to
+  `72.414 ms` p50, about `1.3%` faster).
+- The remaining gap to the attached final design is architectural: replace the
+  direct accumulator bridge with the CUTLASS B2B gated fragment iterator and
+  schedule once that can be done without regressing the measured path.

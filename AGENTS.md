@@ -87,10 +87,10 @@ ncu --set full -o profile_output ./benchmark
 mode. Record the command line and relevant cache/replay behavior in experiment notes so
 numbers remain comparable.
 
-Nsight Systems (`nsys`) is used for system-level profiling (this machine doesn't have
-nsys). It is useful for timeline analysis, kernel launch overhead, CPU/GPU overlap, and
-idle gaps. The project's `benchmark_on_modal.py` script runs `nsys profile` explicitly
-on machines where it is installed.
+Nsight Systems (`nsys`) is used for system-level profiling. It is useful for timeline
+analysis, kernel launch overhead, CPU/GPU overlap, and idle gaps. The project's
+`benchmark_on_modal.py` script runs `nsys profile` explicitly on machines where it is
+installed.
 
 Lock GPU clocks for serious benchmark runs when possible, especially before comparing
 small deltas. GPU frequency changes with power, thermals, and boost state. On machines
@@ -139,7 +139,7 @@ Approximate model memory footprints:
 
 - CUDA 12.x, tracking the latest CUDA 12 release.
 - Core CUDA libraries and tools, including cuBLAS, cuDNN, CUDA Runtime, NVCC,
-  Nsight Systems (this machine doesn't have nsys), and Nsight Compute.
+  Nsight Systems, and Nsight Compute.
 - Python 3.11 for scripts and reference tooling.
 - `uv` for Python environment management.
 - Latest stable PyTorch installed through `uv`.

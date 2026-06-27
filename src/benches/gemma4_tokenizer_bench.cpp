@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -18,7 +20,7 @@ struct Config {
   int warmup = 1;
   int iters = 1;
   int samples = 5;
-  int sleep_ms = 250;
+  int sleep_ms = 0;
 };
 
 // Prints the positional command format for this custom-tokenizer runner.
@@ -189,20 +191,48 @@ int main(int argc, char **argv) {
     const double median = median_ms(samples);
     const double min_ms = *std::min_element(samples.begin(), samples.end());
     const double max_ms = *std::max_element(samples.begin(), samples.end());
+    const double mean_ms =
+        std::accumulate(samples.begin(), samples.end(), 0.0) /
+        double(samples.size());
+    double variance = 0.0;
+    for (double sample : samples) {
+      const double delta = sample - mean_ms;
+      variance += delta * delta;
+    }
+    const double stddev_ms =
+        samples.size() > 1 ? std::sqrt(variance / double(samples.size() - 1))
+                           : 0.0;
     const double seconds = median / 1000.0;
     const double docs = double(texts.size()) * double(config.iters);
     const double mib = double(total_bytes(texts)) * double(config.iters) /
                        (1024.0 * 1024.0);
 
+    std::printf("benchmark_contract name=tokenizer_bench "
+                "measurement=host_visible_tokenizer_end_to_end "
+                "timing=steady_clock_cpu cache=process_warm_filesystem_excluded "
+                "launch_overhead=not_applicable aggregation=raw_samples "
+                "correctness=encode_success_and_token_count_consumed "
+                "warmup=%d iters=%d samples=%d sleep_ms=%d\n",
+                config.warmup, config.iters, config.samples, config.sleep_ms);
+    if (config.sleep_ms > 0) {
+      std::printf("benchmark_warning name=tokenizer_bench sleep_ms=%d "
+                  "reason=pre_timing_sleep_models_bursty_cpu_work\n",
+                  config.sleep_ms);
+    }
     std::printf("tokenizer_bench impl=custom_cpp warmup=%d iters=%d "
                 "samples=%d docs_per_iter=%zu median_ms=%.3f min_ms=%.3f "
-                "max_ms=%.3f docs_per_s=%.2f mib_per_s=%.2f "
-                "tokens_per_s=%.2f tokens_per_sample=%llu checksum=%llu\n",
+                "max_ms=%.3f mean_ms=%.3f stddev_ms=%.3f docs_per_s=%.2f "
+                "mib_per_s=%.2f tokens_per_s=%.2f tokens_per_sample=%llu "
+                "checksum=%llu samples_ms=[",
                 config.warmup, config.iters, config.samples, texts.size(),
-                median, min_ms, max_ms, docs / seconds, mib / seconds,
-                double(sample_tokens) / seconds,
+                median, min_ms, max_ms, mean_ms, stddev_ms, docs / seconds,
+                mib / seconds, double(sample_tokens) / seconds,
                 static_cast<unsigned long long>(sample_tokens),
                 static_cast<unsigned long long>(checksum));
+    for (size_t i = 0; i < samples.size(); ++i) {
+      std::printf("%s%.3f", i == 0 ? "" : ",", samples[i]);
+    }
+    std::printf("]\n");
     return 0;
   } catch (const std::exception &e) {
     std::fprintf(stderr, "tokenizer bench failed: %s\n", e.what());

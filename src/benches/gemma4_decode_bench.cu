@@ -260,6 +260,19 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
                  op.name, e.what());
   }
 
+  char context[96];
+  std::snprintf(context, sizeof(context), "op=%s variant=custom", op.name);
+  gemma4_bench_print_timing_stats("decode_projection", context, custom);
+  std::snprintf(context, sizeof(context), "op=%s variant=custom_swizzle16",
+                op.name);
+  gemma4_bench_print_timing_stats("decode_projection", context, swizzled);
+  std::snprintf(context, sizeof(context), "op=%s variant=cublas_gemv",
+                op.name);
+  gemma4_bench_print_timing_stats("decode_projection", context, gemv);
+  std::snprintf(context, sizeof(context), "op=%s variant=cublas_gemm_m1",
+                op.name);
+  gemma4_bench_print_timing_stats("decode_projection", context, gemm);
+
   std::printf("op=%s,K=%d,N=%d,layers_per_token=%d,weight_gb_per_token=%.3f\n",
               op.name, op.k, op.n, op.layers_per_token, per_token_gb);
   std::printf("dtype=bf16,input_seed=%llu,weight_seed=%llu,input_scale=%.3f,weight_scale=%.3f\n",
@@ -309,6 +322,12 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
               "cudnn_bf16_conv1x1_mean_abs_diff=%.6g,"
               "cudnn_bf16_conv1x1_max_rel_diff=%.6g\n",
               cudnn_max_abs, cudnn_mean_abs, cudnn_max_rel);
+  std::printf("benchmark_correctness op=%s reference=cublas_and_optional_cudnn "
+              "custom_swizzle16_max_abs=%.6g cublas_gemv_max_abs=%.6g "
+              "cublas_gemm_m1_max_abs=%.6g cudnn_conv1x1_max_abs=%.6g "
+              "status=diff_reported\n",
+              op.name, swizzled_diff.max_abs, gemv_diff.max_abs,
+              gemm_diff.max_abs, cudnn_max_abs);
   std::printf("cudnn_bf16_conv1x1_algo=%d,cudnn_bf16_conv1x1_workspace_bytes=%zu\n\n",
               cudnn_algo, cudnn_workspace_bytes);
 }
@@ -320,15 +339,28 @@ int main(int argc, char **argv) {
   const int iter_arg = has_op ? 2 : 1;
   const int warmup_arg = has_op ? 3 : 2;
   const int trials_arg = has_op ? 4 : 3;
-  const int iters = argc > iter_arg ? std::atoi(argv[iter_arg]) : 20;
-  const int warmup = argc > warmup_arg ? std::atoi(argv[warmup_arg]) : 5;
-  const int trials = argc > trials_arg ? std::atoi(argv[trials_arg]) : 2;
+  const int iters = argc > iter_arg ? std::atoi(argv[iter_arg]) : 100;
+  const int warmup = argc > warmup_arg ? std::atoi(argv[warmup_arg]) : 20;
+  const int trials = argc > trials_arg ? std::atoi(argv[trials_arg]) : 5;
+  if (iters <= 0 || warmup < 0 || trials <= 0) {
+    std::fprintf(stderr,
+                 "usage: %s [op=all] [iters=100] [warmup=20] [trials=5]\n",
+                 argv[0]);
+    return 1;
+  }
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  gemma4_bench_print_common_metadata("decode_bench");
   CublasDecode cublas(stream);
   const uint64_t seed = make_seed("GEMMA4_DECODE_BENCH_SEED");
 
+  std::printf("benchmark_contract name=decode_bench measurement=single_token_projection_decode "
+              "timing=cuda_events_same_stream cache=warm_repeated_buffers "
+              "launch_overhead=excluded_from_gpu_elapsed_time aggregation=raw_trial_samples "
+              "correctness=custom_vs_cublas_and_optional_cudnn_diff_reported "
+              "warmup=%d iters=%d trials=%d dtype=bf16 base_seed=%llu\n",
+              warmup, iters, trials, static_cast<unsigned long long>(seed));
   std::printf("selected=%s,iters=%d,warmup_iters=%d,trials=%d,dtype=bf16,base_seed=%llu\n\n",
               selected.c_str(), iters, warmup, trials,
               static_cast<unsigned long long>(seed));

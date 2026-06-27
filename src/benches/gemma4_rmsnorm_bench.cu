@@ -170,6 +170,7 @@ int main(int argc, char **argv) {
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  gemma4_bench_print_common_metadata("rmsnorm_bench");
 
   const size_t max_elems = static_cast<size_t>(max_rows) * width;
   const uint64_t seed = make_seed("GEMMA4_RMSNORM_BENCH_SEED");
@@ -201,15 +202,13 @@ int main(int argc, char **argv) {
       raw_ptr(d_ones_weight), static_cast<size_t>(width), 1.0f, stream);
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
-  int device = 0;
-  cudaDeviceProp prop{};
-  CUDA_CHECK(cudaGetDevice(&device));
-  CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-
-  std::printf("device=%s\n", prop.name);
-  std::printf("shape=width%d,max_rows=%d,seed=0x%llx\n", width, max_rows,
-              static_cast<unsigned long long>(seed));
-  std::printf("iters=%d,warmup_iters=%d,trials=%d\n", iters, warmup, trials);
+  std::printf("benchmark_contract name=rmsnorm_bench measurement=rmsnorm_kernel_family "
+              "timing=cuda_events_same_stream cache=warm_repeated_buffers "
+              "launch_overhead=excluded_from_gpu_elapsed_time aggregation=raw_trial_samples "
+              "correctness=custom_vs_split_and_optional_cudnn warmup=%d iters=%d "
+              "trials=%d dtype=bf16 seed=0x%llx\n",
+              warmup, iters, trials, static_cast<unsigned long long>(seed));
+  std::printf("shape=width%d,max_rows=%d\n", width, max_rows);
   std::printf("cudnn_frontend=%s\n",
 #if GEMMA4_HAS_CUDNN_FRONTEND
               "compiled"
@@ -281,6 +280,20 @@ int main(int argc, char **argv) {
     run_fused();
     run_split();
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    float fused_split_max_abs = -1.0f;
+    if (has_fused) {
+      const DiffStats fused_split_diff =
+          diff_stats_bf16(raw_ptr(d_fused_normed), raw_ptr(d_split_normed),
+                          count);
+      fused_split_max_abs = fused_split_diff.max_abs;
+      std::printf("benchmark_correctness name=rmsnorm_fused_vs_split rows=%d "
+                  "max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n",
+                  rows, fused_split_diff.max_abs, fused_split_diff.mean_abs,
+                  fused_split_diff.max_rel);
+      if (fused_split_diff.max_abs > 0.015625f) {
+        throw std::runtime_error("fused residual+rmsnorm differs from split path");
+      }
+    }
 
     const TimingStats rms_stats =
         time_ms(run_rms, stream, warmup, iters, trials);
@@ -294,6 +307,19 @@ int main(int argc, char **argv) {
     }
     const TimingStats split_stats =
         time_ms(run_split, stream, warmup, iters, trials);
+    char context[96];
+    std::snprintf(context, sizeof(context), "rows=%d variant=rms", rows);
+    gemma4_bench_print_timing_stats("rmsnorm_bench", context, rms_stats);
+    std::snprintf(context, sizeof(context), "rows=%d variant=residual", rows);
+    gemma4_bench_print_timing_stats("rmsnorm_bench", context, residual_stats);
+    std::snprintf(context, sizeof(context), "rows=%d variant=scale_free", rows);
+    gemma4_bench_print_timing_stats("rmsnorm_bench", context, scale_free_stats);
+    if (has_fused) {
+      std::snprintf(context, sizeof(context), "rows=%d variant=fused", rows);
+      gemma4_bench_print_timing_stats("rmsnorm_bench", context, fused_stats);
+    }
+    std::snprintf(context, sizeof(context), "rows=%d variant=split", rows);
+    gemma4_bench_print_timing_stats("rmsnorm_bench", context, split_stats);
 
     float fused_graph_ms = -1.0f;
     float split_graph_ms = -1.0f;
@@ -302,6 +328,10 @@ int main(int argc, char **argv) {
         const TimingStats fused_graph_stats =
             time_ms_graph(run_fused, stream, warmup, iters, trials);
         fused_graph_ms = fused_graph_stats.best_ms;
+        std::snprintf(context, sizeof(context),
+                      "rows=%d variant=fused_graph", rows);
+        gemma4_bench_print_timing_stats("rmsnorm_bench", context,
+                                        fused_graph_stats);
       } catch (const std::exception &e) {
         std::fprintf(
             stderr,
@@ -314,6 +344,10 @@ int main(int argc, char **argv) {
       const TimingStats split_graph_stats =
           time_ms_graph(run_split, stream, warmup, iters, trials);
       split_graph_ms = split_graph_stats.best_ms;
+      std::snprintf(context, sizeof(context), "rows=%d variant=split_graph",
+                    rows);
+      gemma4_bench_print_timing_stats("rmsnorm_bench", context,
+                                      split_graph_stats);
     } catch (const std::exception &e) {
       std::fprintf(stderr,
                    "split residual+RMSNorm CUDA graph timing unavailable for rows=%d: %s\n",
@@ -327,6 +361,10 @@ int main(int argc, char **argv) {
           time_ms_graph(run_rms, stream, warmup, iters, trials);
       rms_graph_ms = rms_graph_stats.best_ms;
       rms_graph_gib_s = gib_per_second(rms_bytes, rms_graph_ms);
+      std::snprintf(context, sizeof(context), "rows=%d variant=rms_graph",
+                    rows);
+      gemma4_bench_print_timing_stats("rmsnorm_bench", context,
+                                      rms_graph_stats);
     } catch (const std::exception &e) {
       std::fprintf(stderr,
                    "custom RMSNorm CUDA graph timing unavailable for rows=%d: %s\n",
@@ -341,6 +379,10 @@ int main(int argc, char **argv) {
       scale_free_graph_ms = scale_free_graph_stats.best_ms;
       scale_free_graph_gib_s =
           gib_per_second(scale_free_bytes, scale_free_graph_ms);
+      std::snprintf(context, sizeof(context),
+                    "rows=%d variant=scale_free_graph", rows);
+      gemma4_bench_print_timing_stats("rmsnorm_bench", context,
+                                      scale_free_graph_stats);
     } catch (const std::exception &e) {
       std::fprintf(stderr,
                    "custom scale-free RMSNorm CUDA graph timing unavailable "
@@ -487,6 +529,9 @@ int main(int argc, char **argv) {
                 fused_graph_ms, split_graph_ms, fused_graph_vs_split_graph,
                 cudnn_split_ms, cudnn_split_graph_ms, fused_vs_cudnn_split,
                 cudnn_split_max_abs);
+    if (has_fused && fused_split_max_abs < 0.0f) {
+      throw std::runtime_error("missing fused residual+rmsnorm correctness check");
+    }
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));

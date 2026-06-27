@@ -19,7 +19,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <math.h>
-#include <numeric>
 #include <vector>
 
 namespace {
@@ -178,39 +177,6 @@ std::vector<float> time_samples(Fn &&fn,
   return values;
 }
 
-float percentile(std::vector<float> sorted, float p) {
-  std::sort(sorted.begin(), sorted.end());
-  const float scaled = p * float(sorted.size() - 1);
-  const size_t lo = size_t(scaled);
-  const size_t hi = std::min(lo + 1, sorted.size() - 1);
-  const float t = scaled - float(lo);
-  return sorted[lo] * (1.0f - t) + sorted[hi] * t;
-}
-
-// Returns a lightly trimmed mean to reduce one-sample launch or clock outliers.
-float trimmed_mean(std::vector<float> sorted) {
-  std::sort(sorted.begin(), sorted.end());
-  const size_t trim = sorted.size() >= 10 ? sorted.size() / 10 : 0;
-  const size_t begin = trim;
-  const size_t end = sorted.size() - trim;
-  const float sum = std::accumulate(sorted.begin() + begin,
-                                    sorted.begin() + end, 0.0f);
-  return sum / float(end - begin);
-}
-
-// Returns sample standard deviation in the same units as the input samples.
-float sample_stddev(const std::vector<float> &samples, float mean) {
-  if (samples.size() < 2) {
-    return 0.0f;
-  }
-  float sum_sq = 0.0f;
-  for (float sample : samples) {
-    const float delta = sample - mean;
-    sum_sq += delta * delta;
-  }
-  return sqrtf(sum_sq / float(samples.size() - 1));
-}
-
 // Times a captured LibTorch CUDA graph with events on the graph replay stream.
 std::vector<float> time_libtorch_graph_samples(at::cuda::CUDAGraph &graph,
                                                c10::cuda::CUDAStream stream,
@@ -266,27 +232,12 @@ void print_stats(const char *variant,
                  float top_p,
                  float temperature,
                  const std::vector<float> &samples) {
-  const float sum = std::accumulate(samples.begin(), samples.end(), 0.0f);
-  const float mean = sum / float(samples.size());
-  auto sorted = samples;
-  std::sort(sorted.begin(), sorted.end());
-  std::printf("variant=%s batch_size=%d top_k=%d top_p=%.3f temp=%.3f "
-              "min_us=%.3f median_us=%.3f trimmed_mean_us=%.3f "
-              "mean_us=%.3f stddev_us=%.3f iqr_us=%.3f p95_us=%.3f "
-              "p99_us=%.3f max_us=%.3f samples_us=[",
-              variant, batch_size, top_k, top_p, temperature,
-              sorted.front() * 1000.0f, percentile(samples, 0.50f) * 1000.0f,
-              trimmed_mean(samples) * 1000.0f, mean * 1000.0f,
-              sample_stddev(samples, mean) * 1000.0f,
-              (percentile(samples, 0.75f) - percentile(samples, 0.25f)) *
-                  1000.0f,
-              percentile(samples, 0.95f) * 1000.0f,
-              percentile(samples, 0.99f) * 1000.0f,
-              sorted.back() * 1000.0f);
-  for (size_t i = 0; i < samples.size(); ++i) {
-    std::printf("%s%.3f", i == 0 ? "" : ",", samples[i] * 1000.0f);
-  }
-  std::printf("]\n");
+  char context[160];
+  std::snprintf(context, sizeof(context),
+                "variant=%s batch_size=%d top_k=%d top_p=%.3f temp=%.3f",
+                variant, batch_size, top_k, top_p, temperature);
+  gemma4_bench_print_timing_stats(
+      "sampling_bench", context, summarize_timing_samples(samples));
 }
 
 }  // namespace
@@ -307,21 +258,19 @@ int main(int argc, char **argv) {
 
   cudaStream_t stream = nullptr;
   CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  gemma4_bench_print_common_metadata("sampling_bench");
   std::printf("benchmark_guardrail stability_scope=single_process "
               "minimum_effect_us=25 close_call_requires_process_rerun=true "
               "candidate_order=fixed\n");
   std::printf("benchmark_threats clocks=unlocked cache=warm_repeated_buffers "
-              "contention=not_exclusively_verified ncu=not_run "
+              "contention=not_exclusively_verified profiler_counters=not_run "
               "process_repeats=not_run\n");
 
-  cudaDeviceProp prop = {};
-  CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
-  std::printf("env=gpu=\"%s\" global_mem_bytes=%zu\n",
-              prop.name, static_cast<size_t>(prop.totalGlobalMem));
-  std::printf("contract=sampling_decode timing=cuda_events "
+  std::printf("benchmark_contract name=sampling_bench measurement=sampling_decode "
+              "timing=cuda_events "
               "stream=nonblocking cache=warm_repeated_buffers "
               "launch_overhead=cpu_enqueue_excluded_by_cuda_events "
-              "warmup=%d iters=%d samples=%d dtype=bf16 "
+              "aggregation=raw_samples warmup=%d iters=%d samples=%d dtype=bf16 "
               "vocab=%d hidden=%d\n",
               warmup, iters, samples, GEMMA4_VOCAB_SIZE, GEMMA4_HIDDEN_SIZE);
   std::printf("benchmark_inputs lm_head_seed=0x5678 hidden_seed=0x2468 "
