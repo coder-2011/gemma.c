@@ -3,6 +3,195 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-27 - FFN Decode Benchmark Roofline Sanity Audit
+
+Question:
+
+- Are the new Tier-2 FFN path and the existing custom FFN path mathematically
+  broken, or is the benchmark contract overclaiming the absolute microsecond
+  timings?
+
+Change:
+
+- Added Tier-2 FFN decode coverage to the existing sparse `test-ffn-decode`
+  fixture. This checks Tier-2 MLP, normed output, and residual output against
+  the same CPU reference used for the existing fused decode path.
+- Updated `gemma4_ffn_libtorch_bench` to label the cache rows as
+  `flush_hint` instead of cold-cache proof.
+- Added a simple FFN weight-stream roofline and warnings when measured decode
+  rows fall below the single-read weight floor.
+
+Commands:
+
+```bash
+make test-ffn-decode
+make ffn-libtorch-bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=0x12345678 ./build/benches/gemma4_ffn_libtorch_bench 100 20 3 1
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=0xabcdef01 ./build/benches/gemma4_ffn_libtorch_bench 100 20 3 1
+git diff --check
+```
+
+Additional one-off sanity checks:
+
+- A quick PyTorch device-to-device copy of roughly one FFN layer of bytes
+  reported about `0.036 ms`.
+- A scratch CUDA `uint32` copy kernel over `353894400` bytes reported about
+  `0.011-0.012 ms`, with a checksum consumed after the copy.
+- These raw-copy numbers are also far above an A6000 DRAM roofline, so this
+  environment/harness cannot prove cold HBM traffic with elapsed time alone.
+- Root cause found later: `/etc/ld.so.preload` injects
+  `/etc/thunder/libthunder.so`, which interposes CUDA event, stream, sync, copy,
+  graph, CUPTI, and NVML APIs. Treat all CUDA timing on this host as invalid
+  until rerun without Thunder preloaded.
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, driver `580.126.16`, CUDA `13.0`.
+- Library baseline: LibTorch `2.11.0`.
+- Shape: BF16 decode row, hidden `3840`, intermediate `15360`.
+- Timing: CUDA events on the measured stream, plus device-sync wall diagnostic
+  for current custom decode.
+- Cache policy: warm repeated buffers; flush rows are only eviction hints.
+- Profiler note: `ncu` and `compute-sanitizer` were not available here.
+
+Results:
+
+```text
+FFN unique weight bytes: 337.500 MiB
+A6000 DRAM peak:         715.345 GiB/s
+single weight-read floor: 0.460742 ms
+```
+
+Seed `0x12345678`:
+
+```text
+tier2_decode_full              0.010468 ms
+custom_fused_decode_events     0.028748 ms
+cache_flush_hint_only          0.005045 ms
+cache_flush_hint_gib_s     49552.441 GiB/s
+```
+
+Seed `0xabcdef01`:
+
+```text
+tier2_decode_full              0.011795 ms
+custom_fused_decode_events     0.027579 ms
+cache_flush_hint_only          0.004890 ms
+cache_flush_hint_gib_s     51126.522 GiB/s
+```
+
+Correctness:
+
+- `make test-ffn-decode` passed with both existing fused decode and Tier-2
+  sparse-reference checks.
+- Benchmark LibTorch checks passed on both fixed seeds:
+  - Tier-2 MLP max abs `<= 4.76837e-07`.
+  - Tier-2 full max abs `<= 0.000976562`.
+  - Existing custom full max abs `<= 0.000976562`.
+
+Conclusion:
+
+- The evidence does not show a math bug in either the existing custom FFN path
+  or the new Tier-2 path.
+- The absolute `~0.01-0.03 ms` FFN decode timings are not trustworthy as real
+  HBM-streaming layer latency. They violate the single FFN weight-read roofline,
+  and the flush hint itself reports impossible effective bandwidth.
+- Treat the Tier-2/current ratios as warm-buffer microbenchmark leads only.
+  Do not promote them as real decode-layer latency without `ncu` traffic and
+  timing counters on a profiling-capable host without Thunder preloaded.
+
+## 2026-06-26 - Tier-2 FFN Decode Prototype
+
+Question:
+
+- Does a fixed-shape Tier-2 decode FFN prototype, which computes one GeGLU
+  tile and reuses it across a wider output group, beat the current FFN MLP and
+  full decode path under a fair benchmark?
+
+Change:
+
+- Added `gemma4_ffn_tier2.cu` / `.cuh` as an experimental path, leaving
+  `gemma4_ffn.cu` untouched.
+- Wired Tier-2 MLP-only and Tier-2 full decode rows into
+  `gemma4_ffn_libtorch_bench`.
+- Fixed a benchmark fairness issue: current custom full decode now has a
+  same-stream CUDA-event timing row, while the old device-sync wall row remains
+  only as a host/launch-overhead diagnostic.
+- Rejected CUDA graph rows after they produced impossible sub-microsecond
+  timings in this harness.
+- Tier-2 now uses a 256-column output group and a fused post-FFN
+  RMSNorm/residual-add kernel with 128 threads.
+
+Commands:
+
+```bash
+make ffn-libtorch-bench
+./build/benches/gemma4_ffn_libtorch_bench 100 20 5 1
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=0x12345678 ./build/benches/gemma4_ffn_libtorch_bench 100 20 5 1
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=0xabcdef01 ./build/benches/gemma4_ffn_libtorch_bench 100 20 5 1
+make test-ffn-decode
+git diff --check
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, PCI bus `00000000:0C:00.0`, driver
+  `580.126.16`, persistence enabled, ECC disabled, power limit `300 W`.
+- Toolchain: `/usr/local/cuda/bin/nvcc`, CUDA `13.0.48`.
+- Library baseline: LibTorch `2.11.0`.
+- Shape: BF16 decode row, hidden `3840`, intermediate `15360`.
+- Timing: CUDA events on the measured stream for the headline rows; current
+  custom decode also reports the old device-sync wall row as a diagnostic.
+- Warmup/iterations: `20` warmups, `100` timed iterations, `5` trials.
+- Cache policy: warm repeated buffers, plus explicit L2-flush rows.
+- Clock policy: clocks not locked.
+- Correctness tolerance: fail above `0.125` max abs versus LibTorch reference.
+- Profiler note: `ncu` was not available on this machine.
+
+Results, seed `0x12345678`:
+
+```text
+path                             best_ms   avg_ms    max_abs
+libtorch_mlp                     0.116685  0.117135  0
+libtorch_full_ffn                0.193577  0.194255  0
+tier2_decode_mlp                 0.006037  0.006165  4.76837e-07
+tier2_decode_full                0.012279  0.012491  0.000976562
+custom_fused_decode_events       0.030521  0.030824  0.000976562
+custom_fused_decode_wall         0.030517  0.031101  0.000976562
+custom_prefill_mlp               0.022564  0.028632  9.53674e-07
+tier2_decode_mlp_cold            0.017627  0.019577
+cache_flush_only                 0.007070  0.007342
+cold_tier2_minus_flush_ms        0.010558
+```
+
+Derived speedups, seed `0x12345678`:
+
+```text
+tier2_decode_mlp_vs_libtorch_mlp_speedup      19.328335x
+tier2_decode_mlp_vs_current_mlp_speedup        3.737679x
+tier2_decode_full_vs_libtorch_full_speedup    15.765064x
+tier2_decode_full_vs_current_decode_speedup    2.485638x
+```
+
+Confirmation, seed `0xabcdef01`:
+
+```text
+tier2_decode_mlp                 0.005610  0.005893  4.76837e-07
+tier2_decode_full                0.011461  0.012055  0.000976562
+custom_fused_decode_events       0.028447  0.036613  0.000976562
+tier2_decode_full_vs_current_decode_speedup    2.482032x
+```
+
+Conclusion:
+
+- The Tier-2 prototype was correct against LibTorch and the current custom MLP
+  at BF16 tolerances.
+- After the fair custom event-timing row and fused post kernel, full Tier-2
+  decode was about `2.48x` faster than current custom full decode on two fixed
+  seeds.
+- Rerun under `ncu` when available before treating the microsecond-scale timing
+  as profiler-grounded.
+
 ## 2026-06-25 - Sampling Bench LibTorch Baseline Port
 
 Question:
