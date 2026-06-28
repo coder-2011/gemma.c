@@ -63,6 +63,19 @@ cudaError_t gemma4_ffn_decode_fused_bf16(
     float eps,
     cudaStream_t stream);
 
+// Runs the decode FFN tail inside a caller-owned cooperative CUDA grid.
+extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
+    __nv_bfloat16 *__restrict__ residual_out,
+    __nv_bfloat16 *__restrict__ normed_out,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ residual,
+    const __nv_bfloat16 *__restrict__ rms_weight,
+    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
+    const __nv_bfloat16 *__restrict__ w_down_decode,
+    Gemma4FfnDecodeScratch *__restrict__ scratch,
+    const __nv_bfloat16 *__restrict__ layer_scalar,
+    float eps);
+
 cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
     __nv_bfloat16 *__restrict__ w_gate_up_swizzled,
     const __nv_bfloat16 *__restrict__ w_gate_up_col_major,
