@@ -8,10 +8,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cute/layout.hpp>
+#include <cute/swizzle.hpp>
+
 #include <string>
 #include <vector>
 
 namespace {
+
+constexpr int kBf16PackWidth = 8;
 
 struct MappedFile {
   void *mapping = nullptr;
@@ -27,14 +32,24 @@ struct MappedFile {
 void pack_down_decode(std::vector<__nv_bfloat16> &dst, const __nv_bfloat16 *down) {
   dst.resize(static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) * GEMMA4_HIDDEN_SIZE);
 
+  const auto src_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE),
+      cute::make_stride(GEMMA4_INTERMEDIATE_SIZE, 1));
+  const auto dst_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const auto hidden_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_HIDDEN_SIZE / kBf16PackWidth, kBf16PackWidth),
+      cute::make_stride(kBf16PackWidth, 1));
+  const cute::Swizzle<3, 0, 3> pack_swizzle;
+
   for (int hidden = 0; hidden < GEMMA4_HIDDEN_SIZE; ++hidden) {
-    const int pack = hidden / 8;
-    const int lane = hidden & 7;
-    const int swizzled_pack = (pack & ~7) | ((pack & 7) ^ ((pack >> 3) & 7));
-    const int dst_col = swizzled_pack * 8 + lane;
-    const __nv_bfloat16 *src = down + static_cast<size_t>(hidden) * GEMMA4_INTERMEDIATE_SIZE;
+    const int pack = hidden / kBf16PackWidth;
+    const int lane = hidden % kBf16PackWidth;
+    const int swizzled_pack = pack_swizzle(pack);
+    const int dst_col = hidden_layout(swizzled_pack, lane);
     for (int row = 0; row < GEMMA4_INTERMEDIATE_SIZE; ++row) {
-      dst[static_cast<size_t>(row) * GEMMA4_HIDDEN_SIZE + dst_col] = src[row];
+      dst[dst_layout(row, dst_col)] = down[src_layout(hidden, row)];
     }
   }
 }
@@ -44,21 +59,33 @@ cudaError_t load_layer_ffn_decode(
     Gemma4TextLayerWeightsDevice &dst, const Gemma4CheckpointLayerHost &src,
     std::vector<__nv_bfloat16> &gate_up_stage,
     std::vector<__nv_bfloat16> &down_stage) {
-  constexpr int hidden_packs = GEMMA4_HIDDEN_SIZE / 8;
+  constexpr int hidden_packs = GEMMA4_HIDDEN_SIZE / kBf16PackWidth;
   gate_up_stage.resize(static_cast<size_t>(GEMMA4_PACKED_FFN_SIZE) * GEMMA4_HIDDEN_SIZE);
+  const auto ffn_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const auto stage_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_PACKED_FFN_SIZE, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const auto hidden_layout = cute::make_layout(
+      cute::make_shape(hidden_packs, kBf16PackWidth),
+      cute::make_stride(kBf16PackWidth, 1));
+  const cute::Swizzle<3, 0, 3> pack_swizzle;
 
   for (int row = 0; row < GEMMA4_INTERMEDIATE_SIZE; ++row) {
-    __nv_bfloat16 *gate_dst = gate_up_stage.data() + static_cast<size_t>(2 * row) * GEMMA4_HIDDEN_SIZE;
-    __nv_bfloat16 *up_dst = gate_dst + GEMMA4_HIDDEN_SIZE;
-    const __nv_bfloat16 *gate_src = src.gate_proj_col_major + static_cast<size_t>(row) * GEMMA4_HIDDEN_SIZE;
-    const __nv_bfloat16 *up_src = src.up_proj_col_major + static_cast<size_t>(row) * GEMMA4_HIDDEN_SIZE;
+    __nv_bfloat16 *gate_dst = gate_up_stage.data() + stage_layout(2 * row, 0);
+    __nv_bfloat16 *up_dst = gate_up_stage.data() + stage_layout(2 * row + 1, 0);
+    const __nv_bfloat16 *gate_src = src.gate_proj_col_major + ffn_layout(row, 0);
+    const __nv_bfloat16 *up_src = src.up_proj_col_major + ffn_layout(row, 0);
 
     for (int pack = 0; pack < hidden_packs; ++pack) {
-      const int src_col = pack * 8;
-      const int swizzled_pack = (pack & ~7) | ((pack & 7) ^ ((pack >> 3) & 7));
-      const int dst_col = swizzled_pack * 8;
-      memcpy(gate_dst + dst_col, gate_src + src_col, 8 * sizeof(__nv_bfloat16));
-      memcpy(up_dst + dst_col, up_src + src_col, 8 * sizeof(__nv_bfloat16));
+      const int swizzled_pack = pack_swizzle(pack);
+      const int src_col = hidden_layout(pack, 0);
+      const int dst_col = hidden_layout(swizzled_pack, 0);
+      memcpy(gate_dst + dst_col, gate_src + src_col,
+             kBf16PackWidth * sizeof(__nv_bfloat16));
+      memcpy(up_dst + dst_col, up_src + src_col,
+             kBf16PackWidth * sizeof(__nv_bfloat16));
     }
   }
 
@@ -93,22 +120,35 @@ cudaError_t load_layer_qkv_decode(
     const Gemma4CheckpointLayerHost &src,
     const Gemma4AttentionSpec &spec,
     std::vector<__nv_bfloat16> &qkv_stage) {
-  const size_t q_elements =
-      static_cast<size_t>(spec.q_heads) * spec.head_dim * GEMMA4_HIDDEN_SIZE;
-  const size_t kv_elements =
-      static_cast<size_t>(spec.kv_heads) * spec.head_dim * GEMMA4_HIDDEN_SIZE;
-  const size_t v_elements = spec.global ? 0 : kv_elements;
+  const int q_width = spec.q_heads * spec.head_dim;
+  const int kv_width = spec.kv_heads * spec.head_dim;
+  const int v_width = spec.global ? 0 : kv_width;
+  const auto q_layout = cute::make_layout(
+      cute::make_shape(q_width, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const auto kv_layout = cute::make_layout(
+      cute::make_shape(kv_width, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const auto v_layout = cute::make_layout(
+      cute::make_shape(v_width, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const auto qkv_layout = cute::make_layout(
+      cute::make_shape(q_width + kv_width + v_width, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const size_t q_elements = cute::size(q_layout);
+  const size_t kv_elements = cute::size(kv_layout);
+  const size_t v_elements = cute::size(v_layout);
   qkv_stage.resize(q_elements + kv_elements + v_elements);
 
-  __nv_bfloat16 *write = qkv_stage.data();
-  memcpy(write, src.q_proj_col_major, q_elements * sizeof(__nv_bfloat16));
-  write += q_elements;
-  memcpy(write, src.k_proj_col_major, kv_elements * sizeof(__nv_bfloat16));
-  write += kv_elements;
+  __nv_bfloat16 *q_dst = qkv_stage.data() + qkv_layout(0, 0);
+  __nv_bfloat16 *k_dst = qkv_stage.data() + qkv_layout(q_width, 0);
+  __nv_bfloat16 *v_dst = qkv_stage.data() + qkv_layout(q_width + kv_width, 0);
+  memcpy(q_dst, src.q_proj_col_major, q_elements * sizeof(__nv_bfloat16));
+  memcpy(k_dst, src.k_proj_col_major, kv_elements * sizeof(__nv_bfloat16));
 
   // Global layers have K=V semantics, so only sliding layers carry a V projection.
   if (v_elements != 0) {
-    memcpy(write, src.v_proj_col_major, v_elements * sizeof(__nv_bfloat16));
+    memcpy(v_dst, src.v_proj_col_major, v_elements * sizeof(__nv_bfloat16));
   }
 
   const size_t bytes = qkv_stage.size() * sizeof(__nv_bfloat16);
@@ -123,8 +163,9 @@ cudaError_t load_layer_qkv_decode(
   }
 
   dst.q_proj_col_major = dst.qkv_proj_col_major;
-  dst.k_proj_col_major = dst.qkv_proj_col_major + q_elements;
-  dst.v_proj_col_major = spec.global ? nullptr : dst.k_proj_col_major + kv_elements;
+  dst.k_proj_col_major = dst.qkv_proj_col_major + qkv_layout(q_width, 0);
+  dst.v_proj_col_major =
+      spec.global ? nullptr : dst.qkv_proj_col_major + qkv_layout(q_width + kv_width, 0);
   return cudaSuccess;
 }
 

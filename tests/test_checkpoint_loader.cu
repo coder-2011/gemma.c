@@ -3,15 +3,18 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cute/swizzle.hpp>
+
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <initializer_list>
 #include <string>
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+
+constexpr int kBf16PackWidth = 8;
 
 // Fails the test with the CUDA status and source location.
 void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
@@ -31,11 +34,8 @@ uint16_t bf16_bits(__nv_bfloat16 value) {
 
 // Repeats the FFN decode hidden-pack swizzle used by the loader.
 int hidden_pack_swizzle_index(int chunk) {
-  constexpr int kSwizzleChunks = 8;
-  const unsigned u = static_cast<unsigned>(chunk);
-  const unsigned col = u & (kSwizzleChunks - 1);
-  const unsigned row = (u >> 3) & (kSwizzleChunks - 1);
-  return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
+  const cute::Swizzle<3, 0, 3> pack_swizzle;
+  return pack_swizzle(chunk);
 }
 
 // Copies one device BF16 value and compares it with the expected mapped value.
@@ -128,7 +128,9 @@ int main(int argc, char **argv) {
 
   const int hidden = 9;
   const int row = 37;
-  const int dst_col = hidden_pack_swizzle_index(hidden / 8) * 8 + (hidden & 7);
+  const int pack = hidden / kBf16PackWidth;
+  const int lane = hidden % kBf16PackWidth;
+  const int dst_col = hidden_pack_swizzle_index(pack) * kBf16PackWidth + lane;
   const size_t down_dst = static_cast<size_t>(row) * GEMMA4_HIDDEN_SIZE +
                           dst_col;
   const size_t down_src = static_cast<size_t>(hidden) *

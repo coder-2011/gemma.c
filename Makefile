@@ -118,7 +118,7 @@ $(BUILD_DIR)/gemma4_prefill_megakernel.o: src/gemma4_prefill_megakernel.cu src/g
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) -c src/gemma4_prefill_megakernel.cu -o $@
 
 $(BUILD_DIR)/gemma4_checkpoint.o: src/gemma4_checkpoint.cu src/gemma4_checkpoint.cuh src/gemma4.h | $(BUILD_DIR)
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -c src/gemma4_checkpoint.cu -o $@
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUTLASS_INCLUDE) -c src/gemma4_checkpoint.cu -o $@
 
 $(BUILD_DIR)/libgemma4_flash_attention.so: src/gemma4_flash_attention.cu src/gemma4_flash_attention.cuh src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_decode_megakernel.cu src/gemma4_megakernel.cuh src/gemma4_runtime.cu src/gemma4_runtime.cuh src/gemma4_sampling.cu src/gemma4_sampling.cuh src/gemma4_ffn.cu src/gemma4_ffn.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_kv_cache.cu src/gemma4_kv_cache.cuh src/gemma4_rope.cu src/gemma4_rope.cuh src/gemma4_embedding_gather.cu src/gemma4_embedding_gather.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)
 	$(NVCC) $(NVCCFLAGS) $(RDC_NVCCFLAGS) $(FLASH_ATTN_NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) -Xcompiler -fPIC -shared $(CPPFLAGS) $(FLASH_ATTN_CUTLASS_CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) src/gemma4_flash_attention.cu src/gemma4_matmul_kernels.cu src/gemma4_decode_megakernel.cu src/gemma4_runtime.cu src/gemma4_sampling.cu src/gemma4_ffn.cu src/gemma4_rmsnorm.cu src/gemma4_kv_cache.cu src/gemma4_rope.cu src/gemma4_embedding_gather.cu -o $@
@@ -199,7 +199,7 @@ $(BUILD_DIR)/tests/test_prefill_megakernel: tests/test_prefill_megakernel.cu src
 	$(NVCC) $(NVCCFLAGS) $(RDC_LTO_NVCCFLAGS) $(CPPFLAGS) -I$(FLASH_ATTN_CUTLASS_INCLUDE) tests/test_prefill_megakernel.cu src/gemma4_embedding_gather.cu $(BUILD_DIR)/gemma4_prefill_megakernel.o $(BUILD_DIR)/gemma4_matmul_kernels.o $(BUILD_DIR)/gemma4_flash_attention.o $(BUILD_DIR)/gemma4_decode_megakernel.o $(BUILD_DIR)/gemma4_runtime.o $(BUILD_DIR)/gemma4_sampling.o $(BUILD_DIR)/gemma4_rope.o $(BUILD_DIR)/gemma4_kv_cache.o $(BUILD_DIR)/gemma4_ffn.o $(BUILD_DIR)/gemma4_rmsnorm.o $(CUDA_LDFLAGS) -lcublas -o $@
 
 $(BUILD_DIR)/tests/test_checkpoint_loader: tests/test_checkpoint_loader.cu src/gemma4_checkpoint.cu src/gemma4_checkpoint.cuh src/gemma4.h | $(BUILD_DIR)/tests
-	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) tests/test_checkpoint_loader.cu src/gemma4_checkpoint.cu -o $@
+	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) -I$(CUTLASS_INCLUDE) tests/test_checkpoint_loader.cu src/gemma4_checkpoint.cu -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)

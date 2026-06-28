@@ -14,7 +14,6 @@ struct Gemma4AttentionProjectionWeights {
   int32_t q_col_base;
   int32_t k_col_base;
   int32_t v_col_base;
-  const __nv_bfloat16 *d_qkv_col_major = nullptr;
 };
 
 // Sliding prefill APIs take total live causal keys, including the current key.

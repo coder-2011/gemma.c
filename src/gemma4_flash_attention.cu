@@ -1308,31 +1308,6 @@ __device__ __forceinline__ float hidden_rms_scale_bf16(
   return rsqrtf(sum / float(GEMMA4_HIDDEN_SIZE) + GEMMA4_RMS_NORM_EPS);
 }
 
-// Accumulates one 8-element BF16 dot-product chunk through CuTe's register GEMM path.
-__device__ __forceinline__ float cute_bf16_pack_dot_add(
-    const Bf16Packed128 &x_pack,
-    const Bf16Packed128 &w_pack,
-    float sum) {
-  float x_values[kBf16Packed128Elements];
-  float w_values[kBf16Packed128Elements];
-#pragma unroll
-  for (int i = 0; i < kBf16Packed128Elements; ++i) {
-    x_values[i] = __bfloat162float(x_pack[i]);
-    w_values[i] = __bfloat162float(w_pack[i]);
-  }
-
-  float c_value[1] = {sum};
-  float d_value[1] = {0.0f};
-  Tensor x = make_tensor(
-      make_rmem_ptr(x_values), make_shape(_1{}, Int<kBf16Packed128Elements>{}));
-  Tensor w = make_tensor(
-      make_rmem_ptr(w_values), make_shape(_1{}, Int<kBf16Packed128Elements>{}));
-  Tensor c = make_tensor(make_rmem_ptr(c_value), make_shape(_1{}, _1{}));
-  Tensor d = make_tensor(make_rmem_ptr(d_value), make_shape(_1{}, _1{}));
-  cute::gemm(d, x, w, c);
-  return d_value[0];
-}
-
 // Project from RMSNorm(x) without materializing the normalized hidden row.
 template <typename Traits>
 __device__ __forceinline__ void project_normed_head_values_bf16(
@@ -1366,48 +1341,6 @@ __device__ __forceinline__ void project_normed_head_values_bf16(
       const Bf16Packed128 w_pack =
           Bf16Packed128{*reinterpret_cast<const int4 *>(w_col_major + weight_offset)};
       gemma4_bf16_pack_accumulate_dot(normed_pack, w_pack, values[i]);
-    }
-  }
-
-#pragma unroll
-  for (int i = 0; i < Derived::kValuesPerLane; ++i) {
-    values[i] = __bfloat162float(__float2bfloat16_rn(values[i]));
-  }
-}
-
-// Projects one packed Q/K/V head from RMSNorm(x) without materializing the normalized row.
-template <typename Traits>
-__device__ __forceinline__ void project_normed_packed_head_values_bf16_cute(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ input_norm_weight,
-    const __nv_bfloat16 *__restrict__ w_qkv_col_major,
-    int col_base,
-    int lane,
-    float hidden_scale,
-    float (&values)[Gemma4AttentionDerived<Traits>::kValuesPerLane]) {
-  using Derived = Gemma4AttentionDerived<Traits>;
-  constexpr int kPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-#pragma unroll
-  for (int i = 0; i < Derived::kValuesPerLane; ++i) {
-    values[i] = 0.0f;
-  }
-
-  for (int pack = 0; pack < kPacks; ++pack) {
-    const int element = pack * kBf16Packed128Elements;
-    const Bf16Packed128 x_pack =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element)};
-    const Bf16Packed128 gamma_pack =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(input_norm_weight + element)};
-    const Bf16Packed128 normed_pack =
-        gemma4_bf16_pack_apply_scale_weight(x_pack, gamma_pack, hidden_scale);
-#pragma unroll
-    for (int i = 0; i < Derived::kValuesPerLane; ++i) {
-      const int dim = lane + i * kWarpSize;
-      const int col = col_base + dim;
-      const int64_t weight_offset = int64_t(col) * GEMMA4_HIDDEN_SIZE + element;
-      const Bf16Packed128 w_pack =
-          Bf16Packed128{*reinterpret_cast<const int4 *>(w_qkv_col_major + weight_offset)};
-      values[i] = cute_bf16_pack_dot_add(normed_pack, w_pack, values[i]);
     }
   }
 
@@ -1695,107 +1628,6 @@ __device__ __forceinline__ void phase_decode_norm_project_prepare_paged_kv(
   }
 }
 
-// Computes the input RMSNorm scale once for the cooperative decode layer.
-template <typename Traits>
-__device__ __forceinline__ float phase_decode_hidden_scale_prologue(
-    const Gemma4DecodeMegakernelLayerArgs &args,
-    cg::grid_group grid,
-    int thread_idx) {
-  const int lane = thread_idx & (kWarpSize - 1);
-  const int warp = thread_idx / kWarpSize;
-  if (blockIdx.x == 0 && warp == 0) {
-    const float hidden_scale = hidden_rms_scale_bf16(args.attention_x, lane);
-    if (lane == 0) {
-      *args.attention_hidden_scale = hidden_scale;
-    }
-  }
-  grid.sync();
-  return *args.attention_hidden_scale;
-}
-
-// Projects one packed Q/K/V head and immediately applies head norm, RoPE, and KV write.
-template <typename Traits>
-__device__ __forceinline__ void phase_decode_packed_qkv_head_projection(
-    const Gemma4DecodeMegakernelLayerArgs &args,
-    int task,
-    float hidden_scale,
-    int thread_idx) {
-  using Derived = Gemma4AttentionDerived<Traits>;
-  constexpr int kQTasks = GEMMA4_NUM_QUERY_HEADS;
-  constexpr int kKTasks = Traits::kKvHeads;
-  constexpr int kVTasks = Traits::kHasVProjection ? Traits::kKvHeads : 0;
-  constexpr int kIngressTasks = kQTasks + kKTasks + kVTasks;
-
-  const int lane = thread_idx & (kWarpSize - 1);
-  const int warp = thread_idx / kWarpSize;
-  if (warp != 0 || task < 0 || task >= kIngressTasks) return;
-
-  const int position =
-      gemma4_warp_uniform_ldg_i32(args.attention_token_position, lane);
-  if (position < 0) return;
-
-  float values[Derived::kValuesPerLane];
-  if (task < kQTasks) {
-    const int q_head = task;
-    const int col_base =
-        args.attention_weights.q_col_base + q_head * Traits::kHeadDim;
-    project_normed_packed_head_values_bf16_cute<Traits>(
-        args.attention_x, args.attention_input_norm_weight,
-        args.attention_weights.d_qkv_col_major, col_base, lane,
-        hidden_scale, values);
-
-    const float *cos_row =
-        args.attention_cos + int64_t(position) * Derived::kRotaryHalf;
-    const float *sin_row =
-        args.attention_sin + int64_t(position) * Derived::kRotaryHalf;
-    const int64_t q_offset = int64_t(q_head) * Traits::kHeadDim;
-    prep_weighted_rope_head_values<Traits>(
-        args.attention_q + q_offset, values, args.attention_q_norm_weight,
-        cos_row, sin_row, lane);
-    return;
-  }
-
-  const int kv_task = task - kQTasks;
-  const int kv_head = kv_task < kKTasks ? kv_task : kv_task - kKTasks;
-  const int64_t cache_offset = decode_cache_head_offset<Traits>(
-      args.attention_cache_config, args.attention_page_table, 0, position,
-      args.attention_cache_layer, kv_head, lane, 1);
-  if (cache_offset < 0) return;
-
-  if (kv_task < kKTasks) {
-    const int col_base =
-        args.attention_weights.k_col_base + kv_head * Traits::kHeadDim;
-    project_normed_packed_head_values_bf16_cute<Traits>(
-        args.attention_x, args.attention_input_norm_weight,
-        args.attention_weights.d_qkv_col_major, col_base, lane,
-        hidden_scale, values);
-
-    const float *cos_row =
-        args.attention_cos + int64_t(position) * Derived::kRotaryHalf;
-    const float *sin_row =
-        args.attention_sin + int64_t(position) * Derived::kRotaryHalf;
-    prep_weighted_rope_head_values<Traits>(
-        args.attention_cache_k + cache_offset, values,
-        args.attention_k_norm_weight, cos_row, sin_row, lane);
-    if constexpr (!Traits::kHasVProjection) {
-      prep_scale_free_head_values<Traits>(
-          args.attention_cache_v + cache_offset, values, lane);
-    }
-    return;
-  }
-
-  if constexpr (Traits::kHasVProjection) {
-    const int col_base =
-        args.attention_weights.v_col_base + kv_head * Traits::kHeadDim;
-    project_normed_packed_head_values_bf16_cute<Traits>(
-        args.attention_x, args.attention_input_norm_weight,
-        args.attention_weights.d_qkv_col_major, col_base, lane,
-        hidden_scale, values);
-    prep_scale_free_head_values<Traits>(
-        args.attention_cache_v + cache_offset, values, lane);
-  }
-}
-
 // Wrapper: decode ingress with input RMSNorm folded into projection loads.
 template <typename Traits>
 __global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kPrepThreads)
@@ -1851,23 +1683,6 @@ bool valid_projection_weights(const Gemma4AttentionProjectionWeights &weights) {
   } else {
     return true;
   }
-}
-
-// Validates the packed QKV projection buffer used by the cooperative decode prologue.
-template <typename Traits>
-bool valid_packed_projection_weights(
-    const Gemma4AttentionProjectionWeights &weights) {
-  if (weights.d_qkv_col_major == nullptr ||
-      !is_aligned_16(weights.d_qkv_col_major)) {
-    return false;
-  }
-  if (weights.q_col_base < 0 || weights.k_col_base < 0) {
-    return false;
-  }
-  if constexpr (Traits::kHasVProjection) {
-    return weights.v_col_base >= 0;
-  }
-  return true;
 }
 
 // Launch the prefill Q/K/V preparation kernel after caller-side buffer validation.
@@ -2592,6 +2407,7 @@ bool valid_decode_megakernel_layer_args(
          args.ffn_gate_up_decode != nullptr &&
          args.ffn_down_decode != nullptr &&
          args.ffn_scratch != nullptr &&
+         args.attention_x != nullptr &&
          args.attention_token_position != nullptr &&
          args.attention_o_proj_col_major != nullptr &&
          args.attention_post_norm_weight != nullptr &&
@@ -2601,6 +2417,7 @@ bool valid_decode_megakernel_layer_args(
          args.attention_cos != nullptr &&
          args.attention_sin != nullptr &&
          args.attention_softmax_scale > 0.0f &&
+         is_aligned_16(args.attention_x) &&
          is_aligned_16(args.ffn_x) &&
          is_aligned_16(args.ffn_residual) &&
          is_aligned_16(args.ffn_norm_weight) &&

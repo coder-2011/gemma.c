@@ -68,6 +68,7 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
   layer_args.attention_num_splits =
       global ? args.global_splits : args.sliding_splits;
   layer_args.attention_softmax_scale = 1.0f / sqrtf(float(head_dim));
+  layer_args.attention_x = hidden_in;
   layer_args.attention_o_proj_col_major = w.o_proj_col_major;
   layer_args.attention_post_norm_weight = w.post_attention_norm_weight;
   layer_args.attention_pre_ffn_norm_weight = w.pre_feedforward_norm_weight;

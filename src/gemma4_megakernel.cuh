@@ -56,9 +56,6 @@ struct Gemma4DecodeMegakernelLayerArgs {
   int32_t attention_num_splits = 0;
   float attention_softmax_scale = 0.0f;
   const __nv_bfloat16 *attention_x = nullptr;
-  const __nv_bfloat16 *attention_input_norm_weight = nullptr;
-  float *attention_hidden_scale = nullptr;
-  Gemma4AttentionProjectionWeights attention_weights = {};
   const __nv_bfloat16 *attention_o_proj_col_major = nullptr;
   const __nv_bfloat16 *attention_post_norm_weight = nullptr;
   const __nv_bfloat16 *attention_pre_ffn_norm_weight = nullptr;
