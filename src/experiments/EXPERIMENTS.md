@@ -3,6 +3,64 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-28 - Restore fast decode projection ingress
+
+Question:
+
+- Can the decode path recover the measured fast projection-ingress win while
+  keeping the fused cooperative attention/O/FFN layer body?
+
+Change:
+
+- Moved decode Q/K/V ingress back to prepared inputs:
+  input RMSNorm, custom column-block decode GEMV projection, Q/K norm/RoPE/cache
+  prep, then the cooperative prepared attention/O/FFN layer kernel.
+- Reused `attention_out` as raw sliding QKV scratch before attention overwrites
+  it, so sliding layers use one packed QKV GEMV launch instead of separate Q, K,
+  and V launches.
+- Removed the now-unused packed in-kernel ingress helpers and hidden-scale
+  scratch field.
+
+Commands:
+
+```bash
+make -B test-decode-megakernel
+make -B test-ffn-decode
+make -B build/gemma4_prompt
+make test-flash-attention-cpp
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+git diff --check
+```
+
+Results:
+
+```text
+Correctness/build:
+  test_decode_megakernel passed
+  ffn decode tests passed
+  flash attention tests passed
+  build/gemma4_prompt linked
+  git diff --check clean
+
+Decode-step, RTX A6000, prompt Hello, split 20, clocks not locked:
+  before rollback p50: 44.669 ms/token
+  run 1 p50:           38.079 ms/token
+  run 2 p50:           38.087 ms/token
+  recovered p50 delta: 6.590 ms/token
+```
+
+Conclusion:
+
+- The rollback hit the requested `6.7 +- 0.2 ms` recovery window while keeping
+  the fused cooperative prepared-attention/O/FFN body.
+- The missing performance was the Q/K/V projection work shape, not the
+  post-attention/FFN fusion.
+
 ## 2026-06-28 - Cooperative direct decode FFN launch
 
 Question:
