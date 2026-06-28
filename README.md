@@ -10,24 +10,25 @@ The current work is to implement kernels individually, assemble a correct unfuse
 
 ## Benchmark
 
-Single-user Gemma 4 12B BF16 prompt benchmark on an NVIDIA RTX A6000 (Jun 27).
-Each measured run used 391 closed-loop requests, one `Hello` prompt token, 256
-requested output tokens per request, `100,096` measured output tokens total,
-and max request concurrency `1`.
+Endpoint-free Gemma 4 12B BF16 decode benchmark on an NVIDIA RTX A6000
+(Jun 27). Each runner used batch `1`, a synthetic `32`-token prompt, `128`
+requested output tokens, no speculative decoding, and no prefix cache reuse.
+The local path uses `offline-decode`: generated tokens stay on GPU during the
+decode loop, and the runner synchronizes the CUDA stream once at the end of each
+request. `gemma.c` and vLLM report decode latency by subtracting a one-token
+generation baseline from the 128-token run, then dividing by the `127` decode
+steps.
 
-| Runner | p50 TTFT | p50 TPOT | Output TPS | Measured time |
-| --- | ---: | ---: | ---: | ---: |
-| vLLM serve | 85.414 ms | 38.191 ms | 26.057 tok/s | 3841.4 s |
-| SGLang serve | unsupported | unsupported | unsupported | unsupported |
-| `gemma4_prompt` local | 37.607 ms | 73.418 ms | 13.647 tok/s | 7334.9 s |
+| Runner | Decode latency | Decode TPS | Status |
+| --- | ---: | ---: | --- |
+| vLLM `bench latency` | 38.480 ms/token | 25.987 tok/s | ok |
+| `gemma4_prompt` `offline-decode` | 72.925 ms/token | 13.713 tok/s | ok |
 
-SGLang 0.5.9 was installed and upgraded to Transformers 5.12.1 so it could
-parse `Gemma4UnifiedConfig`, but its generic Transformers backend failed during
-generation on Gemma 4 Unified's heterogeneous sliding/global KV shapes.
+Raw summary: `docs/benchmarks/decode_32p128g_b1_no_spec_summary.json`.
 
-![p50 TTFT benchmark](docs/benchmarks/ttft_p50_gemma4_vllm_sglang_long.png)
+![decode throughput benchmark](docs/benchmarks/decode_tps_32p128g_b1_no_spec.png)
 
-![decode throughput benchmark](docs/benchmarks/tps_gemma4_vllm_sglang_long.png)
+![decode latency benchmark](docs/benchmarks/decode_ms_per_token_32p128g_b1_no_spec.png)
 
 
 My agents tell me they love working in this repo. It is built heavily w/ them in mind!
