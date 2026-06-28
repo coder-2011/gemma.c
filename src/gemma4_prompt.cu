@@ -13,7 +13,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -21,29 +20,33 @@
 
 namespace {
 
+constexpr const char *kDefaultCheckpointPath = "models/gemma-4-12B/model.safetensors";
+constexpr const char *kDefaultTokenizerPath = "models/gemma-4-12B/tokenizer.json";
+constexpr const char *kDefaultPrompt = "Hello";
 constexpr int32_t kDefaultMaxNewTokens = 1;
 constexpr int32_t kDefaultPageSize = 64;
 constexpr int32_t kDefaultBenchWarmup = 1;
 constexpr int32_t kDefaultBenchIters = 3;
 constexpr int32_t kDefaultBenchSamples = 3;
+constexpr int32_t kPromptBatchSize = 1;
+constexpr size_t kHiddenRowBytes =
+    static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
 
 using PromptClock = std::chrono::steady_clock;
 
 enum class PromptBenchmarkMode {
-  kNone,
-  kDecodeStep,
-  kOfflineDecode,
-  kWarmServing,
+  kNone,          // Run one prompt and print the generated tokens and decoded text.
+  kDecodeStep,    // Time repeated steady-state decode megakernel steps after one prefill.
+  kOfflineDecode, // Time full local generation requests with one final stream sync.
+  kWarmServing,   // Time warm request latency with per-token host synchronization.
 };
 
 struct PromptOptions {
-  std::string checkpoint_path = "models/gemma-4-12B/model.safetensors";
-  std::string tokenizer_path = "models/gemma-4-12B/tokenizer.json";
-  std::string prompt = "Hello";
-  int32_t synthetic_prompt_tokens = 0;
+  std::string checkpoint_path = kDefaultCheckpointPath;
+  std::string tokenizer_path = kDefaultTokenizerPath;
+  std::string prompt = kDefaultPrompt;
   int32_t max_new_tokens = kDefaultMaxNewTokens;
   int32_t page_size = kDefaultPageSize;
-  int32_t decode_split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
   PromptBenchmarkMode benchmark_mode = PromptBenchmarkMode::kNone;
   int32_t bench_warmup = kDefaultBenchWarmup;
   int32_t bench_iters = kDefaultBenchIters;
@@ -74,27 +77,6 @@ struct RuntimeOwner {
   ~RuntimeOwner() { gemma4_runtime_state_free(&value); }
 };
 
-// Converts a CUDA failure to one terse process error.
-int fail_cuda(cudaError_t status) {
-  std::fprintf(stderr, "cuda error: %s\n", cudaGetErrorString(status));
-  return 1;
-}
-
-// Converts a benchmark mode to the stable CLI/reporting name.
-const char *benchmark_mode_name(PromptBenchmarkMode mode) {
-  switch (mode) {
-    case PromptBenchmarkMode::kNone:
-      return "none";
-    case PromptBenchmarkMode::kDecodeStep:
-      return "decode-step";
-    case PromptBenchmarkMode::kOfflineDecode:
-      return "offline-decode";
-    case PromptBenchmarkMode::kWarmServing:
-      return "warm-serving";
-  }
-  return "unknown";
-}
-
 // Parses the explicit benchmark regime requested by the CLI.
 bool parse_benchmark_mode(const std::string &value, PromptBenchmarkMode *mode) {
   if (value == "decode-step") *mode = PromptBenchmarkMode::kDecodeStep;
@@ -121,17 +103,11 @@ bool parse_args(int argc, char **argv, PromptOptions *options) {
     if (arg == "--checkpoint" && read_value(&i, &value)) options->checkpoint_path = value;
     else if (arg == "--tokenizer" && read_value(&i, &value)) options->tokenizer_path = value;
     else if (arg == "--prompt" && read_value(&i, &value)) options->prompt = value;
-    else if (arg == "--prompt-tokens" && read_value(&i, &value)) {
-      options->synthetic_prompt_tokens = std::atoi(value.c_str());
-    }
     else if (arg == "--max-new" && read_value(&i, &value)) {
       options->max_new_tokens = std::atoi(value.c_str());
     }
     else if (arg == "--page-size" && read_value(&i, &value)) {
       options->page_size = std::atoi(value.c_str());
-    }
-    else if (arg == "--decode-split-size" && read_value(&i, &value)) {
-      options->decode_split_size = std::atoi(value.c_str());
     }
     else if (arg == "--benchmark") options->benchmark_mode = PromptBenchmarkMode::kDecodeStep;
     else if (arg == "--benchmark-mode" && read_value(&i, &value)) {
@@ -149,8 +125,6 @@ bool parse_args(int argc, char **argv, PromptOptions *options) {
     else return false;
   }
   return options->max_new_tokens > 0 && options->page_size > 0 &&
-         options->decode_split_size > 0 &&
-         options->synthetic_prompt_tokens >= 0 &&
          options->bench_warmup >= 0 && options->bench_iters > 0 &&
          options->bench_samples > 0;
 }
@@ -201,36 +175,24 @@ int run_prompt(const PromptOptions &options) {
   if (!tokenizer.load(options.tokenizer_path, nullptr)) return 1;
 
   std::vector<int32_t> prompt_tokens;
-  // Synthetic token IDs match offline engine latency benchmarks without
-  // letting tokenizer text length change the requested prompt shape.
-  if (options.synthetic_prompt_tokens > 0) {
-    prompt_tokens.assign(options.synthetic_prompt_tokens, 0);
-  } else if (!tokenizer.encode(options.prompt, &prompt_tokens)) {
-    return 1;
-  }
+  if (!tokenizer.encode(options.prompt, &prompt_tokens)) return 1;
   if (prompt_tokens.empty()) return 1;
   const int32_t prompt_len = static_cast<int32_t>(prompt_tokens.size());
-  const bool benchmark_decode =
-      options.benchmark_mode == PromptBenchmarkMode::kDecodeStep;
   const int32_t benchmark_decode_steps =
-      benchmark_decode ? options.bench_samples *
-                             (options.bench_warmup + options.bench_iters)
-                       : 0;
-  const int32_t max_seq_len =
-      prompt_len + std::max(options.max_new_tokens, benchmark_decode_steps);
+      options.benchmark_mode == PromptBenchmarkMode::kDecodeStep
+          ? options.bench_samples * (options.bench_warmup + options.bench_iters) : 0;
+  const int32_t max_seq_len = prompt_len + std::max(options.max_new_tokens, benchmark_decode_steps);
   std::printf("prompt tokens: %d\n", prompt_len);
 
   WeightOwner weights;
-  cudaError_t status = gemma4_load_text_weights_device_bf16(
-      &weights.value, options.checkpoint_path.c_str(), nullptr);
-  if (status != cudaSuccess) return fail_cuda(status);
+  CUDA_CHECK(gemma4_load_text_weights_device_bf16(
+      &weights.value, options.checkpoint_path.c_str(), nullptr));
 
   RuntimeOwner runtime;
-  status = gemma4_runtime_state_init(
-      &runtime.value, 1, max_seq_len, options.page_size, 0);
-  if (status != cudaSuccess) return fail_cuda(status);
+  CUDA_CHECK(gemma4_runtime_state_init(
+      &runtime.value, kPromptBatchSize, max_seq_len, options.page_size, 0));
   thrust::device_vector<int32_t> d_prompt_tokens(prompt_tokens.size());
-  thrust::device_vector<int32_t> d_next_token(1);
+  thrust::device_vector<int32_t> d_next_token(kPromptBatchSize);
 
   const size_t prompt_hidden_elements =
       static_cast<size_t>(prompt_len) * GEMMA4_HIDDEN_SIZE;
@@ -249,14 +211,13 @@ int run_prompt(const PromptOptions &options) {
   thrust::device_vector<__nv_bfloat16> d_attention_out(
       GEMMA4_GLOBAL_ATTENTION_OUT_SIZE);
 
-  const int32_t split_size = options.decode_split_size;
+  constexpr int32_t split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
   const int32_t sliding_keys = runtime.value.sliding_cache_config.window_size;
-  const int32_t sliding_splits =
-      (sliding_keys + split_size - 1) / split_size;
+  const int32_t sliding_splits = div_up(sliding_keys, split_size);
   const int32_t global_keys =
       runtime.value.global_cache_config.max_pages_per_seq *
       runtime.value.global_cache_config.page_size;
-  const int32_t global_splits = (global_keys + split_size - 1) / split_size;
+  const int32_t global_splits = div_up(global_keys, split_size);
   const int32_t max_splits = std::max(sliding_splits, global_splits);
   thrust::device_vector<float> d_partial_m(
       GEMMA4_NUM_QUERY_HEADS * max_splits);
@@ -274,8 +235,7 @@ int run_prompt(const PromptOptions &options) {
                            tokens.size() * sizeof(int32_t),
                            cudaMemcpyHostToDevice, 0);
   };
-  status = copy_prompt_tokens(prompt_tokens);
-  if (status != cudaSuccess) return fail_cuda(status);
+  CUDA_CHECK(copy_prompt_tokens(prompt_tokens));
 
   auto run_prefill_once = [&]() -> cudaError_t {
     GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_embedding_gather_bf16(
@@ -294,12 +254,11 @@ int run_prompt(const PromptOptions &options) {
     args.seq_len = prompt_len;
     GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_prefill_megakernel(args));
 
-    const size_t row_bytes =
-        static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
     const __nv_bfloat16 *last_row =
         prefill_final_row + int64_t(prompt_len - 1) * GEMMA4_HIDDEN_SIZE;
     GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
-        raw_ptr(d_decode_a), last_row, row_bytes, cudaMemcpyDeviceToDevice, 0));
+        raw_ptr(d_decode_a), last_row, kHiddenRowBytes,
+        cudaMemcpyDeviceToDevice, 0));
     return gemma4_megakernel_sample_final_bf16(
         raw_ptr(d_decode_a), raw_ptr(d_next_token), raw_ptr(d_normed),
         raw_ptr(d_decode_a), &weights.value, raw_ptr(d_decode_scratch),
@@ -389,27 +348,21 @@ int run_prompt(const PromptOptions &options) {
     *e2e_ms = host_elapsed_ms(request_start, request_stop);
     return cudaSuccess;
   };
+  const int32_t measured_requests = options.bench_iters * options.bench_samples;
 
   if (options.benchmark_mode == PromptBenchmarkMode::kDecodeStep) {
-    status = run_prefill_once();
-    if (status != cudaSuccess) return fail_cuda(status);
-    status = cudaStreamSynchronize(0);
-    if (status != cudaSuccess) return fail_cuda(status);
+    CUDA_CHECK(run_prefill_once());
+    CUDA_CHECK(cudaStreamSynchronize(0));
 
-    TimingStats decode_stats;
     auto checked_decode = [&]() { CUDA_CHECK(run_decode_once()); };
-    try {
-      decode_stats = time_ms(
-          checked_decode, 0, options.bench_warmup, options.bench_iters,
-          options.bench_samples);
-    } catch (const std::exception &e) {
-      std::fprintf(stderr, "%s\n", e.what());
-      return 1;
-    }
+    TimingStats decode_stats = time_ms(
+        checked_decode, 0, options.bench_warmup, options.bench_iters,
+        options.bench_samples);
     std::printf(
-        "benchmark mode=%s prompt_len=%d warmup=%d iters=%d samples=%d split=%d\n",
-        benchmark_mode_name(options.benchmark_mode), prompt_len,
-        options.bench_warmup, options.bench_iters, options.bench_samples, split_size);
+        "benchmark mode=decode-step prompt_len=%d warmup=%d iters=%d "
+        "samples=%d split=%d\n",
+        prompt_len, options.bench_warmup, options.bench_iters,
+        options.bench_samples, split_size);
     print_stats_line("decode_step_ms", decode_stats);
     if (decode_stats.median_ms > 0.0f) {
       std::printf("decode_step_tps_p50=%.3f\n",
@@ -419,37 +372,32 @@ int run_prompt(const PromptOptions &options) {
   }
 
   if (options.benchmark_mode == PromptBenchmarkMode::kOfflineDecode) {
-    const int32_t measured_requests = options.bench_iters * options.bench_samples;
     for (int32_t request = 0; request < options.bench_warmup; ++request) {
       float e2e_ms = 0.0f;
-      status = run_offline_decode_request(&e2e_ms);
-      if (status != cudaSuccess) return fail_cuda(status);
+      CUDA_CHECK(run_offline_decode_request(&e2e_ms));
     }
 
     std::vector<float> e2e_ms;
     e2e_ms.reserve(measured_requests);
     for (int32_t request = 0; request < measured_requests; ++request) {
       float sample_ms = 0.0f;
-      status = run_offline_decode_request(&sample_ms);
-      if (status != cudaSuccess) return fail_cuda(status);
+      CUDA_CHECK(run_offline_decode_request(&sample_ms));
       e2e_ms.push_back(sample_ms);
     }
 
     std::printf(
-        "benchmark mode=%s prompt_len=%d output_tokens=%d warmup=%d "
+        "benchmark mode=offline-decode prompt_len=%d output_tokens=%d warmup=%d "
         "measured=%d sync=end\n",
-        benchmark_mode_name(options.benchmark_mode), prompt_len,
-        options.max_new_tokens, options.bench_warmup, measured_requests);
+        prompt_len, options.max_new_tokens, options.bench_warmup,
+        measured_requests);
     print_stats_line("e2e_ms", summarize_timing_samples(std::move(e2e_ms)));
     return 0;
   }
 
   if (options.benchmark_mode == PromptBenchmarkMode::kWarmServing) {
-    const int32_t measured_requests = options.bench_iters * options.bench_samples;
     for (int32_t request = 0; request < options.bench_warmup; ++request) {
       PromptRequestTiming timing;
-      status = run_serving_request(&timing);
-      if (status != cudaSuccess) return fail_cuda(status);
+      CUDA_CHECK(run_serving_request(&timing));
     }
 
     std::vector<float> ttft_ms;
@@ -464,8 +412,7 @@ int run_prompt(const PromptOptions &options) {
     const PromptClock::time_point benchmark_start = PromptClock::now();
     for (int32_t request = 0; request < measured_requests; ++request) {
       PromptRequestTiming timing;
-      status = run_serving_request(&timing);
-      if (status != cudaSuccess) return fail_cuda(status);
+      CUDA_CHECK(run_serving_request(&timing));
       ttft_ms.push_back(timing.ttft_ms);
       e2e_ms.push_back(timing.e2e_ms);
       if (options.max_new_tokens > 1) {
@@ -491,10 +438,10 @@ int run_prompt(const PromptOptions &options) {
         static_cast<float>(total_tokens) / benchmark_duration_s;
 
     std::printf(
-        "benchmark mode=%s prompt_len=%d output_tokens=%d warmup=%d "
+        "benchmark mode=warm-serving prompt_len=%d output_tokens=%d warmup=%d "
         "measured=%d\n",
-        benchmark_mode_name(options.benchmark_mode), prompt_len,
-        options.max_new_tokens, options.bench_warmup, measured_requests);
+        prompt_len, options.max_new_tokens, options.bench_warmup,
+        measured_requests);
     std::printf(
         "benchmark_duration_ms=%.3f successful_requests=%d "
         "total_input_tokens=%lld total_output_tokens=%lld "
@@ -514,8 +461,7 @@ int run_prompt(const PromptOptions &options) {
   }
 
   std::vector<int32_t> generated;
-  status = generate_tokens(options.max_new_tokens, &generated);
-  if (status != cudaSuccess) return fail_cuda(status);
+  CUDA_CHECK(generate_tokens(options.max_new_tokens, &generated));
 
   std::string decoded;
   if (!tokenizer.decode(generated, &decoded)) {

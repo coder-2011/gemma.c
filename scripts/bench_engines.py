@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
         default="models/gemma-4-12B-it/tokenizer.json",
     )
     parser.add_argument("--prompt-binary", default="build/gemma4_prompt")
+    parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--vllm-bin", default="/tmp/vllm-bench-venv/bin/vllm")
     parser.add_argument(
         "--sglang-python",
@@ -193,7 +194,7 @@ def capture_environment(out_dir: Path) -> dict:
     return env_info
 
 
-# Benchmarks the local gemma.c prompt runner with the same synthetic prompt shape.
+# Benchmarks the local gemma.c prompt runner with the requested prompt text.
 def bench_local(args: argparse.Namespace, out_dir: Path) -> dict:
     if not args.skip_build:
         build = run_logged(["make", "prompt"], out_dir / "local_build")
@@ -220,8 +221,8 @@ def bench_local(args: argparse.Namespace, out_dir: Path) -> dict:
             str(args.iters),
             "--bench-samples",
             str(args.samples),
-            "--prompt-tokens",
-            str(args.input_len),
+            "--prompt",
+            args.prompt,
             "--max-new",
             str(output_len),
         ]
