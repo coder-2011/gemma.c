@@ -3,6 +3,372 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-28 - Cooperative direct decode FFN launch
+
+Question:
+
+- Can decode FFN avoid the separate gate/up, GeGLU, down, and post-norm launches
+  while moving the gate/up tile math into `gemma4_matmul_kernels.cu` as a real
+  device helper instead of another kernel launch?
+
+Change:
+
+- Replaced the decode FFN host sequence with one cooperative
+  `direct_decode_ffn_kernel` launch.
+- The kernel clears the FFN accumulator, computes gate/up + GeGLU + down
+  accumulation, synchronizes the cooperative grid, then runs post-FFN RMSNorm
+  and residual from the same launch.
+- Moved the FFN gate/up tile dot+CTA-reduce step into
+  `gemma4_ffn_gate_up_tile_bf16_device` in `gemma4_matmul_kernels.cu`; FFN calls
+  it inside the same cooperative kernel, so there is no nested launch.
+- Split Makefile RDC flags so FFN/matmul use device LTO, while unrelated
+  fast-math objects stay out of LTO links.
+
+Commands:
+
+```bash
+make -B test-ffn-decode
+make -B test-decode-megakernel
+make -B build/gemma4_prompt
+make -B build/benches/gemma4_ffn_libtorch_bench
+./build/benches/gemma4_ffn_libtorch_bench 100 20 3
+make build/benches/gemma4_decode_bench
+./build/benches/gemma4_decode_bench all 100 20 3
+git diff --check
+```
+
+Results:
+
+```text
+Correctness/build:
+  ffn decode tests passed
+  test_decode_megakernel passed
+  build/gemma4_prompt linked with partial device LTO
+
+FFN decode, RTX A6000, CUDA events on one stream, warm repeated buffers:
+  custom_fused_decode best/median:        0.503183 / 0.503234 ms
+  dualgemm_chain_decode_layout best:      0.529551 ms
+  libtorch_full_ffn best:                 0.528343 ms
+  custom vs DualGemm-chain speedup:       1.052402x
+  custom max abs vs libtorch:             0.000976562
+
+Important decode projections, custom best vs cuBLAS best:
+  ffn_gate_up:  0.334817 ms vs 0.342374 ms
+  ffn_down:     0.170373 ms vs 0.173425 ms
+  sliding_q:    0.047821 ms vs 0.049469 ms
+  sliding_kv:   0.025876 ms vs 0.028785 ms
+  sliding_qkv:  0.091924 ms vs 0.097137 ms
+  sliding_o:    0.047687 ms vs 0.049408 ms
+  global_q:     0.091914 ms vs 0.097741 ms
+  global_k:     0.005335 ms vs 0.006697 ms
+  global_o:     0.091904 ms vs 0.096716 ms
+  final_logits: 2.826834 ms vs 2.836541 ms
+```
+
+Note:
+
+- Building the cross-file device helper without `-dlto` made the custom fused
+  FFN regress to about `1.499790 ms`; device LTO restored the `0.503 ms` path.
+- cuDNN comparison in the projection bench was unavailable on this host because
+  cuDNN reported a sublibrary version mismatch, so that table is custom vs
+  cuBLAS.
+
+## 2026-06-27 - Decode Megakernel Projection Ingress Bug Fix
+
+Question:
+
+- What real bug still explains the custom decode megakernel being much slower
+  than the standalone custom decode projection kernels?
+
+Findings:
+
+- Nsight Systems showed the fused attention/FFN-prepare bridge still taking
+  about `455 us` per sliding layer and `761 us` per global layer after the first
+  ingress split.
+- The standalone custom decode GEMV path measured the same large projection
+  shapes at about `48 us` for sliding O, `92 us` for sliding QKV/global Q, and
+  `92 us` for global O.
+- The megakernel was still projecting Q/K/V one head at a time with one active
+  warp per CTA. That underparallelized the dominant attention ingress weight
+  traffic compared with the column-block GEMV kernel.
+- A stale-object run also linked an older FFN object while `src/gemma4_ffn.cu`
+  had newer source on disk. Rebuilding removed the old `b2b_decode` symbols and
+  confirmed the source-matched baseline was about `51.9 ms/token`.
+
+Change:
+
+- Added split sliding decode projection cases for Q and K/V so the separate
+  checkpoint Q/K/V weights can use the fast custom GEMV path.
+- Changed the decode attention layer to materialize input RMSNorm, project Q/K/V
+  with `gemma4_projection_decode`, run the existing Q/K/V RMSNorm/RoPE paged
+  cache prep, then enter the cooperative attention/O/FFN bridge from prepared
+  Q/K/V.
+- Kept the old on-the-fly ingress device path available, but the decode layer
+  launcher now uses the faster prepared-input path.
+- Updated direct flash-attention/test link targets that compile
+  `gemma4_flash_attention.cu` directly so they also link
+  `gemma4_matmul_kernels.cu`.
+
+Commands:
+
+```bash
+make prompt test-decode-megakernel test-ffn-decode
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 1 --bench-iters 3 --bench-samples 3 \
+  --prompt-tokens 32 --max-new 1
+nsys profile --trace=cuda,nvtx,osrt --stats=true --force-overwrite=true \
+  -o build/bench_results/decode_step_after_fast_projection \
+  ./build/gemma4_prompt \
+    --checkpoint models/gemma-4-12B-it/model.safetensors \
+    --tokenizer models/gemma-4-12B-it/tokenizer.json \
+    --benchmark-mode decode-step \
+    --bench-warmup 1 --bench-iters 1 --bench-samples 1 \
+    --prompt-tokens 32 --max-new 1
+/tmp/vllm-bench-venv/bin/python scripts/bench_engines.py --engines gemma.c
+```
+
+Results:
+
+```text
+Correctness/build:
+  test_decode_megakernel passed
+  ffn decode tests passed
+
+Short CUDA-event decode-step:
+  p50: 38.002 ms/token
+  mean: 38.091 ms/token
+  min/max: 38.001 / 38.270 ms/token
+
+Nsight Systems sanity check:
+  prepared sliding attention/O/FFN bridge: ~80.6 us avg
+  prepared global attention/O/FFN bridge:  ~213.9 us avg
+  sliding Q GEMV:                          ~47.2 us avg
+  sliding K/V GEMV:                        ~25.8 us avg
+  global Q GEMV:                           ~91.4 us avg
+  global K GEMV:                           ~8.6 us avg
+
+Custom-only 32 prompt / 128 generated offline decode:
+  baseline mean:          38.396 ms
+  128-token run mean:   4888.542 ms
+  decode tokens:          127
+  decode latency:          38.190 ms/token
+  decode throughput:       26.185 tok/s
+```
+
+Artifacts:
+
+- `docs/benchmarks/decode_32p128g_b1_no_spec_summary.json`
+- `docs/benchmarks/decode_tps_32p128g_b1_no_spec.png`
+- `docs/benchmarks/decode_ms_per_token_32p128g_b1_no_spec.png`
+- `build/bench_results/decode_step_after_fast_projection.nsys-rep`
+- `build/bench_results/decode_step_after_fast_projection.sqlite`
+
+Conclusion:
+
+- This was the real remaining performance bug: attention ingress projection was
+  effectively head-serial inside the cooperative megakernel.
+- The custom-only graph moved from `72.893 ms/token` before the bug hunt to
+  `38.190 ms/token` after the projection-ingress fix, about `1.91x` faster.
+- Remaining decode time is now dominated by FFN CUTLASS M=1 GEMMs and final
+  logits sampling, not by the old attention projection ingress.
+
+## 2026-06-27 - Local-Only Offline Decode Bug-Fix Rerun
+
+Question:
+
+- Do prompt-runner split sizing and repeated cooperative-launch metadata queries
+  explain a large custom megakernel benchmark slowdown?
+
+Change:
+
+- Changed `gemma4_prompt` to size sliding decode split scratch from the runtime
+  sliding cache window instead of always using the full 1024-token window.
+- Cached cooperative decode launch geometry for the two live decoded-layer
+  kernels, avoiding repeated device-property and occupancy queries inside the
+  48-layer decode loop.
+
+Commands:
+
+```bash
+make prompt test-decode-megakernel
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode offline-decode \
+  --bench-warmup 0 --bench-iters 1 --bench-samples 1 \
+  --prompt-tokens 32 --max-new 2
+/tmp/vllm-bench-venv/bin/python scripts/bench_engines.py \
+  --engines gemma.c --skip-build
+```
+
+Contract:
+
+- Local-only rerun: vLLM and SGLang were not rerun.
+- Shape: batch `1`, BF16, synthetic prompt length `32`, requested output length
+  `128`, one-token baseline length `1`.
+- Timing: `gemma4_prompt offline-decode` host wall time, with generated tokens
+  kept on GPU and one final stream synchronization per request.
+- Warmup/repeats: `5` warmup requests and `10` measured requests for the
+  baseline and 128-token run.
+- Clock policy: clocks were not locked.
+
+Results:
+
+```text
+Correctness/build:
+  test_decode_megakernel passed
+  offline-decode smoke max-new=2 passed
+
+Local-only offline decode:
+  baseline mean:          38.362 ms
+  128-token run mean:   9295.744 ms
+  decode tokens:          127
+  decode latency:          72.893 ms/token
+  decode throughput:       13.719 tok/s
+```
+
+Artifacts:
+
+- `docs/benchmarks/decode_32p128g_b1_no_spec_summary.json`
+- `docs/benchmarks/decode_tps_32p128g_b1_no_spec.png`
+- `docs/benchmarks/decode_ms_per_token_32p128g_b1_no_spec.png`
+- Raw local logs under `build/bench_results/local_*.stdout.txt`.
+
+Conclusion:
+
+- The split-sizing and launch-metadata issues were real benchmark-path bugs, but
+  this local-only run moved from the prior `72.925 ms/token` to
+  `72.893 ms/token`, so they do not explain a 2x-4x custom megakernel slowdown.
+- The remaining gap is in the per-token kernel structure and dominant GPU work,
+  not in per-token host token copies, split overprovisioning, or repeated launch
+  metadata queries.
+
+## 2026-06-27 - Endpoint-Free 32p128g Decode Engine Benchmark
+
+Question:
+
+- What is a fair local decode-latency comparison against vLLM and SGLang if
+  serving endpoints and repeated-prompt prefix-cache reuse are removed?
+
+Change:
+
+- Added `--prompt-tokens` to `gemma4_prompt` so the local runner can use the
+  same fixed synthetic prompt shape as offline engine benchmarks.
+- Added `scripts/bench_engines.py` to run `gemma.c`, vLLM, and SGLang under one
+  decode benchmark contract and regenerate README graphs from the JSON summary.
+- Replaced the README's old endpoint-serving benchmark with the endpoint-free
+  decode benchmark.
+
+Research basis:
+
+- vLLM's official `bench latency` CLI is an in-process latency benchmark with
+  configurable `--input-len`, `--output-len`, warmups, and JSON output:
+  `https://docs.vllm.ai/en/v0.23.0/cli/bench/latency/`.
+- vLLM's latency benchmark source constructs synthetic prompt token IDs and
+  calls `LLM.generate` directly rather than an HTTP endpoint:
+  `https://github.com/vllm-project/vllm/blob/3e49479c/vllm/benchmarks/latency.py`.
+- SGLang's `bench_one_batch` is its low-level offline single-static-batch
+  benchmark and reports prefill plus decode timing:
+  `https://docs.sglang.io/docs/developer_guide/benchmark_and_profiling` and
+  `https://github.com/sgl-project/sglang/blob/21c4fc63/python/sglang/bench_one_batch.py`.
+- NVIDIA's LLM benchmarking guidance separates input sequence length, output
+  sequence length, time to first token, inter-token latency, and total latency:
+  `https://developer.nvidia.com/blog/llm-benchmarking-fundamental-concepts/`.
+
+Commands:
+
+```bash
+make prompt
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode warm-serving \
+  --bench-warmup 0 \
+  --bench-iters 1 \
+  --bench-samples 1 \
+  --max-new 1 \
+  --prompt-tokens 32
+/tmp/vllm-bench-venv/bin/python scripts/bench_engines.py
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:05:00.0`, driver `580.159.03`,
+  power limit `300 W`, ECC disabled, MIG not applicable.
+- Toolchain: CUDA `13.0`, nvcc `13.0.88`.
+- Shape: batch `1`, BF16, synthetic prompt length `32`, requested output length
+  `128`, one-token baseline length `1`.
+- Warmup/repeats: `5` warmups and `10` measured iterations for `gemma.c` and
+  vLLM. SGLang failed during initialization before its measured batch.
+- Cache policy: repeated prompt buffers, no prefix/radix cache reuse where the
+  engine exposes that switch.
+- Timing: host-visible offline engine latency. This is end-to-end runner timing,
+  not a kernel-only CUDA-event or `ncu` measurement.
+- Clock policy: clocks were not locked. `LD_PRELOAD` was empty for the final
+  run.
+
+Fairness reasoning:
+
+- The old vLLM serving benchmark was not the right comparison for decode
+  latency because it included endpoint behavior and could be confused by prefix
+  cache behavior on repeated prompts.
+- The new benchmark fixes input length, output length, batch size, dtype, and
+  warmup policy across runners.
+- For `gemma.c` and vLLM, subtracting the one-token generation baseline removes
+  the shared prefill plus first-token path and leaves the `128 - 1 = 127`
+  iterative decode steps.
+- Prefix/radix cache reuse is disabled because a repeated synthetic prompt is an
+  artifact of the benchmark harness, not real new-user work.
+- Speculation is not configured for any runner. vLLM rejected the explicit
+  string form of `--spec-method None`, so the final command leaves speculative
+  options unset.
+- CUDA graphs are allowed because they are a normal offline runtime execution
+  strategy, not a workload-changing optimization like prefix caching or
+  speculative decoding.
+
+Results:
+
+```text
+runner              decode_ms/token   decode_tps
+vLLM                      38.478595       25.988475
+gemma.c                   73.099488       13.679986
+SGLang               unsupported      unsupported
+```
+
+SGLang outcome:
+
+- SGLang `0.5.9` loaded the Gemma 4 Unified checkpoint through its Transformers
+  fallback.
+- The first attempt failed before benchmarking because FlashInfer JIT could not
+  find `ninja`; `ninja` was already installed in the SGLang venv, but the script
+  needed to prepend the venv `bin` directory to `PATH`.
+- With the venv `PATH` fixed and graph capture restricted to batch size `1`,
+  SGLang still failed during CUDA graph capture:
+  `shape '[-1, 8, 256]' is invalid for input of size 512`.
+- I did not chart the `--disable-cuda-graph` fallback because SGLang's own error
+  says that path has a huge performance loss, and comparing it against vLLM's
+  normal optimized offline path would be a different benchmark contract.
+
+Artifacts:
+
+- `scripts/bench_engines.py`
+- `docs/benchmarks/decode_32p128g_b1_no_spec_summary.json`
+- `docs/benchmarks/decode_tps_32p128g_b1_no_spec.png`
+- `docs/benchmarks/decode_ms_per_token_32p128g_b1_no_spec.png`
+- Raw logs under `build/bench_results/`.
+
+Conclusion:
+
+- Under this endpoint-free decode contract, vLLM is about `1.90x` faster than
+  the current local path (`25.988 / 13.680`).
+- The comparison is much fairer than the previous serving test, but it is still
+  host-visible runtime timing with unlocked clocks and only one final process
+  pass. Treat it as the current README benchmark, not a profiler-grade kernel
+  attribution.
+
 ## 2026-06-27 - FFN Decode Benchmark Roofline Sanity Audit
 
 Question:
@@ -15979,3 +16345,177 @@ Conclusion:
   produces tokens about `1.91x` faster end-to-end (`26.057 / 13.647`).
 - The README now reports the long closed-loop comparison rather than the old
   short 16-token comparison.
+
+## 2026-06-27 - FFN Decode B2B Path Audit Cleanup
+
+Question:
+
+- Can the current main FFN decode path be made honest about the real B2B goal
+  without adding another path or leaving speculative unused bridge code?
+
+Change:
+
+- Renamed the live no-activation-spill decode helpers from `direct_*` to
+  `b2b_*`.
+- Removed the unused gated fragment bridge sketch from `src/gemma4_ffn.cu`.
+- Left the runtime schedule unchanged: each intermediate tile computes gate/up
+  once, applies GeGLU on chip, folds directly into the down projection, and
+  accumulates into the final MLP row.
+
+Commands:
+
+```bash
+make test-ffn-decode
+make ffn-libtorch-bench
+GEMMA4_FFN_LIBTORCH_BENCH_SEED=20260627 \
+  ./build/benches/gemma4_ffn_libtorch_bench 100 20 3
+git diff --check
+```
+
+Results:
+
+```text
+Correctness:
+  test_ffn_decode passed
+  git diff --check clean
+  custom_decode_normed_vs_libtorch max_abs=0.000488281
+  custom_decode_residual_vs_libtorch max_abs=0.000976562
+
+FFN microbench:
+  libtorch_full_ffn median_ms=0.528178 min_ms=0.528148
+  custom_fused_decode median_ms=0.503798 min_ms=0.503726
+  custom_decode_vs_libtorch_full_speedup=1.048483x
+```
+
+Conclusion:
+
+- The main decode FFN path is now named around the B2B/no-spill invariant it
+  actually satisfies, and the file no longer contains an unused fragment bridge
+  that could be mistaken for the live path.
+- This does not complete the final high-throughput tensor-core B2B design. The
+  remaining blocker is the same hardware scheduling tradeoff: avoiding both
+  gate/up duplication and output partial atomics needs a larger cooperative
+  reduction or producer-consumer design on the A6000-class target.
+
+## 2026-06-27 - FFN Decode B2B Roofline Check
+
+Question:
+
+- Is the edited main FFN decode path still missing a high-throughput B2B
+  schedule, or is it already streaming the unavoidable weights at the A6000
+  memory roofline?
+
+Commands:
+
+```bash
+ncu --metrics \
+  gpu__time_duration.sum,\
+sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__bytes.sum,lts__t_bytes.sum,\
+smsp__warps_active.avg.pct_of_peak_sustained_active \
+  --target-processes all \
+  --kernel-name regex:b2b_decode_mlp_accumulate \
+  --launch-count 1 \
+  ./build/benches/gemma4_ffn_libtorch_bench 1 0 1
+```
+
+Results:
+
+```text
+b2b_decode_mlp_accumulate_kernel:
+  grid=(7200,1,1), block=(480,1,1)
+  gpu__time_duration.sum=503.52 us
+  dram__bytes.sum=356.00 MB
+  lts__t_bytes.sum=465.44 MB
+  dram__throughput.avg.pct_of_peak_sustained_elapsed=97.00%
+  sm__throughput.avg.pct_of_peak_sustained_elapsed=17.04%
+  smsp__warps_active.avg.pct_of_peak_sustained_active=57.43%
+```
+
+Conclusion:
+
+- The live decode FFN accumulate kernel is DRAM-bound and close to the A6000
+  sustained memory roofline.
+- The measured `356 MB` DRAM traffic is consistent with one pass over the
+  `337.5 MiB` FFN weights plus small input/output/scratch effects. That means
+  the current schedule is doing the essential real B2B thing for decode:
+  gate/up is computed once, GeGLU is kept on chip, and the down pass consumes
+  the generated activation without an HBM activation tensor.
+- A stock tensor-core B2B schedule is not automatically a higher-throughput
+  target here. If it tiles over output columns, it duplicates the `225 MiB`
+  gate/up stream; if it keeps gate/up single-pass, it needs a larger
+  cooperative output-reduction design. For the current A6000 decode shape, the
+  edited main path is already bounded by the one-pass weight stream.
+
+## 2026-06-27 - Offline Decode Benchmark Without Per-Token Host Sync
+
+Question:
+
+- Does the local decode benchmark look unfair because it copies the sampled
+  token to host and synchronizes once per generated token?
+
+Change:
+
+- Added `gemma4_prompt --benchmark-mode offline-decode`.
+- The mode runs prefill plus all decode steps with generated tokens kept on GPU,
+  then synchronizes the CUDA stream once at the end of the request.
+- Updated `scripts/bench_engines.py` to compare only `gemma.c` and vLLM for the
+  endpoint-free 32-token prompt / 128 generated token contract.
+
+Commands:
+
+```bash
+make prompt
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode offline-decode --bench-warmup 1 --bench-iters 1 \
+  --bench-samples 1 --prompt-tokens 32 --max-new 2
+python3 scripts/bench_engines.py --skip-build
+/tmp/vllm-bench-venv/bin/python - <<'PY'
+import argparse
+import json
+from pathlib import Path
+import importlib.util
+
+script = Path("scripts/bench_engines.py")
+spec = importlib.util.spec_from_file_location("bench_engines", script)
+bench = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bench)
+summary_path = Path("docs/benchmarks/decode_32p128g_b1_no_spec_summary.json")
+summary = json.loads(summary_path.read_text())
+args = argparse.Namespace(summary=str(summary_path), chart_dir="docs/benchmarks")
+bench.write_outputs(summary, args)
+PY
+```
+
+Results:
+
+```text
+runner                         decode ms/token   decode TPS
+vLLM bench latency                    38.480        25.987
+gemma4_prompt offline-decode          72.925        13.713
+```
+
+Notes:
+
+- The first `python3 scripts/bench_engines.py --skip-build` pass completed the
+  benchmark and wrote the JSON summary, but the system Python lacked
+  Matplotlib, so chart generation failed after timing finished. The charts were
+  regenerated from the saved summary using the vLLM benchmark venv.
+- Removing the per-token device-to-host token copy and stream synchronization
+  only improved the local result from `13.680` to `13.713 tok/s`. The fairness
+  bug was real, but it was not the main performance gap.
+
+Artifacts:
+
+- `docs/benchmarks/decode_32p128g_b1_no_spec_summary.json`
+- `docs/benchmarks/decode_tps_32p128g_b1_no_spec.png`
+- `docs/benchmarks/decode_ms_per_token_32p128g_b1_no_spec.png`
+
+Conclusion:
+
+- The local path is still about `1.90x` slower than vLLM under this cleaner
+  offline decode contract.
+- The next bottleneck investigation should focus on the actual per-token launch
+  and kernel structure, not per-token host synchronization in the benchmark.
