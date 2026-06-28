@@ -16696,3 +16696,242 @@ Conclusion:
   offline decode contract.
 - The next bottleneck investigation should focus on the actual per-token launch
   and kernel structure, not per-token host synchronization in the benchmark.
+
+## 2026-06-28 - SGLang 0.5.14 Gemma 4 Unified Serving Benchmark
+
+Question:
+
+- Can SGLang run the local Gemma 4 12B Unified checkpoint on this A6000 host,
+  and what is its single-user real-prompt serving result?
+
+Setup:
+
+- Upgraded the isolated `/tmp/sglang-bench-venv` from SGLang `0.5.9` to
+  SGLang `0.5.14`.
+- Cleared `/root/.cache/pip`, `/root/.cache/uv`, and `/root/.cache/vllm` after
+  the first upgrade attempt ran the filesystem out of space.
+- SGLang `0.5.14` required `transformers==5.8.1`, but that Transformers release
+  did not recognize `model_type: gemma4_unified`. Restored
+  `transformers==5.12.1`, which parses the local checkpoint as
+  `Gemma4UnifiedConfig`.
+- `pip check` caveat: `sglang 0.5.14 has requirement transformers==5.8.1, but
+  you have transformers 5.12.1`.
+
+Versions:
+
+```text
+sglang 0.5.14
+transformers 5.12.1
+torch 2.11.0
+flashinfer-python 0.6.12
+sglang-kernel 0.4.4
+triton 3.6.0
+torch_cuda 13.0
+```
+
+Server command:
+
+```bash
+PATH=/tmp/sglang-bench-venv/bin:$PATH /tmp/sglang-bench-venv/bin/sglang serve \
+  --model-path models/gemma-4-12B-it \
+  --host 127.0.0.1 --port 30000 \
+  --served-model-name gemma4-local \
+  --dtype bfloat16 \
+  --context-length 512 \
+  --mem-fraction-static 0.80 \
+  --max-running-requests 1 \
+  --max-total-tokens 4096 \
+  --trust-remote-code \
+  --disable-radix-cache \
+  --log-level info \
+  2>&1 | tee build/bench_results/sglang_gemma4_12b_server_20260628.log
+```
+
+Benchmark command:
+
+```bash
+PATH=/tmp/vllm-bench-venv/bin:$PATH /tmp/vllm-bench-venv/bin/vllm bench serve \
+  --backend openai \
+  --base-url http://127.0.0.1:30000 \
+  --endpoint /v1/completions \
+  --model gemma4-local \
+  --tokenizer models/gemma-4-12B-it \
+  --trust-remote-code \
+  --dataset-name custom \
+  --dataset-path build/bench_results/hello_prompt_out128_20x_20260628.jsonl \
+  --skip-chat-template \
+  --custom-output-len 128 \
+  --num-warmups 5 \
+  --num-prompts 20 \
+  --request-rate inf \
+  --max-concurrency 1 \
+  --ignore-eos \
+  --temperature 0.0 \
+  --top-p 1.0 \
+  --percentile-metrics ttft,tpot,itl,e2el \
+  --metric-percentiles 50,90,95,99 \
+  --save-result \
+  --result-dir build/bench_results \
+  --result-filename sglang_gemma4_12b_it_hello_out128_c1_20_20260628.json \
+  --disable-tqdm \
+  2>&1 | tee build/bench_results/sglang_gemma4_12b_it_hello_out128_c1_20_20260628.bench.log
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:05:00.0`, driver `580.159.03`,
+  power limit `300 W`, ECC disabled, MIG not applicable.
+- Model: local `models/gemma-4-12B-it`, BF16, SGLang native
+  `Gemma4UnifiedForConditionalGeneration`.
+- Prompt: explicit text prompt `Hello`, not synthetic prompt tokens.
+- Shape: closed-loop single user, max concurrency `1`, output length `128`,
+  warmups `5`, measured requests `20`.
+- Cache policy: SGLang launched with `--disable-radix-cache`; server log shows
+  `SWAChunkCache hybrid_swa=True`.
+- Timing: `vllm bench serve` client-side OpenAI-compatible HTTP timing against
+  SGLang `/v1/completions`; server startup, model load, graph capture, and
+  benchmark warmups excluded.
+- Clock policy: clocks were not locked.
+
+Results:
+
+```text
+Successful requests:            20
+Failed requests:                0
+Benchmark duration:             94.44 s
+Total input tokens:             20
+Total generated tokens:         2560
+Output throughput:              27.106 tok/s
+Total token throughput:         27.318 tok/s
+Median TTFT:                    79.052 ms
+Median TPOT:                    36.556 ms
+P90 TPOT:                       36.593 ms
+P99 TPOT:                       36.610 ms
+Median ITL:                     36.553 ms
+Median E2E:                     4721.993 ms
+```
+
+Notes:
+
+- The first SGLang launch without `--disable-radix-cache` also loaded and
+  served successfully, but the benchmark run used radix cache disabled to avoid
+  repeated-prompt prefix-cache artifacts.
+- SGLang selected the Triton attention backend for Gemma4 on A6000 and captured
+  decode CUDA graph for batch size `1`.
+- Non-text multimodal processor imports logged `torchcodec`/FFmpeg warnings, but
+  text completion served successfully.
+
+Artifacts:
+
+- `build/bench_results/hello_prompt_out128_20x_20260628.jsonl`
+- `build/bench_results/sglang_gemma4_12b_server_20260628.log`
+- `build/bench_results/sglang_gemma4_12b_it_hello_out128_c1_20_20260628.bench.log`
+- `build/bench_results/sglang_gemma4_12b_it_hello_out128_c1_20_20260628.json`
+- `build/bench_results/sglang_gemma4_12b_env_20260628.txt`
+- `build/bench_results/sglang_gemma4_12b_nvidia_smi_20260628.csv`
+
+Conclusion:
+
+- SGLang now runs the local Gemma 4 12B Unified checkpoint on this host.
+- Under this real-prompt, radix-cache-disabled, single-user serving contract,
+  SGLang measured `27.106 tok/s` output throughput and `36.556 ms` median TPOT.
+
+## 2026-06-28 - SGLang Offline Engine Gemma 4 Unified Benchmark
+
+Question:
+
+- What does SGLang measure through its in-process offline Engine path, without
+  the OpenAI-compatible HTTP server/client layer?
+
+Setup:
+
+- Used SGLang's `Engine.generate()` API directly instead of
+  `sglang.bench_offline_throughput`.
+- The built-in offline throughput harness only accepts ShareGPT/random/shared
+  prefix datasets, and its ShareGPT loader prunes one-token prompts. This run
+  keeps the benchmark input as the explicit text prompt `Hello`.
+- The first stdin-based Engine attempt failed because Python multiprocessing
+  `spawn` could not re-import `<stdin>`. The final run used a file-backed
+  script with a `__main__` guard.
+
+Versions:
+
+```text
+sglang 0.5.14
+transformers 5.12.1
+torch 2.11.0
+flashinfer-python 0.6.12
+sglang-kernel 0.4.4
+triton 3.6.0
+torch_cuda 13.0
+```
+
+Command:
+
+```bash
+set -o pipefail
+PATH=/tmp/sglang-bench-venv/bin:$PATH \
+  /tmp/sglang-bench-venv/bin/python \
+  build/bench_results/sglang_offline_engine_hello_bench_20260628.py \
+  2>&1 | tee \
+  build/bench_results/sglang_gemma4_12b_offline_engine_hello_out128_c1_20_20260628.log
+```
+
+Contract:
+
+- Hardware: NVIDIA RTX A6000, bus `00000000:05:00.0`, driver `580.159.03`,
+  power limit `300 W`, ECC disabled, MIG not applicable.
+- Model: local `models/gemma-4-12B-it`, BF16, SGLang native
+  `Gemma4UnifiedForConditionalGeneration`.
+- Prompt: explicit text prompt `Hello`, not synthetic prompt tokens.
+- Shape: in-process single-user loop, `max_running_requests=1`, output length
+  `128`, warmups `5`, measured requests `20`.
+- Cache policy: SGLang launched with `disable_radix_cache=True`; server log
+  shows `SWAChunkCache hybrid_swa=True`.
+- Timing: host-visible `time.perf_counter()` around synchronous
+  `Engine.generate()` calls. Model load, scheduler startup, graph capture, and
+  warmups were excluded.
+- Clock policy: clocks were not locked.
+
+Results:
+
+```text
+Successful requests:            20
+Failed requests:                0
+Total input tokens:             20
+Total generated tokens:         2560
+Output throughput:              27.098 tok/s
+Total token throughput:         27.309 tok/s
+Median E2E:                     4724.795 ms
+P90 E2E:                        4726.656 ms
+P95 E2E:                        4726.888 ms
+P99 E2E:                        4727.779 ms
+Median ms/output token:         36.912 ms
+Engine load excluded:           24.592 s
+```
+
+Notes:
+
+- The timed requests completed successfully. The first result JSON write failed
+  after shutdown because SGLang's nested `server_info` contains non-JSON-native
+  objects; the artifact was reconstructed from the raw per-request JSON lines in
+  the log, and the script was fixed with `default=str` for future runs.
+- The offline Engine result is effectively the same throughput band as the
+  HTTP serving benchmark. Removing the OpenAI-compatible HTTP client/server
+  layer did not materially change this one-request-at-a-time decode result.
+- Non-text multimodal processor imports again logged `torchcodec`/FFmpeg
+  warnings, but text completion ran successfully.
+
+Artifacts:
+
+- `build/bench_results/sglang_offline_engine_hello_bench_20260628.py`
+- `build/bench_results/sglang_gemma4_12b_offline_engine_hello_out128_c1_20_20260628.log`
+- `build/bench_results/sglang_gemma4_12b_offline_engine_hello_out128_c1_20_20260628.json`
+- `build/bench_results/sglang_gemma4_12b_offline_env_20260628.txt`
+- `build/bench_results/sglang_gemma4_12b_offline_nvidia_smi_20260628.csv`
+
+Conclusion:
+
+- Under the same real-prompt, radix-cache-disabled, single-user shape, SGLang's
+  offline Engine path measured `27.098 tok/s` output throughput and
+  `36.912 ms/output token` by host-visible synchronous request timing.

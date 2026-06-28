@@ -160,8 +160,7 @@ int run_prompt(const PromptOptions &options) {
   CUDA_CHECK(gemma4_load_text_weights_device_bf16(&weights.value, options.checkpoint_path.c_str(), nullptr));
 
   RuntimeOwner runtime;
-  CUDA_CHECK(gemma4_runtime_state_init(
-      &runtime.value, kPromptBatchSize, max_seq_len, options.page_size, 0));
+  CUDA_CHECK(gemma4_runtime_state_init(&runtime.value, kPromptBatchSize, max_seq_len, options.page_size, 0));
   thrust::device_vector<int32_t> d_prompt_tokens(prompt_tokens.size());
   thrust::device_vector<int32_t> d_next_token(kPromptBatchSize);
 
@@ -188,16 +187,12 @@ int run_prompt(const PromptOptions &options) {
       runtime.value.global_cache_config.page_size;
   const int32_t global_splits = div_up(global_keys, split_size);
   const int32_t max_splits = std::max(sliding_splits, global_splits);
-  thrust::device_vector<float> d_partial_m(
-      GEMMA4_NUM_QUERY_HEADS * max_splits);
-  thrust::device_vector<float> d_partial_l(
-      GEMMA4_NUM_QUERY_HEADS * max_splits);
+  thrust::device_vector<float> d_partial_m(GEMMA4_NUM_QUERY_HEADS * max_splits);
+  thrust::device_vector<float> d_partial_l(GEMMA4_NUM_QUERY_HEADS * max_splits);
   thrust::device_vector<float> d_partial_acc(
-      static_cast<size_t>(GEMMA4_NUM_QUERY_HEADS) * max_splits *
-      GEMMA4_GLOBAL_HEAD_DIM);
+      static_cast<size_t>(GEMMA4_NUM_QUERY_HEADS) * max_splits * GEMMA4_GLOBAL_HEAD_DIM);
   const size_t decode_scratch_bytes = gemma4_decode_megakernel_scratch_bytes();
-  thrust::device_vector<unsigned char> d_decode_scratch(
-      decode_scratch_bytes);
+  thrust::device_vector<unsigned char> d_decode_scratch(decode_scratch_bytes);
 
   auto copy_prompt_tokens = [&](const std::vector<int32_t> &tokens) {
     return cudaMemcpyAsync(raw_ptr(d_prompt_tokens), tokens.data(),
@@ -208,8 +203,7 @@ int run_prompt(const PromptOptions &options) {
 
   auto run_prefill_once = [&]() -> cudaError_t {
     GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_embedding_gather_bf16(
-        raw_ptr(d_prefill_a), raw_ptr(d_prompt_tokens), weights.value.token_embedding,
-        prompt_len, 0));
+        raw_ptr(d_prefill_a), raw_ptr(d_prompt_tokens), weights.value.token_embedding, prompt_len, 0));
 
     __nv_bfloat16 *prefill_final_row = nullptr;
     Gemma4PrefillMegakernelArgs args = {};
@@ -226,8 +220,7 @@ int run_prompt(const PromptOptions &options) {
     const __nv_bfloat16 *last_row =
         prefill_final_row + int64_t(prompt_len - 1) * GEMMA4_HIDDEN_SIZE;
     GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
-        raw_ptr(d_decode_a), last_row, kHiddenRowBytes,
-        cudaMemcpyDeviceToDevice, 0));
+        raw_ptr(d_decode_a), last_row, kHiddenRowBytes, cudaMemcpyDeviceToDevice, 0));
     return gemma4_megakernel_sample_final_bf16(
         raw_ptr(d_decode_a), raw_ptr(d_next_token), raw_ptr(d_normed),
         raw_ptr(d_decode_a), &weights.value, raw_ptr(d_decode_scratch),
@@ -256,18 +249,15 @@ int run_prompt(const PromptOptions &options) {
     return gemma4_decode_megakernel(args);
   };
 
-  auto generate_tokens = [&](int32_t max_tokens,
-                             std::vector<int32_t> *generated) -> cudaError_t {
+  auto generate_tokens = [&](int32_t max_tokens, std::vector<int32_t> *generated) -> cudaError_t {
     GEMMA4_RETURN_IF_CUDA_ERROR(run_prefill_once());
 
     generated->clear();
-    GEMMA4_RETURN_IF_CUDA_ERROR(
-        copy_next_token(raw_ptr(d_next_token), generated, 0));
+    GEMMA4_RETURN_IF_CUDA_ERROR( copy_next_token(raw_ptr(d_next_token), generated, 0));
 
     while (static_cast<int32_t>(generated->size()) < max_tokens) {
       GEMMA4_RETURN_IF_CUDA_ERROR(run_decode_once());
-      GEMMA4_RETURN_IF_CUDA_ERROR(
-          copy_next_token(raw_ptr(d_next_token), generated, 0));
+      GEMMA4_RETURN_IF_CUDA_ERROR(copy_next_token(raw_ptr(d_next_token), generated, 0));
     }
     return cudaSuccess;
   };
@@ -277,15 +267,13 @@ int run_prompt(const PromptOptions &options) {
     GEMMA4_RETURN_IF_CUDA_ERROR(copy_prompt_tokens(prompt_tokens));
     std::vector<int32_t> generated;
     GEMMA4_RETURN_IF_CUDA_ERROR(run_prefill_once());
-    GEMMA4_RETURN_IF_CUDA_ERROR(
-        copy_next_token(raw_ptr(d_next_token), &generated, 0));
+    GEMMA4_RETURN_IF_CUDA_ERROR(copy_next_token(raw_ptr(d_next_token), &generated, 0));
 
     const PromptClock::time_point first_token_time = PromptClock::now();
     PromptClock::time_point previous_token_time = first_token_time;
     while (static_cast<int32_t>(generated.size()) < options.max_new_tokens) {
       GEMMA4_RETURN_IF_CUDA_ERROR(run_decode_once());
-      GEMMA4_RETURN_IF_CUDA_ERROR(
-          copy_next_token(raw_ptr(d_next_token), &generated, 0));
+      GEMMA4_RETURN_IF_CUDA_ERROR(copy_next_token(raw_ptr(d_next_token), &generated, 0));
       const PromptClock::time_point token_time = PromptClock::now();
       timing->itl_ms.push_back(
           std::chrono::duration<float, std::milli>(
@@ -345,8 +333,7 @@ int run_prompt(const PromptOptions &options) {
         options.bench_samples, split_size);
     print_stats_line("decode_step_ms", decode_stats, "_ms");
     if (decode_stats.median_ms > 0.0f) {
-      std::printf("decode_step_tps_p50=%.3f\n",
-                  1000.0f / decode_stats.median_ms);
+      std::printf("decode_step_tps_p50=%.3f\n", 1000.0f / decode_stats.median_ms);
     }
     return 0;
   }
@@ -406,22 +393,17 @@ int run_prompt(const PromptOptions &options) {
         std::chrono::duration<float, std::milli>(
             benchmark_stop - benchmark_start)
             .count();
+
     const float benchmark_duration_s = benchmark_duration_ms / 1000.0f;
-    const int64_t total_input_tokens =
-        int64_t(prompt_len) * measured_requests;
-    const int64_t total_output_tokens =
-        int64_t(options.max_new_tokens) * measured_requests;
+    const int64_t total_input_tokens = int64_t(prompt_len) * measured_requests;
+    const int64_t total_output_tokens = int64_t(options.max_new_tokens) * measured_requests;
     const int64_t total_tokens = total_input_tokens + total_output_tokens;
-    const float request_throughput =
-        static_cast<float>(measured_requests) / benchmark_duration_s;
-    const float output_token_throughput =
-        static_cast<float>(total_output_tokens) / benchmark_duration_s;
-    const float total_token_throughput =
-        static_cast<float>(total_tokens) / benchmark_duration_s;
+    const float request_throughput = static_cast<float>(measured_requests) / benchmark_duration_s;
+    const float output_token_throughput = static_cast<float>(total_output_tokens) / benchmark_duration_s;
+    const float total_token_throughput = static_cast<float>(total_tokens) / benchmark_duration_s;
 
     std::printf(
-        "benchmark mode=warm-serving prompt_len=%d output_tokens=%d warmup=%d "
-        "measured=%d\n",
+        "benchmark mode=warm-serving prompt_len=%d output_tokens=%d warmup=%d measured=%d\n",
         prompt_len, options.max_new_tokens, options.bench_warmup,
         measured_requests);
     std::printf(
@@ -459,10 +441,10 @@ int run_prompt(const PromptOptions &options) {
 }  // namespace
 
 // Runs the local Gemma 4 text prompt path.
+  }
 int main(int argc, char **argv) {
   PromptOptions options;
   if (!parse_args(argc, argv, &options)) {
     return 1;
-  }
   return run_prompt(options);
 }
