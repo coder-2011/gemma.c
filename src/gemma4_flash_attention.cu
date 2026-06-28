@@ -10,6 +10,7 @@
 #include <limits>
 #include <type_traits>
 
+#include <cute/algorithm/gemm.hpp>
 #include <cute/algorithm/tensor_reduce.hpp>
 #include <cute/tensor.hpp>
 #include <cutlass/array.h>
@@ -20,6 +21,7 @@
 
 #include "gemma4_flash_attention.cuh"
 #include "gemma4_cuda_utils.cuh"
+#include "gemma4_matmul_kernels.cuh"
 #include "gemma4_megakernel.cuh"
 #include "gemma4_ffn.cuh"
 #include "gemma4_rmsnorm.cuh"
@@ -27,13 +29,6 @@
 #include "gemma4.h"
 
 #include <cooperative_groups.h>
-
-// Completes the split decode FFN tail after FlashAttention prepares FFN inputs.
-cudaError_t gemma4_decode_megakernel_finish_layer_bf16(
-    const Gemma4DecodeMegakernelLayerArgs &args,
-    void *__restrict__ scratch,
-    size_t scratch_bytes,
-    cudaStream_t stream);
 
 namespace gemma4_flash_attention {
 
@@ -223,6 +218,13 @@ using Gemma4SlidingFa2KernelTraits =
     Gemma4FlashFwdKernelTraits<GEMMA4_SLIDING_HEAD_DIM, 64, 64, 4>;
 using Gemma4GlobalFa2KernelTraits =
     Gemma4FlashFwdKernelTraits<GEMMA4_GLOBAL_HEAD_DIM, 32, 32, 2>;
+
+// Caches host-side cooperative launch geometry for one decoded layer kernel.
+struct DecodeLayerLaunchCache {
+  void *kernel = nullptr;
+  int device = -1;
+  int active_blocks = 0;
+};
 
 template <bool IsGlobal>
 struct Gemma4AttentionTraits;
@@ -1306,6 +1308,31 @@ __device__ __forceinline__ float hidden_rms_scale_bf16(
   return rsqrtf(sum / float(GEMMA4_HIDDEN_SIZE) + GEMMA4_RMS_NORM_EPS);
 }
 
+// Accumulates one 8-element BF16 dot-product chunk through CuTe's register GEMM path.
+__device__ __forceinline__ float cute_bf16_pack_dot_add(
+    const Bf16Packed128 &x_pack,
+    const Bf16Packed128 &w_pack,
+    float sum) {
+  float x_values[kBf16Packed128Elements];
+  float w_values[kBf16Packed128Elements];
+#pragma unroll
+  for (int i = 0; i < kBf16Packed128Elements; ++i) {
+    x_values[i] = __bfloat162float(x_pack[i]);
+    w_values[i] = __bfloat162float(w_pack[i]);
+  }
+
+  float c_value[1] = {sum};
+  float d_value[1] = {0.0f};
+  Tensor x = make_tensor(
+      make_rmem_ptr(x_values), make_shape(_1{}, Int<kBf16Packed128Elements>{}));
+  Tensor w = make_tensor(
+      make_rmem_ptr(w_values), make_shape(_1{}, Int<kBf16Packed128Elements>{}));
+  Tensor c = make_tensor(make_rmem_ptr(c_value), make_shape(_1{}, _1{}));
+  Tensor d = make_tensor(make_rmem_ptr(d_value), make_shape(_1{}, _1{}));
+  cute::gemm(d, x, w, c);
+  return d_value[0];
+}
+
 // Project from RMSNorm(x) without materializing the normalized hidden row.
 template <typename Traits>
 __device__ __forceinline__ void project_normed_head_values_bf16(
@@ -1339,6 +1366,48 @@ __device__ __forceinline__ void project_normed_head_values_bf16(
       const Bf16Packed128 w_pack =
           Bf16Packed128{*reinterpret_cast<const int4 *>(w_col_major + weight_offset)};
       gemma4_bf16_pack_accumulate_dot(normed_pack, w_pack, values[i]);
+    }
+  }
+
+#pragma unroll
+  for (int i = 0; i < Derived::kValuesPerLane; ++i) {
+    values[i] = __bfloat162float(__float2bfloat16_rn(values[i]));
+  }
+}
+
+// Projects one packed Q/K/V head from RMSNorm(x) without materializing the normalized row.
+template <typename Traits>
+__device__ __forceinline__ void project_normed_packed_head_values_bf16_cute(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ input_norm_weight,
+    const __nv_bfloat16 *__restrict__ w_qkv_col_major,
+    int col_base,
+    int lane,
+    float hidden_scale,
+    float (&values)[Gemma4AttentionDerived<Traits>::kValuesPerLane]) {
+  using Derived = Gemma4AttentionDerived<Traits>;
+  constexpr int kPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+#pragma unroll
+  for (int i = 0; i < Derived::kValuesPerLane; ++i) {
+    values[i] = 0.0f;
+  }
+
+  for (int pack = 0; pack < kPacks; ++pack) {
+    const int element = pack * kBf16Packed128Elements;
+    const Bf16Packed128 x_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element)};
+    const Bf16Packed128 gamma_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(input_norm_weight + element)};
+    const Bf16Packed128 normed_pack =
+        gemma4_bf16_pack_apply_scale_weight(x_pack, gamma_pack, hidden_scale);
+#pragma unroll
+    for (int i = 0; i < Derived::kValuesPerLane; ++i) {
+      const int dim = lane + i * kWarpSize;
+      const int col = col_base + dim;
+      const int64_t weight_offset = int64_t(col) * GEMMA4_HIDDEN_SIZE + element;
+      const Bf16Packed128 w_pack =
+          Bf16Packed128{*reinterpret_cast<const int4 *>(w_qkv_col_major + weight_offset)};
+      values[i] = cute_bf16_pack_dot_add(normed_pack, w_pack, values[i]);
     }
   }
 
@@ -1626,6 +1695,107 @@ __device__ __forceinline__ void phase_decode_norm_project_prepare_paged_kv(
   }
 }
 
+// Computes the input RMSNorm scale once for the cooperative decode layer.
+template <typename Traits>
+__device__ __forceinline__ float phase_decode_hidden_scale_prologue(
+    const Gemma4DecodeMegakernelLayerArgs &args,
+    cg::grid_group grid,
+    int thread_idx) {
+  const int lane = thread_idx & (kWarpSize - 1);
+  const int warp = thread_idx / kWarpSize;
+  if (blockIdx.x == 0 && warp == 0) {
+    const float hidden_scale = hidden_rms_scale_bf16(args.attention_x, lane);
+    if (lane == 0) {
+      *args.attention_hidden_scale = hidden_scale;
+    }
+  }
+  grid.sync();
+  return *args.attention_hidden_scale;
+}
+
+// Projects one packed Q/K/V head and immediately applies head norm, RoPE, and KV write.
+template <typename Traits>
+__device__ __forceinline__ void phase_decode_packed_qkv_head_projection(
+    const Gemma4DecodeMegakernelLayerArgs &args,
+    int task,
+    float hidden_scale,
+    int thread_idx) {
+  using Derived = Gemma4AttentionDerived<Traits>;
+  constexpr int kQTasks = GEMMA4_NUM_QUERY_HEADS;
+  constexpr int kKTasks = Traits::kKvHeads;
+  constexpr int kVTasks = Traits::kHasVProjection ? Traits::kKvHeads : 0;
+  constexpr int kIngressTasks = kQTasks + kKTasks + kVTasks;
+
+  const int lane = thread_idx & (kWarpSize - 1);
+  const int warp = thread_idx / kWarpSize;
+  if (warp != 0 || task < 0 || task >= kIngressTasks) return;
+
+  const int position =
+      gemma4_warp_uniform_ldg_i32(args.attention_token_position, lane);
+  if (position < 0) return;
+
+  float values[Derived::kValuesPerLane];
+  if (task < kQTasks) {
+    const int q_head = task;
+    const int col_base =
+        args.attention_weights.q_col_base + q_head * Traits::kHeadDim;
+    project_normed_packed_head_values_bf16_cute<Traits>(
+        args.attention_x, args.attention_input_norm_weight,
+        args.attention_weights.d_qkv_col_major, col_base, lane,
+        hidden_scale, values);
+
+    const float *cos_row =
+        args.attention_cos + int64_t(position) * Derived::kRotaryHalf;
+    const float *sin_row =
+        args.attention_sin + int64_t(position) * Derived::kRotaryHalf;
+    const int64_t q_offset = int64_t(q_head) * Traits::kHeadDim;
+    prep_weighted_rope_head_values<Traits>(
+        args.attention_q + q_offset, values, args.attention_q_norm_weight,
+        cos_row, sin_row, lane);
+    return;
+  }
+
+  const int kv_task = task - kQTasks;
+  const int kv_head = kv_task < kKTasks ? kv_task : kv_task - kKTasks;
+  const int64_t cache_offset = decode_cache_head_offset<Traits>(
+      args.attention_cache_config, args.attention_page_table, 0, position,
+      args.attention_cache_layer, kv_head, lane, 1);
+  if (cache_offset < 0) return;
+
+  if (kv_task < kKTasks) {
+    const int col_base =
+        args.attention_weights.k_col_base + kv_head * Traits::kHeadDim;
+    project_normed_packed_head_values_bf16_cute<Traits>(
+        args.attention_x, args.attention_input_norm_weight,
+        args.attention_weights.d_qkv_col_major, col_base, lane,
+        hidden_scale, values);
+
+    const float *cos_row =
+        args.attention_cos + int64_t(position) * Derived::kRotaryHalf;
+    const float *sin_row =
+        args.attention_sin + int64_t(position) * Derived::kRotaryHalf;
+    prep_weighted_rope_head_values<Traits>(
+        args.attention_cache_k + cache_offset, values,
+        args.attention_k_norm_weight, cos_row, sin_row, lane);
+    if constexpr (!Traits::kHasVProjection) {
+      prep_scale_free_head_values<Traits>(
+          args.attention_cache_v + cache_offset, values, lane);
+    }
+    return;
+  }
+
+  if constexpr (Traits::kHasVProjection) {
+    const int col_base =
+        args.attention_weights.v_col_base + kv_head * Traits::kHeadDim;
+    project_normed_packed_head_values_bf16_cute<Traits>(
+        args.attention_x, args.attention_input_norm_weight,
+        args.attention_weights.d_qkv_col_major, col_base, lane,
+        hidden_scale, values);
+    prep_scale_free_head_values<Traits>(
+        args.attention_cache_v + cache_offset, values, lane);
+  }
+}
+
 // Wrapper: decode ingress with input RMSNorm folded into projection loads.
 template <typename Traits>
 __global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kPrepThreads)
@@ -1681,6 +1851,23 @@ bool valid_projection_weights(const Gemma4AttentionProjectionWeights &weights) {
   } else {
     return true;
   }
+}
+
+// Validates the packed QKV projection buffer used by the cooperative decode prologue.
+template <typename Traits>
+bool valid_packed_projection_weights(
+    const Gemma4AttentionProjectionWeights &weights) {
+  if (weights.d_qkv_col_major == nullptr ||
+      !is_aligned_16(weights.d_qkv_col_major)) {
+    return false;
+  }
+  if (weights.q_col_base < 0 || weights.k_col_base < 0) {
+    return false;
+  }
+  if constexpr (Traits::kHasVProjection) {
+    return weights.v_col_base >= 0;
+  }
+  return true;
 }
 
 // Launch the prefill Q/K/V preparation kernel after caller-side buffer validation.
@@ -2178,26 +2365,13 @@ void decode_paged_reduce_kernel(
       int32_t(threadIdx.x), int32_t(blockDim.x));
 }
 
-// Runs the decode FlashAttention phase inside the cooperative layer launcher.
+// Runs split-KV decode attention after Q and the cache row are already prepared.
 template <typename Traits>
-__device__ inline void phase_megakernel_flash_attention(
+__device__ inline void phase_megakernel_flash_attention_from_prepared(
     const Gemma4DecodeMegakernelLayerArgs &args,
     cg::grid_group grid) {
   const int block = int(blockIdx.x);
   const int stride = int(gridDim.x);
-
-  for (int kv_head = block; kv_head < Traits::kKvHeads; kv_head += stride) {
-    phase_decode_norm_project_prepare_paged_kv<Traits>(
-        args.attention_q, args.attention_cache_k, args.attention_cache_v,
-        args.attention_cache_config, args.attention_page_table,
-        args.attention_token_position, args.attention_cache_layer,
-        args.attention_x, args.attention_input_norm_weight,
-        args.attention_weights, args.attention_q_norm_weight,
-        args.attention_k_norm_weight, args.attention_cos, args.attention_sin,
-        0, kv_head, int(threadIdx.x), 1);
-  }
-  grid.sync();
-
   const int split_tasks = Traits::kKvHeads * args.attention_num_splits;
   for (int task = block; task < split_tasks; task += stride) {
     const int kv_head = task / args.attention_num_splits;
@@ -2228,10 +2402,18 @@ __device__ inline void phase_megakernel_flash_attention(
   }
 }
 
-// Runs FlashAttention and prepares the post-attention FFN input rows.
+// Runs split-KV FlashAttention inside the cooperative layer after Q/K/V prep.
+template <typename Traits>
+__device__ inline void phase_megakernel_flash_attention(
+    const Gemma4DecodeMegakernelLayerArgs &args,
+    cg::grid_group grid) {
+  phase_megakernel_flash_attention_from_prepared<Traits>(args, grid);
+}
+
+// Runs one fused decode layer from attention ingress through the FFN tail.
 template <typename Traits>
 __global__ __launch_bounds__(kDecodeMegaThreads, 1)
-void decode_megakernel_flash_attention_prepare_ffn_kernel(
+void decode_megakernel_fused_layer_kernel(
     Gemma4DecodeMegakernelLayerArgs args) {
   cg::grid_group grid = cg::this_grid();
 
@@ -2244,6 +2426,10 @@ void decode_megakernel_flash_attention_prepare_ffn_kernel(
 
   decode_attention_to_ffn(args);
   grid.sync();
+  gemma4_ffn_decode_fused_bf16_device(
+      args.residual_out, args.normed_out, args.ffn_x, args.ffn_residual,
+      args.ffn_norm_weight, args.ffn_gate_up_decode, args.ffn_down_decode,
+      args.ffn_scratch, args.layer_scalar, GEMMA4_RMS_NORM_EPS);
 }
 
 using SlidingAttentionTraits = Gemma4AttentionTraits<false>;
@@ -2385,6 +2571,46 @@ cudaError_t launch_decode_paged(
   return cudaErrorInvalidValue;
 }
 
+// Validates inputs consumed by the fused decode layer cooperative kernel.
+template <typename Traits>
+bool valid_decode_megakernel_layer_args(
+    const Gemma4DecodeMegakernelLayerArgs &args) {
+  if (!valid_decode_paged_args<Traits>(
+          args.attention_out, args.attention_partial_m,
+          args.attention_partial_l, args.attention_partial_acc,
+          args.attention_q, args.attention_cache_k, args.attention_cache_v,
+          args.attention_page_table, args.attention_seq_lengths,
+          args.attention_cache_config, args.attention_cache_layer, 1,
+          args.attention_split_size, args.attention_num_splits)) {
+    return false;
+  }
+  return args.residual_out != nullptr &&
+         args.normed_out != nullptr &&
+         args.ffn_x != nullptr &&
+         args.ffn_residual != nullptr &&
+         args.ffn_norm_weight != nullptr &&
+         args.ffn_gate_up_decode != nullptr &&
+         args.ffn_down_decode != nullptr &&
+         args.ffn_scratch != nullptr &&
+         args.attention_token_position != nullptr &&
+         args.attention_o_proj_col_major != nullptr &&
+         args.attention_post_norm_weight != nullptr &&
+         args.attention_pre_ffn_norm_weight != nullptr &&
+         args.attention_q_norm_weight != nullptr &&
+         args.attention_k_norm_weight != nullptr &&
+         args.attention_cos != nullptr &&
+         args.attention_sin != nullptr &&
+         args.attention_softmax_scale > 0.0f &&
+         is_aligned_16(args.ffn_x) &&
+         is_aligned_16(args.ffn_residual) &&
+         is_aligned_16(args.ffn_norm_weight) &&
+         is_aligned_16(args.ffn_gate_up_decode) &&
+         is_aligned_16(args.ffn_down_decode) &&
+         is_aligned_16(args.attention_q) &&
+         is_aligned_16(args.attention_out) &&
+         is_aligned_16(args.attention_o_proj_col_major);
+}
+
 // Small diagnostic helper for tests/benchmarks that want register count,
 // dynamic shared memory, binary target, and related CUDA function attributes.
 template <typename KernelTraits, bool IsLocal>
@@ -2409,37 +2635,53 @@ cudaError_t selected_kernel_attributes(long long *out, int len) {
   return cudaSuccess;
 }
 
-// Launches the cooperative decode prep grid used by the fused O-proj bridge.
+// Launches the cooperative decode grid that owns the fused layer body.
 template <typename Kernel>
-cudaError_t launch_decode_prepare(
+cudaError_t launch_decode_layer(
     const Gemma4DecodeMegakernelLayerArgs &args,
     cudaStream_t stream,
     Kernel kernel) {
+  static DecodeLayerLaunchCache launch_cache[2];
   int device = 0;
   cudaError_t status = cudaGetDevice(&device);
   GEMMA4_RETURN_IF_CUDA_ERROR(status);
+  void *kernel_ptr = reinterpret_cast<void *>(kernel);
 
-  cudaDeviceProp prop = {};
-  status = cudaGetDeviceProperties(&prop, device);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
-  if (!prop.cooperativeLaunch) {
-    return cudaErrorNotSupported;
+  // Device properties and occupancy are invariant across all 48 decode layers.
+  DecodeLayerLaunchCache *cached = nullptr;
+  for (DecodeLayerLaunchCache &entry : launch_cache) {
+    if (entry.kernel == kernel_ptr && entry.device == device &&
+        entry.active_blocks > 0) {
+      cached = &entry;
+    }
   }
+  if (cached == nullptr) {
+    cached = launch_cache[0].kernel == nullptr ? &launch_cache[0]
+                                               : &launch_cache[1];
+    cudaDeviceProp prop = {};
+    status = cudaGetDeviceProperties(&prop, device);
+    GEMMA4_RETURN_IF_CUDA_ERROR(status);
+    if (!prop.cooperativeLaunch) {
+      return cudaErrorNotSupported;
+    }
 
-  int active_blocks_per_sm = 0;
-  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_blocks_per_sm, kernel, kDecodeMegaThreads, 0);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
-  const int active_blocks = active_blocks_per_sm * prop.multiProcessorCount;
-  if (active_blocks <= 0) {
-    return cudaErrorInvalidValue;
+    int active_blocks_per_sm = 0;
+    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks_per_sm, kernel, kDecodeMegaThreads, 0);
+    GEMMA4_RETURN_IF_CUDA_ERROR(status);
+    cached->kernel = kernel_ptr;
+    cached->device = device;
+    cached->active_blocks = active_blocks_per_sm * prop.multiProcessorCount;
+    if (cached->active_blocks <= 0) {
+      return cudaErrorInvalidValue;
+    }
   }
 
   Gemma4DecodeMegakernelLayerArgs kernel_args_value = args;
   void *kernel_args[] = {&kernel_args_value};
   status = cudaLaunchCooperativeKernel(
-      reinterpret_cast<void *>(kernel), active_blocks, kDecodeMegaThreads,
-      kernel_args, 0, stream);
+      kernel_ptr, cached->active_blocks, kDecodeMegaThreads, kernel_args, 0,
+      stream);
   if (status != cudaSuccess) {
     return status;
   }
@@ -2448,32 +2690,36 @@ cudaError_t launch_decode_prepare(
 
 }  // namespace gemma4_flash_attention
 
-// Launches the decode FlashAttention + fused O-proj + FFN branch.
+// Launches one fused decode layer from attention ingress through FFN post-norm.
 cudaError_t gemma4_decode_megakernel_flash_attention_layer_bf16(
     const Gemma4DecodeMegakernelLayerArgs &args,
-    void *__restrict__ scratch,
-    size_t scratch_bytes,
     cudaStream_t stream) {
   const Gemma4KvCacheConfig &config = args.attention_cache_config;
   cudaError_t status = cudaErrorInvalidValue;
   if (config.head_dim == GEMMA4_SLIDING_HEAD_DIM &&
       config.num_heads == GEMMA4_SLIDING_KV_HEADS) {
-    status = gemma4_flash_attention::launch_decode_prepare(
+    if (!gemma4_flash_attention::valid_decode_megakernel_layer_args<
+            gemma4_flash_attention::Gemma4AttentionTraits<false>>(args)) {
+      return cudaErrorInvalidValue;
+    }
+    status = gemma4_flash_attention::launch_decode_layer(
         args, stream,
         gemma4_flash_attention::
-            decode_megakernel_flash_attention_prepare_ffn_kernel<
+            decode_megakernel_fused_layer_kernel<
                 gemma4_flash_attention::Gemma4AttentionTraits<false>>);
   } else if (config.head_dim == GEMMA4_GLOBAL_HEAD_DIM &&
              config.num_heads == GEMMA4_GLOBAL_KV_HEADS) {
-    status = gemma4_flash_attention::launch_decode_prepare(
+    if (!gemma4_flash_attention::valid_decode_megakernel_layer_args<
+            gemma4_flash_attention::Gemma4AttentionTraits<true>>(args)) {
+      return cudaErrorInvalidValue;
+    }
+    status = gemma4_flash_attention::launch_decode_layer(
         args, stream,
         gemma4_flash_attention::
-            decode_megakernel_flash_attention_prepare_ffn_kernel<
+            decode_megakernel_fused_layer_kernel<
                 gemma4_flash_attention::Gemma4AttentionTraits<true>>);
   }
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
-  return gemma4_decode_megakernel_finish_layer_bf16(
-      args, scratch, scratch_bytes, stream);
+  return status;
 }
 
 // Host launcher for Gemma 4 sliding-window attention. Inputs and output are
@@ -2625,6 +2871,42 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_
       d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
       d_token_position, batch_size, cache_layer, d_q, d_k, d_v,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
+}
+
+extern "C" cudaError_t gemma4_flash_attention_decode_prepare_q_paged_kv_bf16(
+    __nv_bfloat16 *__restrict__ d_q_prepared,
+    __nv_bfloat16 *__restrict__ d_cache_k,
+    __nv_bfloat16 *__restrict__ d_cache_v,
+    Gemma4KvCacheConfig cache_config,
+    const int32_t *__restrict__ d_page_table,
+    const int32_t *__restrict__ d_token_position,
+    int32_t batch_size,
+    int32_t cache_layer,
+    const __nv_bfloat16 *__restrict__ d_q,
+    const __nv_bfloat16 *__restrict__ d_k,
+    const __nv_bfloat16 *__restrict__ d_v,
+    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
+    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
+    const float *__restrict__ d_cos,
+    const float *__restrict__ d_sin,
+    cudaStream_t stream) {
+  if (cache_config.head_dim == GEMMA4_SLIDING_HEAD_DIM &&
+      cache_config.num_heads == GEMMA4_SLIDING_KV_HEADS) {
+    return gemma4_flash_attention::prepare_decode_q_paged_kv_norm_rope<
+        gemma4_flash_attention::Gemma4AttentionTraits<false>>(
+        d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
+        d_token_position, batch_size, cache_layer, d_q, d_k, d_v,
+        d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
+  }
+  if (cache_config.head_dim == GEMMA4_GLOBAL_HEAD_DIM &&
+      cache_config.num_heads == GEMMA4_GLOBAL_KV_HEADS) {
+    return gemma4_flash_attention::prepare_decode_q_paged_kv_norm_rope<
+        gemma4_flash_attention::Gemma4AttentionTraits<true>>(
+        d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
+        d_token_position, batch_size, cache_layer, d_q, d_k, d_v,
+        d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
+  }
+  return cudaErrorInvalidValue;
 }
 
 extern "C" cudaError_t gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16(
