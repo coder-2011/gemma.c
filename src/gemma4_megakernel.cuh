@@ -10,6 +10,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct Gemma4FfnDecodeScratch;
+
 enum class Gemma4MegakernelPrepMode {
   kPrefill,
   kDecode,
@@ -35,6 +37,7 @@ struct Gemma4DecodeMegakernelLayerArgs {
   const __nv_bfloat16 *ffn_norm_weight = nullptr;
   const __nv_bfloat16 *ffn_gate_up_decode = nullptr;
   const __nv_bfloat16 *ffn_down_decode = nullptr;
+  Gemma4FfnDecodeScratch *ffn_scratch = nullptr;
   const __nv_bfloat16 *layer_scalar = nullptr;
 
   __nv_bfloat16 *attention_q = nullptr;
@@ -54,6 +57,7 @@ struct Gemma4DecodeMegakernelLayerArgs {
   float attention_softmax_scale = 0.0f;
   const __nv_bfloat16 *attention_x = nullptr;
   const __nv_bfloat16 *attention_input_norm_weight = nullptr;
+  float *attention_hidden_scale = nullptr;
   Gemma4AttentionProjectionWeights attention_weights = {};
   const __nv_bfloat16 *attention_o_proj_col_major = nullptr;
   const __nv_bfloat16 *attention_post_norm_weight = nullptr;
