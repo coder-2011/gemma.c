@@ -91,31 +91,32 @@ cudaError_t prepare_decode_attention_inputs(
       args.normed, hidden_in, w.input_norm_weight, 1, GEMMA4_HIDDEN_SIZE,
       GEMMA4_RMS_NORM_EPS, args.stream));
 
-  const Gemma4Projection q_projection =
-      global ? GEMMA4_PROJECTION_GLOBAL_Q : GEMMA4_PROJECTION_SLIDING_Q;
-  const Gemma4Projection k_projection =
-      global ? GEMMA4_PROJECTION_GLOBAL_K : GEMMA4_PROJECTION_SLIDING_KV;
-  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_projection_decode(
-      q_projection, args.normed, w.q_proj_col_major, args.attention_q,
-      args.stream));
-
+  __nv_bfloat16 *raw_q = args.attention_q;
   __nv_bfloat16 *raw_k = args.attention_out;
-  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_projection_decode(
-      k_projection, args.normed, w.k_proj_col_major, raw_k, args.stream));
-
   __nv_bfloat16 *raw_v = nullptr;
-  if (!global) {
+
+  if (global) {
+    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_projection_decode(
+        GEMMA4_PROJECTION_GLOBAL_Q, args.normed, w.q_proj_col_major,
+        args.attention_q, args.stream));
+    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_projection_decode(
+        GEMMA4_PROJECTION_GLOBAL_K, args.normed, w.k_proj_col_major, raw_k,
+        args.stream));
+  } else {
+    // The sliding raw QKV row fits in attention_out before attention overwrites it.
+    raw_q = args.attention_out;
+    raw_k = raw_q + GEMMA4_SLIDING_Q_PROJ_SIZE;
     raw_v = raw_k + GEMMA4_SLIDING_KV_PROJ_SIZE;
     GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_projection_decode(
-        GEMMA4_PROJECTION_SLIDING_KV, args.normed, w.v_proj_col_major, raw_v,
-        args.stream));
+        GEMMA4_PROJECTION_SLIDING_QKV, args.normed, w.qkv_proj_col_major,
+        args.attention_out, args.stream));
   }
 
   return gemma4_flash_attention_decode_prepare_q_paged_kv_bf16(
       args.attention_q, layer_args.attention_cache_k,
       layer_args.attention_cache_v, layer_args.attention_cache_config,
       layer_args.attention_page_table, layer_args.attention_token_position, 1,
-      layer_args.attention_cache_layer, args.attention_q, raw_k, raw_v,
+      layer_args.attention_cache_layer, raw_q, raw_k, raw_v,
       w.q_norm_weight, w.k_norm_weight, layer_args.attention_cos,
       layer_args.attention_sin, args.stream);
 }
