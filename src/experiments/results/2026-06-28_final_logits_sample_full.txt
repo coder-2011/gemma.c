@@ -1,0 +1,4 @@
+==PROF== Connected to process 558515 (/root/gemma.c/build/gemma4_prompt)
+==PROF== Profiling "<unnamed>::final_logits_sample_kernel(__nv_bfloat16 *, int *, const __nv_bfloat16 *, const __nv_bfloat16 *, Gemma4SampleCandidate *, unsigned int *, Gemma4SamplingStage, int)": 0%....50%....100% - 43 passes
+==PROF== Disconnected from process 558515
+==PROF== Report: /root/gemma.c/src/experiments/results/2026-06-28_final_logits_sample_full.ncu-rep

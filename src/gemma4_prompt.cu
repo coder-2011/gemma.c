@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -77,51 +78,40 @@ struct RuntimeOwner {
   ~RuntimeOwner() { gemma4_runtime_state_free(&value); }
 };
 
-// Parses the explicit benchmark regime requested by the CLI.
-bool parse_benchmark_mode(const std::string &value, PromptBenchmarkMode *mode) {
-  if (value == "decode-step") *mode = PromptBenchmarkMode::kDecodeStep;
-  else if (value == "offline-decode") {
-    *mode = PromptBenchmarkMode::kOfflineDecode;
-  }
-  else if (value == "warm-serving") *mode = PromptBenchmarkMode::kWarmServing;
-  else if (value == "none") *mode = PromptBenchmarkMode::kNone;
-  else return false;
-  return true;
-}
-
 // Parses the tiny prompt-runner CLI.
 bool parse_args(int argc, char **argv, PromptOptions *options) {
-  auto read_value = [&](int *i, std::string *value) {
-    if (*i + 1 >= argc) return false;
-    *value = argv[++*i];
-    return true;
-  };
-
   for (int i = 1; i < argc; ++i) {
-    const std::string arg = argv[i];
-    std::string value;
-    if (arg == "--checkpoint" && read_value(&i, &value)) options->checkpoint_path = value;
-    else if (arg == "--tokenizer" && read_value(&i, &value)) options->tokenizer_path = value;
-    else if (arg == "--prompt" && read_value(&i, &value)) options->prompt = value;
-    else if (arg == "--max-new" && read_value(&i, &value)) {
-      options->max_new_tokens = std::atoi(value.c_str());
+    const std::string_view arg = argv[i];
+    if (arg == "--benchmark") {
+      options->benchmark_mode = PromptBenchmarkMode::kDecodeStep;
+      continue;
     }
-    else if (arg == "--page-size" && read_value(&i, &value)) {
-      options->page_size = std::atoi(value.c_str());
+
+    // Every supported option except --benchmark consumes the next argv entry.
+    if (i + 1 >= argc) return false;
+    const char *value_arg = argv[++i];
+    if (arg == "--checkpoint") options->checkpoint_path = value_arg;
+    else if (arg == "--tokenizer") options->tokenizer_path = value_arg;
+    else if (arg == "--prompt") options->prompt = value_arg;
+    else if (arg == "--max-new") options->max_new_tokens = std::atoi(value_arg);
+    else if (arg == "--page-size") options->page_size = std::atoi(value_arg);
+    else if (arg == "--benchmark-mode") {
+      const std::string_view value = value_arg;
+      if (value == "decode-step") {
+        options->benchmark_mode = PromptBenchmarkMode::kDecodeStep;
+      }
+      else if (value == "offline-decode") {
+        options->benchmark_mode = PromptBenchmarkMode::kOfflineDecode;
+      }
+      else if (value == "warm-serving") {
+        options->benchmark_mode = PromptBenchmarkMode::kWarmServing;
+      }
+      else if (value == "none") options->benchmark_mode = PromptBenchmarkMode::kNone;
+      else return false;
     }
-    else if (arg == "--benchmark") options->benchmark_mode = PromptBenchmarkMode::kDecodeStep;
-    else if (arg == "--benchmark-mode" && read_value(&i, &value)) {
-      if (!parse_benchmark_mode(value, &options->benchmark_mode)) return false;
-    }
-    else if (arg == "--bench-warmup" && read_value(&i, &value)) {
-      options->bench_warmup = std::atoi(value.c_str());
-    }
-    else if (arg == "--bench-iters" && read_value(&i, &value)) {
-      options->bench_iters = std::atoi(value.c_str());
-    }
-    else if (arg == "--bench-samples" && read_value(&i, &value)) {
-      options->bench_samples = std::atoi(value.c_str());
-    }
+    else if (arg == "--bench-warmup") options->bench_warmup = std::atoi(value_arg);
+    else if (arg == "--bench-iters") options->bench_iters = std::atoi(value_arg);
+    else if (arg == "--bench-samples") options->bench_samples = std::atoi(value_arg);
     else return false;
   }
   return options->max_new_tokens > 0 && options->page_size > 0 &&
@@ -138,22 +128,6 @@ void print_stats_line(
       name, stats.samples_ms.size(), unit, stats.avg_ms, unit,
       stats.median_ms, unit, stats.p95_ms, unit, stats.p99_ms, unit,
       stats.min_ms, unit, stats.max_ms);
-}
-
-// Prints one compact distribution line for millisecond samples.
-void print_stats_line(const char *name, const TimingStats &stats) {
-  print_stats_line(name, stats, "_ms");
-}
-
-// Prints one compact distribution line for throughput samples.
-void print_rate_stats_line(const char *name, const TimingStats &stats) {
-  print_stats_line(name, stats, "");
-}
-
-// Returns elapsed host-visible milliseconds between two steady-clock timestamps.
-float host_elapsed_ms(PromptClock::time_point start,
-                      PromptClock::time_point stop) {
-  return std::chrono::duration<float, std::milli>(stop - start).count();
 }
 
 // Copies one sampled token from device to host.
@@ -178,15 +152,12 @@ int run_prompt(const PromptOptions &options) {
   if (!tokenizer.encode(options.prompt, &prompt_tokens)) return 1;
   if (prompt_tokens.empty()) return 1;
   const int32_t prompt_len = static_cast<int32_t>(prompt_tokens.size());
-  const int32_t benchmark_decode_steps =
-      options.benchmark_mode == PromptBenchmarkMode::kDecodeStep
-          ? options.bench_samples * (options.bench_warmup + options.bench_iters) : 0;
+  const int32_t benchmark_decode_steps = options.benchmark_mode == PromptBenchmarkMode::kDecodeStep  ? options.bench_samples * (options.bench_warmup + options.bench_iters) : 0;
   const int32_t max_seq_len = prompt_len + std::max(options.max_new_tokens, benchmark_decode_steps);
   std::printf("prompt tokens: %d\n", prompt_len);
 
   WeightOwner weights;
-  CUDA_CHECK(gemma4_load_text_weights_device_bf16(
-      &weights.value, options.checkpoint_path.c_str(), nullptr));
+  CUDA_CHECK(gemma4_load_text_weights_device_bf16(&weights.value, options.checkpoint_path.c_str(), nullptr));
 
   RuntimeOwner runtime;
   CUDA_CHECK(gemma4_runtime_state_init(
@@ -198,18 +169,16 @@ int run_prompt(const PromptOptions &options) {
       static_cast<size_t>(prompt_len) * GEMMA4_HIDDEN_SIZE;
   thrust::device_vector<__nv_bfloat16> d_prefill_a(prompt_hidden_elements);
   thrust::device_vector<__nv_bfloat16> d_prefill_b(prompt_hidden_elements);
-  const size_t prefill_scratch_elements =
-      gemma4_prefill_megakernel_scratch_elements(prompt_len);
-  thrust::device_vector<__nv_bfloat16> d_prefill_scratch(
-      prefill_scratch_elements);
+  const size_t prefill_scratch_elements = gemma4_prefill_megakernel_scratch_elements(prompt_len);
+
+  thrust::device_vector<__nv_bfloat16> d_prefill_scratch(prefill_scratch_elements);
   thrust::device_vector<__nv_bfloat16> d_decode_a(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_decode_b(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_normed(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_sampled(GEMMA4_HIDDEN_SIZE);
-  thrust::device_vector<__nv_bfloat16> d_attention_q(
-      GEMMA4_GLOBAL_Q_PROJ_SIZE);
-  thrust::device_vector<__nv_bfloat16> d_attention_out(
-      GEMMA4_GLOBAL_ATTENTION_OUT_SIZE);
+
+  thrust::device_vector<__nv_bfloat16> d_attention_q(GEMMA4_GLOBAL_Q_PROJ_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_attention_out(GEMMA4_GLOBAL_ATTENTION_OUT_SIZE);
 
   constexpr int32_t split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
   const int32_t sliding_keys = runtime.value.sliding_cache_config.window_size;
@@ -318,12 +287,21 @@ int run_prompt(const PromptOptions &options) {
       GEMMA4_RETURN_IF_CUDA_ERROR(
           copy_next_token(raw_ptr(d_next_token), &generated, 0));
       const PromptClock::time_point token_time = PromptClock::now();
-      timing->itl_ms.push_back(host_elapsed_ms(previous_token_time, token_time));
+      timing->itl_ms.push_back(
+          std::chrono::duration<float, std::milli>(
+              token_time - previous_token_time)
+              .count());
       previous_token_time = token_time;
     }
 
-    timing->ttft_ms = host_elapsed_ms(request_start, first_token_time);
-    timing->e2e_ms = host_elapsed_ms(request_start, previous_token_time);
+    timing->ttft_ms =
+        std::chrono::duration<float, std::milli>(
+            first_token_time - request_start)
+            .count();
+    timing->e2e_ms =
+        std::chrono::duration<float, std::milli>(
+            previous_token_time - request_start)
+            .count();
     if (generated.size() > 1) {
       const float decode_ms = timing->e2e_ms - timing->ttft_ms;
       timing->tpot_ms = decode_ms / static_cast<float>(generated.size() - 1);
@@ -345,7 +323,9 @@ int run_prompt(const PromptOptions &options) {
     }
     GEMMA4_RETURN_IF_CUDA_ERROR(cudaStreamSynchronize(0));
     const PromptClock::time_point request_stop = PromptClock::now();
-    *e2e_ms = host_elapsed_ms(request_start, request_stop);
+    *e2e_ms =
+        std::chrono::duration<float, std::milli>(request_stop - request_start)
+            .count();
     return cudaSuccess;
   };
   const int32_t measured_requests = options.bench_iters * options.bench_samples;
@@ -363,7 +343,7 @@ int run_prompt(const PromptOptions &options) {
         "samples=%d split=%d\n",
         prompt_len, options.bench_warmup, options.bench_iters,
         options.bench_samples, split_size);
-    print_stats_line("decode_step_ms", decode_stats);
+    print_stats_line("decode_step_ms", decode_stats, "_ms");
     if (decode_stats.median_ms > 0.0f) {
       std::printf("decode_step_tps_p50=%.3f\n",
                   1000.0f / decode_stats.median_ms);
@@ -390,7 +370,7 @@ int run_prompt(const PromptOptions &options) {
         "measured=%d sync=end\n",
         prompt_len, options.max_new_tokens, options.bench_warmup,
         measured_requests);
-    print_stats_line("e2e_ms", summarize_timing_samples(std::move(e2e_ms)));
+    print_stats_line("e2e_ms", summarize_timing_samples(std::move(e2e_ms)), "_ms");
     return 0;
   }
 
@@ -423,7 +403,9 @@ int run_prompt(const PromptOptions &options) {
     }
     const PromptClock::time_point benchmark_stop = PromptClock::now();
     const float benchmark_duration_ms =
-        host_elapsed_ms(benchmark_start, benchmark_stop);
+        std::chrono::duration<float, std::milli>(
+            benchmark_stop - benchmark_start)
+            .count();
     const float benchmark_duration_s = benchmark_duration_ms / 1000.0f;
     const int64_t total_input_tokens =
         int64_t(prompt_len) * measured_requests;
@@ -451,12 +433,11 @@ int run_prompt(const PromptOptions &options) {
         static_cast<long long>(total_input_tokens),
         static_cast<long long>(total_output_tokens), request_throughput,
         output_token_throughput, total_token_throughput);
-    print_stats_line("ttft_ms", summarize_timing_samples(std::move(ttft_ms)));
-    print_stats_line("tpot_ms", summarize_timing_samples(std::move(tpot_ms)));
-    print_stats_line("itl_ms", summarize_timing_samples(std::move(itl_ms)));
-    print_stats_line("e2e_ms", summarize_timing_samples(std::move(e2e_ms)));
-    print_rate_stats_line("per_user_tps",
-                          summarize_timing_samples(std::move(per_user_tps)));
+    print_stats_line("ttft_ms", summarize_timing_samples(std::move(ttft_ms)), "_ms");
+    print_stats_line("tpot_ms", summarize_timing_samples(std::move(tpot_ms)), "_ms");
+    print_stats_line("itl_ms", summarize_timing_samples(std::move(itl_ms)), "_ms");
+    print_stats_line("e2e_ms", summarize_timing_samples(std::move(e2e_ms)), "_ms");
+    print_stats_line("per_user_tps", summarize_timing_samples(std::move(per_user_tps)), "");
     return 0;
   }
 

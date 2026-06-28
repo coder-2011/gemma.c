@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run endpoint-free 32-token prompt / 128-token gemma.c/vLLM benchmarks."""
+"""Run a real-prompt gemma.c decode benchmark."""
 
 from __future__ import annotations
 
@@ -8,29 +8,15 @@ import json
 import os
 from pathlib import Path
 import shutil
-import statistics
 import subprocess
 import time
-
-
-SOURCE_LINKS = {
-    "vllm_latency_docs": "https://docs.vllm.ai/en/v0.23.0/cli/bench/latency/",
-    "vllm_latency_source": (
-        "https://github.com/vllm-project/vllm/blob/3e49479c/vllm/benchmarks/latency.py"
-    ),
-    "nvidia_llm_metrics": (
-        "https://developer.nvidia.com/blog/llm-benchmarking-fundamental-concepts/"
-    ),
-}
 
 
 # Parses the benchmark contract and runner locations.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark gemma.c and vLLM without serving endpoints."
+        description="Benchmark gemma.c from explicit prompt text."
     )
-    parser.add_argument("--engines", default="gemma.c,vllm")
-    parser.add_argument("--model", default="models/gemma-4-12B-it")
     parser.add_argument(
         "--checkpoint",
         default="models/gemma-4-12B-it/model.safetensors",
@@ -41,23 +27,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prompt-binary", default="build/gemma4_prompt")
     parser.add_argument("--prompt", default="Hello")
-    parser.add_argument("--vllm-bin", default="/tmp/vllm-bench-venv/bin/vllm")
-    parser.add_argument(
-        "--sglang-python",
-        default="/tmp/sglang-bench-venv/bin/python",
-    )
-    parser.add_argument("--input-len", type=int, default=32)
     parser.add_argument("--output-len", type=int, default=128)
     parser.add_argument("--baseline-output-len", type=int, default=1)
-    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--samples", type=int, default=1)
-    parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--out-dir", default="build/bench_results")
     parser.add_argument(
         "--summary",
-        default="docs/benchmarks/decode_32p128g_b1_no_spec_summary.json",
+        default="docs/benchmarks/decode_prompt_b1_no_spec_summary.json",
     )
     parser.add_argument("--chart-dir", default="docs/benchmarks")
     parser.add_argument("--skip-build", action="store_true")
@@ -250,134 +228,7 @@ def bench_local(args: argparse.Namespace, out_dir: Path) -> dict:
     return result
 
 
-# Benchmarks vLLM through its official in-process latency CLI, not an endpoint.
-def bench_vllm(args: argparse.Namespace, out_dir: Path) -> dict:
-    vllm_bin = find_executable(args.vllm_bin)
-    if vllm_bin is None:
-        return error_result("vLLM", "vLLM benchmark executable not found")
-    # Child JIT/build helpers should resolve against the same venv as vLLM.
-    env = os.environ.copy()
-    env["PATH"] = str(Path(vllm_bin).parent) + os.pathsep + env.get("PATH", "")
-
-    # Runs one vLLM output length and returns average offline latency seconds.
-    def run_once(output_len: int, label: str) -> tuple[float, dict]:
-        output_json = out_dir / f"vllm_{label}.json"
-        cmd = [
-            vllm_bin,
-            "bench",
-            "latency",
-            "--model",
-            args.model,
-            "--tokenizer",
-            args.model,
-            "--trust-remote-code",
-            "--dtype",
-            args.dtype,
-            "--max-model-len",
-            str(args.input_len + args.output_len),
-            "--input-len",
-            str(args.input_len),
-            "--output-len",
-            str(output_len),
-            "--batch-size",
-            str(args.batch_size),
-            "--num-iters-warmup",
-            str(args.warmup),
-            "--num-iters",
-            str(measured_iterations(args)),
-            "--disable-detokenize",
-            "--no-enable-prefix-caching",
-            "--output-json",
-            str(output_json),
-        ]
-        run = run_logged(cmd, out_dir / f"vllm_{label}", env=env, timeout_s=7200)
-        if run["returncode"] != 0:
-            raise RuntimeError(f"vLLM {label} run failed; see {run['stderr_path']}")
-        data = json.loads(output_json.read_text())
-        latency_s = float(data.get("avg_latency", statistics.mean(data["latencies"])))
-        return latency_s, run
-
-    try:
-        baseline_s, baseline = run_once(args.baseline_output_len, "baseline")
-        run_s, run = run_once(args.output_len, "run")
-    except Exception as exc:
-        return error_result("vLLM", str(exc))
-
-    result = decode_from_baseline("vLLM", baseline_s, run_s, args)
-    result["timing_method"] = "vllm bench latency avg latency subtraction"
-    result["logs"] = {
-        "baseline_stdout": baseline["stdout_path"],
-        "run_stdout": run["stdout_path"],
-    }
-    return result
-
-
-# Benchmarks SGLang with its low-level single-batch offline latency runner.
-def bench_sglang(args: argparse.Namespace, out_dir: Path) -> dict:
-    sglang_python = find_executable(args.sglang_python)
-    if sglang_python is None:
-        return error_result("SGLang", "SGLang python executable not found")
-    # FlashInfer JIT launches ninja by name, so keep the SGLang venv on PATH.
-    env = os.environ.copy()
-    env["PATH"] = str(Path(sglang_python).parent) + os.pathsep + env.get("PATH", "")
-
-    result_file = out_dir / "sglang_one_batch.jsonl"
-    if result_file.exists():
-        result_file.unlink()
-
-    # Batch-1 capture avoids default graph sizes that are outside this contract.
-    cmd = [
-        sglang_python,
-        "-m",
-        "sglang.bench_one_batch",
-        "--model-path",
-        args.model,
-        "--trust-remote-code",
-        "--dtype",
-        args.dtype,
-        "--context-length",
-        str(args.input_len + args.output_len),
-        "--batch-size",
-        str(args.batch_size),
-        "--input-len",
-        str(args.input_len),
-        "--output-len",
-        str(args.output_len),
-        "--disable-radix-cache",
-        "--cuda-graph-max-bs",
-        str(args.batch_size),
-        "--cuda-graph-bs",
-        str(args.batch_size),
-        "--result-filename",
-        str(result_file),
-    ]
-    run = run_logged(cmd, out_dir / "sglang_run", env=env, timeout_s=7200)
-    if run["returncode"] != 0:
-        return error_result("SGLang", "SGLang bench_one_batch failed", run)
-    if not result_file.exists():
-        return error_result("SGLang", "SGLang did not write a result file", run)
-
-    lines = [line for line in result_file.read_text().splitlines() if line.strip()]
-    if not lines:
-        return error_result("SGLang", "SGLang wrote an empty result file", run)
-    data = json.loads(lines[-1])
-    latency_s = float(data["median_decode_latency"])
-    decode_tps = float(data["median_decode_throughput"])
-    return {
-        "runner": "SGLang",
-        "status": "ok",
-        "decode_tokens": args.output_len - args.baseline_output_len,
-        "decode_s": latency_s * (args.output_len - args.baseline_output_len),
-        "decode_ms_per_token": 1000.0 * latency_s,
-        "decode_tps": decode_tps,
-        "timing_method": "SGLang median decode step latency",
-        "prefill_s": float(data["prefill_latency"]),
-        "run_s": float(data["total_latency"]),
-        "logs": {"run_stdout": run["stdout_path"]},
-    }
-
-
-# Writes README-ready bar charts from the benchmark summary.
+# Writes bar charts from the benchmark summary.
 def write_chart(
     results: list[dict],
     field: str,
@@ -423,7 +274,7 @@ def write_chart(
     plt.close(fig)
 
 
-# Writes the compact JSON artifact and the two README graphs.
+# Writes the compact JSON artifact and the two graphs.
 def write_outputs(summary: dict, args: argparse.Namespace) -> None:
     summary_path = Path(args.summary)
     chart_dir = Path(args.chart_dir)
@@ -434,57 +285,38 @@ def write_outputs(summary: dict, args: argparse.Namespace) -> None:
         summary["results"],
         "decode_tps",
         "Decode tokens / second",
-        "Decode throughput, 32 prompt tokens / 128 generated",
-        chart_dir / "decode_tps_32p128g_b1_no_spec.png",
+        f"Decode throughput, prompt / {args.output_len} generated",
+        chart_dir / "decode_tps_prompt_b1_no_spec.png",
     )
     write_chart(
         summary["results"],
         "decode_ms_per_token",
         "Milliseconds / decode token",
-        "Decode latency, 32 prompt tokens / 128 generated",
-        chart_dir / "decode_ms_per_token_32p128g_b1_no_spec.png",
+        f"Decode latency, prompt / {args.output_len} generated",
+        chart_dir / "decode_ms_per_token_prompt_b1_no_spec.png",
     )
 
 
-# Runs the requested engines and records the shared benchmark contract.
+# Runs the local benchmark and records its explicit-prompt contract.
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    engines = [engine.strip() for engine in args.engines.split(",") if engine.strip()]
-    runners = {
-        "gemma.c": bench_local,
-        "vllm": bench_vllm,
-        "sglang": bench_sglang,
-    }
-
-    results = []
-    for engine in engines:
-        runner = runners.get(engine)
-        if runner is None:
-            results.append(error_result(engine, "unknown engine"))
-            continue
-        results.append(runner(args, out_dir))
+    results = [bench_local(args, out_dir)]
 
     summary = {
         "contract": {
-            "input_len": args.input_len,
+            "prompt": args.prompt,
             "output_len": args.output_len,
             "baseline_output_len": args.baseline_output_len,
-            "batch_size": args.batch_size,
-            "dtype": args.dtype,
             "warmup": args.warmup,
             "measured_iterations": measured_iterations(args),
-            "endpoint_free": True,
             "speculation": "not configured; no draft/speculative options passed",
-            "prefix_cache": "disabled where exposed",
             "local_timing": (
                 "offline-decode host wall time with one final stream sync per "
                 "request; generated tokens stay on GPU during decode"
             ),
-            "detokenization": "disabled for vLLM; not part of local timing",
         },
-        "sources": SOURCE_LINKS,
         "environment": capture_environment(out_dir),
         "results": results,
     }

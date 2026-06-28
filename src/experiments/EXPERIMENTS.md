@@ -3,6 +3,125 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-28 - Decode body Nsight Compute bandwidth audit
+
+Question:
+
+- Why is full-body BF16 decode still around `38 ms/token`, and is there a
+  consequential bug hiding in the decode body?
+
+Setup:
+
+- Git commit: `d9a7d57a2b726902e769d02d581d9484e7c0d08f`.
+- GPU: NVIDIA RTX A6000, driver `580.159.03`, clocks observed at
+  `1800 MHz` SM and `8001 MHz` memory, clocks not locked, persistence disabled.
+- Tools: CUDA compiler `13.0.88`, Nsight Compute `2025.3.1.0`, Nsight Systems
+  `2025.3.2.474-253236389321v0`.
+- Worktree had unrelated dirty files while profiling; profiler outputs were
+  written under `src/experiments/results/`.
+
+Commands:
+
+```bash
+make -B build/gemma4_prompt
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode offline-decode \
+  --bench-warmup 1 --bench-iters 1 --bench-samples 3 \
+  --max-new 128 --prompt Hello
+ncu --target-processes all --print-kernel-base demangled \
+  --metrics gpu__time_duration.sum --page raw --csv --launch-count 2000 \
+  --log-file src/experiments/results/2026-06-28_decode_step_ncu_time.csv \
+  ./build/gemma4_prompt ... --benchmark-mode decode-step \
+  --bench-warmup 0 --bench-iters 1 --bench-samples 1 --prompt Hello
+ncu --target-processes all --set full --kernel-name regex:decode_megakernel_fused_layer_kernel \
+  --launch-count 1 --export src/experiments/results/2026-06-28_decode_fused_sliding_full \
+  --force-overwrite ./build/gemma4_prompt ...
+ncu --target-processes all --kernel-name-base demangled --set full \
+  --kernel-name 'regex:decode_megakernel_fused_layer_kernel.*Gemma4AttentionTraits<\(bool\)1>' \
+  --launch-count 1 --export src/experiments/results/2026-06-28_decode_fused_global_full \
+  --force-overwrite ./build/gemma4_prompt ...
+ncu --target-processes all --kernel-name-base demangled --set full \
+  --kernel-name 'regex:gemma4_decode_gemv_cols_kernel.*3840.*8192' \
+  --launch-count 1 --export src/experiments/results/2026-06-28_decode_gemv_8192_full \
+  --force-overwrite ./build/gemma4_prompt ...
+ncu --target-processes all --kernel-name-base demangled --set full \
+  --kernel-name regex:final_logits_sample_kernel \
+  --launch-count 1 --export src/experiments/results/2026-06-28_final_logits_sample_full \
+  --force-overwrite ./build/gemma4_prompt ...
+nsys profile --trace=cuda,nvtx,osrt --stats=true --force-overwrite=true \
+  -o src/experiments/results/2026-06-28_decode_step_nsys \
+  ./build/gemma4_prompt ... --benchmark-mode decode-step \
+  --bench-warmup 0 --bench-iters 1 --bench-samples 1 --prompt Hello
+```
+
+Results:
+
+```text
+Baseline decode-step:
+  p50: 38.079 ms/token
+  min/max: 37.405 / 38.096 ms/token
+
+Offline decode, 128 output tokens:
+  p50 e2e: 4865.423 ms/request
+
+Single decode step NCU timing aggregation:
+  total kernel time:             37.415 ms
+  fused layer body:              29.483 ms, 48 launches, 78.80%
+  decode GEMV projections:        4.541 ms, 56 launches, 12.14%
+  final logits/sample:            2.844 ms,  1 launch,   7.60%
+  QKV norm/RoPE/cache prep:       0.342 ms, 48 launches,  0.91%
+  RMSNorm decode launches:        0.206 ms, 49 launches,  0.55%
+
+Focused NCU counters:
+  fused sliding body:
+    duration: 608.288 us
+    DRAM/SM throughput: 91.13% / 17.93%
+    DRAM read/write: 393.254 MB / 10.788 MB
+    achieved DRAM bandwidth: 664.227 GB/s
+    top stalls: long scoreboard 43.6%, barrier 28.1%
+
+  fused global body:
+    duration: 665.024 us
+    DRAM/SM throughput: 89.87% / 16.62%
+    DRAM read/write: 424.757 MB / 10.873 MB
+    achieved DRAM bandwidth: 655.059 GB/s
+    top stalls: long scoreboard 45.8%, barrier 28.1%
+
+  3840 x 8192 decode GEMV projection:
+    duration: 96.384 us
+    DRAM/SM throughput: 92.60% / 17.93%
+    DRAM read/write: 62.934 MB / 2.086 MB
+    achieved DRAM bandwidth: 674.590 GB/s
+
+  final logits/sample:
+    duration: 2849.024 us
+    DRAM/SM throughput: 97.04% / 33.54%
+    DRAM read/write: 2013.333 MB / 2.089 MB
+    achieved DRAM bandwidth: 707.408 GB/s
+```
+
+Conclusion:
+
+- I did not find evidence of a consequential decode bug in this profile.
+- The main slowdown is dense BF16 weight streaming. The fused layer body reads
+  almost exactly the expected O projection plus FFN gate/up/down weights:
+  sliding layers read about `393 MB`, global layers about `425 MB`.
+- Final logits/sample reads about `2.0 GB`, matching the tied
+  `262144 x 3840` embedding matrix.
+- The hot kernels are already running at roughly `655-707 GB/s` DRAM bandwidth
+  on an A6000-class card. This leaves ordinary kernel tuning room, but not the
+  requested `40-250%` speedup in the current dense BF16, batch-1, exact-logits
+  path unless the path reduces bytes per token with quantization, caching,
+  speculative tricks, or a different sampling/logit strategy.
+
 ## 2026-06-28 - Restore fast decode projection ingress
 
 Question:

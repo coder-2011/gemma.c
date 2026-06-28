@@ -1,0 +1,4 @@
+==PROF== Connected to process 552159 (/root/gemma.c/build/gemma4_prompt)
+==PROF== Profiling "decode_megakernel_fused_layer_kernel": 0%....50%....100% - 43 passes
+==PROF== Disconnected from process 552159
+==PROF== Report: /root/gemma.c/src/experiments/results/2026-06-28_decode_fused_sliding_full.ncu-rep

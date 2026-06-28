@@ -10,25 +10,9 @@ The current work is to implement kernels individually, assemble a correct unfuse
 
 ## Benchmark
 
-Endpoint-free Gemma 4 12B BF16 decode benchmark on an NVIDIA RTX A6000
-(Jun 27). Each runner used batch `1`, a synthetic `32`-token prompt, `128`
-requested output tokens, no speculative decoding, and no prefix cache reuse.
-The local path uses `offline-decode`: generated tokens stay on GPU during the
-decode loop, and the runner synchronizes the CUDA stream once at the end of each
-request. `gemma.c` and vLLM report decode latency by subtracting a one-token
-generation baseline from the 128-token run, then dividing by the `127` decode
-steps.
-
-| Runner | Decode latency | Decode TPS | Status |
-| --- | ---: | ---: | --- |
-| vLLM `bench latency` | 38.480 ms/token | 25.987 tok/s | ok |
-| `gemma4_prompt` `offline-decode` | 72.925 ms/token | 13.713 tok/s | ok |
-
-Raw summary: `docs/benchmarks/decode_32p128g_b1_no_spec_summary.json`.
-
-![decode throughput benchmark](docs/benchmarks/decode_tps_32p128g_b1_no_spec.png)
-
-![decode latency benchmark](docs/benchmarks/decode_ms_per_token_32p128g_b1_no_spec.png)
+Benchmarks should use an explicit prompt string through `--prompt`. The local
+`offline-decode` path keeps generated tokens on GPU during the decode loop and
+synchronizes the CUDA stream once at the end of each request.
 
 
 My agents tell me they love working in this repo. It is built heavily w/ them in mind!
