@@ -3,6 +3,167 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-06-28 - Decode fused ingress promotion gate
+
+Question:
+
+- Can the existing folded decode ingress kernel replace the production split
+  `RMSNorm -> projection -> QKV prep/KV write` path end to end?
+
+Change:
+
+- Added a split-vs-fused regression case to `tests/test_flash_attention.cu`.
+  The test runs the current split GPU path and the existing folded
+  `gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16` path for
+  both sliding and global decode ingress, then compares prepared Q and paged
+  cache K/V.
+- Temporarily wired `src/gemma4_decode_megakernel.cu` to the folded ingress API
+  and ran the full prompt/decode benchmark.
+- Reverted the production wire-up after the performance gate failed. The
+  temporary split-vs-fused test was later removed at user request.
+
+Environment:
+
+- GPU: NVIDIA RTX A6000, driver `580.159.03`.
+- CUDA compiler: `13.0.88`.
+- Clocks observed before timing: `1800 MHz` SM, `8001 MHz` memory.
+- Clocks not locked, persistence disabled.
+
+Commands:
+
+```bash
+make -B test-flash-attention-cpp
+make -B test-decode-megakernel
+make -B build/gemma4_prompt
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --max-new 8 --prompt Hello
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+```
+
+Results:
+
+```text
+Folded ingress correctness:
+  test_flash_attention passed
+  split-vs-fused sliding/global prepared Q and cache K/V matched tolerance
+
+Temporary production folded-ingress benchmark:
+  decode_step_ms n=5 mean_ms=72.826 p50_ms=72.957
+
+Final restored production path:
+  test_decode_megakernel passed
+  prompt tokens: 1
+  generated token ids: 236770 236770 236770 236770 236770 236770 236770 236770
+  text: 11111111
+  decode_step_ms n=5 mean_ms=37.936 p50_ms=38.066
+```
+
+Conclusion:
+
+- The existing folded ingress kernel is functionally correct for this sparse
+  split-vs-fused coverage, but it is not production-viable.
+- The slowdown is consistent with its launch geometry: sliding uses only
+  `batch * 8` CTAs and global uses only `batch * 1` CTA for projection work that
+  the current GEMV path spreads over roughly `1024/1088` CTAs.
+- Production stays on the fast split ingress. The next viable direction is not
+  this low-CTA folded kernel; it is a high-parallel ingress fusion design that
+  preserves projection bandwidth.
+
+## 2026-06-28 - Global decode QK projection launch unification
+
+Question:
+
+- Can global-layer decode ingress use the already packed QK decode weights in one
+  projection launch, matching the sliding packed-QKV path more closely?
+
+Change:
+
+- Added `GEMMA4_PROJECTION_GLOBAL_QK` for the existing column-major decode GEMV
+  kernel with shape `[3840, 8704]`.
+- Global decode layers now project raw QK into `attention_out` as one packed row
+  before the existing Q/K norm, RoPE, and KV-cache prep.
+- Increased decode `attention_out` scratch to `GEMMA4_GLOBAL_QK_SIZE`.
+
+Verification:
+
+```bash
+make build/gemma4_prompt
+make test-decode-megakernel
+```
+
+Result:
+
+- `build/gemma4_prompt` compiled.
+- `test_decode_megakernel passed`.
+- No timing run was done in this pass.
+
+Follow-up verification:
+
+```bash
+make -B build/gemma4_prompt
+make test-decode-megakernel
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --max-new 8 --prompt Hello
+make decode-bench
+./build/benches/gemma4_decode_bench global_qk 20 5 2
+./build/benches/gemma4_decode_bench global_q 20 5 2
+./build/benches/gemma4_decode_bench global_k 20 5 2
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 5 \
+  --prompt Hello
+./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json \
+  --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 20 --bench-samples 10 \
+  --prompt Hello
+```
+
+Follow-up result:
+
+```text
+Full prompt smoke:
+  prompt tokens: 1
+  generated token ids: 236770 236770 236770 236770 236770 236770 236770 236770
+  text: 11111111
+
+Projection correctness/timing, CUDA events, warm repeated buffers:
+  global_qk custom median: 0.097741 ms, custom_swizzle16 max_abs diff: 0
+  global_q custom median:  0.092234 ms, custom_swizzle16 max_abs diff: 0
+  global_k custom median:  0.005427 ms, custom_swizzle16 max_abs diff: 0
+
+Decode-step, short repeat:
+  current p50: 38.078 ms/token
+  prior p50:   38.079 ms/token
+
+Decode-step, longer repeat:
+  current p50: 38.496 ms/token
+```
+
+Conclusion:
+
+- The packed global QK path compiles, runs through the full checkpoint/tokenizer
+  prompt path, and the new projection shape matches the swizzled custom path
+  bit-for-bit.
+- End-to-end decode-step speedup was not measurable under this CUDA-event
+  contract. The short repeat was effectively flat versus the previous `38.079
+  ms/token` baseline, and the longer repeat drifted slower.
+- This change still removes one projection launch from each of the eight global
+  layers, but the removed work is only the tiny global-K decode launch; dense
+  BF16 weight streaming remains the bottleneck.
+
 ## 2026-06-28 - Decode body Nsight Compute bandwidth audit
 
 Question:
@@ -16935,3 +17096,382 @@ Conclusion:
 - Under the same real-prompt, radix-cache-disabled, single-user shape, SGLang's
   offline Engine path measured `27.098 tok/s` output throughput and
   `36.912 ms/output token` by host-visible synchronous request timing.
+
+## 2026-06-29 - Decode ingress, final tail, and token-kernel fusion pass
+
+Changes:
+
+- Added fused decode-layer ingress inside the cooperative layer body:
+  input RMSNorm, packed QKV/QK projection, and Q/K/V norm/RoPE/KV-cache write.
+- Added fused final RMSNorm plus LM-head sampling path.
+- Added an experimental one-cooperative-launch decode-token kernel that loops
+  over all 48 layers on device.
+- Kept debug fallbacks:
+  `GEMMA4_SPLIT_ATTENTION_INGRESS=1` for the old split ingress and
+  `GEMMA4_TOKEN_MEGAKERNEL=1` for the one-launch token kernel.
+
+Verification:
+
+```bash
+make -B build/gemma4_prompt test-decode-megakernel test-sampling
+
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --max-new 2
+
+GEMMA4_TOKEN_MEGAKERNEL=1 ./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --max-new 2
+
+GEMMA4_SPLIT_ATTENTION_INGRESS=1 ./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --max-new 2
+```
+
+All three generation paths produced:
+
+```text
+generated token ids: 236770 236770
+text: 11
+```
+
+Timing commands:
+
+```bash
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+  --max-new 1 --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 3
+
+GEMMA4_TOKEN_MEGAKERNEL=1 ./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+  --max-new 1 --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 3
+
+GEMMA4_SPLIT_ATTENTION_INGRESS=1 ./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+  --max-new 1 --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 3
+```
+
+Results:
+
+| Path | p50 decode step | p50 TPS |
+| --- | ---: | ---: |
+| Default per-layer fused ingress/final tail | `38.636 ms` | `25.883` |
+| `GEMMA4_TOKEN_MEGAKERNEL=1` | `39.161 ms` | `25.535` |
+| `GEMMA4_SPLIT_ATTENTION_INGRESS=1` | `38.117 ms` | `26.235` |
+
+Profiler notes:
+
+```bash
+nsys profile --trace=cuda --stats=true --force-overwrite=true \
+  -o /tmp/gemma4_phase2_fused ./build/gemma4_prompt ... \
+  --benchmark-mode decode-step --bench-warmup 0 --bench-iters 1 \
+  --bench-samples 1
+
+nsys profile --trace=cuda --stats=true --force-overwrite=true \
+  -o /tmp/gemma4_phase3_token ./build/gemma4_prompt ... \
+  --benchmark-mode decode-step --bench-warmup 0 --bench-iters 1 \
+  --bench-samples 1
+```
+
+- Fused ingress removes per-layer ingress launches, but makes the cooperative
+  layer body longer. In the one-step `nsys` run, sliding layer kernels were
+  about `706 us` median with fused ingress versus about `594 us` with split
+  ingress, while the removed standalone ingress work was not enough to win.
+- Fused final RMSNorm removes the final standalone RMSNorm launches. The new
+  `final_norm_logits_sample_kernel` remained about `2.83 ms`, so the full-step
+  effect is only a few microseconds.
+- The token megakernel compiled without local memory:
+  `REG:128`, `SHARED:27540`, `CONSTANT[0]:12424`.
+  Its one-step GPU duration was `34.925 ms`; the summed per-layer fused kernels
+  were about `34.43 ms`, so 48 cooperative `grid.sync()` barriers cost slightly
+  more than the GPU-side launch-gap savings in this benchmark.
+
+Conclusion:
+
+- The fusion paths are correct and benchmarkable. The default now exercises
+  per-layer fused ingress plus fused final tail, while the one-launch token
+  kernel remains opt-in because it is slower in this benchmark. The fastest
+  measured path is still the split-ingress fallback, so the next optimization
+  pass should focus on making ingress projection efficient inside the
+  cooperative layer instead of adding more launch fusion blindly.
+
+## 2026-06-29 - Decode no-raw-QKV direct ingress check
+
+Change:
+
+- Added `GEMMA4_DIRECT_ATTENTION_INGRESS=1`, an opt-in path that calls the
+  existing direct input-norm/projection/QKV-prep kernel before the cooperative
+  layer body. This path prepares Q and writes the KV cache without materializing
+  packed raw QKV/QK in `attention_out`.
+
+Verification:
+
+```bash
+make -B build/gemma4_prompt test-decode-megakernel
+
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --max-new 2
+
+GEMMA4_DIRECT_ATTENTION_INGRESS=1 ./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --max-new 2
+```
+
+Both paths produced:
+
+```text
+generated token ids: 236770 236770
+text: 11
+```
+
+Timing contract:
+
+- CUDA-event decode-step benchmark.
+- Prompt `Hello`, batch 1, BF16 `models/gemma-4-12B-it`.
+- Warmups `5`, measured `10` iterations per sample, samples `3`.
+- Process-serial runs to avoid checkpoint-load memory contention.
+- Cache state uncontrolled/warm by repeated decode iterations.
+- Clocks not locked.
+
+Commands:
+
+```bash
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+  --max-new 1 --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 3
+
+GEMMA4_SPLIT_ATTENTION_INGRESS=1 ./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+  --max-new 1 --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 3
+
+GEMMA4_DIRECT_ATTENTION_INGRESS=1 ./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+  --max-new 1 --benchmark-mode decode-step \
+  --bench-warmup 5 --bench-iters 10 --bench-samples 3
+```
+
+Results:
+
+| Path | p50 decode step | p50 TPS |
+| --- | ---: | ---: |
+| Default per-layer fused ingress/final tail | `38.630 ms` | `25.886` |
+| `GEMMA4_SPLIT_ATTENTION_INGRESS=1` | `38.107 ms` | `26.242` |
+| `GEMMA4_DIRECT_ATTENTION_INGRESS=1` | `72.771 ms` | `13.742` |
+
+Conclusion:
+
+- Raw-QKV materialization is not the current bottleneck. The direct no-raw path
+  is correct but much slower because the existing direct projection+prep kernel
+  only launches one CTA per KV head (`8` sliding CTAs, `1` global CTA). The next
+  viable Phase 4 design needs high-parallelism per-head reductions or another
+  way to keep projected head values live without collapsing projection
+  throughput.
+
+## 2026-06-29 - Sliding persistent decode scheduler restored
+
+Question: can the sliding decode attention persistent work queue be restored as
+a correct scaffold for the next scheduler phase?
+
+Change:
+
+- Re-enabled `gemma4_flash_attention_sliding_decode_paged_persistent_bf16`
+  behind its existing explicit API.
+- Kept the implementation narrow: the persistent worker reuses the current
+  paged split and reduce device helpers, and adds only queue initialization,
+  split completion counters, reduce-task publication, and a host launcher.
+- Did not wire this path into full decode; the benchmark remains the gate before
+  promotion.
+
+Verification:
+
+```bash
+make -B build/benches/gemma4_kv_cache_bench
+make -B test-decode-megakernel
+
+./build/benches/gemma4_kv_cache_bench 4096 64 64 10 50 7
+
+./build/benches/gemma4_kv_cache_bench \
+  --seq-len 32 --page-size 64 --split-size 512 \
+  --warmup 3 --iters 10 --samples 3 --extra-splits 1
+```
+
+Results:
+
+| Shape | Direct p50 | Persistent p50 | Correctness |
+| --- | ---: | ---: | --- |
+| `seq_len=4096`, `split_size=64`, `splits=16` | `0.060518 ms` | `0.082207 ms` | `max_abs=0`, `mean_abs=0` |
+| `seq_len=32`, `split_size=512`, `splits=2` | `0.026010 ms` | `0.032563 ms` | `max_abs=0`, `mean_abs=0` |
+
+Notes:
+
+- The second run intentionally includes one empty split. It verifies that the
+  queue exits overprovisioned split tasks without publishing duplicate reduces.
+- A too-small run with `seq_len=32`, `split_size=64`, and `splits=3` failed
+  before the persistent path because the existing direct launcher requires
+  `split_size * num_splits >= sliding_window`.
+
+Conclusion:
+
+- The scheduler scaffold is correct and benchmarkable, but not faster as a
+  flash-only replacement. It should stay opt-in until projection/prep producer
+  tasks or cross-phase scheduling can use the queue to remove grid-wide phase
+  barriers.
+
+## 2026-06-29 - Token megakernel final sampling tail
+
+Question: can the opt-in token megakernel own final RMSNorm, LM-head sampling,
+and next-embedding gather instead of returning to a standalone sampling launch?
+
+Change:
+
+- Added device-callable sampling from an already-normalized hidden row.
+- Extended `Gemma4DecodeTokenMegakernelArgs` with `next_token` plus the existing
+  sampling scratch split into candidate and ready-flag regions.
+- The `GEMMA4_TOKEN_MEGAKERNEL=1` path now computes final RMSNorm inside the
+  token kernel, samples/gathers the next embedding into `hidden_a`, and returns
+  without launching `gemma4_megakernel_sample_final_bf16`.
+- Kept default per-layer decode unchanged.
+
+Data movement:
+
+- First version cached normalized hidden inside every sampling producer CTA,
+  which raised token-kernel static shared memory to `35816` bytes.
+- Revised version writes the final normalized row to the existing `normed`
+  global scratch once, then has LM-head producers read that row. This costs a
+  tiny hidden-row write/read but lowers token-kernel shared memory to `28124`
+  bytes.
+- `cuobjdump --dump-resource-usage build/gemma4_prompt` for the revised token
+  kernel: `REG:128`, `STACK:408`, `SHARED:28124`, `LOCAL:0`.
+
+Verification:
+
+```bash
+make -B build/gemma4_prompt
+make -B test-decode-megakernel
+make -B test-sampling
+
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --max-new 2
+
+GEMMA4_TOKEN_MEGAKERNEL=1 ./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --max-new 2
+```
+
+Both generation paths produced:
+
+```text
+generated token ids: 236770 236770
+text: 11
+```
+
+Timing contract:
+
+- CUDA-event decode-step benchmark.
+- Prompt `Hello`, batch 1, BF16 `models/gemma-4-12B-it`.
+- Warmups `5`, measured `10` iterations per sample, samples `3`.
+- Cache state warm/uncontrolled by repeated decode iterations.
+- Clocks not locked.
+
+Results:
+
+| Path | p50 decode step | p50 TPS |
+| --- | ---: | ---: |
+| Default per-layer fused ingress/final tail | `38.630 ms` | `25.887` |
+| `GEMMA4_TOKEN_MEGAKERNEL=1` with in-kernel sampling | `39.379 ms` | `25.395` |
+
+Conclusion:
+
+- The token path now owns the final sampling tail and is closer to the intended
+  one-token kernel shape, but it remains slower than the default. Keep it
+  opt-in. The remaining gap is not the final sampling launch by itself; the
+  token kernel still pays 48 layer-wide grid synchronizations and carries a
+  larger combined code/resource footprint than the per-layer kernels.
+
+## 2026-06-29 - Token megakernel device runtime prep
+
+Question: can the opt-in token megakernel own the per-token runtime metadata
+update instead of relying on host-side page-table and sequence-length prep before
+launch?
+
+Change:
+
+- The `GEMMA4_TOKEN_MEGAKERNEL=1` path now skips
+  `gemma4_megakernel_prepare_runtime` on the host.
+- Added a device-side metadata prep step at the start of the cooperative token
+  kernel. For batch 1 it updates the sliding/global page tables, writes the
+  token position, and advances the device sequence length before the layer loop.
+- Kept the default host-orchestrated path unchanged.
+
+Scope:
+
+- This is intentionally batch-1 only. The public token-megakernel launcher
+  already rejects non-batch-1 decode.
+- Host-side `h_seq_lengths` and related runtime mirrors are not advanced on this
+  path. The opt-in token path is expected to stay on the token path for the
+  decode loop instead of switching back to host-prepared decode in the same
+  runtime.
+
+Resource usage:
+
+```text
+gemma4_sample_next_bf16_device:
+  REG:72 STACK:0 SHARED:0 LOCAL:0
+
+decode_token_megakernel_kernel:
+  REG:128 STACK:408 SHARED:28124 LOCAL:0 CONSTANT[0]:12448
+```
+
+Verification:
+
+```bash
+make -B test-decode-megakernel
+make -B build/gemma4_prompt
+
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --max-new 4
+
+GEMMA4_TOKEN_MEGAKERNEL=1 ./build/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --max-new 4
+```
+
+Both generation paths produced:
+
+```text
+generated token ids: 236770 236770 236770 236770
+text: 1111
+```
+
+Timing contract:
+
+- CUDA-event decode-step benchmark.
+- Prompt `Hello`, batch 1, BF16 `models/gemma-4-12B-it`.
+- Warmups `5`, measured `10` iterations per sample, samples `3`.
+- Cache state warm/uncontrolled by repeated decode iterations.
+- Clocks not locked.
+
+Results:
+
+| Path | p50 decode step | p50 TPS |
+| --- | ---: | ---: |
+| Default per-layer fused ingress/final tail | `38.632 ms` | `25.885` |
+| `GEMMA4_TOKEN_MEGAKERNEL=1` with device runtime prep | `39.286 ms` | `25.454` |
+
+Conclusion:
+
+- The token path now owns runtime prep, all layer work, final sampling, and next
+  embedding gather inside one cooperative launch per generated token.
+- Device runtime prep shaved a small amount from the token path compared with
+  the previous `39.379 ms` p50, but the token path is still slower than default.
+  The remaining problem is the coarse megakernel execution model: 48 repeated
+  grid-synchronized layers plus a larger combined resource footprint, not
+  host-side runtime prep.
