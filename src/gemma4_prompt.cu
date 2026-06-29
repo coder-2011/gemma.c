@@ -177,7 +177,8 @@ int run_prompt(const PromptOptions &options) {
   thrust::device_vector<__nv_bfloat16> d_sampled(GEMMA4_HIDDEN_SIZE);
 
   thrust::device_vector<__nv_bfloat16> d_attention_q(GEMMA4_GLOBAL_Q_PROJ_SIZE);
-  thrust::device_vector<__nv_bfloat16> d_attention_out(GEMMA4_GLOBAL_ATTENTION_OUT_SIZE);
+  thrust::device_vector<__nv_bfloat16> d_attention_out(
+      GEMMA4_DECODE_ATTENTION_OUT_SCRATCH_SIZE);
 
   constexpr int32_t split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
   const int32_t sliding_keys = runtime.value.sliding_cache_config.window_size;
@@ -246,6 +247,12 @@ int run_prompt(const PromptOptions &options) {
     args.split_size = split_size;
     args.sliding_splits = sliding_splits;
     args.global_splits = global_splits;
+    args.use_split_attention_ingress =
+        std::getenv("GEMMA4_SPLIT_ATTENTION_INGRESS") != nullptr;
+    args.use_direct_attention_ingress =
+        std::getenv("GEMMA4_DIRECT_ATTENTION_INGRESS") != nullptr;
+    args.use_token_megakernel =
+        std::getenv("GEMMA4_TOKEN_MEGAKERNEL") != nullptr;
     return gemma4_decode_megakernel(args);
   };
 
@@ -441,10 +448,10 @@ int run_prompt(const PromptOptions &options) {
 }  // namespace
 
 // Runs the local Gemma 4 text prompt path.
-  }
 int main(int argc, char **argv) {
   PromptOptions options;
   if (!parse_args(argc, argv, &options)) {
     return 1;
+  }
   return run_prompt(options);
 }
