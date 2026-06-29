@@ -91,25 +91,6 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_
     const float *__restrict__ d_sin,
     cudaStream_t stream);
 
-// Prepares already-projected decode Q/K/V for either sliding or global attention.
-extern "C" cudaError_t gemma4_flash_attention_decode_prepare_q_paged_kv_bf16(
-    __nv_bfloat16 *__restrict__ d_q_prepared,
-    __nv_bfloat16 *__restrict__ d_cache_k,
-    __nv_bfloat16 *__restrict__ d_cache_v,
-    Gemma4KvCacheConfig cache_config,
-    const int32_t *__restrict__ d_page_table,
-    const int32_t *__restrict__ d_token_position,
-    int32_t batch_size,
-    int32_t cache_layer,
-    const __nv_bfloat16 *__restrict__ d_q,
-    const __nv_bfloat16 *__restrict__ d_k,
-    const __nv_bfloat16 *__restrict__ d_v,
-    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
-    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
-    const float *__restrict__ d_cos,
-    const float *__restrict__ d_sin,
-    cudaStream_t stream);
-
 extern "C" cudaError_t gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16(
     __nv_bfloat16 *__restrict__ d_q_prepared,
     __nv_bfloat16 *__restrict__ d_cache_k,

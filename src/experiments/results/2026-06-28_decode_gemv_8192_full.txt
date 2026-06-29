@@ -1,4 +1,0 @@
-==PROF== Connected to process 558234 (/root/gemma.c/build/gemma4_prompt)
-==PROF== Profiling "void <unnamed>::gemma4_decode_gemv_cols_kernel<(int)3840, (int)8192, (int)8, (int)512, (int)2, (int)1>(const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *)": 0%....50%....100% - 43 passes
-==PROF== Disconnected from process 558234
-==PROF== Report: /root/gemma.c/src/experiments/results/2026-06-28_decode_gemv_8192_full.ncu-rep

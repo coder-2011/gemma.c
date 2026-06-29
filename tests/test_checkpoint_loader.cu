@@ -3,18 +3,15 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include <cute/swizzle.hpp>
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <initializer_list>
 #include <string>
 
 #define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
-
-constexpr int kBf16PackWidth = 8;
 
 // Fails the test with the CUDA status and source location.
 void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
@@ -34,8 +31,11 @@ uint16_t bf16_bits(__nv_bfloat16 value) {
 
 // Repeats the FFN decode hidden-pack swizzle used by the loader.
 int hidden_pack_swizzle_index(int chunk) {
-  const cute::Swizzle<3, 0, 3> pack_swizzle;
-  return pack_swizzle(chunk);
+  constexpr int kSwizzleChunks = 8;
+  const unsigned u = static_cast<unsigned>(chunk);
+  const unsigned col = u & (kSwizzleChunks - 1);
+  const unsigned row = (u >> 3) & (kSwizzleChunks - 1);
+  return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
 }
 
 // Copies one device BF16 value and compares it with the expected mapped value.
@@ -82,55 +82,10 @@ int main(int argc, char **argv) {
   expect_device_value(weights.layers[0].ffn_gate_up_decode, GEMMA4_HIDDEN_SIZE,
                       checkpoint.layers[0].up_proj_col_major[0],
                       "up row 0");
-  expect_device_value(weights.layers[0].qkv_proj_col_major, 0,
-                      checkpoint.layers[0].q_proj_col_major[0],
-                      "sliding packed q");
-  expect_device_value(
-      weights.layers[0].qkv_proj_col_major,
-      static_cast<size_t>(GEMMA4_SLIDING_Q_PROJ_SIZE) * GEMMA4_HIDDEN_SIZE,
-      checkpoint.layers[0].k_proj_col_major[0],
-      "sliding packed k");
-  expect_device_value(
-      weights.layers[0].qkv_proj_col_major,
-      static_cast<size_t>(GEMMA4_SLIDING_Q_PROJ_SIZE +
-                          GEMMA4_SLIDING_KV_PROJ_SIZE) *
-          GEMMA4_HIDDEN_SIZE,
-      checkpoint.layers[0].v_proj_col_major[0],
-      "sliding packed v");
-  expect_device_value(
-      weights.layers[5].qkv_proj_col_major,
-      static_cast<size_t>(GEMMA4_GLOBAL_Q_PROJ_SIZE) * GEMMA4_HIDDEN_SIZE,
-      checkpoint.layers[5].k_proj_col_major[0],
-      "global packed k");
-  Gemma4TextLayerWeightsDevice &sliding0 = weights.layers[0];
-  const size_t sliding_q_elements =
-      static_cast<size_t>(GEMMA4_SLIDING_Q_PROJ_SIZE) * GEMMA4_HIDDEN_SIZE;
-  const size_t sliding_kv_elements =
-      static_cast<size_t>(GEMMA4_SLIDING_KV_PROJ_SIZE) * GEMMA4_HIDDEN_SIZE;
-  if (sliding0.q_proj_col_major != sliding0.qkv_proj_col_major ||
-      sliding0.k_proj_col_major !=
-          sliding0.qkv_proj_col_major + sliding_q_elements ||
-      sliding0.v_proj_col_major !=
-          sliding0.k_proj_col_major + sliding_kv_elements) {
-    fprintf(stderr, "sliding Q/K/V aliases do not point into packed QKV\n");
-    return 1;
-  }
-  Gemma4TextLayerWeightsDevice &global5 = weights.layers[5];
-  const size_t global_q_elements =
-      static_cast<size_t>(GEMMA4_GLOBAL_Q_PROJ_SIZE) * GEMMA4_HIDDEN_SIZE;
-  if (global5.q_proj_col_major != global5.qkv_proj_col_major ||
-      global5.k_proj_col_major !=
-          global5.qkv_proj_col_major + global_q_elements ||
-      global5.v_proj_col_major != nullptr) {
-    fprintf(stderr, "global Q/K aliases do not point into packed QK\n");
-    return 1;
-  }
 
   const int hidden = 9;
   const int row = 37;
-  const int pack = hidden / kBf16PackWidth;
-  const int lane = hidden % kBf16PackWidth;
-  const int dst_col = hidden_pack_swizzle_index(pack) * kBf16PackWidth + lane;
+  const int dst_col = hidden_pack_swizzle_index(hidden / 8) * 8 + (hidden & 7);
   const size_t down_dst = static_cast<size_t>(row) * GEMMA4_HIDDEN_SIZE +
                           dst_col;
   const size_t down_src = static_cast<size_t>(hidden) *
@@ -139,7 +94,19 @@ int main(int argc, char **argv) {
                       checkpoint.layers[0].down_proj_checkpoint[down_src],
                       "down transpose");
 
-  gemma4_text_weights_device_free(&weights);
+  for (__nv_bfloat16 *ptr : {weights.token_embedding, weights.final_norm_weight}) cudaFree(ptr);
+  for (int layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
+    Gemma4TextLayerWeightsDevice &w = weights.layers[layer];
+    for (__nv_bfloat16 *ptr : {
+        w.input_norm_weight, w.post_attention_norm_weight,
+        w.pre_feedforward_norm_weight, w.post_feedforward_norm_weight,
+        w.layer_scalar, w.q_norm_weight, w.k_norm_weight, w.q_proj_col_major,
+        w.k_proj_col_major, w.v_proj_col_major, w.o_proj_col_major,
+        w.ffn_gate_up_decode, w.ffn_down_decode}) {
+      cudaFree(ptr);
+    }
+  }
+  weights = Gemma4TextWeightsDevice();
   munmap(checkpoint.mapping, checkpoint.mapping_bytes);
   checkpoint = Gemma4CheckpointHost();
   puts("checkpoint loader tests passed");

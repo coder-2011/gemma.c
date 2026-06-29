@@ -1,4 +1,0 @@
-==PROF== Connected to process 555064 (/root/gemma.c/build/gemma4_prompt)
-==PROF== Profiling "void gemma4_flash_attention::decode_megakernel_fused_layer_kernel<gemma4_flash_attention::Gemma4AttentionTraits<(bool)1>>(Gemma4DecodeMegakernelLayerArgs)": 0%....50%....100% - 43 passes
-==PROF== Disconnected from process 555064
-==PROF== Report: /root/gemma.c/src/experiments/results/2026-06-28_decode_fused_global_full.ncu-rep

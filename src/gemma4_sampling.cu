@@ -10,10 +10,9 @@
 namespace {
 
 constexpr int kFinalLogitsThreads = 1024;
-constexpr int kFinalLogitsColsPerBlock = GEMMA4_SAMPLE_NEXT_COLS_PER_BLOCK;
+constexpr int kFinalLogitsColsPerBlock = 8;
 constexpr int kFinalLogitsMinBlocksPerSm = 1;
-constexpr int kCandidateCount = GEMMA4_SAMPLE_NEXT_CANDIDATE_COUNT;
-constexpr int kFinalHiddenPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+constexpr int kCandidateCount = GEMMA4_VOCAB_SIZE / kFinalLogitsColsPerBlock;
 
 // Applies the Gemma final logit softcap for either first-token or decode sampling.
 __device__ inline float softcapped_logit(float logit, Gemma4SamplingStage stage) {
@@ -134,56 +133,6 @@ __device__ Gemma4SampleCandidate lm_head_block_candidate(
   return {best_logit, best_token_id};
 }
 
-// Computes final RMSNorm once per producer CTA into shared memory so the LM-head
-// tile loop reuses normalized hidden from shared instead of global memory.
-template <int Threads>
-__device__ void cache_final_norm_hidden(
-    Bf16Packed128 *__restrict__ normed_hidden,
-    const __nv_bfloat16 *__restrict__ state,
-    const __nv_bfloat16 *__restrict__ final_norm_weight,
-    float *__restrict__ warp_sums,
-    float *__restrict__ scale,
-    int thread_idx) {
-  float sum_sq = 0.0f;
-  for (int pack = thread_idx; pack < kFinalHiddenPacks;
-       pack += Threads) {
-    const int offset = pack * kBf16Packed128Elements;
-    const Bf16Packed128 values =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(state + offset)};
-    normed_hidden[pack] = values;
-    gemma4_bf16_pack_accumulate_square(values, sum_sq);
-  }
-
-  const int lane = thread_idx & (warpSize - 1);
-  const int warp = thread_idx / warpSize;
-  constexpr int warps = Threads / 32;
-
-  sum_sq = warp_reduce_sum(sum_sq);
-  if (lane == 0) {
-    warp_sums[warp] = sum_sq;
-  }
-  __syncthreads();
-
-  sum_sq = thread_idx < warps ? warp_sums[lane] : 0.0f;
-  if (warp == 0) {
-    sum_sq = warp_reduce_sum(sum_sq);
-  }
-  if (thread_idx == 0) {
-    *scale = rsqrtf(sum_sq / GEMMA4_HIDDEN_SIZE + GEMMA4_RMS_NORM_EPS);
-  }
-  __syncthreads();
-
-  for (int pack = thread_idx; pack < kFinalHiddenPacks;
-       pack += kFinalLogitsThreads) {
-    const int offset = pack * kBf16Packed128Elements;
-    const Bf16Packed128 gamma =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(final_norm_weight + offset)};
-    normed_hidden[pack] =
-        gemma4_bf16_pack_apply_scale_weight(normed_hidden[pack], gamma, *scale);
-  }
-  __syncthreads();
-}
-
 // Polls producer candidates from warp 0, then gathers the selected row.
 template <int Threads>
 __device__ void consume_and_gather(
@@ -248,8 +197,8 @@ void final_logits_sample_kernel(
     uint32_t *__restrict__ d_ready_flags,
     Gemma4SamplingStage stage,
     int producer_count) {
-    if (blockIdx.x == 0) {
-      consume_and_gather<kFinalLogitsThreads>(
+  if (blockIdx.x == 0) {
+    consume_and_gather<kFinalLogitsThreads>(
         d_next_hidden, d_next_token, d_lm_head_col_major, d_candidates,
         d_ready_flags, producer_count, int(threadIdx.x));
     return;
@@ -263,50 +212,6 @@ void final_logits_sample_kernel(
           kCandidateCount>(
           d_final_hidden, d_lm_head_col_major, producer_idx,
           producer_count, stage, int(threadIdx.x));
-
-  if (threadIdx.x == 0) {
-    d_candidates[producer_idx] = candidate;
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ready(
-        d_ready_flags[producer_idx]);
-    ready.store(1u, cuda::memory_order_release);
-  }
-}
-
-// Lets block 0 consume while producers normalize the final row and compute tiles.
-__global__ __launch_bounds__(kFinalLogitsThreads, kFinalLogitsMinBlocksPerSm)
-void final_norm_logits_sample_kernel(
-    __nv_bfloat16 *__restrict__ d_next_hidden,
-    int32_t *__restrict__ d_next_token,
-    const __nv_bfloat16 *__restrict__ d_state,
-    const __nv_bfloat16 *__restrict__ d_final_norm_weight,
-    const __nv_bfloat16 *__restrict__ d_lm_head_col_major,
-    Gemma4SampleCandidate *__restrict__ d_candidates,
-    uint32_t *__restrict__ d_ready_flags,
-    Gemma4SamplingStage stage,
-    int producer_count) {
-  if (blockIdx.x == 0) {
-    consume_and_gather<kFinalLogitsThreads>(
-        d_next_hidden, d_next_token, d_lm_head_col_major, d_candidates,
-        d_ready_flags, producer_count, int(threadIdx.x));
-    return;
-  }
-
-  __shared__ Bf16Packed128 normed_hidden[kFinalHiddenPacks];
-  __shared__ float norm_warp_sums[kFinalLogitsThreads / 32];
-  __shared__ float norm_scale;
-  cache_final_norm_hidden<kFinalLogitsThreads>(
-      normed_hidden, d_state, d_final_norm_weight, norm_warp_sums,
-      &norm_scale, int(threadIdx.x));
-
-  const int producer_idx = int(blockIdx.x) - 1;
-  const Gemma4SampleCandidate candidate =
-      lm_head_block_candidate<
-          kFinalLogitsColsPerBlock,
-          kFinalLogitsThreads,
-          kCandidateCount>(
-          reinterpret_cast<const __nv_bfloat16 *>(normed_hidden),
-          d_lm_head_col_major, producer_idx, producer_count, stage,
-          int(threadIdx.x));
 
   if (threadIdx.x == 0) {
     d_candidates[producer_idx] = candidate;
@@ -347,47 +252,6 @@ cudaError_t producer_count_for_kernel(const void *kernel, int *producer_count) {
 }
 
 }  // namespace
-
-// Runs the decode sampling tail inside a caller-owned token megakernel.
-extern "C" __device__ __noinline__ void gemma4_sample_next_bf16_device(
-    __nv_bfloat16 *__restrict__ next_hidden,
-    int32_t *__restrict__ next_token,
-    Gemma4SampleCandidate *__restrict__ candidates,
-    uint32_t *__restrict__ ready_flags,
-    const __nv_bfloat16 *__restrict__ final_hidden,
-    const __nv_bfloat16 *__restrict__ lm_head_col_major,
-    int producer_count,
-    int thread_idx) {
-  constexpr int kThreads = 512;
-  static_assert(kThreads % 32 == 0);
-
-  if (blockIdx.x == 0) {
-    consume_and_gather<kThreads>(
-        next_hidden, next_token, lm_head_col_major, candidates, ready_flags,
-        producer_count, thread_idx);
-    return;
-  }
-
-  const int producer_idx = int(blockIdx.x) - 1;
-  if (producer_idx >= producer_count) {
-    return;
-  }
-
-  const Gemma4SampleCandidate candidate =
-      lm_head_block_candidate<
-          kFinalLogitsColsPerBlock,
-          kThreads,
-          kCandidateCount>(
-          final_hidden, lm_head_col_major, producer_idx, producer_count,
-          Gemma4SamplingStage::kDecode, thread_idx);
-
-  if (threadIdx.x == 0) {
-    candidates[producer_idx] = candidate;
-    cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ready(
-        ready_flags[producer_idx]);
-    ready.store(1u, cuda::memory_order_release);
-  }
-}
 
 // Returns the caller-owned scratch bytes needed by the fused sampling kernel.
 size_t gemma4_sample_next_scratch_bytes(void) {
@@ -436,48 +300,6 @@ cudaError_t gemma4_sample_next_bf16(
   final_logits_sample_kernel<<<grid_dim, block_dim, 0, stream>>>(
       d_next_hidden, d_next_token, d_final_hidden, d_lm_head_col_major,
       d_candidates, d_ready_flags, stage, producer_count);
-  return cudaGetLastError();
-}
-
-// Launches final RMSNorm fused with token selection from state to next embedding.
-cudaError_t gemma4_sample_next_final_norm_bf16(
-    __nv_bfloat16 *__restrict__ d_next_hidden,
-    int32_t *__restrict__ d_next_token,
-    void *__restrict__ d_scratch,
-    size_t scratch_bytes,
-    const __nv_bfloat16 *__restrict__ d_state,
-    const __nv_bfloat16 *__restrict__ d_final_norm_weight,
-    const __nv_bfloat16 *__restrict__ d_lm_head_col_major,
-    Gemma4SamplingStage stage,
-    cudaStream_t stream) {
-  const size_t candidate_bytes =
-      static_cast<size_t>(kCandidateCount) * sizeof(Gemma4SampleCandidate);
-  if (scratch_bytes < gemma4_sample_next_scratch_bytes()) {
-    return cudaErrorInvalidValue;
-  }
-
-  auto *d_candidates =
-      reinterpret_cast<Gemma4SampleCandidate *>(d_scratch);
-  auto *d_ready_flags =
-      reinterpret_cast<uint32_t *>(static_cast<char *>(d_scratch) +
-                                   candidate_bytes);
-
-  int producer_count = 0;
-  cudaError_t status = producer_count_for_kernel(
-      reinterpret_cast<const void *>(final_norm_logits_sample_kernel),
-      &producer_count);
-  if (status != cudaSuccess) { return status; }
-
-  const size_t active_ready_bytes =
-      static_cast<size_t>(producer_count) * sizeof(uint32_t);
-  status = cudaMemsetAsync(d_ready_flags, 0, active_ready_bytes, stream);
-  if (status != cudaSuccess) { return status; }
-
-  const dim3 grid_dim(producer_count + 1);
-  const dim3 block_dim(kFinalLogitsThreads);
-  final_norm_logits_sample_kernel<<<grid_dim, block_dim, 0, stream>>>(
-      d_next_hidden, d_next_token, d_state, d_final_norm_weight,
-      d_lm_head_col_major, d_candidates, d_ready_flags, stage, producer_count);
   return cudaGetLastError();
 }
 

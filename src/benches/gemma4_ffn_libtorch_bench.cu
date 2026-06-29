@@ -1,6 +1,5 @@
 #include "gemma4_bench_utils.cuh"
 #include "gemma4_ffn.cuh"
-#include "gemma4_rmsnorm.cuh"
 #include "gemma4.h"
 
 #include <ATen/ATen.h>
@@ -83,19 +82,12 @@ int main(int argc, char **argv) {
   at::Tensor torch_out = at::empty({1, GEMMA4_HIDDEN_SIZE}, bf16_options);
   at::Tensor torch_normed = at::empty({1, GEMMA4_HIDDEN_SIZE}, bf16_options);
   at::Tensor torch_residual = at::empty({1, GEMMA4_HIDDEN_SIZE}, bf16_options);
-  at::Tensor dual_mlp = at::empty({1, GEMMA4_HIDDEN_SIZE}, bf16_options);
-  at::Tensor dual_normed = at::empty({1, GEMMA4_HIDDEN_SIZE}, bf16_options);
-  at::Tensor dual_residual = at::empty({1, GEMMA4_HIDDEN_SIZE}, bf16_options);
   at::Tensor torch_rstd;
   at::Tensor w_gate_up_swizzled = at::empty_like(w_gate_up);
   at::Tensor w_down_swizzled = at::empty_like(w_down);
   at::Tensor custom_residual = at::empty({GEMMA4_HIDDEN_SIZE}, bf16_options);
   at::Tensor custom_normed = at::empty({GEMMA4_HIDDEN_SIZE}, bf16_options);
   thrust::device_vector<unsigned char> d_scratch(sizeof(Gemma4FfnDecodeScratch));
-  thrust::device_vector<__nv_bfloat16> d_dual_scratch(
-      gemma4_ffn_prefill_scratch_elements(1));
-  Gemma4FfnPrefillScratch dual_scratch =
-      gemma4_ffn_prefill_scratch_from_buffer(raw_ptr(d_dual_scratch), 1);
 
   CUDA_CHECK(gemma4_ffn_decode_swizzle_weights_bf16(
       bf16_ptr(w_gate_up_swizzled), bf16_ptr(w_gate_up),
@@ -121,33 +113,13 @@ int main(int argc, char **argv) {
         reinterpret_cast<Gemma4FfnDecodeScratch *>(raw_ptr(d_scratch)),
         nullptr, GEMMA4_RMS_NORM_EPS, stream));
   };
-  auto run_dualgemm_chain = [&]() {
-    CUDA_CHECK(gemma4_ffn_prefill_mlp_bf16(
-        bf16_ptr(dual_mlp), bf16_ptr(x), bf16_ptr(w_gate_up_swizzled),
-        bf16_ptr(w_down_swizzled), dual_scratch, 1, stream));
-    CUDA_CHECK(gemma4_rmsnorm_bf16(
-        bf16_ptr(dual_normed), bf16_ptr(dual_mlp), bf16_ptr(rms_weight),
-        1, GEMMA4_HIDDEN_SIZE, GEMMA4_RMS_NORM_EPS, stream));
-    CUDA_CHECK(gemma4_residual_add_bf16(
-        bf16_ptr(dual_residual), bf16_ptr(residual), bf16_ptr(dual_normed),
-        GEMMA4_HIDDEN_SIZE, stream));
-  };
 
   run_libtorch_full();
-  run_dualgemm_chain();
   run_custom_decode();
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   at::Tensor torch_normed_row = torch_normed.select(0, 0);
   at::Tensor torch_residual_row = torch_residual.select(0, 0);
-  at::Tensor dual_normed_row = dual_normed.select(0, 0);
-  at::Tensor dual_residual_row = dual_residual.select(0, 0);
-  const DiffStats dual_normed_diff =
-      diff_stats_bf16(bf16_ptr(dual_normed_row), bf16_ptr(torch_normed_row),
-                      GEMMA4_HIDDEN_SIZE);
-  const DiffStats dual_residual_diff =
-      diff_stats_bf16(bf16_ptr(dual_residual_row), bf16_ptr(torch_residual_row),
-                      GEMMA4_HIDDEN_SIZE);
   const DiffStats normed_diff =
       diff_stats_bf16(bf16_ptr(custom_normed), bf16_ptr(torch_normed_row),
                       GEMMA4_HIDDEN_SIZE);
@@ -156,22 +128,17 @@ int main(int argc, char **argv) {
                       GEMMA4_HIDDEN_SIZE);
   const float custom_max_abs =
       std::max(normed_diff.max_abs, residual_diff.max_abs);
-  const float dual_max_abs =
-      std::max(dual_normed_diff.max_abs, dual_residual_diff.max_abs);
   constexpr float kTolerance = 0.125f;
-  if (std::max(custom_max_abs, dual_max_abs) > kTolerance) {
+  if (custom_max_abs > kTolerance) {
     std::fprintf(stderr,
-                 "FFN correctness failed custom_max_abs=%.6g "
-                 "dualgemm_max_abs=%.6g "
+                 "custom decode correctness failed max_abs=%.6g "
                  "tolerance=%.6g\n",
-                 custom_max_abs, dual_max_abs, kTolerance);
+                 custom_max_abs, kTolerance);
     return 1;
   }
 
   const TimingStats torch_stats =
       time_ms(run_libtorch_full, stream, warmup, iters, trials);
-  const TimingStats dual_stats =
-      time_ms(run_dualgemm_chain, stream, warmup, iters, trials);
   const TimingStats custom_stats =
       time_ms(run_custom_decode, stream, warmup, iters, trials);
 
@@ -195,8 +162,7 @@ int main(int argc, char **argv) {
   std::printf("benchmark_contract name=ffn_libtorch_bench "
               "timing=cuda_events_same_stream cache=warm_repeated_buffers "
               "launch_overhead=events_exclude_host_enqueue "
-              "aggregation=raw_trial_samples "
-              "correctness=custom_and_dualgemm_vs_libtorch "
+              "aggregation=raw_trial_samples correctness=custom_vs_libtorch "
               "warmup=%d iters=%d trials=%d rows=1 dtype=bf16\n",
               warmup, iters, trials);
   std::printf("benchmark_env torch_version=%s seed=0x%llx\n", TORCH_VERSION,
@@ -212,31 +178,17 @@ int main(int argc, char **argv) {
               "max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n",
               residual_diff.max_abs, residual_diff.mean_abs,
               residual_diff.max_rel);
-  std::printf("benchmark_correctness path=dualgemm_chain_normed_vs_libtorch "
-              "max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n",
-              dual_normed_diff.max_abs, dual_normed_diff.mean_abs,
-              dual_normed_diff.max_rel);
-  std::printf("benchmark_correctness path=dualgemm_chain_residual_vs_libtorch "
-              "max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n",
-              dual_residual_diff.max_abs, dual_residual_diff.mean_abs,
-              dual_residual_diff.max_rel);
   gemma4_bench_print_timing_stats(
       "ffn_libtorch_bench", "path=libtorch_full_ffn", torch_stats);
-  gemma4_bench_print_timing_stats(
-      "ffn_libtorch_bench", "path=dualgemm_chain_decode_layout", dual_stats);
   gemma4_bench_print_timing_stats(
       "ffn_libtorch_bench", "path=custom_fused_decode", custom_stats);
   std::printf("mode,rows,hidden,intermediate,path,best_ms,avg_ms,"
               "max_abs_vs_libtorch\n");
   print_row("libtorch_full_ffn", torch_stats, 0.0f);
-  print_row("dualgemm_chain_decode_layout", dual_stats, dual_max_abs);
   print_row("custom_fused_decode", custom_stats, custom_max_abs);
   std::printf("custom_decode_vs_libtorch_full_speedup,decode,1,%d,%d,%.6f\n",
               GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE,
               torch_stats.best_ms / custom_stats.best_ms);
-  std::printf("custom_decode_vs_dualgemm_chain_speedup,decode,1,%d,%d,%.6f\n",
-              GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE,
-              dual_stats.best_ms / custom_stats.best_ms);
   if (custom_stats.best_ms < ffn_weight_stream_floor_ms) {
     std::printf("benchmark_warning label=custom_fused_decode "
                 "measured_ms=%.6f floor_ms=%.6f "

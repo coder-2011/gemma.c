@@ -14,14 +14,6 @@ namespace gemma4_matmul_kernel_impl {
 constexpr int kFinalLogitsDecodeThreads = 1024;
 constexpr int kFinalLogitsDecodeColsPerBlock = 8;
 constexpr int kFinalLogitsDecodeMinBlocksPerSm = 1;
-constexpr int kAttentionProjectionThreads = 512;
-constexpr int kAttentionProjectionWarps = kAttentionProjectionThreads / 32;
-constexpr int kAttentionProjectionColsPerBlock = 8;
-constexpr int kFfnGateUpTileCols = 2;
-constexpr int kFfnGateUpThreads = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-constexpr int kFfnGateUpWarps = kFfnGateUpThreads / 32;
-static_assert((kFfnGateUpThreads % 32) == 0,
-              "FFN gate/up device helper requires whole warps");
 
 __device__ inline int pack_offset(int pack_idx) {
   return pack_idx * kBf16Packed128Elements;
@@ -141,6 +133,40 @@ __device__ inline void dot_cols(
 #endif
 }
 
+template <int K, int ColsPerBlock, int Threads>
+__device__ inline void dot_cols_pair(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_a_col_major,
+    const __nv_bfloat16 *__restrict__ w_b_col_major,
+    int col0_a,
+    int col0_b,
+    int thread_idx,
+    float (&a_sums)[ColsPerBlock],
+    float (&b_sums)[ColsPerBlock]) {
+  static_assert((Threads % 32) == 0,
+                "decode thread count must be a whole number of warps");
+
+  constexpr int packs_per_col = K / kBf16Packed128Elements;
+
+#pragma unroll
+  for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
+    const int element_idx = pack_offset(pack_idx);
+    const Bf16Packed128 x_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element_idx)};
+#pragma unroll
+    for (int col = 0; col < ColsPerBlock; ++col) {
+      const Bf16Packed128 a_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(
+              w_a_col_major + weight_offset<K>(col0_a + col, element_idx))};
+      const Bf16Packed128 b_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(
+              w_b_col_major + weight_offset<K>(col0_b + col, element_idx))};
+      gemma4_bf16_pack_accumulate_dot(x_pack, a_pack, a_sums[col]);
+      gemma4_bf16_pack_accumulate_dot(x_pack, b_pack, b_sums[col]);
+    }
+  }
+}
+
 template <bool SwizzleX>
 __device__ inline int shared_pack_index(int chunk) {
   if constexpr (SwizzleX) {
@@ -153,69 +179,37 @@ __device__ inline int shared_pack_index(int chunk) {
   return chunk;
 }
 
-// Computes one Gemma 4 FFN gate/up decode tile for a caller-owned CTA.
-extern "C" __device__ void gemma4_ffn_gate_up_tile_bf16_device(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_interleaved_row_major,
-    int col0,
+template <int K, int ColsPerBlock, int Threads, bool SwizzleX>
+__device__ inline void dot_cols_pair_shared_x(
+    const Bf16Packed128 *__restrict__ s_x,
+    const __nv_bfloat16 *__restrict__ w_a_col_major,
+    const __nv_bfloat16 *__restrict__ w_b_col_major,
+    int col0_a,
+    int col0_b,
     int thread_idx,
-    float *__restrict__ warp_sums,
-    float *__restrict__ gate,
-    float *__restrict__ up) {
-  constexpr int packs_per_col =
-      GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+    float (&a_sums)[ColsPerBlock],
+    float (&b_sums)[ColsPerBlock]) {
+  static_assert((Threads % 32) == 0,
+                "decode thread count must be a whole number of warps");
 
-  for (int pack_idx = thread_idx; pack_idx < packs_per_col;
-       pack_idx += kFfnGateUpThreads) {
-    const int x_col = pack_offset(pack_idx);
-    const int weight_col = pack_offset(shared_pack_index<true>(pack_idx));
-    const Bf16Packed128 x_pack =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(x + x_col)};
-    const __nv_bfloat16 *gate_ptr =
-        w_interleaved_row_major +
-        static_cast<int64_t>(2 * col0) * GEMMA4_HIDDEN_SIZE + weight_col;
-    const __nv_bfloat16 *up_ptr = gate_ptr + GEMMA4_HIDDEN_SIZE;
+  constexpr int packs_per_col = K / kBf16Packed128Elements;
 
 #pragma unroll
-    for (int t = 0; t < kFfnGateUpTileCols; ++t) {
-      const int64_t row_offset =
-          static_cast<int64_t>(2 * t) * GEMMA4_HIDDEN_SIZE;
-      const Bf16Packed128 gate_pack =
-          Bf16Packed128{
-              *reinterpret_cast<const int4 *>(gate_ptr + row_offset)};
-      const Bf16Packed128 up_pack =
-          Bf16Packed128{
-              *reinterpret_cast<const int4 *>(up_ptr + row_offset)};
-      gemma4_bf16_pack_accumulate_dot(x_pack, gate_pack, gate[t]);
-      gemma4_bf16_pack_accumulate_dot(x_pack, up_pack, up[t]);
-    }
-  }
-
-  const int lane = thread_idx & (warpSize - 1);
-  const int warp = thread_idx / warpSize;
-
+  for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
+    const int element_idx = pack_offset(pack_idx);
+    const int swizzled_pack_idx = shared_pack_index<SwizzleX>(pack_idx);
+    const int swizzled_element_idx = pack_offset(swizzled_pack_idx);
+    const Bf16Packed128 x_pack = s_x[swizzled_pack_idx];
 #pragma unroll
-  for (int t = 0; t < kFfnGateUpTileCols; ++t) {
-    gate[t] = warp_reduce_sum(gate[t]);
-    up[t] = warp_reduce_sum(up[t]);
-    if (lane == 0 && warp < kFfnGateUpWarps) {
-      warp_sums[t * kFfnGateUpWarps + warp] = gate[t];
-      warp_sums[(kFfnGateUpTileCols + t) * kFfnGateUpWarps + warp] = up[t];
-    }
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int t = 0; t < kFfnGateUpTileCols; ++t) {
-    gate[t] = thread_idx < kFfnGateUpWarps
-                  ? warp_sums[t * kFfnGateUpWarps + lane]
-                  : 0.0f;
-    up[t] = thread_idx < kFfnGateUpWarps
-                ? warp_sums[(kFfnGateUpTileCols + t) * kFfnGateUpWarps + lane]
-                : 0.0f;
-    if (warp == 0) {
-      gate[t] = warp_reduce_sum(gate[t]);
-      up[t] = warp_reduce_sum(up[t]);
+    for (int col = 0; col < ColsPerBlock; ++col) {
+      const Bf16Packed128 a_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(
+              w_a_col_major + weight_offset<K>(col0_a + col, swizzled_element_idx))};
+      const Bf16Packed128 b_pack = Bf16Packed128{
+          *reinterpret_cast<const int4 *>(
+              w_b_col_major + weight_offset<K>(col0_b + col, swizzled_element_idx))};
+      gemma4_bf16_pack_accumulate_dot(x_pack, a_pack, a_sums[col]);
+      gemma4_bf16_pack_accumulate_dot(x_pack, b_pack, b_sums[col]);
     }
   }
 }
@@ -249,6 +243,41 @@ __device__ inline void reduce_cols(
   }
 }
 
+template <int ColsPerBlock, int Threads>
+__device__ inline void reduce_cols_pair(
+    int thread_idx,
+    float (&a_warp_sums)[ColsPerBlock][Threads / 32],
+    float (&b_warp_sums)[ColsPerBlock][Threads / 32],
+    float (&a_sums)[ColsPerBlock],
+    float (&b_sums)[ColsPerBlock]) {
+  constexpr int warps = Threads / 32;
+  const int lane = thread_idx & (warpSize - 1);
+  const int warp = thread_idx / warpSize;
+
+  warp_reduce_sum_to_lane0(a_sums);
+  warp_reduce_sum_to_lane0(b_sums);
+
+  if (lane == 0) {
+#pragma unroll
+    for (int col = 0; col < ColsPerBlock; ++col) {
+      a_warp_sums[col][warp] = a_sums[col];
+      b_warp_sums[col][warp] = b_sums[col];
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int col = 0; col < ColsPerBlock; ++col) {
+    a_sums[col] = thread_idx < warps ? a_warp_sums[col][lane] : 0.0f;
+    b_sums[col] = thread_idx < warps ? b_warp_sums[col][lane] : 0.0f;
+  }
+
+  if (warp == 0) {
+    warp_reduce_sum_to_lane0(a_sums);
+    warp_reduce_sum_to_lane0(b_sums);
+  }
+}
+
 template <int K, int ColsPerBlock, int Threads>
 __device__ inline void dot_cols_reduce(
     const __nv_bfloat16 *__restrict__ x,
@@ -259,6 +288,44 @@ __device__ inline void dot_cols_reduce(
     float (&sums)[ColsPerBlock]) {
   dot_cols<K, ColsPerBlock, Threads>(x, w_col_major, col0, thread_idx, sums);
   reduce_cols<ColsPerBlock, Threads>(thread_idx, warp_sums, sums);
+}
+
+template <int K, int ColsPerBlock, int Threads>
+__device__ inline void dot_cols_pair_reduce(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_a_col_major,
+    const __nv_bfloat16 *__restrict__ w_b_col_major,
+    int col0_a,
+    int col0_b,
+    int thread_idx,
+    float (&a_warp_sums)[ColsPerBlock][Threads / 32],
+    float (&b_warp_sums)[ColsPerBlock][Threads / 32],
+    float (&a_sums)[ColsPerBlock],
+    float (&b_sums)[ColsPerBlock]) {
+  dot_cols_pair<K, ColsPerBlock, Threads>(
+      x, w_a_col_major, w_b_col_major, col0_a, col0_b, thread_idx,
+      a_sums, b_sums);
+  reduce_cols_pair<ColsPerBlock, Threads>(
+      thread_idx, a_warp_sums, b_warp_sums, a_sums, b_sums);
+}
+
+template <int K, int ColsPerBlock, int Threads, bool SwizzleX>
+__device__ inline void dot_cols_pair_shared_x_reduce(
+    const Bf16Packed128 *__restrict__ s_x,
+    const __nv_bfloat16 *__restrict__ w_a_col_major,
+    const __nv_bfloat16 *__restrict__ w_b_col_major,
+    int col0_a,
+    int col0_b,
+    int thread_idx,
+    float (&a_warp_sums)[ColsPerBlock][Threads / 32],
+    float (&b_warp_sums)[ColsPerBlock][Threads / 32],
+    float (&a_sums)[ColsPerBlock],
+    float (&b_sums)[ColsPerBlock]) {
+  dot_cols_pair_shared_x<K, ColsPerBlock, Threads, SwizzleX>(
+      s_x, w_a_col_major, w_b_col_major, col0_a, col0_b, thread_idx,
+      a_sums, b_sums);
+  reduce_cols_pair<ColsPerBlock, Threads>(
+      thread_idx, a_warp_sums, b_warp_sums, a_sums, b_sums);
 }
 
 template <int K,
@@ -289,88 +356,22 @@ __device__ inline void decode_gemv_cols_device(
   }
 }
 
-// Computes the packed attention ingress projection for all column tiles owned
-// by this CTA in the cooperative layer grid.
-template <int N>
-__device__ inline void attention_projection_grid_device(
+template <int K,
+          int N,
+          int ColsPerBlock,
+          int Threads,
+          int SwizzleTileBlocks,
+          bool StoreOutput = true>
+__device__ inline void decode_gemv_cols_device(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major,
     __nv_bfloat16 *__restrict__ y,
-    int block_idx,
-    int grid_stride,
-    int thread_idx,
-    float *__restrict__ warp_sums_ptr) {
-  static_assert((N % kAttentionProjectionColsPerBlock) == 0,
-                "attention projection width must divide the column tile");
-  constexpr int blocks = N / kAttentionProjectionColsPerBlock;
-  float (&warp_sums)[kAttentionProjectionColsPerBlock]
-                    [kAttentionProjectionWarps] =
-      *reinterpret_cast<float (*)[kAttentionProjectionColsPerBlock]
-                                [kAttentionProjectionWarps]>(warp_sums_ptr);
-
-  for (int physical_block = block_idx; physical_block < blocks;
-       physical_block += grid_stride) {
-    const int col0 = physical_block * kAttentionProjectionColsPerBlock;
-    float sums[kAttentionProjectionColsPerBlock] = {};
-    dot_cols_reduce<GEMMA4_HIDDEN_SIZE, kAttentionProjectionColsPerBlock,
-                    kAttentionProjectionThreads>(
-        x, w_col_major, col0, thread_idx, warp_sums, sums);
-    if (thread_idx == 0) {
-      store_cols<kAttentionProjectionColsPerBlock>(y + col0, sums);
-    }
-    // The next loop iteration reuses warp_sums, so keep the CTA behind the
-    // final store before any thread starts accumulating the next tile.
-    __syncthreads();
-  }
-}
-
-// Dispatches the layer-specific packed attention projection from a caller
-// kernel that owns the launch shape and shared-memory buffer.
-extern "C" __device__ void gemma4_attention_projection_decode_bf16_device(
-    bool global,
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_col_major,
-    __nv_bfloat16 *__restrict__ y,
-    int block_idx,
-    int grid_stride,
-    int thread_idx,
-    float *__restrict__ warp_sums) {
-  if (global) {
-    attention_projection_grid_device<GEMMA4_GLOBAL_QK_SIZE>(
-        x, w_col_major, y, block_idx, grid_stride, thread_idx, warp_sums);
-  } else {
-    attention_projection_grid_device<GEMMA4_SLIDING_QKV_SIZE>(
-        x, w_col_major, y, block_idx, grid_stride, thread_idx, warp_sums);
-  }
-}
-
-// Computes one projection tile and its raw head-norm contribution.
-extern "C" __device__ void gemma4_attention_projection_tile_bf16_device(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_col_major,
-    int col0,
-    int thread_idx,
-    float *__restrict__ warp_sums_ptr,
-    __nv_bfloat16 *__restrict__ y,
-    float *__restrict__ tile_sum_sq) {
-  float (&warp_sums)[kAttentionProjectionColsPerBlock]
-                    [kAttentionProjectionWarps] =
-      *reinterpret_cast<float (*)[kAttentionProjectionColsPerBlock]
-                                [kAttentionProjectionWarps]>(warp_sums_ptr);
-
-  float sums[kAttentionProjectionColsPerBlock] = {};
-  dot_cols_reduce<GEMMA4_HIDDEN_SIZE, kAttentionProjectionColsPerBlock,
-                  kAttentionProjectionThreads>(
-      x, w_col_major, col0, thread_idx, warp_sums, sums);
-  if (thread_idx == 0) {
-    float sum_sq = 0.0f;
-#pragma unroll
-    for (int col = 0; col < kAttentionProjectionColsPerBlock; ++col) {
-      sum_sq = fmaf(sums[col], sums[col], sum_sq);
-    }
-    store_cols<kAttentionProjectionColsPerBlock>(y, sums);
-    *tile_sum_sq = sum_sq;
-  }
+    int physical_block_idx,
+    float (&warp_sums)[ColsPerBlock][Threads / 32]) {
+  float sums[ColsPerBlock] = {};
+  decode_gemv_cols_device<K, N, ColsPerBlock, Threads, SwizzleTileBlocks,
+                          StoreOutput>(
+      x, w_col_major, y, physical_block_idx, warp_sums, sums);
 }
 
 }  // namespace gemma4_matmul_kernel_impl
@@ -576,16 +577,6 @@ cudaError_t projection_decode_impl(
         kFfnDownColsPerBlock, kFfnDownThreads,
         kFfnDownMinBlocksPerSm, SwizzleTileBlocks>(
         x, w_col_major, y, stream);
-  case GEMMA4_PROJECTION_SLIDING_Q:
-    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_Q_PROJ_SIZE,
-                              kDefaultColsPerBlock, kDefaultThreads,
-                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
-        x, w_col_major, y, stream);
-  case GEMMA4_PROJECTION_SLIDING_KV:
-    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_KV_PROJ_SIZE,
-                              kDefaultColsPerBlock, kDefaultThreads,
-                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
-        x, w_col_major, y, stream);
   case GEMMA4_PROJECTION_SLIDING_QKV:
     return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE,
                               kDefaultColsPerBlock, kDefaultThreads,
@@ -603,11 +594,6 @@ cudaError_t projection_decode_impl(
         x, w_col_major, y, stream);
   case GEMMA4_PROJECTION_GLOBAL_K:
     return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
-                              kDefaultColsPerBlock, kDefaultThreads,
-                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
-        x, w_col_major, y, stream);
-  case GEMMA4_PROJECTION_GLOBAL_QK:
-    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_QK_SIZE,
                               kDefaultColsPerBlock, kDefaultThreads,
                               kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
         x, w_col_major, y, stream);

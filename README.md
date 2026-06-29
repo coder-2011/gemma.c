@@ -10,9 +10,24 @@ The current work is to implement kernels individually, assemble a correct unfuse
 
 ## Benchmark
 
-Benchmarks should use an explicit prompt string through `--prompt`. The local
-`offline-decode` path keeps generated tokens on GPU during the decode loop and
-synchronizes the CUDA stream once at the end of each request.
+Single-user Gemma 4 12B BF16 prompt benchmark on an NVIDIA RTX A6000 (Jun 27).
+Each measured run used 391 closed-loop requests, one `Hello` prompt token, 256
+requested output tokens per request, `100,096` measured output tokens total,
+and max request concurrency `1`.
+
+| Runner | p50 TTFT | p50 TPOT | Output TPS | Measured time |
+| --- | ---: | ---: | ---: | ---: |
+| vLLM serve | 85.414 ms | 38.191 ms | 26.057 tok/s | 3841.4 s |
+| SGLang serve | unsupported | unsupported | unsupported | unsupported |
+| `gemma4_prompt` local | 37.607 ms | 73.418 ms | 13.647 tok/s | 7334.9 s |
+
+SGLang 0.5.9 was installed and upgraded to Transformers 5.12.1 so it could
+parse `Gemma4UnifiedConfig`, but its generic Transformers backend failed during
+generation on Gemma 4 Unified's heterogeneous sliding/global KV shapes.
+
+![p50 TTFT benchmark](docs/benchmarks/ttft_p50_gemma4_vllm_sglang_long.png)
+
+![decode throughput benchmark](docs/benchmarks/tps_gemma4_vllm_sglang_long.png)
 
 
 My agents tell me they love working in this repo. It is built heavily w/ them in mind!
