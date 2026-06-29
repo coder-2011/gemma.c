@@ -61,20 +61,7 @@ struct WeightOwner {
   Gemma4TextWeightsDevice value = {};
 
   // Frees all weight allocations owned by the checkpoint loader.
-  ~WeightOwner() {
-    for (__nv_bfloat16 *ptr : {value.token_embedding, value.final_norm_weight}) cudaFree(ptr);
-    for (int layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
-      Gemma4TextLayerWeightsDevice &w = value.layers[layer];
-      for (__nv_bfloat16 *ptr : {
-          w.input_norm_weight, w.post_attention_norm_weight,
-          w.pre_feedforward_norm_weight, w.post_feedforward_norm_weight,
-          w.layer_scalar, w.q_norm_weight, w.k_norm_weight, w.q_proj_col_major,
-          w.k_proj_col_major, w.v_proj_col_major, w.o_proj_col_major,
-          w.ffn_gate_up_decode, w.ffn_down_decode}) {
-        cudaFree(ptr);
-      }
-    }
-  }
+  ~WeightOwner() { gemma4_text_weights_device_free(&value); }
 };
 
 // Releases runtime KV/cache metadata when leaving the prompt runner.
@@ -248,8 +235,9 @@ int run_prompt(const PromptOptions &options) {
       GEMMA4_GLOBAL_ATTENTION_OUT_SIZE);
 
   const int32_t split_size = options.decode_split_size;
+  const int32_t sliding_keys = runtime.value.sliding_cache_config.window_size;
   const int32_t sliding_splits =
-      (GEMMA4_SLIDING_WINDOW + split_size - 1) / split_size;
+      (sliding_keys + split_size - 1) / split_size;
   const int32_t global_keys =
       runtime.value.global_cache_config.max_pages_per_seq *
       runtime.value.global_cache_config.page_size;
