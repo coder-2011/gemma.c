@@ -16,6 +16,7 @@ typedef enum {
   GEMMA4_PROJECTION_GLOBAL_K,
   GEMMA4_PROJECTION_GLOBAL_O,
   GEMMA4_PROJECTION_FINAL_LOGITS,
+  GEMMA4_PROJECTION_GLOBAL_QK,
 } Gemma4Projection;
 
 typedef enum {
@@ -59,5 +60,26 @@ extern "C" __device__ void gemma4_ffn_gate_up_tile_bf16_device(
     float *__restrict__ warp_sums,
     float *__restrict__ gate,
     float *__restrict__ up);
+
+// Projects the packed sliding QKV or global QK decode row inside a caller CTA.
+extern "C" __device__ void gemma4_attention_projection_decode_bf16_device(
+    bool global,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int block_idx,
+    int grid_stride,
+    int thread_idx,
+    float *__restrict__ warp_sums);
+
+// Computes one 8-column attention projection tile for caller-owned handoffs.
+extern "C" __device__ void gemma4_attention_projection_tile_bf16_device(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    int col0,
+    int thread_idx,
+    float *__restrict__ warp_sums,
+    __nv_bfloat16 *__restrict__ y,
+    float *__restrict__ tile_sum_sq);
 
 }  // namespace gemma4_matmul_kernel_impl

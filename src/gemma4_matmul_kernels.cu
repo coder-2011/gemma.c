@@ -14,6 +14,9 @@ namespace gemma4_matmul_kernel_impl {
 constexpr int kFinalLogitsDecodeThreads = 1024;
 constexpr int kFinalLogitsDecodeColsPerBlock = 8;
 constexpr int kFinalLogitsDecodeMinBlocksPerSm = 1;
+constexpr int kAttentionProjectionThreads = 512;
+constexpr int kAttentionProjectionWarps = kAttentionProjectionThreads / 32;
+constexpr int kAttentionProjectionColsPerBlock = 8;
 constexpr int kFfnGateUpTileCols = 2;
 constexpr int kFfnGateUpThreads = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 constexpr int kFfnGateUpWarps = kFfnGateUpThreads / 32;
@@ -286,6 +289,90 @@ __device__ inline void decode_gemv_cols_device(
   }
 }
 
+// Computes the packed attention ingress projection for all column tiles owned
+// by this CTA in the cooperative layer grid.
+template <int N>
+__device__ inline void attention_projection_grid_device(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int block_idx,
+    int grid_stride,
+    int thread_idx,
+    float *__restrict__ warp_sums_ptr) {
+  static_assert((N % kAttentionProjectionColsPerBlock) == 0,
+                "attention projection width must divide the column tile");
+  constexpr int blocks = N / kAttentionProjectionColsPerBlock;
+  float (&warp_sums)[kAttentionProjectionColsPerBlock]
+                    [kAttentionProjectionWarps] =
+      *reinterpret_cast<float (*)[kAttentionProjectionColsPerBlock]
+                                [kAttentionProjectionWarps]>(warp_sums_ptr);
+
+  for (int physical_block = block_idx; physical_block < blocks;
+       physical_block += grid_stride) {
+    const int col0 = physical_block * kAttentionProjectionColsPerBlock;
+    float sums[kAttentionProjectionColsPerBlock] = {};
+    dot_cols_reduce<GEMMA4_HIDDEN_SIZE, kAttentionProjectionColsPerBlock,
+                    kAttentionProjectionThreads>(
+        x, w_col_major, col0, thread_idx, warp_sums, sums);
+    if (thread_idx == 0) {
+      store_cols<kAttentionProjectionColsPerBlock>(y + col0, sums);
+    }
+    // The next loop iteration reuses warp_sums, so keep the CTA behind the
+    // final store before any thread starts accumulating the next tile.
+    __syncthreads();
+  }
+}
+
+// Dispatches the layer-specific packed attention projection from a caller
+// kernel that owns the launch shape and shared-memory buffer.
+extern "C" __device__ void gemma4_attention_projection_decode_bf16_device(
+    bool global,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    __nv_bfloat16 *__restrict__ y,
+    int block_idx,
+    int grid_stride,
+    int thread_idx,
+    float *__restrict__ warp_sums) {
+  if (global) {
+    attention_projection_grid_device<GEMMA4_GLOBAL_QK_SIZE>(
+        x, w_col_major, y, block_idx, grid_stride, thread_idx, warp_sums);
+  } else {
+    attention_projection_grid_device<GEMMA4_SLIDING_QKV_SIZE>(
+        x, w_col_major, y, block_idx, grid_stride, thread_idx, warp_sums);
+  }
+}
+
+// Computes one projection tile and its raw head-norm contribution.
+extern "C" __device__ void gemma4_attention_projection_tile_bf16_device(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    int col0,
+    int thread_idx,
+    float *__restrict__ warp_sums_ptr,
+    __nv_bfloat16 *__restrict__ y,
+    float *__restrict__ tile_sum_sq) {
+  float (&warp_sums)[kAttentionProjectionColsPerBlock]
+                    [kAttentionProjectionWarps] =
+      *reinterpret_cast<float (*)[kAttentionProjectionColsPerBlock]
+                                [kAttentionProjectionWarps]>(warp_sums_ptr);
+
+  float sums[kAttentionProjectionColsPerBlock] = {};
+  dot_cols_reduce<GEMMA4_HIDDEN_SIZE, kAttentionProjectionColsPerBlock,
+                  kAttentionProjectionThreads>(
+      x, w_col_major, col0, thread_idx, warp_sums, sums);
+  if (thread_idx == 0) {
+    float sum_sq = 0.0f;
+#pragma unroll
+    for (int col = 0; col < kAttentionProjectionColsPerBlock; ++col) {
+      sum_sq = fmaf(sums[col], sums[col], sum_sq);
+    }
+    store_cols<kAttentionProjectionColsPerBlock>(y, sums);
+    *tile_sum_sq = sum_sq;
+  }
+}
+
 }  // namespace gemma4_matmul_kernel_impl
 
 namespace {
@@ -516,6 +603,11 @@ cudaError_t projection_decode_impl(
         x, w_col_major, y, stream);
   case GEMMA4_PROJECTION_GLOBAL_K:
     return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_GLOBAL_QK:
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_QK_SIZE,
                               kDefaultColsPerBlock, kDefaultThreads,
                               kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
         x, w_col_major, y, stream);
