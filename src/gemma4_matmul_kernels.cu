@@ -11,9 +11,6 @@
 
 namespace gemma4_matmul_kernel_impl {
 
-constexpr int kFinalLogitsDecodeThreads = 1024;
-constexpr int kFinalLogitsDecodeColsPerBlock = 8;
-constexpr int kFinalLogitsDecodeMinBlocksPerSm = 1;
 constexpr int kFfnGateUpTileCols = 2;
 constexpr int kFfnGateUpThreads = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 constexpr int kFfnGateUpWarps = kFfnGateUpThreads / 32;
@@ -98,16 +95,12 @@ __device__ inline void dot_cols(
 #endif
 }
 
-template <bool SwizzleX>
 __device__ inline int shared_pack_index(int chunk) {
-  if constexpr (SwizzleX) {
-    constexpr int kSwizzleChunks = 8;  // 8 x 128-bit chunks = one 128-byte row.
-    const unsigned u = static_cast<unsigned>(chunk);
-    const unsigned col = u & (kSwizzleChunks - 1);
-    const unsigned row = (u >> 3) & (kSwizzleChunks - 1);
-    return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
-  }
-  return chunk;
+  constexpr int kSwizzleChunks = 8;  // 8 x 128-bit chunks = one 128-byte row.
+  const unsigned u = static_cast<unsigned>(chunk);
+  const unsigned col = u & (kSwizzleChunks - 1);
+  const unsigned row = (u >> 3) & (kSwizzleChunks - 1);
+  return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
 }
 
 // Computes one Gemma 4 FFN gate/up decode tile for a caller-owned CTA.
@@ -126,7 +119,7 @@ extern "C" __device__ void gemma4_ffn_gate_up_tile_bf16_device(
        pack_idx += kFfnGateUpThreads) {
     const int x_col = pack_idx * kBf16Packed128Elements;
     const int weight_col =
-        shared_pack_index<true>(pack_idx) * kBf16Packed128Elements;
+        shared_pack_index(pack_idx) * kBf16Packed128Elements;
     const Bf16Packed128 x_pack =
         Bf16Packed128{*reinterpret_cast<const int4 *>(x + x_col)};
     const __nv_bfloat16 *gate_ptr =
@@ -207,24 +200,11 @@ __device__ inline void reduce_cols(
   }
 }
 
-template <int K, int ColsPerBlock, int Threads>
-__device__ inline void dot_cols_reduce(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_col_major,
-    int col0,
-    int thread_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / 32],
-    float (&sums)[ColsPerBlock]) {
-  dot_cols<K, ColsPerBlock, Threads>(x, w_col_major, col0, thread_idx, sums);
-  reduce_cols<ColsPerBlock, Threads>(thread_idx, warp_sums, sums);
-}
-
 template <int K,
           int N,
           int ColsPerBlock,
           int Threads,
-          int SwizzleTileBlocks,
-          bool StoreOutput = true>
+          int SwizzleTileBlocks>
 __device__ inline void decode_gemv_cols_device(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major,
@@ -241,23 +221,22 @@ __device__ inline void decode_gemv_cols_device(
   }
   const int col0 = logical_block * ColsPerBlock;
 
-  dot_cols_reduce<K, ColsPerBlock, Threads>(
-      x, w_col_major, col0, threadIdx.x, warp_sums, sums);
+  dot_cols<K, ColsPerBlock, Threads>(
+      x, w_col_major, col0, threadIdx.x, sums);
+  reduce_cols<ColsPerBlock, Threads>(threadIdx.x, warp_sums, sums);
 
-  if constexpr (StoreOutput) {
-    if (threadIdx.x == 0) {
-      if constexpr (ColsPerBlock == kBf16Packed128Elements) {
-        Bf16Packed128 out;
+  if (threadIdx.x == 0) {
+    if constexpr (ColsPerBlock == kBf16Packed128Elements) {
+      Bf16Packed128 out;
 #pragma unroll
-        for (int col = 0; col < ColsPerBlock; ++col) {
-          out[col] = __float2bfloat16_rn(sums[col]);
-        }
-        *reinterpret_cast<int4 *>(y + col0) = out.bits();
-      } else {
+      for (int col = 0; col < ColsPerBlock; ++col) {
+        out[col] = __float2bfloat16_rn(sums[col]);
+      }
+      *reinterpret_cast<int4 *>(y + col0) = out.bits();
+    } else {
 #pragma unroll
-        for (int col = 0; col < ColsPerBlock; ++col) {
-          y[col0 + col] = __float2bfloat16_rn(sums[col]);
-        }
+      for (int col = 0; col < ColsPerBlock; ++col) {
+        y[col0 + col] = __float2bfloat16_rn(sums[col]);
       }
     }
   }
@@ -276,12 +255,9 @@ constexpr int kFfnDownMinBlocksPerSm = 1;
 constexpr int kGlobalOThreads = 512;
 constexpr int kGlobalOColsPerBlock = 8;
 constexpr int kGlobalOMinBlocksPerSm = 1;
-constexpr int kFinalLogitsThreads =
-    gemma4_matmul_kernel_impl::kFinalLogitsDecodeThreads;
-constexpr int kFinalLogitsColsPerBlock =
-    gemma4_matmul_kernel_impl::kFinalLogitsDecodeColsPerBlock;
-constexpr int kFinalLogitsMinBlocksPerSm =
-    gemma4_matmul_kernel_impl::kFinalLogitsDecodeMinBlocksPerSm;
+constexpr int kFinalLogitsThreads = 1024;
+constexpr int kFinalLogitsColsPerBlock = 8;
+constexpr int kFinalLogitsMinBlocksPerSm = 1;
 
 template <int K,
           int N,

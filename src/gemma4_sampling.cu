@@ -14,6 +14,12 @@ constexpr int kFinalLogitsColsPerBlock = 8;
 constexpr int kFinalLogitsMinBlocksPerSm = 1;
 constexpr int kCandidateCount = GEMMA4_VOCAB_SIZE / kFinalLogitsColsPerBlock;
 
+// Carries one token candidate and its score through block-level reductions.
+struct alignas(8) Gemma4SampleCandidate {
+  float logit;
+  int32_t token_id;
+};
+
 // Applies the Gemma final logit softcap to one candidate.
 __device__ inline float softcapped_logit(float logit) {
   return tanhf(logit / GEMMA4_FINAL_LOGIT_SOFTCAPPING) *
@@ -218,8 +224,8 @@ void final_logits_sample_kernel(
   }
 }
 
-// Computes producer count while leaving one resident slot for the consumer CTA.
-cudaError_t producer_count_for_kernel(const void *kernel, int *producer_count) {
+// Computes producer count for final logits while leaving one resident consumer CTA slot.
+cudaError_t producer_count_for_final_logits_kernel(int *producer_count) {
   int device = 0;
   GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDevice(&device));
 
@@ -227,7 +233,9 @@ cudaError_t producer_count_for_kernel(const void *kernel, int *producer_count) {
   GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDeviceProperties(&prop, device));
   int active_blocks_per_sm = 0;
   GEMMA4_RETURN_IF_CUDA_ERROR(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_blocks_per_sm, kernel, kFinalLogitsThreads, 0));
+      &active_blocks_per_sm,
+      reinterpret_cast<const void *>(final_logits_sample_kernel),
+      kFinalLogitsThreads, 0));
 
   *producer_count = active_blocks_per_sm * prop.multiProcessorCount - 1;
   if (*producer_count > kCandidateCount) {
@@ -274,9 +282,8 @@ cudaError_t gemma4_sample_next_bf16(
                                    candidate_bytes);
 
   int producer_count = 0;
-  GEMMA4_RETURN_IF_CUDA_ERROR(producer_count_for_kernel(
-      reinterpret_cast<const void *>(final_logits_sample_kernel),
-      &producer_count));
+  GEMMA4_RETURN_IF_CUDA_ERROR(
+      producer_count_for_final_logits_kernel(&producer_count));
 
   const size_t active_ready_bytes =
       static_cast<size_t>(producer_count) * sizeof(uint32_t);

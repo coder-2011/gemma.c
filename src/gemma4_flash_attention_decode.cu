@@ -282,7 +282,6 @@ __device__ __forceinline__ void prep_scale_free_head_values(
 // Convert a decode token position into the Layout-A paged-cache row for one KV
 // head. Page allocation stays on the host/runtime side; this kernel only writes
 // if the page table already maps the requested position.
-template <typename Traits>
 __device__ __forceinline__ int64_t decode_cache_head_offset(
     const Gemma4KvCacheConfig &config,
     const int32_t *__restrict__ page_table,
@@ -290,15 +289,13 @@ __device__ __forceinline__ int64_t decode_cache_head_offset(
     int position,
     int cache_layer,
     int head,
-    int lane,
-    int batch_count) {
+    int lane) {
   const int logical_page = position / config.page_size;
   const int slot = logical_page % config.max_pages_per_seq;
-  auto page_table_layout = make_layout(
-      make_shape(batch_count, config.max_pages_per_seq),
-      make_stride(config.max_pages_per_seq, 1));
+  const int64_t page_table_offset =
+      int64_t(batch) * config.max_pages_per_seq + slot;
   const int physical_page = gemma4_warp_uniform_ldg_i32(
-      page_table + page_table_layout(batch, slot), lane);
+      page_table + page_table_offset, lane);
   if (physical_page < 0 || physical_page >= config.num_pages) return -1;
   const int page_offset = position - logical_page * config.page_size;
   return gemma4_kv_cache_offset(config, cache_layer, physical_page, page_offset,
@@ -324,8 +321,7 @@ __device__ __forceinline__ void phase_decode_q_paged_kv_norm_rope(
     const float *__restrict__ sin,
     int batch,
     int kv_head,
-    int thread_idx,
-    int batch_count) {
+    int thread_idx) {
   using Derived = Gemma4AttentionDerived<Traits>;
   constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
   constexpr int kKvHeads = Traits::kKvHeads;
@@ -356,9 +352,8 @@ __device__ __forceinline__ void phase_decode_q_paged_kv_norm_rope(
       (!Traits::kHasVProjection || warp != Derived::kDecodeVWarp)) {
     return;
   }
-  const int64_t cache_offset = decode_cache_head_offset<Traits>(
-      cache_config, page_table, batch, position, cache_layer, kv_head, lane,
-      batch_count);
+  const int64_t cache_offset = decode_cache_head_offset(
+      cache_config, page_table, batch, position, cache_layer, kv_head, lane);
   if (cache_offset < 0) return;
 
   const int64_t kv_offset = (int64_t(batch) * kKvHeads + kv_head) * kHeadDim;
@@ -524,8 +519,7 @@ __device__ inline void phase_megakernel_project_prepare_paged_kv(
         args.attention_token_position, args.attention_cache_layer, raw_q,
         raw_k, raw_v, args.attention_q_norm_weight,
         args.attention_k_norm_weight, args.attention_cos, args.attention_sin,
-        0, kv_head,
-        int(threadIdx.x), 1);
+        0, kv_head, int(threadIdx.x));
   }
   grid.sync();
 }
@@ -736,7 +730,7 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
   const int32_t first_key =
       config.window_size > 0 ? std::max(0, seq_len - config.window_size) : 0;
   const int32_t key_count = std::max(0, seq_len - first_key);
-  const int32_t actual_splits = (key_count + split_size - 1) / split_size;
+  const int32_t actual_splits = div_up(key_count, split_size);
   const bool write_direct = num_splits == 1;
   if (key_count == 0 && write_direct) {
 #pragma unroll
@@ -918,7 +912,7 @@ __device__ __forceinline__ void phase_decode_paged_reduce(
   const int32_t first_key =
       config.window_size > 0 ? std::max(0, seq_len - config.window_size) : 0;
   const int32_t key_count = std::max(0, seq_len - first_key);
-  const int32_t actual_splits = (key_count + split_size - 1) / split_size;
+  const int32_t actual_splits = div_up(key_count, split_size);
   const int32_t reduce_splits = std::min(actual_splits, num_splits);
 
   // A zero-length row has no attention mass. This should be rare, but returning

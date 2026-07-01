@@ -118,9 +118,7 @@ void run_case(thrust::device_vector<__nv_bfloat16> &d_lm_head,
 void run_sample_cases() {
   const size_t lm_head_elems =
       static_cast<size_t>(GEMMA4_VOCAB_SIZE) * GEMMA4_HIDDEN_SIZE;
-  const size_t scratch_bytes =
-      static_cast<size_t>(GEMMA4_VOCAB_SIZE / 8) *
-      (sizeof(Gemma4SampleCandidate) + sizeof(uint32_t));
+  const size_t scratch_bytes = gemma4_sample_next_scratch_bytes();
 
   thrust::device_vector<__nv_bfloat16> d_lm_head(lm_head_elems);
   thrust::device_vector<__nv_bfloat16> d_hidden(GEMMA4_HIDDEN_SIZE);

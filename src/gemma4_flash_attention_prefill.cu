@@ -41,7 +41,6 @@ struct Gemma4FlashFwdParams {
   int seqlen_q;
   int seqlen_k;
 
-  float scale_softmax;
   float scale_softmax_log2;
   int window_size;
 };
@@ -66,7 +65,7 @@ struct Gemma4FlashFwdKernelTraits {
   static constexpr bool kIsLocal = kIsLocal_;
   static constexpr int kKvHeads = kIsLocal ? GEMMA4_SLIDING_KV_HEADS : GEMMA4_GLOBAL_KV_HEADS;
 
-  // Global memory is loaded as 128-bit vectors. kBlockKSmem controls the
+  // Global memory is loaded as 128-bit vectors. kBlockKSmem controls the K tile width.
   using BlockKSmemInt = std::conditional_t<(kHeadDim % 64 == 0), Int<64>, Int<32>>;
   static constexpr int kBlockKSmem = BlockKSmemInt::value;
   static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -1142,8 +1141,7 @@ cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
   using PrepTraits = gemma4_flash_attention::Gemma4AttentionTraits<false>;
   using PrepDerived = gemma4_flash_attention::Gemma4AttentionDerived<PrepTraits>;
   constexpr int kHeadGroups =
-      (GEMMA4_NUM_QUERY_HEADS + PrepDerived::kHeadsPerBlock - 1) /
-      PrepDerived::kHeadsPerBlock;
+      div_up(GEMMA4_NUM_QUERY_HEADS, PrepDerived::kHeadsPerBlock);
   const dim3 prep_grid_dim(seqlen_q, kHeadGroups, batch_size);
   constexpr dim3 prep_block_dim(PrepDerived::kPrepThreads);
   gemma4_flash_attention::gemma4_qkv_norm_rope_kernel<PrepTraits>
@@ -1163,7 +1161,6 @@ cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
   params.o_ptr = reinterpret_cast<gemma4_flash_attention::Element *>(d_out);
   params.seqlen_q = seqlen_q;
   params.seqlen_k = seqlen_k;
-  params.scale_softmax = softmax_scale;
   params.scale_softmax_log2 = softmax_scale * float(M_LOG2E);
   params.window_size = window_size;
 
@@ -1217,8 +1214,7 @@ cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
   using PrepTraits = gemma4_flash_attention::Gemma4AttentionTraits<true>;
   using PrepDerived = gemma4_flash_attention::Gemma4AttentionDerived<PrepTraits>;
   constexpr int kHeadGroups =
-      (GEMMA4_NUM_QUERY_HEADS + PrepDerived::kHeadsPerBlock - 1) /
-      PrepDerived::kHeadsPerBlock;
+      div_up(GEMMA4_NUM_QUERY_HEADS, PrepDerived::kHeadsPerBlock);
   const dim3 prep_grid_dim(seqlen_q, kHeadGroups, batch_size);
   constexpr dim3 prep_block_dim(PrepDerived::kPrepThreads);
   gemma4_flash_attention::gemma4_qkv_norm_rope_kernel<PrepTraits>
@@ -1238,7 +1234,6 @@ cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
   params.o_ptr = reinterpret_cast<gemma4_flash_attention::Element *>(d_out);
   params.seqlen_q = seqlen_q;
   params.seqlen_k = seqlen_k;
-  params.scale_softmax = softmax_scale;
   params.scale_softmax_log2 = softmax_scale * float(M_LOG2E);
   params.window_size = 0;
 

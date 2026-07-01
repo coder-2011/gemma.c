@@ -1,5 +1,4 @@
 #include "gemma4_ffn.cuh"
-#include "gemma4_matmul_kernels.cuh"
 
 #include <cooperative_groups.h>
 #include <cutlass/array.h>
@@ -12,7 +11,23 @@
 
 #include "device/dual_gemm.h"
 
+namespace gemma4_matmul_kernel_impl {
+
+// Computes one fixed Gemma 4 FFN gate/up decode tile inside a caller kernel.
+extern "C" __device__ void gemma4_ffn_gate_up_tile_bf16_device(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_interleaved_row_major,
+    int col0,
+    int thread_idx,
+    float *__restrict__ warp_sums,
+    float *__restrict__ gate,
+    float *__restrict__ up);
+
+}  // namespace gemma4_matmul_kernel_impl
+
 namespace gemma4_ffn_decode_device {
+
+using FfnBf16Pack = Bf16Packed128;
 
 // Swizzles one row of hidden-width BF16 packs for decode-friendly layout.
 __device__ inline void swizzle_hidden_packs(

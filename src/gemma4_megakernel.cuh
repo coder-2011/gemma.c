@@ -1,7 +1,6 @@
 #pragma once
 
 #include "gemma4_checkpoint.cuh"
-#include "gemma4_flash_attention.cuh"
 #include "gemma4_runtime.cuh"
 #include "gemma4_sampling.cuh"
 

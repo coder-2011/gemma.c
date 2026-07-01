@@ -24,30 +24,6 @@ constexpr int kMaxRmsnormThreads = 512;
 constexpr int kMaxRmsnormWarpSums = 16;
 constexpr int kResidualAddThreads = 256;
 
-// Builds the row argument bundle used by host launchers and device entries.
-__host__ __device__ constexpr Gemma4RmsnormRowArgs gemma4_rmsnorm_make_args(
-    __nv_bfloat16 *out,
-    __nv_bfloat16 *residual_out,
-    const __nv_bfloat16 *input,
-    const __nv_bfloat16 *residual_in,
-    const __nv_bfloat16 *weight,
-    int rows,
-    int width,
-    float eps,
-    bool add_residual) {
-  Gemma4RmsnormRowArgs args = {};
-  args.out = out;
-  args.residual_out = residual_out;
-  args.input = input;
-  args.residual_in = residual_in;
-  args.weight = weight;
-  args.rows = rows;
-  args.width = width;
-  args.eps = eps;
-  args.add_residual = add_residual;
-  return args;
-}
-
 // Processes one row with caller-owned block threads and scratch, optionally adding a residual.
 __device__ void gemma4_rmsnorm_row_bf16(
     const Gemma4RmsnormRowArgs &args,
@@ -187,9 +163,8 @@ extern "C" __device__ void gemma4_rmsnorm_hidden_row_512_bf16_device(
     float *__restrict__ warp_sums,
     float *__restrict__ scale,
     int thread_idx) {
-  const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
-      out, nullptr, in, nullptr, weight, 1, GEMMA4_HIDDEN_SIZE, eps,
-      false);
+  const Gemma4RmsnormRowArgs args = {
+      out, nullptr, in, nullptr, weight, 1, GEMMA4_HIDDEN_SIZE, eps, false};
   gemma4_rmsnorm_row_bf16(
       args, 0, cached_row, warp_sums, *scale, thread_idx, kMaxRmsnormThreads);
 }
@@ -206,9 +181,8 @@ cudaError_t gemma4_rmsnorm_bf16(__nv_bfloat16 *out,
     return cudaErrorInvalidValue;
   }
 
-  const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
-      out, nullptr, inp, nullptr, weight, rows, width, eps,
-      false);
+  const Gemma4RmsnormRowArgs args = {
+      out, nullptr, inp, nullptr, weight, rows, width, eps, false};
   return gemma4_rmsnorm_launch_bf16(args, stream);
 }
 
@@ -244,8 +218,7 @@ cudaError_t gemma4_residual_add_rmsnorm_bf16(__nv_bfloat16 *residual,
     return cudaErrorInvalidValue;
   }
 
-  const Gemma4RmsnormRowArgs args = gemma4_rmsnorm_make_args(
-      normed, residual, inp1, inp2, weight, rows, width, eps,
-      true);
+  const Gemma4RmsnormRowArgs args = {
+      normed, residual, inp1, inp2, weight, rows, width, eps, true};
   return gemma4_rmsnorm_launch_bf16(args, stream);
 }

@@ -2,6 +2,7 @@
 
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_ffn.cuh"
+#include "gemma4_flash_attention.cuh"
 #include "gemma4_matmul_kernels.cuh"
 #include "gemma4_rmsnorm.cuh"
 
@@ -231,7 +232,7 @@ cudaError_t run_prefill_layer(
       scratch.hidden_work, rows * GEMMA4_HIDDEN_SIZE, stream));
 
   const int packs = rows * GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-  const dim3 grid_dim((packs + kScaleThreads - 1) / kScaleThreads);
+  const dim3 grid_dim(div_up(packs, kScaleThreads));
   const dim3 block_dim(kScaleThreads);
   scale_hidden_bf16_kernel<<<grid_dim, block_dim, 0, stream>>>(
       out, scratch.hidden_delta, weights.layer_scalar, packs);

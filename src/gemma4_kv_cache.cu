@@ -6,7 +6,6 @@
 namespace {
 
 constexpr int kKvWriteVecThreads = 32;
-constexpr int kKvWritePackElements = kBf16Packed128Elements;
 
 // Copies the K/V packs assigned to one token/head for the kernel wrapper.
 __device__ inline void kv_cache_write_vec_device(
@@ -44,8 +43,8 @@ __device__ inline void kv_cache_write_vec_device(
        config.num_heads + head) * vecs_per_head;
 
   for (int i = vec; i < vecs_per_head; i += vec_stride) {
-    const int64_t src = (src_base + i) * kKvWritePackElements;
-    const int64_t dst = (dst_base + i) * kKvWritePackElements;
+    const int64_t src = (src_base + i) * kBf16Packed128Elements;
+    const int64_t dst = (dst_base + i) * kBf16Packed128Elements;
     const Bf16Packed128 k_pack =
         Bf16Packed128{*reinterpret_cast<const int4 *>(k + src)};
     const Bf16Packed128 v_pack =
@@ -138,9 +137,10 @@ int32_t gemma4_kv_cache_ensure_range(
   const int32_t last_page = last_position / config.page_size;
   for (int32_t page = first_page; page <= last_page; ++page) {
     const int32_t position = page * config.page_size;
-    const int32_t ensured_page = gemma4_kv_cache_ensure_page(
-        page_table, slot_logical_pages, config, batch, position);
-    if (ensured_page < 0) return -1;
+    if (gemma4_kv_cache_ensure_page(page_table, slot_logical_pages, config,
+                                    batch, position) < 0) {
+      return -1;
+    }
   }
   return 0;
 }

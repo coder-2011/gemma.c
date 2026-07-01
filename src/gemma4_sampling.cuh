@@ -5,12 +5,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Carries one token candidate and its score through block-level reductions.
-struct alignas(8) Gemma4SampleCandidate {
-  float logit;
-  int32_t token_id;
-};
-
 enum class Gemma4SamplingStage {
   kPrefill,
   kDecode,

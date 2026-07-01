@@ -1,5 +1,7 @@
 #include "gemma4_megakernel.cuh"
 
+#include <cuda_runtime.h>
+
 #include <stdio.h>
 
 // Prints one failed condition and gives the tiny API sentinel a single exit path.

@@ -63,8 +63,6 @@ constexpr int kHiddenPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 static_assert(kHiddenPacks == GEMMA4_FFN_DECODE_HIDDEN_PACKS,
               "FFN scratch hidden-pack shape must match bf16 pack width");
 
-using FfnBf16Pack = Bf16Packed128;
-
 // Maps natural hidden packs into the swizzled decode weight layout.
 __host__ __device__ inline int hidden_pack_swizzle_index(int chunk) {
   constexpr int kSwizzleChunks = 8;
