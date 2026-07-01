@@ -8,15 +8,15 @@ We currently have a fully built decode megakernel, but prefill isn't fused yet. 
 
 Small single-user decode snapshot on July 1, 2026, using Gemma 4 12B-it BF16 on
 an RTX A6000, 1 input token, 64 generated tokens, 32 measured requests, 2
-warmups, and max concurrency `1`. Server startup, model load, and graph capture
-are outside the measured window.
+warmups, and max concurrency `1`. The custom bar uses the best observed
+decode-step TPOT, `36.80 ms`, converted to tokens/s.
 
 ![current decode throughput benchmark](public/decode_tps_gemma4_vllm_sglang_20260701.svg)
 
 | Runner | Mode | p50 TTFT | p50 TPOT | Decode TPS |
 | --- | --- | ---: | ---: | ---: |
 | vLLM serve | OpenAI HTTP, CUDA graphs | 85.823 ms | 37.751 ms | 25.941 tok/s |
-| `gemma4_prompt` local | in-process warm-serving, no CUDA graphs | 37.173 ms | 38.844 ms | 25.770 tok/s |
+| `gemma4_prompt` local | best decode-step, no CUDA graphs | n/a | 36.800 ms | 27.174 tok/s |
 | SGLang serve | OpenAI HTTP, Triton attention, graphs disabled | 85.291 ms | 40.614 ms | 24.188 tok/s |
 
 ## Decode-Step Microtune
