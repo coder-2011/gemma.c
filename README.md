@@ -2,9 +2,7 @@
 
 `gemma.c` is an experimental inference runtime for Gemma dense models, with an initial focus on running the Gemma 4 12B Unified text path efficiently on NVIDIA RTX A6000 GPUs.
 
-The long-term goal is a highly optimized mega-kernel inference path, w/ minimal imports.
-
-The current work is to implement kernels individually, assemble a correct unfused path, benchmark it, and then fuse measured hot paths together incrementally.
+We currently have a fully built decode megakernel, but prefill isn't fused yet. For now, my goal is to get decode to ~15-20% above SGL and vLLM. We are currently hovering around <5%
 
 ## Current Decode Snapshot
 
