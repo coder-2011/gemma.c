@@ -17417,3 +17417,180 @@ Conclusion:
   benchmark; `32` tied it, and `16` was slightly slower.
 - Next useful work should focus on reducing bytes moved or avoiding full
   weight streams, not on additional local arithmetic/scheduling tweaks.
+
+## 2026-07-01 - Small Serving Decode Comparison vs vLLM and SGLang
+
+Question:
+
+- After the decode megakernel work, what does a small same-shape serving
+  comparison show for the custom path, vLLM, and SGLang?
+- Can the newer local SGLang environment run this Gemma 4 Unified checkpoint?
+
+Build and validation:
+
+```bash
+make -j$(nproc) build/gemma4_prompt test-flash-attention \
+  test-decode-megakernel test-prefill-megakernel
+```
+
+Result:
+
+```text
+test_decode_megakernel passed
+test_prefill_megakernel passed
+flash attention tests passed
+```
+
+Build note:
+
+- The flash-attention source is split by owner. The prompt/decode tests link
+  the decode-layer launcher, while the standalone flash-attention test links
+  only the prefill helpers it exercises.
+
+Environment:
+
+```text
+GPU: NVIDIA RTX A6000
+Driver: 580.159.03
+CUDA/NVCC: CUDA 13.0 / V13.0.88
+Clock policy: unlocked
+vLLM: 0.23.0 in /tmp/vllm-bench-venv
+SGLang: 0.5.14 in /tmp/sglang-bench-venv
+Transformers in serving venvs: 5.12.1
+```
+
+Custom decode-step probes:
+
+```bash
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+  --max-new 4 --benchmark-mode decode-step --bench-warmup 3 \
+  --bench-iters 5 --bench-samples 3
+```
+
+```text
+prompt_len=1 split=20
+decode_step_ms p50 = 38.017
+decode_step_tps_p50 = 26.304
+```
+
+```bash
+env LONG_PROMPT="$(python3 -c 'print("Hello " * 512)')" bash -c \
+  './build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt "$LONG_PROMPT" \
+  --max-new 4 --benchmark-mode decode-step --bench-warmup 1 \
+  --bench-iters 3 --bench-samples 2'
+```
+
+```text
+prompt_len=513 split=20
+decode_step_ms p50 = 40.538
+decode_step_tps_p50 = 24.668
+```
+
+```bash
+env LONG_PROMPT="$(python3 -c 'print("Hello " * 512)')" bash -c \
+  './build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt "$LONG_PROMPT" \
+  --max-new 4 --benchmark-mode decode-step --bench-warmup 1 \
+  --bench-iters 3 --bench-samples 2 --decode-split-size 32'
+```
+
+```text
+prompt_len=513 split=32
+decode_step_ms p50 = 41.090
+decode_step_tps_p50 = 24.337
+```
+
+SGLang setup:
+
+- `sglang==0.5.14` now recognizes Gemma 4 Unified and rejects the old
+  `torch_native` attention backend with:
+  `Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend`.
+- Retried with `--attention-backend triton` and graph backends disabled.
+- `--context-length 128` failed during SGLang's own warmup because the warmup
+  request was 275 tokens. `--context-length 512` started successfully.
+- A one-request `/v1/completions` smoke test returned 8 generated tokens, so
+  SGLang is no longer marked unsupported for this checkpoint/version.
+
+Serving comparison contract:
+
+- Shape: 1 input token, 64 generated tokens, 32 measured requests, max
+  concurrency 1, 2 warmup requests.
+- Sampling: `temperature=0.0`, `top_p=1.0`, `ignore_eos`.
+- vLLM and SGLang were measured through OpenAI-compatible HTTP using
+  `vllm bench serve`.
+- The local runner was measured in-process with
+  `gemma4_prompt --benchmark-mode warm-serving`.
+- Server startup, model load, torch.compile, CUDA graph capture, and benchmark
+  warmups are excluded from the throughput rows.
+
+Custom command:
+
+```bash
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+  --max-new 64 --benchmark-mode warm-serving --bench-warmup 2 \
+  --bench-iters 32 --bench-samples 1
+```
+
+SGLang server command:
+
+```bash
+PATH=/tmp/sglang-bench-venv/bin:$PATH /tmp/sglang-bench-venv/bin/python \
+  -m sglang.launch_server --model-path models/gemma-4-12B-it \
+  --host 127.0.0.1 --port 30000 --served-model-name gemma4-local \
+  --dtype bfloat16 --context-length 512 --mem-fraction-static 0.80 \
+  --max-running-requests 1 --max-total-tokens 4096 --trust-remote-code \
+  --attention-backend triton --cuda-graph-backend-decode disabled \
+  --cuda-graph-backend-prefill disabled --log-level info
+```
+
+vLLM server command:
+
+```bash
+PATH=/tmp/vllm-bench-venv/bin:$PATH /tmp/vllm-bench-venv/bin/vllm serve \
+  models/gemma-4-12B-it --host 127.0.0.1 --port 8000 \
+  --served-model-name gemma4-local --dtype bfloat16 --max-model-len 512 \
+  --gpu-memory-utilization 0.90 --tensor-parallel-size 1 --max-num-seqs 1 \
+  --max-num-batched-tokens 4096 --no-enable-log-requests \
+  --trust-remote-code
+```
+
+Shared `vllm bench serve` client shape:
+
+```bash
+vllm bench serve --backend openai --endpoint /v1/completions \
+  --model gemma4-local --tokenizer models/gemma-4-12B-it \
+  --trust-remote-code --dataset-name random --random-input-len 1 \
+  --random-output-len 64 --num-warmups 2 --num-prompts 32 \
+  --request-rate inf --max-concurrency 1 --ignore-eos \
+  --temperature 0.0 --top-p 1.0 \
+  --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,90,95,99 \
+  --save-result --result-dir build/bench_results --disable-tqdm
+```
+
+Results:
+
+```text
+Runner                output tok/s   p50 TPOT    p50 TTFT
+vLLM serve                 25.941    37.751 ms   85.823 ms
+gemma4_prompt local        25.770    38.844 ms   37.173 ms
+SGLang serve               24.188    40.614 ms   85.291 ms
+```
+
+Artifacts:
+
+- `build/bench_results/vllm_gemma4_12b_it_online_random_1in_64out_32_20260701.json`
+- `build/bench_results/sglang_gemma4_12b_it_online_random_1in_64out_32_20260701.json`
+- `build/bench_results/gemma4_vllm_sglang_decode_tps_20260701.json`
+
+Conclusion:
+
+- On this small single-user decode-serving shape, the custom path is now close
+  to vLLM: `25.770 tok/s` vs vLLM `25.941 tok/s`.
+- vLLM still has the best decode throughput and p50 TPOT in this run, while the
+  local runner keeps a much lower p50 TTFT because it is in-process and avoids
+  HTTP serving overhead.
+- SGLang `0.5.14` can run the checkpoint with Triton attention, but in this
+  graph-disabled smoke benchmark it trails vLLM/custom at `24.188 tok/s`.
