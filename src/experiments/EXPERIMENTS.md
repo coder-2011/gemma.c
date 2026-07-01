@@ -17747,3 +17747,35 @@ Branch `exp/gemv-barrier-reduction`, folder `src/experiments/gemv_barrier_reduct
   already overlapped with the DRAM weight stream; synchronization is not the
   binding constraint. Next levers: register diet to reach 2 CTAs/SM (32 warps),
   then quantized weights. Flag stays default-off.
+
+## 2026-07-01 - Norm-fold stack: -1.1% decode on the 3090, token-exact (branch exp/gemv-barrier-reduction)
+
+Full designs/results in `src/experiments/gemv_barrier_reduction/`. Three
+stacked, flag-gated decode changes (sm_86 target, all default 0):
+
+1. `GEMMA4_FFN_FOLDED_PRE_NORM`: dot(w, s*(gamma .* y)) = s*dot(w, gamma .* y).
+   CTA0 stages gamma_pre*y and the s2 scale in its existing post-attention
+   residual pass; FFN gate/up stream unchanged, s2 applied post-reduction.
+   Deletes the CTA0 pre-FFN norm phase + one grid.sync/layer. -0.25%.
+2. `GEMMA4_FOLDED_INPUT_NORM`: layer i's FFN tail stages gamma_next*residual;
+   layer i+1 skips its input-norm phase + grid.sync. No row scale needed at
+   all because Q/K learned RMSNorms and the scale-free V norm are invariant to
+   a uniform input scale. Layer 0 falls back. Additional ~-0.45%.
+3. `GEMMA4_TRIM_REDUNDANT_SYNC`: the FFN entry sync already publishes the
+   post-attention epilogue writes; drop the back-to-back trailing grid.sync.
+   Additional ~-0.4%.
+
+Final interleaved A/B (2 reps, 30 measured steps each, greedy tokens
+identical):
+
+| seq | baseline p50 | folded p50 | delta |
+| ---: | ---: | ---: | ---: |
+| 121 | 33.552 ms | 33.162 ms | -1.16% |
+| 1001 | 37.537 ms | 37.099 ms | -1.17% |
+| 4001 | 40.356 ms | 39.932 ms | -1.05% |
+
+Measured negatives kept for the record: runtime gamma multiply inside the
+gate/up dot (+1.2%, deepens the per-pack dependency chain - always
+pre-stage per-row products, never touch the hot loop); distributed
+post-attention norm with per-CTA partial slots (+0.5% vs CTA0 staging - the
+serial CTA0 pass was already overlapped).
