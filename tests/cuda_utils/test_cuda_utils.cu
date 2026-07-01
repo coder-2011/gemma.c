@@ -9,15 +9,14 @@
 
 namespace {
 
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
-    std::exit(1);
-  }
-}
-
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+#define CHECK_CUDA(expr)                                                        \
+  do {                                                                          \
+    if (const cudaError_t status = (expr); status != cudaSuccess) {              \
+      std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", __FILE__,          \
+                   __LINE__, #expr, cudaGetErrorString(status));                \
+      std::exit(1);                                                             \
+    }                                                                           \
+  } while (0)
 
 __global__ void warp_reduce_sum_real_kernel(const float *inp, float *out,
                                             int warps_per_block) {

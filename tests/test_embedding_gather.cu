@@ -11,15 +11,14 @@
 
 namespace {
 
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
-    std::exit(1);
-  }
-}
-
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+#define CHECK_CUDA(expr)                                                        \
+  do {                                                                          \
+    if (const cudaError_t status = (expr); status != cudaSuccess) {              \
+      std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", __FILE__,          \
+                   __LINE__, #expr, cudaGetErrorString(status));                \
+      std::exit(1);                                                             \
+    }                                                                           \
+  } while (0)
 
 __nv_bfloat16 make_value(int token, int channel) {
   float value = static_cast<float>((token * 131 + channel * 17) % 4096) / 16.0f;
@@ -66,7 +65,6 @@ void run_case(int vocab_size, const std::vector<int32_t> &token_ids) {
                         cudaMemcpyDeviceToHost));
 
   const uint16_t *out_bits = reinterpret_cast<const uint16_t *>(out.data());
-  const uint16_t *embedding_bits = reinterpret_cast<const uint16_t *>(embeddings.data());
   for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
     int32_t token_id = token_ids[token_idx];
     for (int c = 0; c < hidden_size; ++c) {

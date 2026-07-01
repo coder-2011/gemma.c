@@ -5,20 +5,19 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 #include <vector>
 
 namespace {
 
-// Fails the test immediately when a CUDA API call returns an error.
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
-    std::exit(1);
-  }
-}
-
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+#define CHECK_CUDA(expr)                                                        \
+  do {                                                                          \
+    if (const cudaError_t status = (expr); status != cudaSuccess) {              \
+      std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", __FILE__,          \
+                   __LINE__, #expr, cudaGetErrorString(status));                \
+      std::exit(1);                                                             \
+    }                                                                           \
+  } while (0)
 
 // Copies device int metadata into a host vector.
 void copy_i32(std::vector<int32_t> &dst, const int32_t *src) {
@@ -30,7 +29,8 @@ void copy_i32(std::vector<int32_t> &dst, const int32_t *src) {
 void run_prefill_decode_metadata_case() {
   Gemma4RuntimeState state = {};
   CHECK_CUDA(gemma4_runtime_state_init(&state, 2, 66, 64, 0));
-  CHECK_CUDA(gemma4_runtime_prepare_prefill(&state, 65, 0));
+
+  CHECK_CUDA(gemma4_runtime_prepare_prefill(&state, 64, 0));
   CHECK_CUDA(cudaDeviceSynchronize());
 
   std::vector<int32_t> seq_lengths(2);
@@ -40,19 +40,21 @@ void run_prefill_decode_metadata_case() {
   copy_i32(token_batch, state.token_batch);
   copy_i32(token_position, state.token_position);
 
-  if (seq_lengths[0] != 65 || seq_lengths[1] != 65) {
+  if (seq_lengths[0] != 64 || seq_lengths[1] != 64) {
     std::fprintf(stderr, "prefill sequence lengths were not uploaded\n");
     std::exit(1);
   }
-  if (token_batch[64] != 0 || token_position[64] != 64 ||
-      token_batch[65] != 1 || token_position[65] != 0) {
+  if (token_batch[63] != 0 || token_position[63] != 63 ||
+      token_batch[64] != 1 || token_position[64] != 0) {
     std::fprintf(stderr, "prefill token rows are not batch-major\n");
     std::exit(1);
   }
+  const int32_t sliding_stride = state.sliding_cache_config.max_pages_per_seq;
+  const int32_t global_stride = state.global_cache_config.max_pages_per_seq;
   if (state.h_sliding_page_table[0] < 0 ||
-      state.h_sliding_page_table[1] < 0 ||
+      state.h_sliding_page_table[sliding_stride] < 0 ||
       state.h_global_page_table[0] < 0 ||
-      state.h_global_page_table[1] < 0) {
+      state.h_global_page_table[global_stride] < 0) {
     std::fprintf(stderr, "prefill did not allocate expected cache pages\n");
     std::exit(1);
   }
@@ -62,13 +64,18 @@ void run_prefill_decode_metadata_case() {
   seq_lengths.assign(2, 0);
   token_batch.assign(state.token_count, 0);
   token_position.assign(state.token_count, 0);
+  std::vector<int32_t> sliding_pages(state.h_sliding_page_table.size());
+  std::vector<int32_t> global_pages(state.h_global_page_table.size());
   copy_i32(seq_lengths, state.seq_lengths);
   copy_i32(token_batch, state.token_batch);
   copy_i32(token_position, state.token_position);
+  copy_i32(sliding_pages, state.sliding_page_table);
+  copy_i32(global_pages, state.global_page_table);
 
-  if (seq_lengths[0] != 66 || seq_lengths[1] != 66 ||
+  if (seq_lengths[0] != 65 || seq_lengths[1] != 65 ||
       token_batch[0] != 0 || token_batch[1] != 1 ||
-      token_position[0] != 65 || token_position[1] != 65) {
+      token_position[0] != 64 || token_position[1] != 64 ||
+      sliding_pages[1] != 1 || global_pages[1] != 1) {
     std::fprintf(stderr, "decode append metadata mismatch\n");
     std::exit(1);
   }

@@ -8,10 +8,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cute/layout.hpp>
+#include <cute/swizzle.hpp>
+
 #include <string>
 #include <vector>
 
 namespace {
+
+constexpr int kBf16PackWidth = 8;
 
 struct MappedFile {
   void *mapping = nullptr;
@@ -27,14 +32,24 @@ struct MappedFile {
 void pack_down_decode(std::vector<__nv_bfloat16> &dst, const __nv_bfloat16 *down) {
   dst.resize(static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) * GEMMA4_HIDDEN_SIZE);
 
+  const auto src_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE),
+      cute::make_stride(GEMMA4_INTERMEDIATE_SIZE, 1));
+  const auto dst_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const auto hidden_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_HIDDEN_SIZE / kBf16PackWidth, kBf16PackWidth),
+      cute::make_stride(kBf16PackWidth, 1));
+  const cute::Swizzle<3, 0, 3> pack_swizzle;
+
   for (int hidden = 0; hidden < GEMMA4_HIDDEN_SIZE; ++hidden) {
-    const int pack = hidden / 8;
-    const int lane = hidden & 7;
-    const int swizzled_pack = (pack & ~7) | ((pack & 7) ^ ((pack >> 3) & 7));
-    const int dst_col = swizzled_pack * 8 + lane;
-    const __nv_bfloat16 *src = down + static_cast<size_t>(hidden) * GEMMA4_INTERMEDIATE_SIZE;
+    const int pack = hidden / kBf16PackWidth;
+    const int lane = hidden % kBf16PackWidth;
+    const int swizzled_pack = pack_swizzle(pack);
+    const int dst_col = hidden_layout(swizzled_pack, lane);
     for (int row = 0; row < GEMMA4_INTERMEDIATE_SIZE; ++row) {
-      dst[static_cast<size_t>(row) * GEMMA4_HIDDEN_SIZE + dst_col] = src[row];
+      dst[dst_layout(row, dst_col)] = down[src_layout(hidden, row)];
     }
   }
 }
@@ -44,25 +59,36 @@ cudaError_t load_layer_ffn_decode(
     Gemma4TextLayerWeightsDevice &dst, const Gemma4CheckpointLayerHost &src,
     std::vector<__nv_bfloat16> &gate_up_stage,
     std::vector<__nv_bfloat16> &down_stage) {
-  constexpr int hidden_packs = GEMMA4_HIDDEN_SIZE / 8;
+  constexpr int hidden_packs = GEMMA4_HIDDEN_SIZE / kBf16PackWidth;
   gate_up_stage.resize(static_cast<size_t>(GEMMA4_PACKED_FFN_SIZE) * GEMMA4_HIDDEN_SIZE);
+  const auto ffn_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_INTERMEDIATE_SIZE, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const auto stage_layout = cute::make_layout(
+      cute::make_shape(GEMMA4_PACKED_FFN_SIZE, GEMMA4_HIDDEN_SIZE),
+      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
+  const auto hidden_layout = cute::make_layout(
+      cute::make_shape(hidden_packs, kBf16PackWidth),
+      cute::make_stride(kBf16PackWidth, 1));
+  const cute::Swizzle<3, 0, 3> pack_swizzle;
 
   for (int row = 0; row < GEMMA4_INTERMEDIATE_SIZE; ++row) {
-    __nv_bfloat16 *gate_dst = gate_up_stage.data() + static_cast<size_t>(2 * row) * GEMMA4_HIDDEN_SIZE;
-    __nv_bfloat16 *up_dst = gate_dst + GEMMA4_HIDDEN_SIZE;
-    const __nv_bfloat16 *gate_src = src.gate_proj_col_major + static_cast<size_t>(row) * GEMMA4_HIDDEN_SIZE;
-    const __nv_bfloat16 *up_src = src.up_proj_col_major + static_cast<size_t>(row) * GEMMA4_HIDDEN_SIZE;
+    __nv_bfloat16 *gate_dst = gate_up_stage.data() + stage_layout(2 * row, 0);
+    __nv_bfloat16 *up_dst = gate_up_stage.data() + stage_layout(2 * row + 1, 0);
+    const __nv_bfloat16 *gate_src = src.gate_proj_col_major + ffn_layout(row, 0);
+    const __nv_bfloat16 *up_src = src.up_proj_col_major + ffn_layout(row, 0);
 
     for (int pack = 0; pack < hidden_packs; ++pack) {
-      const int src_col = pack * 8;
-      const int swizzled_pack = (pack & ~7) | ((pack & 7) ^ ((pack >> 3) & 7));
-      const int dst_col = swizzled_pack * 8;
-      memcpy(gate_dst + dst_col, gate_src + src_col, 8 * sizeof(__nv_bfloat16));
-      memcpy(up_dst + dst_col, up_src + src_col, 8 * sizeof(__nv_bfloat16));
+      const int swizzled_pack = pack_swizzle(pack);
+      const int src_col = hidden_layout(pack, 0);
+      const int dst_col = hidden_layout(swizzled_pack, 0);
+      memcpy(gate_dst + dst_col, gate_src + src_col,
+             kBf16PackWidth * sizeof(__nv_bfloat16));
+      memcpy(up_dst + dst_col, up_src + src_col,
+             kBf16PackWidth * sizeof(__nv_bfloat16));
     }
   }
 
-  dst.ffn_gate_up_decode = nullptr;
   size_t bytes = gate_up_stage.size() * sizeof(__nv_bfloat16);
   cudaError_t status = cudaMalloc(&dst.ffn_gate_up_decode, bytes);
   if (status != cudaSuccess) return status;
@@ -74,7 +100,6 @@ cudaError_t load_layer_ffn_decode(
   }
 
   pack_down_decode(down_stage, src.down_proj_checkpoint);
-  dst.ffn_down_decode = nullptr;
   bytes = down_stage.size() * sizeof(__nv_bfloat16);
   status = cudaMalloc(&dst.ffn_down_decode, bytes);
   if (status == cudaSuccess) {
@@ -87,6 +112,49 @@ cudaError_t load_layer_ffn_decode(
     dst.ffn_gate_up_decode = nullptr;
   }
   return status;
+}
+
+// Packs Q/K/(V) projection matrices into the contiguous decode layout.
+cudaError_t load_layer_qkv_decode(
+    Gemma4TextLayerWeightsDevice &dst,
+    const Gemma4CheckpointLayerHost &src,
+    const Gemma4AttentionSpec &spec,
+    std::vector<__nv_bfloat16> &qkv_stage) {
+  const int q_width = spec.q_heads * spec.head_dim;
+  const int kv_width = spec.kv_heads * spec.head_dim;
+  const int v_width = spec.global ? 0 : kv_width;
+  const size_t q_elements = static_cast<size_t>(q_width) * GEMMA4_HIDDEN_SIZE;
+  const size_t kv_elements = static_cast<size_t>(kv_width) * GEMMA4_HIDDEN_SIZE;
+  const size_t v_elements = static_cast<size_t>(v_width) * GEMMA4_HIDDEN_SIZE;
+  qkv_stage.resize(q_elements + kv_elements + v_elements);
+
+  __nv_bfloat16 *q_dst = qkv_stage.data();
+  __nv_bfloat16 *k_dst = q_dst + q_elements;
+  memcpy(q_dst, src.q_proj_col_major, q_elements * sizeof(__nv_bfloat16));
+  memcpy(k_dst, src.k_proj_col_major, kv_elements * sizeof(__nv_bfloat16));
+
+  // Global layers have K=V semantics, so only sliding layers carry a V projection.
+  if (v_elements != 0) {
+    __nv_bfloat16 *v_dst = k_dst + kv_elements;
+    memcpy(v_dst, src.v_proj_col_major, v_elements * sizeof(__nv_bfloat16));
+  }
+
+  const size_t bytes = qkv_stage.size() * sizeof(__nv_bfloat16);
+  cudaError_t status = cudaMalloc(&dst.qkv_proj_col_major, bytes);
+  if (status == cudaSuccess) {
+    status = cudaMemcpy(dst.qkv_proj_col_major, qkv_stage.data(), bytes, cudaMemcpyHostToDevice);
+  }
+  if (status != cudaSuccess) {
+    cudaFree(dst.qkv_proj_col_major);
+    dst.qkv_proj_col_major = nullptr;
+    return status;
+  }
+
+  dst.q_proj_col_major = dst.qkv_proj_col_major;
+  dst.k_proj_col_major = dst.qkv_proj_col_major + q_elements;
+  dst.v_proj_col_major =
+      spec.global ? nullptr : dst.qkv_proj_col_major + q_elements + kv_elements;
+  return cudaSuccess;
 }
 
 }  // namespace
@@ -126,7 +194,6 @@ bool gemma4_checkpoint_open_text_bf16(
   }
   const size_t data_start = 8 + static_cast<size_t>(header_bytes);
 
-
   const std::string header(bytes + 8, bytes + 8 + header_bytes);
   const char *data_base = bytes + data_start;
   const size_t data_bytes = file.bytes - data_start;
@@ -135,7 +202,6 @@ bool gemma4_checkpoint_open_text_bf16(
     std::string name;
     size_t elements = 0;
     const __nv_bfloat16 **out = nullptr;
-    bool required = true;
   };
   std::vector<TensorRequest> requests;
   requests.reserve(2 + GEMMA4_NUM_LAYERS * 14);
@@ -145,8 +211,8 @@ bool gemma4_checkpoint_open_text_bf16(
   for (int layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
     Gemma4CheckpointLayerHost &dst = checkpoint->layers[layer];
     const Gemma4AttentionSpec spec = gemma4_attention_spec(layer);
-    const int64_t q_size = int64_t(spec.q_heads) * spec.head_dim;
-    const int64_t kv_size = int64_t(spec.kv_heads) * spec.head_dim;
+    const size_t q_size = static_cast<size_t>(spec.q_heads) * spec.head_dim;
+    const size_t kv_size = static_cast<size_t>(spec.kv_heads) * spec.head_dim;
     const std::string prefix = "model.language_model.layers." + std::to_string(layer) + ".";
     requests.insert(requests.end(), {
         {prefix + "input_layernorm.weight", GEMMA4_HIDDEN_SIZE, &dst.input_norm_weight},
@@ -156,21 +222,25 @@ bool gemma4_checkpoint_open_text_bf16(
         {prefix + "layer_scalar", 1, &dst.layer_scalar},
         {prefix + "self_attn.q_norm.weight", static_cast<size_t>(spec.head_dim), &dst.q_norm_weight},
         {prefix + "self_attn.k_norm.weight", static_cast<size_t>(spec.head_dim), &dst.k_norm_weight},
-        {prefix + "self_attn.q_proj.weight", static_cast<size_t>(q_size) * GEMMA4_HIDDEN_SIZE, &dst.q_proj_col_major},
-        {prefix + "self_attn.k_proj.weight", static_cast<size_t>(kv_size) * GEMMA4_HIDDEN_SIZE, &dst.k_proj_col_major},
-        {prefix + "self_attn.v_proj.weight", static_cast<size_t>(spec.global ? 0 : kv_size) * GEMMA4_HIDDEN_SIZE, &dst.v_proj_col_major, !spec.global},
+        {prefix + "self_attn.q_proj.weight", q_size * GEMMA4_HIDDEN_SIZE, &dst.q_proj_col_major},
+        {prefix + "self_attn.k_proj.weight", kv_size * GEMMA4_HIDDEN_SIZE, &dst.k_proj_col_major},
         {prefix + "self_attn.o_proj.weight", GEMMA4_HIDDEN_SIZE * static_cast<size_t>(q_size), &dst.o_proj_col_major},
         {prefix + "mlp.gate_proj.weight", static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) * GEMMA4_HIDDEN_SIZE, &dst.gate_proj_col_major},
         {prefix + "mlp.up_proj.weight", static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) * GEMMA4_HIDDEN_SIZE, &dst.up_proj_col_major},
         {prefix + "mlp.down_proj.weight", static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * GEMMA4_INTERMEDIATE_SIZE, &dst.down_proj_checkpoint},
     });
+    if (!spec.global) {
+      requests.push_back({
+          prefix + "self_attn.v_proj.weight",
+          kv_size * GEMMA4_HIDDEN_SIZE,
+          &dst.v_proj_col_major,
+      });
+    }
   }
 
   constexpr char kOffsets[] = "\"data_offsets\":[";
 
   for (const TensorRequest &request : requests) {
-    if (!request.required) continue;
-
     const std::string key = "\"" + request.name + "\":";
     const size_t object = header.find(key);
     if (object == std::string::npos) {
@@ -221,58 +291,48 @@ cudaError_t gemma4_load_text_weights_device_bf16(
     return cudaErrorInvalidValue;
   }
 
-  struct DeviceCopy {
-    __nv_bfloat16 **dst = nullptr;
-    const __nv_bfloat16 *src = nullptr;
-    size_t elements = 0;
-  };
-  cudaError_t status = cudaSuccess;
-  for (const DeviceCopy &copy : {
-      DeviceCopy{&weights->token_embedding, checkpoint.token_embedding,
-                 static_cast<size_t>(GEMMA4_VOCAB_SIZE) * GEMMA4_HIDDEN_SIZE},
-      DeviceCopy{&weights->final_norm_weight, checkpoint.final_norm_weight,
-                 GEMMA4_HIDDEN_SIZE},
-  }) {
-    if (copy.src == nullptr) continue;
-
-    *copy.dst = nullptr;
-    const size_t bytes = copy.elements * sizeof(__nv_bfloat16);
-    status = cudaMalloc(copy.dst, bytes);
-    if (status != cudaSuccess) break;
-    status = cudaMemcpy(*copy.dst, copy.src, bytes, cudaMemcpyHostToDevice);
-    if (status != cudaSuccess) {
-      cudaFree(*copy.dst);
-      *copy.dst = nullptr;
-      break;
-    }
+  size_t bytes = static_cast<size_t>(GEMMA4_VOCAB_SIZE) * GEMMA4_HIDDEN_SIZE *
+                 sizeof(__nv_bfloat16);
+  cudaError_t status = cudaMalloc(&weights->token_embedding, bytes);
+  if (status == cudaSuccess) {
+    status = cudaMemcpy(weights->token_embedding, checkpoint.token_embedding, bytes,
+                        cudaMemcpyHostToDevice);
   }
+  if (status == cudaSuccess) {
+    bytes = GEMMA4_HIDDEN_SIZE * sizeof(__nv_bfloat16);
+    status = cudaMalloc(&weights->final_norm_weight, bytes);
+  }
+  if (status == cudaSuccess) {
+    status = cudaMemcpy(weights->final_norm_weight, checkpoint.final_norm_weight, bytes,
+                        cudaMemcpyHostToDevice);
+  }
+
   std::vector<__nv_bfloat16> gate_up_stage;
   std::vector<__nv_bfloat16> down_stage;
+  std::vector<__nv_bfloat16> qkv_stage;
   for (int layer = 0; status == cudaSuccess && layer < GEMMA4_NUM_LAYERS; ++layer) {
     Gemma4TextLayerWeightsDevice &dst = weights->layers[layer];
     const Gemma4CheckpointLayerHost &src = checkpoint.layers[layer];
     const Gemma4AttentionSpec spec = gemma4_attention_spec(layer);
-    const int64_t q_size = int64_t(spec.q_heads) * spec.head_dim;
-    const int64_t kv_size = int64_t(spec.kv_heads) * spec.head_dim;
+    const size_t q_size = static_cast<size_t>(spec.q_heads) * spec.head_dim;
 
-    for (const DeviceCopy &copy : {
-        DeviceCopy{&dst.input_norm_weight, src.input_norm_weight, GEMMA4_HIDDEN_SIZE},
-        DeviceCopy{&dst.post_attention_norm_weight, src.post_attention_norm_weight, GEMMA4_HIDDEN_SIZE},
-        DeviceCopy{&dst.pre_feedforward_norm_weight, src.pre_feedforward_norm_weight, GEMMA4_HIDDEN_SIZE},
-        DeviceCopy{&dst.post_feedforward_norm_weight, src.post_feedforward_norm_weight, GEMMA4_HIDDEN_SIZE},
-        DeviceCopy{&dst.layer_scalar, src.layer_scalar, 1},
-        DeviceCopy{&dst.q_norm_weight, src.q_norm_weight, static_cast<size_t>(spec.head_dim)},
-        DeviceCopy{&dst.k_norm_weight, src.k_norm_weight, static_cast<size_t>(spec.head_dim)},
-        DeviceCopy{&dst.q_proj_col_major, src.q_proj_col_major, static_cast<size_t>(q_size) * GEMMA4_HIDDEN_SIZE},
-        DeviceCopy{&dst.k_proj_col_major, src.k_proj_col_major, static_cast<size_t>(kv_size) * GEMMA4_HIDDEN_SIZE},
-        DeviceCopy{&dst.v_proj_col_major, src.v_proj_col_major,
-                   static_cast<size_t>(spec.global ? 0 : kv_size) * GEMMA4_HIDDEN_SIZE},
-        DeviceCopy{&dst.o_proj_col_major, src.o_proj_col_major, GEMMA4_HIDDEN_SIZE * static_cast<size_t>(q_size)},
-    }) {
-      if (copy.src == nullptr) continue;
-
-      *copy.dst = nullptr;
-      const size_t bytes = copy.elements * sizeof(__nv_bfloat16);
+    struct DeviceCopy {
+      __nv_bfloat16 **dst;
+      const __nv_bfloat16 *src;
+      size_t elements;
+    };
+    const DeviceCopy layer_copies[] = {
+        {&dst.input_norm_weight, src.input_norm_weight, GEMMA4_HIDDEN_SIZE},
+        {&dst.post_attention_norm_weight, src.post_attention_norm_weight, GEMMA4_HIDDEN_SIZE},
+        {&dst.pre_feedforward_norm_weight, src.pre_feedforward_norm_weight, GEMMA4_HIDDEN_SIZE},
+        {&dst.post_feedforward_norm_weight, src.post_feedforward_norm_weight, GEMMA4_HIDDEN_SIZE},
+        {&dst.layer_scalar, src.layer_scalar, 1},
+        {&dst.q_norm_weight, src.q_norm_weight, static_cast<size_t>(spec.head_dim)},
+        {&dst.k_norm_weight, src.k_norm_weight, static_cast<size_t>(spec.head_dim)},
+        {&dst.o_proj_col_major, src.o_proj_col_major, GEMMA4_HIDDEN_SIZE * q_size},
+    };
+    for (const DeviceCopy &copy : layer_copies) {
+      bytes = copy.elements * sizeof(__nv_bfloat16);
       status = cudaMalloc(copy.dst, bytes);
       if (status != cudaSuccess) break;
       status = cudaMemcpy(*copy.dst, copy.src, bytes, cudaMemcpyHostToDevice);
@@ -283,26 +343,17 @@ cudaError_t gemma4_load_text_weights_device_bf16(
       }
     }
     if (status == cudaSuccess) {
-      status = load_layer_ffn_decode(weights->layers[layer], checkpoint.layers[layer], gate_up_stage, down_stage);
+      status = load_layer_qkv_decode(dst, src, spec, qkv_stage);
+    }
+    if (status == cudaSuccess) {
+      status = load_layer_ffn_decode(dst, src, gate_up_stage, down_stage);
     }
   }
 
   munmap(checkpoint.mapping, checkpoint.mapping_bytes);
   checkpoint = Gemma4CheckpointHost();
   if (status != cudaSuccess) {
-    for (__nv_bfloat16 *ptr : {weights->token_embedding, weights->final_norm_weight}) cudaFree(ptr);
-    for (int layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
-      Gemma4TextLayerWeightsDevice &w = weights->layers[layer];
-      for (__nv_bfloat16 *ptr : {
-          w.input_norm_weight, w.post_attention_norm_weight,
-          w.pre_feedforward_norm_weight, w.post_feedforward_norm_weight,
-          w.layer_scalar, w.q_norm_weight, w.k_norm_weight, w.q_proj_col_major,
-          w.k_proj_col_major, w.v_proj_col_major, w.o_proj_col_major,
-          w.ffn_gate_up_decode, w.ffn_down_decode}) {
-        cudaFree(ptr);
-      }
-    }
-    *weights = Gemma4TextWeightsDevice();
+    gemma4_text_weights_device_free(weights);
   }
   return status;
 }

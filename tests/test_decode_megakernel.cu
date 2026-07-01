@@ -1,6 +1,7 @@
-#include "gemma4_decode_megakernel.cuh"
+#include "gemma4_megakernel.cuh"
 
 #include <cuda_runtime.h>
+
 #include <stdio.h>
 
 // Prints one failed condition and keeps the sentinel test compact.

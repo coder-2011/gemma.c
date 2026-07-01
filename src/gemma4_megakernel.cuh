@@ -1,7 +1,6 @@
 #pragma once
 
 #include "gemma4_checkpoint.cuh"
-#include "gemma4_flash_attention.cuh"
 #include "gemma4_runtime.cuh"
 #include "gemma4_sampling.cuh"
 
@@ -9,6 +8,8 @@
 #include <cuda_runtime.h>
 #include <stddef.h>
 #include <stdint.h>
+
+struct Gemma4FfnDecodeScratch;
 
 enum class Gemma4MegakernelPrepMode {
   kPrefill,
@@ -35,6 +36,7 @@ struct Gemma4DecodeMegakernelLayerArgs {
   const __nv_bfloat16 *ffn_norm_weight = nullptr;
   const __nv_bfloat16 *ffn_gate_up_decode = nullptr;
   const __nv_bfloat16 *ffn_down_decode = nullptr;
+  Gemma4FfnDecodeScratch *ffn_scratch = nullptr;
   const __nv_bfloat16 *layer_scalar = nullptr;
 
   __nv_bfloat16 *attention_q = nullptr;
@@ -54,7 +56,7 @@ struct Gemma4DecodeMegakernelLayerArgs {
   float attention_softmax_scale = 0.0f;
   const __nv_bfloat16 *attention_x = nullptr;
   const __nv_bfloat16 *attention_input_norm_weight = nullptr;
-  Gemma4AttentionProjectionWeights attention_weights = {};
+  const __nv_bfloat16 *attention_qkv_proj_col_major = nullptr;
   const __nv_bfloat16 *attention_o_proj_col_major = nullptr;
   const __nv_bfloat16 *attention_post_norm_weight = nullptr;
   const __nv_bfloat16 *attention_pre_ffn_norm_weight = nullptr;
@@ -95,7 +97,7 @@ cudaError_t gemma4_megakernel_prepare_runtime(
 // Returns caller-owned BF16 scratch elements needed by the full prefill path.
 size_t gemma4_prefill_megakernel_scratch_elements(int32_t rows);
 
-// Runs all 48 prefill layers over caller-provided prompt embeddings.
+// Runs all model prefill layers over caller-provided prompt embeddings.
 cudaError_t gemma4_prefill_megakernel(const Gemma4PrefillMegakernelArgs &args);
 
 // Returns caller-owned scratch bytes needed by one full decode step.
@@ -113,5 +115,5 @@ cudaError_t gemma4_megakernel_sample_final_bf16(
     Gemma4SamplingStage stage,
     cudaStream_t stream);
 
-// Runs the batch-1 48-layer decode step and writes the next token embedding.
+// Runs one batch-1 model decode step and writes the next token embedding.
 cudaError_t gemma4_decode_megakernel(const Gemma4DecodeMegakernelArgs &args);

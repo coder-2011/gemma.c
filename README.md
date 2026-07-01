@@ -6,6 +6,14 @@ The long-term goal is a highly optimized mega-kernel inference path, w/ minimal 
 
 The current work is to implement kernels individually, assemble a correct unfused path, benchmark it, and then fuse measured hot paths together incrementally.
 
+## Current Decode Snapshot
+
+Small single-user decode snapshot on July 1, using 1 input token, 64 generated
+tokens, 32 measured requests, and max concurrency `1`. The custom bar uses
+`36.8 ms` decode-step TPOT converted to tokens/s.
+
+![current decode throughput benchmark](public/benchmarks/decode_tps_gemma4_vllm_sglang_20260701.png)
+
 ## Benchmark
 
 Single-user Gemma 4 12B prompt benchmark on an NVIDIA RTX A6000 (Jun 26):

@@ -1,4 +1,4 @@
-#include "gemma4_decode_megakernel.cuh"
+#include "gemma4_megakernel.cuh"
 
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_ffn.cuh"
@@ -6,12 +6,9 @@
 
 #include <math.h>
 #include <stdint.h>
-#include <utility>
 
 cudaError_t gemma4_decode_megakernel_flash_attention_layer_bf16(
     const Gemma4DecodeMegakernelLayerArgs &args,
-    void *__restrict__ scratch,
-    size_t scratch_bytes,
     cudaStream_t stream);
 
 namespace {
@@ -22,16 +19,18 @@ struct DecodeScratch {
   size_t sample_bytes = 0;
 };
 
-// Splits caller-owned decode scratch into FFN and final-sampling regions.
+// Splits caller-owned decode scratch into FFN and sampling regions.
 DecodeScratch decode_scratch_from_buffer(void *scratch) {
   auto *ffn = reinterpret_cast<Gemma4FfnDecodeScratch *>(scratch);
   void *sample = reinterpret_cast<void *>(ffn + 1);
-  return {ffn, sample, gemma4_sample_next_scratch_bytes()};
+  const size_t sample_bytes = gemma4_sample_next_scratch_bytes();
+  return {ffn, sample, sample_bytes};
 }
 
-// Fills the per-layer FlashAttention+FFN argument block from runtime state.
+// Fills the per-layer cooperative FlashAttention+FFN argument block.
 Gemma4DecodeMegakernelLayerArgs decode_layer_args(
     const Gemma4DecodeMegakernelArgs &args,
+    Gemma4FfnDecodeScratch *ffn_scratch,
     int32_t layer,
     __nv_bfloat16 *hidden_in,
     __nv_bfloat16 *hidden_out) {
@@ -43,11 +42,12 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
   Gemma4DecodeMegakernelLayerArgs layer_args = {};
   layer_args.residual_out = hidden_out;
   layer_args.normed_out = args.normed;
-  layer_args.ffn_x = args.normed;
+  layer_args.ffn_x = args.attention_out;
   layer_args.ffn_residual = hidden_out;
   layer_args.ffn_norm_weight = w.post_feedforward_norm_weight;
   layer_args.ffn_gate_up_decode = w.ffn_gate_up_decode;
   layer_args.ffn_down_decode = w.ffn_down_decode;
+  layer_args.ffn_scratch = ffn_scratch;
   layer_args.layer_scalar = w.layer_scalar;
   layer_args.attention_q = args.attention_q;
   layer_args.attention_out = args.attention_out;
@@ -59,9 +59,11 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
   layer_args.attention_cache_v =
       global ? args.runtime->global_cache_v : args.runtime->sliding_cache_v;
   layer_args.attention_cache_config =
-      global ? args.runtime->global_cache_config : args.runtime->sliding_cache_config;
+      global ? args.runtime->global_cache_config
+             : args.runtime->sliding_cache_config;
   layer_args.attention_page_table =
-      global ? args.runtime->global_page_table : args.runtime->sliding_page_table;
+      global ? args.runtime->global_page_table
+             : args.runtime->sliding_page_table;
   layer_args.attention_token_position = args.runtime->token_position;
   layer_args.attention_seq_lengths = args.runtime->seq_lengths;
   layer_args.attention_cache_layer = gemma4_kv_cache_layer_index(layer, global);
@@ -71,15 +73,16 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
   layer_args.attention_softmax_scale = 1.0f / sqrtf(float(head_dim));
   layer_args.attention_x = hidden_in;
   layer_args.attention_input_norm_weight = w.input_norm_weight;
-  layer_args.attention_weights =
-      {w.q_proj_col_major, w.k_proj_col_major, w.v_proj_col_major, 0, 0, 0};
+  layer_args.attention_qkv_proj_col_major = w.qkv_proj_col_major;
   layer_args.attention_o_proj_col_major = w.o_proj_col_major;
   layer_args.attention_post_norm_weight = w.post_attention_norm_weight;
   layer_args.attention_pre_ffn_norm_weight = w.pre_feedforward_norm_weight;
   layer_args.attention_q_norm_weight = w.q_norm_weight;
   layer_args.attention_k_norm_weight = w.k_norm_weight;
-  layer_args.attention_cos = global ? args.runtime->global_cos : args.runtime->sliding_cos;
-  layer_args.attention_sin = global ? args.runtime->global_sin : args.runtime->sliding_sin;
+  layer_args.attention_cos =
+      global ? args.runtime->global_cos : args.runtime->sliding_cos;
+  layer_args.attention_sin =
+      global ? args.runtime->global_sin : args.runtime->sliding_sin;
   return layer_args;
 }
 
@@ -132,23 +135,7 @@ cudaError_t gemma4_megakernel_sample_final_bf16(
       weights->token_embedding, stage, stream);
 }
 
-// Finishes one FlashAttention-prepared decode layer with FFN and layer scalar.
-cudaError_t gemma4_decode_megakernel_finish_layer_bf16(
-    const Gemma4DecodeMegakernelLayerArgs &args,
-    void *__restrict__ scratch,
-    size_t scratch_bytes,
-    cudaStream_t stream) {
-  if (scratch == nullptr || scratch_bytes < sizeof(Gemma4FfnDecodeScratch)) {
-    return cudaErrorInvalidValue;
-  }
-  DecodeScratch scratch_parts = decode_scratch_from_buffer(scratch);
-  return gemma4_ffn_decode_fused_bf16(
-      args.residual_out, args.normed_out, args.ffn_x, args.ffn_residual,
-      args.ffn_norm_weight, args.ffn_gate_up_decode, args.ffn_down_decode,
-      scratch_parts.ffn, args.layer_scalar, GEMMA4_RMS_NORM_EPS, stream);
-}
-
-// Runs the batch-1 48-layer decode step and writes the next token embedding.
+// Runs one batch-1 model decode step and writes the next token embedding.
 cudaError_t gemma4_decode_megakernel(const Gemma4DecodeMegakernelArgs &args) {
   if (args.hidden_a == nullptr || args.hidden_b == nullptr ||
       args.normed == nullptr || args.sampled_hidden == nullptr ||
@@ -168,28 +155,45 @@ cudaError_t gemma4_decode_megakernel(const Gemma4DecodeMegakernelArgs &args) {
   GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_megakernel_prepare_runtime(
       args.runtime, Gemma4MegakernelPrepMode::kDecode, 0, args.stream));
 
-  __nv_bfloat16 *hidden_in = args.hidden_a;
-  __nv_bfloat16 *hidden_out = args.hidden_b;
-  for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
-    const Gemma4DecodeMegakernelLayerArgs layer_args =
-        decode_layer_args(args, layer, hidden_in, hidden_out);
-    GEMMA4_RETURN_IF_CUDA_ERROR(
-        gemma4_decode_megakernel_flash_attention_layer_bf16(
-            layer_args, args.scratch, args.scratch_bytes, args.stream));
-    std::swap(hidden_in, hidden_out);
+  const int32_t seq_len = args.runtime->h_seq_lengths[0];
+  const int32_t window = args.runtime->sliding_cache_config.window_size;
+  const int32_t sliding_keys = seq_len < window ? seq_len : window;
+  Gemma4DecodeMegakernelArgs active_args = args;
+  active_args.sliding_splits = div_up(sliding_keys, args.split_size);
+  active_args.global_splits = div_up(seq_len, args.split_size);
+  if (active_args.sliding_splits > args.sliding_splits ||
+      active_args.global_splits > args.global_splits) {
+    return cudaErrorInvalidValue;
   }
 
-  DecodeScratch scratch_parts = decode_scratch_from_buffer(args.scratch);
+  DecodeScratch scratch_parts = decode_scratch_from_buffer(active_args.scratch);
+  __nv_bfloat16 *hidden_in = active_args.hidden_a;
+  __nv_bfloat16 *hidden_out = active_args.hidden_b;
+  for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
+    Gemma4DecodeMegakernelLayerArgs layer_args =
+        decode_layer_args(
+            active_args, scratch_parts.ffn, layer, hidden_in, hidden_out);
+    GEMMA4_RETURN_IF_CUDA_ERROR(
+        gemma4_decode_megakernel_flash_attention_layer_bf16(
+            layer_args, active_args.stream));
+
+    __nv_bfloat16 *tmp = hidden_in;
+    hidden_in = hidden_out;
+    hidden_out = tmp;
+  }
+
+  const __nv_bfloat16 *final_hidden = hidden_in;
   GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_megakernel_sample_final_bf16(
-      args.sampled_hidden, args.next_token, args.normed, hidden_in,
-      args.weights, scratch_parts.sample, scratch_parts.sample_bytes,
-      Gemma4SamplingStage::kDecode, args.stream));
-  if (args.hidden_a == args.sampled_hidden) {
+      active_args.sampled_hidden, active_args.next_token, active_args.normed,
+      final_hidden, active_args.weights, scratch_parts.sample,
+      scratch_parts.sample_bytes, Gemma4SamplingStage::kDecode,
+      active_args.stream));
+  if (active_args.hidden_a == active_args.sampled_hidden) {
     return cudaSuccess;
   }
   const size_t row_bytes =
       static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
   return cudaMemcpyAsync(
-      args.hidden_a, args.sampled_hidden, row_bytes, cudaMemcpyDeviceToDevice,
-      args.stream);
+      active_args.hidden_a, active_args.sampled_hidden, row_bytes,
+      cudaMemcpyDeviceToDevice, active_args.stream);
 }

@@ -1,5 +1,6 @@
 #include "gemma4_tokenizer.cuh"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 

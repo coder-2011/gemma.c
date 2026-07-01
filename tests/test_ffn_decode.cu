@@ -1,4 +1,5 @@
 #include "gemma4_ffn.cuh"
+#include "gemma4_rmsnorm.cuh"
 #include "gemma4.h"
 
 #include <cuda_bf16.h>
@@ -15,15 +16,14 @@
 
 namespace {
 
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
-    std::exit(1);
-  }
-}
-
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+#define CHECK_CUDA(expr)                                                        \
+  do {                                                                          \
+    if (const cudaError_t status = (expr); status != cudaSuccess) {              \
+      std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", __FILE__,          \
+                   __LINE__, #expr, cudaGetErrorString(status));                \
+      std::exit(1);                                                             \
+    }                                                                           \
+  } while (0)
 
 // Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
@@ -74,6 +74,15 @@ __nv_bfloat16 make_down_value(int tile, int col) {
   return __float2bfloat16(static_cast<float>(centered) / 512.0f);
 }
 
+// Maps a natural hidden column into the decode FFN swizzled weight layout.
+int decode_hidden_col(int col) {
+  const int pack = col / GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS;
+  const int lane = col % GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS;
+  return gemma4_ffn_decode_device::hidden_pack_swizzle_index(pack) *
+             GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS +
+         lane;
+}
+
 void compare_bf16(const std::vector<__nv_bfloat16> &actual,
                   const std::vector<__nv_bfloat16> &expected,
                   float tolerance,
@@ -106,139 +115,47 @@ void run_sparse_case() {
   const size_t down_count =
       static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE) * GEMMA4_HIDDEN_SIZE;
 
-  std::vector<__nv_bfloat16> x(GEMMA4_HIDDEN_SIZE);
-  std::vector<__nv_bfloat16> residual(GEMMA4_HIDDEN_SIZE);
   std::vector<__nv_bfloat16> gamma(GEMMA4_HIDDEN_SIZE);
-  std::vector<__nv_bfloat16> actual_residual(GEMMA4_HIDDEN_SIZE);
-  std::vector<__nv_bfloat16> actual_normed(GEMMA4_HIDDEN_SIZE);
-  std::vector<__nv_bfloat16> expected_residual(GEMMA4_HIDDEN_SIZE);
-  std::vector<__nv_bfloat16> expected_scaled_residual(GEMMA4_HIDDEN_SIZE);
-  std::vector<__nv_bfloat16> expected_normed(GEMMA4_HIDDEN_SIZE);
   std::vector<float> ffn_out(GEMMA4_HIDDEN_SIZE, 0.0f);
+  std::vector<__nv_bfloat16> gate_up_decode(gate_up_count,
+                                            __float2bfloat16(0.0f));
+  std::vector<__nv_bfloat16> down_decode(down_count,
+                                         __float2bfloat16(0.0f));
 
   for (int i = 0; i < GEMMA4_HIDDEN_SIZE; ++i) {
-    x[i] = make_x_value(i);
-    residual[i] = make_residual_value(i);
     const float gamma_value =
         0.85f + static_cast<float>((i * 7 + 3) % 41) / 128.0f;
     gamma[i] = __float2bfloat16(gamma_value);
   }
 
-  thrust::device_vector<__nv_bfloat16> d_x(GEMMA4_HIDDEN_SIZE);
-  thrust::device_vector<__nv_bfloat16> d_residual(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_gamma(GEMMA4_HIDDEN_SIZE);
-  thrust::device_vector<__nv_bfloat16> d_residual_out(GEMMA4_HIDDEN_SIZE);
-  thrust::device_vector<__nv_bfloat16> d_normed_out(GEMMA4_HIDDEN_SIZE);
-  thrust::device_vector<__nv_bfloat16> d_gate_up_src(gate_up_count);
   thrust::device_vector<__nv_bfloat16> d_gate_up(gate_up_count);
-  thrust::device_vector<__nv_bfloat16> d_down_src(down_count);
   thrust::device_vector<__nv_bfloat16> d_down(down_count);
-  thrust::device_vector<unsigned char> d_scratch(
-      sizeof(Gemma4FfnDecodeScratch));
-  thrust::device_vector<__nv_bfloat16> d_layer_scalar(1);
 
-  copy_to_device(d_x, x);
-  copy_to_device(d_residual, residual);
   copy_to_device(d_gamma, gamma);
-  d_layer_scalar[0] = __float2bfloat16(0.5f);
-  CHECK_CUDA(cudaMemset(raw_ptr(d_gate_up_src), 0,
-                        gate_up_count * sizeof(__nv_bfloat16)));
-  CHECK_CUDA(cudaMemset(raw_ptr(d_down_src), 0,
-                        down_count * sizeof(__nv_bfloat16)));
-
-  std::vector<__nv_bfloat16> gate_col(GEMMA4_HIDDEN_SIZE);
-  std::vector<__nv_bfloat16> up_col(GEMMA4_HIDDEN_SIZE);
-  std::vector<__nv_bfloat16> down_row(GEMMA4_HIDDEN_SIZE);
 
   for (int tile = 0; tile < tiles; ++tile) {
     const int intermediate_col =
         tile * tile_width + ((tile * 19 + 7) % tile_width);
     const int x_index = (tile * 97 + 13) % GEMMA4_HIDDEN_SIZE;
-    std::fill(gate_col.begin(), gate_col.end(), __float2bfloat16(0.0f));
-    std::fill(up_col.begin(), up_col.end(), __float2bfloat16(0.0f));
-
     const __nv_bfloat16 gate_weight =
         __float2bfloat16(0.35f + static_cast<float>(tile % 5) * 0.03125f);
     const __nv_bfloat16 up_weight =
         __float2bfloat16(-0.25f + static_cast<float>(tile % 7) * 0.0234375f);
-    gate_col[x_index] = gate_weight;
-    up_col[x_index] = up_weight;
-
-    CHECK_CUDA(cudaMemcpy(
-        raw_ptr(d_gate_up_src) +
-            static_cast<size_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE,
-        gate_col.data(), gate_col.size() * sizeof(__nv_bfloat16),
-        cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(
-        raw_ptr(d_gate_up_src) +
-            static_cast<size_t>(GEMMA4_INTERMEDIATE_SIZE + intermediate_col) *
-                GEMMA4_HIDDEN_SIZE,
-        up_col.data(), up_col.size() * sizeof(__nv_bfloat16),
-        cudaMemcpyHostToDevice));
+    gate_up_decode[(2 * intermediate_col) * GEMMA4_HIDDEN_SIZE +
+                   decode_hidden_col(x_index)] = gate_weight;
+    gate_up_decode[(2 * intermediate_col + 1) * GEMMA4_HIDDEN_SIZE +
+                   decode_hidden_col(x_index)] = up_weight;
 
     for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
-      down_row[col] = make_down_value(tile, col);
-    }
-    CHECK_CUDA(cudaMemcpy(
-        raw_ptr(d_down_src) +
-            static_cast<size_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE,
-        down_row.data(), down_row.size() * sizeof(__nv_bfloat16),
-        cudaMemcpyHostToDevice));
-
-    const float xv = bf16_to_float(x[x_index]);
-    const float gate = xv * bf16_to_float(gate_weight);
-    const float up = xv * bf16_to_float(up_weight);
-    const float act = gelu_tanh_reference(gate) * up;
-    for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
-      ffn_out[col] = fmaf(act, bf16_to_float(down_row[col]), ffn_out[col]);
+      const __nv_bfloat16 down_value = make_down_value(tile, col);
+      down_decode[static_cast<size_t>(intermediate_col) * GEMMA4_HIDDEN_SIZE +
+                  decode_hidden_col(col)] = down_value;
     }
   }
 
-  double sum_sq = 0.0;
-  std::vector<float> ffn_float(GEMMA4_HIDDEN_SIZE);
-  for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
-    const __nv_bfloat16 ffn_bf16 = __float2bfloat16_rn(ffn_out[col]);
-    const float value = bf16_to_float(ffn_bf16);
-    ffn_float[col] = value;
-    sum_sq += static_cast<double>(value) * value;
-  }
-  const float scale =
-      1.0f / std::sqrt(static_cast<float>(sum_sq / GEMMA4_HIDDEN_SIZE) +
-                       GEMMA4_RMS_NORM_EPS);
-  for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
-    const float normed = ffn_float[col] * scale * bf16_to_float(gamma[col]);
-    expected_normed[col] = __float2bfloat16_rn(normed);
-    expected_residual[col] = __float2bfloat16_rn(
-        bf16_to_float(residual[col]) + bf16_to_float(expected_normed[col]));
-  }
-
-  CHECK_CUDA(gemma4_ffn_decode_swizzle_weights_bf16(
-      raw_ptr(d_gate_up), raw_ptr(d_gate_up_src), raw_ptr(d_down), raw_ptr(d_down_src),
-      0));
-  CHECK_CUDA(gemma4_ffn_decode_fused_bf16(
-      raw_ptr(d_residual_out), raw_ptr(d_normed_out), raw_ptr(d_x), raw_ptr(d_residual),
-      raw_ptr(d_gamma), raw_ptr(d_gate_up), raw_ptr(d_down),
-      reinterpret_cast<Gemma4FfnDecodeScratch *>(raw_ptr(d_scratch)),
-      nullptr, GEMMA4_RMS_NORM_EPS, 0));
-  copy_to_host(actual_residual, d_residual_out);
-  copy_to_host(actual_normed, d_normed_out);
-
-  compare_bf16(actual_residual, expected_residual, 0.03125f,
-               "fused FFN residual");
-  compare_bf16(actual_normed, expected_normed, 0.03125f,
-               "fused FFN normed");
-  for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
-    expected_scaled_residual[col] =
-        __float2bfloat16_rn(bf16_to_float(expected_residual[col]) * 0.5f);
-  }
-  CHECK_CUDA(gemma4_ffn_decode_fused_bf16(
-      raw_ptr(d_residual_out), raw_ptr(d_normed_out), raw_ptr(d_x), raw_ptr(d_residual),
-      raw_ptr(d_gamma), raw_ptr(d_gate_up), raw_ptr(d_down),
-      reinterpret_cast<Gemma4FfnDecodeScratch *>(raw_ptr(d_scratch)),
-      raw_ptr(d_layer_scalar), GEMMA4_RMS_NORM_EPS, 0));
-  copy_to_host(actual_residual, d_residual_out);
-  compare_bf16(actual_residual, expected_scaled_residual, 0.03125f,
-               "fused FFN scaled residual");
+  copy_to_device(d_gate_up, gate_up_decode);
+  copy_to_device(d_down, down_decode);
 
   constexpr int prefill_rows = 3;
   std::vector<__nv_bfloat16> x_prefill(
@@ -248,6 +165,7 @@ void run_sparse_case() {
   std::vector<__nv_bfloat16> actual_prefill_normed(x_prefill.size());
   std::vector<__nv_bfloat16> expected_prefill_residual(x_prefill.size());
   std::vector<__nv_bfloat16> expected_prefill_normed(x_prefill.size());
+  std::vector<float> ffn_float(GEMMA4_HIDDEN_SIZE);
 
   for (int row = 0; row < prefill_rows; ++row) {
     for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
@@ -276,7 +194,7 @@ void run_sparse_case() {
       }
     }
 
-    sum_sq = 0.0;
+    double sum_sq = 0.0;
     for (int col = 0; col < GEMMA4_HIDDEN_SIZE; ++col) {
       const __nv_bfloat16 ffn_bf16 = __float2bfloat16_rn(ffn_out[col]);
       const float value = bf16_to_float(ffn_bf16);
@@ -299,6 +217,7 @@ void run_sparse_case() {
 
   thrust::device_vector<__nv_bfloat16> d_x_prefill(x_prefill.size());
   thrust::device_vector<__nv_bfloat16> d_residual_prefill(residual_prefill.size());
+  thrust::device_vector<__nv_bfloat16> d_prefill_mlp_out(x_prefill.size());
   thrust::device_vector<__nv_bfloat16> d_prefill_residual_out(x_prefill.size());
   thrust::device_vector<__nv_bfloat16> d_prefill_normed_out(x_prefill.size());
   thrust::device_vector<__nv_bfloat16> d_prefill_scratch(
@@ -306,20 +225,19 @@ void run_sparse_case() {
   copy_to_device(d_x_prefill, x_prefill);
   copy_to_device(d_residual_prefill, residual_prefill);
 
-  Gemma4FfnBf16Args prefill_args = {};
-  prefill_args.residual_out = raw_ptr(d_prefill_residual_out);
-  prefill_args.normed_out = raw_ptr(d_prefill_normed_out);
-  prefill_args.x = raw_ptr(d_x_prefill);
-  prefill_args.residual = raw_ptr(d_residual_prefill);
-  prefill_args.rms_weight = raw_ptr(d_gamma);
-  prefill_args.w_gate_up_decode = raw_ptr(d_gate_up);
-  prefill_args.w_down_decode = raw_ptr(d_down);
-  prefill_args.prefill_scratch =
+  Gemma4FfnPrefillScratch prefill_scratch =
       gemma4_ffn_prefill_scratch_from_buffer(
           raw_ptr(d_prefill_scratch), prefill_rows);
-  prefill_args.rows = prefill_rows;
-  prefill_args.eps = GEMMA4_RMS_NORM_EPS;
-  CHECK_CUDA(gemma4_ffn_bf16(prefill_args));
+  CHECK_CUDA(gemma4_ffn_prefill_mlp_bf16(
+      raw_ptr(d_prefill_mlp_out), raw_ptr(d_x_prefill), raw_ptr(d_gate_up),
+      raw_ptr(d_down), prefill_scratch, prefill_rows, 0));
+  CHECK_CUDA(gemma4_rmsnorm_bf16(
+      raw_ptr(d_prefill_normed_out), raw_ptr(d_prefill_mlp_out),
+      raw_ptr(d_gamma), prefill_rows, GEMMA4_HIDDEN_SIZE,
+      GEMMA4_RMS_NORM_EPS, 0));
+  CHECK_CUDA(gemma4_residual_add_bf16(
+      raw_ptr(d_prefill_residual_out), raw_ptr(d_residual_prefill),
+      raw_ptr(d_prefill_normed_out), int(x_prefill.size()), 0));
   copy_to_host(actual_prefill_residual, d_prefill_residual_out);
   copy_to_host(actual_prefill_normed, d_prefill_normed_out);
 

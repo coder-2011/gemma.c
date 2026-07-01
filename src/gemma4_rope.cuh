@@ -1,6 +1,6 @@
 #pragma once
 
-#include "gemma4_cuda_utils.cuh"
+#include <cuda_bf16.h>
 
 namespace gemma4_rope {
 

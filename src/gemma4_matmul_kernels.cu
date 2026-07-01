@@ -11,49 +11,11 @@
 
 namespace gemma4_matmul_kernel_impl {
 
-constexpr int kFinalLogitsDecodeThreads = 1024;
-constexpr int kFinalLogitsDecodeColsPerBlock = 8;
-constexpr int kFinalLogitsDecodeMinBlocksPerSm = 1;
-
-__device__ inline int pack_offset(int pack_idx) {
-  return pack_idx * kBf16Packed128Elements;
-}
-
-template <int K>
-__device__ inline int weight_offset(int col, int element_idx) {
-  return col * K + element_idx;
-}
-
-template <int BlockCount, int SwizzleTileBlocks>
-__device__ inline int swizzle_col_block(int block_idx) {
-  if constexpr (SwizzleTileBlocks <= 1) {
-    return block_idx;
-  } else {
-    static_assert((BlockCount % SwizzleTileBlocks) == 0,
-                  "swizzled decode GEMV block count must divide tile size");
-    constexpr int tiles = BlockCount / SwizzleTileBlocks;
-    return (block_idx % SwizzleTileBlocks) * tiles +
-           block_idx / SwizzleTileBlocks;
-  }
-}
-
-template <int ColsPerBlock>
-__device__ inline void store_cols(
-    __nv_bfloat16 *__restrict__ dst, const float (&sums)[ColsPerBlock]) {
-  if constexpr (ColsPerBlock == kBf16Packed128Elements) {
-    Bf16Packed128 out;
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      out[col] = __float2bfloat16_rn(sums[col]);
-    }
-    *reinterpret_cast<int4 *>(dst) = out.bits();
-  } else {
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      dst[col] = __float2bfloat16_rn(sums[col]);
-    }
-  }
-}
+constexpr int kFfnGateUpTileCols = 2;
+constexpr int kFfnGateUpThreads = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+constexpr int kFfnGateUpWarps = kFfnGateUpThreads / 32;
+static_assert((kFfnGateUpThreads % 32) == 0,
+              "FFN gate/up device helper requires whole warps");
 
 template <int K, int ColsPerBlock, int Threads>
 __device__ inline void dot_cols(
@@ -68,14 +30,14 @@ __device__ inline void dot_cols(
 #if GEMMA4_DECODE_GEMV_BUFFER_STAGES <= 1
 #pragma unroll
   for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
-    const int element_idx = pack_offset(pack_idx);
+    const int element_idx = pack_idx * kBf16Packed128Elements;
     const Bf16Packed128 x_pack =
         Bf16Packed128{*reinterpret_cast<const int4 *>(x + element_idx)};
 #pragma unroll
     for (int col = 0; col < ColsPerBlock; ++col) {
+      const int weight_idx = (col0 + col) * K + element_idx;
       const Bf16Packed128 w_pack = Bf16Packed128{
-          *reinterpret_cast<const int4 *>(
-              w_col_major + weight_offset<K>(col0 + col, element_idx))};
+          *reinterpret_cast<const int4 *>(w_col_major + weight_idx)};
       gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
     }
   }
@@ -91,14 +53,14 @@ __device__ inline void dot_cols(
   for (int stage = 0; stage < kStages; ++stage) {
     const int stage_pack_idx = thread_idx + stage * Threads;
     if (stage_pack_idx < packs_per_col) {
-      const int element_idx = pack_offset(stage_pack_idx);
+      const int element_idx = stage_pack_idx * kBf16Packed128Elements;
       x_stage[stage] =
           Bf16Packed128{*reinterpret_cast<const int4 *>(x + element_idx)};
 #pragma unroll
       for (int col = 0; col < ColsPerBlock; ++col) {
+        const int weight_idx = (col0 + col) * K + element_idx;
         w_stage[stage][col] = Bf16Packed128{
-            *reinterpret_cast<const int4 *>(
-                w_col_major + weight_offset<K>(col0 + col, element_idx))};
+            *reinterpret_cast<const int4 *>(w_col_major + weight_idx)};
       }
     }
   }
@@ -114,14 +76,14 @@ __device__ inline void dot_cols(
 
     const int next_pack_idx = pack_idx + kStages * Threads;
     if (next_pack_idx < packs_per_col) {
-      const int element_idx = pack_offset(next_pack_idx);
+      const int element_idx = next_pack_idx * kBf16Packed128Elements;
       x_stage[stage] =
           Bf16Packed128{*reinterpret_cast<const int4 *>(x + element_idx)};
 #pragma unroll
       for (int col = 0; col < ColsPerBlock; ++col) {
+        const int weight_idx = (col0 + col) * K + element_idx;
         w_stage[stage][col] = Bf16Packed128{
-            *reinterpret_cast<const int4 *>(
-                w_col_major + weight_offset<K>(col0 + col, element_idx))};
+            *reinterpret_cast<const int4 *>(w_col_major + weight_idx)};
       }
     }
 
@@ -133,83 +95,78 @@ __device__ inline void dot_cols(
 #endif
 }
 
-template <int K, int ColsPerBlock, int Threads>
-__device__ inline void dot_cols_pair(
+__device__ inline int shared_pack_index(int chunk) {
+  constexpr int kSwizzleChunks = 8;  // 8 x 128-bit chunks = one 128-byte row.
+  const unsigned u = static_cast<unsigned>(chunk);
+  const unsigned col = u & (kSwizzleChunks - 1);
+  const unsigned row = (u >> 3) & (kSwizzleChunks - 1);
+  return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
+}
+
+// Computes one Gemma 4 FFN gate/up decode tile for a caller-owned CTA.
+extern "C" __device__ void gemma4_ffn_gate_up_tile_bf16_device(
     const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_a_col_major,
-    const __nv_bfloat16 *__restrict__ w_b_col_major,
-    int col0_a,
-    int col0_b,
+    const __nv_bfloat16 *__restrict__ w_interleaved_row_major,
+    int col0,
     int thread_idx,
-    float (&a_sums)[ColsPerBlock],
-    float (&b_sums)[ColsPerBlock]) {
-  static_assert((Threads % 32) == 0,
-                "decode thread count must be a whole number of warps");
+    float *__restrict__ warp_sums,
+    float *__restrict__ gate,
+    float *__restrict__ up) {
+  constexpr int packs_per_col =
+      GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 
-  constexpr int packs_per_col = K / kBf16Packed128Elements;
-
-#pragma unroll
-  for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
-    const int element_idx = pack_offset(pack_idx);
+  for (int pack_idx = thread_idx; pack_idx < packs_per_col;
+       pack_idx += kFfnGateUpThreads) {
+    const int x_col = pack_idx * kBf16Packed128Elements;
+    const int weight_col =
+        shared_pack_index(pack_idx) * kBf16Packed128Elements;
     const Bf16Packed128 x_pack =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element_idx)};
+        Bf16Packed128{*reinterpret_cast<const int4 *>(x + x_col)};
+    const __nv_bfloat16 *gate_ptr =
+        w_interleaved_row_major +
+        static_cast<int64_t>(2 * col0) * GEMMA4_HIDDEN_SIZE + weight_col;
+    const __nv_bfloat16 *up_ptr = gate_ptr + GEMMA4_HIDDEN_SIZE;
+
 #pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      const Bf16Packed128 a_pack = Bf16Packed128{
-          *reinterpret_cast<const int4 *>(
-              w_a_col_major + weight_offset<K>(col0_a + col, element_idx))};
-      const Bf16Packed128 b_pack = Bf16Packed128{
-          *reinterpret_cast<const int4 *>(
-              w_b_col_major + weight_offset<K>(col0_b + col, element_idx))};
-      gemma4_bf16_pack_accumulate_dot(x_pack, a_pack, a_sums[col]);
-      gemma4_bf16_pack_accumulate_dot(x_pack, b_pack, b_sums[col]);
+    for (int t = 0; t < kFfnGateUpTileCols; ++t) {
+      const int64_t row_offset =
+          static_cast<int64_t>(2 * t) * GEMMA4_HIDDEN_SIZE;
+      const Bf16Packed128 gate_pack =
+          Bf16Packed128{
+              *reinterpret_cast<const int4 *>(gate_ptr + row_offset)};
+      const Bf16Packed128 up_pack =
+          Bf16Packed128{
+              *reinterpret_cast<const int4 *>(up_ptr + row_offset)};
+      gemma4_bf16_pack_accumulate_dot(x_pack, gate_pack, gate[t]);
+      gemma4_bf16_pack_accumulate_dot(x_pack, up_pack, up[t]);
     }
   }
-}
 
-template <bool SwizzleX>
-__device__ inline int shared_pack_index(int chunk) {
-  if constexpr (SwizzleX) {
-    constexpr int kSwizzleChunks = 8;  // 8 x 128-bit chunks = one 128-byte row.
-    const unsigned u = static_cast<unsigned>(chunk);
-    const unsigned col = u & (kSwizzleChunks - 1);
-    const unsigned row = (u >> 3) & (kSwizzleChunks - 1);
-    return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
+  const int lane = thread_idx & (warpSize - 1);
+  const int warp = thread_idx / warpSize;
+
+#pragma unroll
+  for (int t = 0; t < kFfnGateUpTileCols; ++t) {
+    gate[t] = warp_reduce_sum(gate[t]);
+    up[t] = warp_reduce_sum(up[t]);
+    if (lane == 0 && warp < kFfnGateUpWarps) {
+      warp_sums[t * kFfnGateUpWarps + warp] = gate[t];
+      warp_sums[(kFfnGateUpTileCols + t) * kFfnGateUpWarps + warp] = up[t];
+    }
   }
-  return chunk;
-}
-
-template <int K, int ColsPerBlock, int Threads, bool SwizzleX>
-__device__ inline void dot_cols_pair_shared_x(
-    const Bf16Packed128 *__restrict__ s_x,
-    const __nv_bfloat16 *__restrict__ w_a_col_major,
-    const __nv_bfloat16 *__restrict__ w_b_col_major,
-    int col0_a,
-    int col0_b,
-    int thread_idx,
-    float (&a_sums)[ColsPerBlock],
-    float (&b_sums)[ColsPerBlock]) {
-  static_assert((Threads % 32) == 0,
-                "decode thread count must be a whole number of warps");
-
-  constexpr int packs_per_col = K / kBf16Packed128Elements;
+  __syncthreads();
 
 #pragma unroll
-  for (int pack_idx = thread_idx; pack_idx < packs_per_col; pack_idx += Threads) {
-    const int element_idx = pack_offset(pack_idx);
-    const int swizzled_pack_idx = shared_pack_index<SwizzleX>(pack_idx);
-    const int swizzled_element_idx = pack_offset(swizzled_pack_idx);
-    const Bf16Packed128 x_pack = s_x[swizzled_pack_idx];
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      const Bf16Packed128 a_pack = Bf16Packed128{
-          *reinterpret_cast<const int4 *>(
-              w_a_col_major + weight_offset<K>(col0_a + col, swizzled_element_idx))};
-      const Bf16Packed128 b_pack = Bf16Packed128{
-          *reinterpret_cast<const int4 *>(
-              w_b_col_major + weight_offset<K>(col0_b + col, swizzled_element_idx))};
-      gemma4_bf16_pack_accumulate_dot(x_pack, a_pack, a_sums[col]);
-      gemma4_bf16_pack_accumulate_dot(x_pack, b_pack, b_sums[col]);
+  for (int t = 0; t < kFfnGateUpTileCols; ++t) {
+    gate[t] = thread_idx < kFfnGateUpWarps
+                  ? warp_sums[t * kFfnGateUpWarps + lane]
+                  : 0.0f;
+    up[t] = thread_idx < kFfnGateUpWarps
+                ? warp_sums[(kFfnGateUpTileCols + t) * kFfnGateUpWarps + lane]
+                : 0.0f;
+    if (warp == 0) {
+      gate[t] = warp_reduce_sum(gate[t]);
+      up[t] = warp_reduce_sum(up[t]);
     }
   }
 }
@@ -243,97 +200,11 @@ __device__ inline void reduce_cols(
   }
 }
 
-template <int ColsPerBlock, int Threads>
-__device__ inline void reduce_cols_pair(
-    int thread_idx,
-    float (&a_warp_sums)[ColsPerBlock][Threads / 32],
-    float (&b_warp_sums)[ColsPerBlock][Threads / 32],
-    float (&a_sums)[ColsPerBlock],
-    float (&b_sums)[ColsPerBlock]) {
-  constexpr int warps = Threads / 32;
-  const int lane = thread_idx & (warpSize - 1);
-  const int warp = thread_idx / warpSize;
-
-  warp_reduce_sum_to_lane0(a_sums);
-  warp_reduce_sum_to_lane0(b_sums);
-
-  if (lane == 0) {
-#pragma unroll
-    for (int col = 0; col < ColsPerBlock; ++col) {
-      a_warp_sums[col][warp] = a_sums[col];
-      b_warp_sums[col][warp] = b_sums[col];
-    }
-  }
-  __syncthreads();
-
-#pragma unroll
-  for (int col = 0; col < ColsPerBlock; ++col) {
-    a_sums[col] = thread_idx < warps ? a_warp_sums[col][lane] : 0.0f;
-    b_sums[col] = thread_idx < warps ? b_warp_sums[col][lane] : 0.0f;
-  }
-
-  if (warp == 0) {
-    warp_reduce_sum_to_lane0(a_sums);
-    warp_reduce_sum_to_lane0(b_sums);
-  }
-}
-
-template <int K, int ColsPerBlock, int Threads>
-__device__ inline void dot_cols_reduce(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_col_major,
-    int col0,
-    int thread_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / 32],
-    float (&sums)[ColsPerBlock]) {
-  dot_cols<K, ColsPerBlock, Threads>(x, w_col_major, col0, thread_idx, sums);
-  reduce_cols<ColsPerBlock, Threads>(thread_idx, warp_sums, sums);
-}
-
-template <int K, int ColsPerBlock, int Threads>
-__device__ inline void dot_cols_pair_reduce(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_a_col_major,
-    const __nv_bfloat16 *__restrict__ w_b_col_major,
-    int col0_a,
-    int col0_b,
-    int thread_idx,
-    float (&a_warp_sums)[ColsPerBlock][Threads / 32],
-    float (&b_warp_sums)[ColsPerBlock][Threads / 32],
-    float (&a_sums)[ColsPerBlock],
-    float (&b_sums)[ColsPerBlock]) {
-  dot_cols_pair<K, ColsPerBlock, Threads>(
-      x, w_a_col_major, w_b_col_major, col0_a, col0_b, thread_idx,
-      a_sums, b_sums);
-  reduce_cols_pair<ColsPerBlock, Threads>(
-      thread_idx, a_warp_sums, b_warp_sums, a_sums, b_sums);
-}
-
-template <int K, int ColsPerBlock, int Threads, bool SwizzleX>
-__device__ inline void dot_cols_pair_shared_x_reduce(
-    const Bf16Packed128 *__restrict__ s_x,
-    const __nv_bfloat16 *__restrict__ w_a_col_major,
-    const __nv_bfloat16 *__restrict__ w_b_col_major,
-    int col0_a,
-    int col0_b,
-    int thread_idx,
-    float (&a_warp_sums)[ColsPerBlock][Threads / 32],
-    float (&b_warp_sums)[ColsPerBlock][Threads / 32],
-    float (&a_sums)[ColsPerBlock],
-    float (&b_sums)[ColsPerBlock]) {
-  dot_cols_pair_shared_x<K, ColsPerBlock, Threads, SwizzleX>(
-      s_x, w_a_col_major, w_b_col_major, col0_a, col0_b, thread_idx,
-      a_sums, b_sums);
-  reduce_cols_pair<ColsPerBlock, Threads>(
-      thread_idx, a_warp_sums, b_warp_sums, a_sums, b_sums);
-}
-
 template <int K,
           int N,
           int ColsPerBlock,
           int Threads,
-          int SwizzleTileBlocks,
-          bool StoreOutput = true>
+          int SwizzleTileBlocks>
 __device__ inline void decode_gemv_cols_device(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_col_major,
@@ -342,36 +213,33 @@ __device__ inline void decode_gemv_cols_device(
     float (&warp_sums)[ColsPerBlock][Threads / 32],
     float (&sums)[ColsPerBlock]) {
   constexpr int blocks = N / ColsPerBlock;
-  const int logical_block =
-      swizzle_col_block<blocks, SwizzleTileBlocks>(physical_block_idx);
+  int logical_block = physical_block_idx;
+  if constexpr (SwizzleTileBlocks > 1) {
+    constexpr int tiles = blocks / SwizzleTileBlocks;
+    logical_block = (physical_block_idx % SwizzleTileBlocks) * tiles +
+                    physical_block_idx / SwizzleTileBlocks;
+  }
   const int col0 = logical_block * ColsPerBlock;
 
-  dot_cols_reduce<K, ColsPerBlock, Threads>(
-      x, w_col_major, col0, threadIdx.x, warp_sums, sums);
+  dot_cols<K, ColsPerBlock, Threads>(
+      x, w_col_major, col0, threadIdx.x, sums);
+  reduce_cols<ColsPerBlock, Threads>(threadIdx.x, warp_sums, sums);
 
-  if constexpr (StoreOutput) {
-    if (threadIdx.x == 0) {
-      store_cols<ColsPerBlock>(y + col0, sums);
+  if (threadIdx.x == 0) {
+    if constexpr (ColsPerBlock == kBf16Packed128Elements) {
+      Bf16Packed128 out;
+#pragma unroll
+      for (int col = 0; col < ColsPerBlock; ++col) {
+        out[col] = __float2bfloat16_rn(sums[col]);
+      }
+      *reinterpret_cast<int4 *>(y + col0) = out.bits();
+    } else {
+#pragma unroll
+      for (int col = 0; col < ColsPerBlock; ++col) {
+        y[col0 + col] = __float2bfloat16_rn(sums[col]);
+      }
     }
   }
-}
-
-template <int K,
-          int N,
-          int ColsPerBlock,
-          int Threads,
-          int SwizzleTileBlocks,
-          bool StoreOutput = true>
-__device__ inline void decode_gemv_cols_device(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_col_major,
-    __nv_bfloat16 *__restrict__ y,
-    int physical_block_idx,
-    float (&warp_sums)[ColsPerBlock][Threads / 32]) {
-  float sums[ColsPerBlock] = {};
-  decode_gemv_cols_device<K, N, ColsPerBlock, Threads, SwizzleTileBlocks,
-                          StoreOutput>(
-      x, w_col_major, y, physical_block_idx, warp_sums, sums);
 }
 
 }  // namespace gemma4_matmul_kernel_impl
@@ -381,19 +249,15 @@ namespace {
 constexpr int kDefaultThreads = 512;
 constexpr int kDefaultColsPerBlock = 8;
 constexpr int kDefaultMinBlocksPerSm = 2;
-constexpr int kInterleaveSwizzleBlocks = 16;
 constexpr int kFfnDownThreads = 960;
 constexpr int kFfnDownColsPerBlock = 8;
 constexpr int kFfnDownMinBlocksPerSm = 1;
 constexpr int kGlobalOThreads = 512;
 constexpr int kGlobalOColsPerBlock = 8;
 constexpr int kGlobalOMinBlocksPerSm = 1;
-constexpr int kFinalLogitsThreads =
-    gemma4_matmul_kernel_impl::kFinalLogitsDecodeThreads;
-constexpr int kFinalLogitsColsPerBlock =
-    gemma4_matmul_kernel_impl::kFinalLogitsDecodeColsPerBlock;
-constexpr int kFinalLogitsMinBlocksPerSm =
-    gemma4_matmul_kernel_impl::kFinalLogitsDecodeMinBlocksPerSm;
+constexpr int kFinalLogitsThreads = 1024;
+constexpr int kFinalLogitsColsPerBlock = 8;
+constexpr int kFinalLogitsMinBlocksPerSm = 1;
 
 template <int K,
           int N,
@@ -577,6 +441,16 @@ cudaError_t projection_decode_impl(
         kFfnDownColsPerBlock, kFfnDownThreads,
         kFfnDownMinBlocksPerSm, SwizzleTileBlocks>(
         x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_SLIDING_Q:
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_Q_PROJ_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_SLIDING_KV:
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_KV_PROJ_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
   case GEMMA4_PROJECTION_SLIDING_QKV:
     return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_SLIDING_QKV_SIZE,
                               kDefaultColsPerBlock, kDefaultThreads,
@@ -594,6 +468,11 @@ cudaError_t projection_decode_impl(
         x, w_col_major, y, stream);
   case GEMMA4_PROJECTION_GLOBAL_K:
     return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_K_PROJ_SIZE,
+                              kDefaultColsPerBlock, kDefaultThreads,
+                              kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
+        x, w_col_major, y, stream);
+  case GEMMA4_PROJECTION_GLOBAL_QK:
+    return launch_decode_gemv<GEMMA4_HIDDEN_SIZE, GEMMA4_GLOBAL_QK_PROJ_SIZE,
                               kDefaultColsPerBlock, kDefaultThreads,
                               kDefaultMinBlocksPerSm, SwizzleTileBlocks>(
         x, w_col_major, y, stream);
@@ -620,23 +499,6 @@ cudaError_t gemma4_projection_decode(Gemma4Projection projection,
                                      __nv_bfloat16 *__restrict__ y,
                                      cudaStream_t stream) {
   return projection_decode_impl<1>(projection, x, w_col_major, y, stream);
-}
-
-cudaError_t gemma4_projection_decode_swizzled(
-    Gemma4Projection projection,
-    Gemma4DecodeSwizzle swizzle,
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_col_major,
-    __nv_bfloat16 *__restrict__ y,
-    cudaStream_t stream) {
-  switch (swizzle) {
-  case GEMMA4_DECODE_SWIZZLE_IDENTITY:
-    return projection_decode_impl<1>(projection, x, w_col_major, y, stream);
-  case GEMMA4_DECODE_SWIZZLE_INTERLEAVE_16:
-    return projection_decode_impl<kInterleaveSwizzleBlocks>(
-        projection, x, w_col_major, y, stream);
-  }
-  return cudaErrorInvalidValue;
 }
 
 // Runs the public generic BF16 prefill projection GEMM.

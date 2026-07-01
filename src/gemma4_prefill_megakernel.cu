@@ -1,7 +1,8 @@
-#include "gemma4_decode_megakernel.cuh"
+#include "gemma4_megakernel.cuh"
 
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_ffn.cuh"
+#include "gemma4_flash_attention.cuh"
 #include "gemma4_matmul_kernels.cuh"
 #include "gemma4_rmsnorm.cuh"
 
@@ -172,18 +173,17 @@ cudaError_t run_prefill_layer(
         scratch.hidden_work, weights.v_proj_col_major, scratch.v, rows,
         GEMMA4_HIDDEN_SIZE, shape.kv_width, stream));
     GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
-        scratch.attention_out, nullptr, scratch.q_prepared,
-        scratch.k_prepared, scratch.v_prepared, scratch.q, scratch.k,
-        scratch.v, weights.q_norm_weight, weights.k_norm_weight, cos, sin,
+        scratch.attention_out, scratch.q_prepared, scratch.k_prepared,
+        scratch.v_prepared, scratch.q, scratch.k, scratch.v,
+        weights.q_norm_weight, weights.k_norm_weight, cos, sin,
         runtime->token_position, batch_size, seq_len, seq_len,
         shape.window_size, softmax_scale, stream));
   } else {
     GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_flash_attention_global_fwd_bf16_norm_rope(
-        scratch.attention_out, nullptr, scratch.q_prepared,
-        scratch.k_prepared, scratch.v_prepared, scratch.q, scratch.k,
-        weights.q_norm_weight, weights.k_norm_weight, cos, sin,
-        runtime->token_position, batch_size, seq_len, seq_len,
-        softmax_scale, stream));
+        scratch.attention_out, scratch.q_prepared, scratch.k_prepared,
+        scratch.v_prepared, scratch.q, scratch.k, weights.q_norm_weight,
+        weights.k_norm_weight, cos, sin, runtime->token_position, batch_size,
+        seq_len, seq_len, softmax_scale, stream));
   }
 
   if (global || seq_len <= GEMMA4_SLIDING_WINDOW) {
@@ -232,7 +232,7 @@ cudaError_t run_prefill_layer(
       scratch.hidden_work, rows * GEMMA4_HIDDEN_SIZE, stream));
 
   const int packs = rows * GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-  const dim3 grid_dim((packs + kScaleThreads - 1) / kScaleThreads);
+  const dim3 grid_dim(div_up(packs, kScaleThreads));
   const dim3 block_dim(kScaleThreads);
   scale_hidden_bf16_kernel<<<grid_dim, block_dim, 0, stream>>>(
       out, scratch.hidden_delta, weights.layer_scalar, packs);
@@ -248,7 +248,7 @@ size_t gemma4_prefill_megakernel_scratch_elements(int32_t rows) {
   return sliding > global ? sliding : global;
 }
 
-// Runs all 48 prefill layers over caller-provided prompt embeddings.
+// Runs all model prefill layers over caller-provided prompt embeddings.
 cudaError_t gemma4_prefill_megakernel(const Gemma4PrefillMegakernelArgs &args) {
   if (args.hidden_a == nullptr || args.hidden_b == nullptr ||
       args.scratch == nullptr || args.weights == nullptr ||

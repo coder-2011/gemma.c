@@ -14,16 +14,14 @@
 
 namespace {
 
-// Fails the test immediately when a CUDA API call returns an error.
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
-    std::exit(1);
-  }
-}
-
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+#define CHECK_CUDA(expr)                                                        \
+  do {                                                                          \
+    if (const cudaError_t status = (expr); status != cudaSuccess) {              \
+      std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", __FILE__,          \
+                   __LINE__, #expr, cudaGetErrorString(status));                \
+      std::exit(1);                                                             \
+    }                                                                           \
+  } while (0)
 
 // Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>

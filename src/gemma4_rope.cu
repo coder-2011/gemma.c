@@ -1,5 +1,7 @@
 #include "gemma4_rope.cuh"
 
+#include "gemma4_cuda_utils.cuh"
+
 namespace gemma4_rope {
 
 // Stores one already-loaded split-half RoPE pair after FP32 rotation.

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -33,6 +34,31 @@ void fill_token_ids(std::vector<int32_t> &token_ids, int count, int vocab_size) 
   }
 }
 
+// Checks gathered output against the model-scaled source embedding row.
+bool matches_scaled_bf16_row(
+    const __nv_bfloat16 *lhs,
+    const __nv_bfloat16 *rhs,
+    int count,
+    float rhs_scale) {
+  std::vector<__nv_bfloat16> h_lhs(count);
+  std::vector<__nv_bfloat16> h_rhs(count);
+  CUDA_CHECK(cudaMemcpy(h_lhs.data(), lhs, count * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_rhs.data(), rhs, count * sizeof(__nv_bfloat16),
+                        cudaMemcpyDeviceToHost));
+
+  for (int i = 0; i < count; ++i) {
+    const float a = __bfloat162float(h_lhs[i]);
+    const __nv_bfloat16 expected =
+        __float2bfloat16_rn(__bfloat162float(h_rhs[i]) * rhs_scale);
+    const float b = __bfloat162float(expected);
+    if (a != b) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -51,9 +77,11 @@ int main(int argc, char **argv) {
 
   cudaStream_t stream = nullptr;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  gemma4_bench_print_common_metadata("embedding_gather_bench");
 
   constexpr int hidden_size = GEMMA4_HIDDEN_SIZE;
   constexpr int vocab_size = GEMMA4_VOCAB_SIZE;
+  const uint64_t seed = make_seed("GEMMA4_EMBEDDING_GATHER_BENCH_SEED");
 
   const size_t embedding_elems = static_cast<size_t>(vocab_size) * hidden_size;
   const size_t embedding_bytes = embedding_elems * sizeof(__nv_bfloat16);
@@ -63,22 +91,20 @@ int main(int argc, char **argv) {
   thrust::device_vector<__nv_bfloat16> d_embeddings(embedding_elems);
   thrust::device_vector<__nv_bfloat16> d_out(out_elems);
   thrust::device_vector<int32_t> d_token_ids(max_tokens);
-  CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_embeddings), 0, embedding_bytes));
-  CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_out), 0, out_bytes));
+  fill_random_bf16(raw_ptr(d_embeddings), embedding_elems, seed, 1.0f, stream);
+  CUDA_CHECK(cudaMemsetAsync(raw_ptr(d_out), 0, out_bytes, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   std::vector<int32_t> h_token_ids(max_tokens);
 
-  int device = 0;
-  cudaDeviceProp prop{};
-  CUDA_CHECK(cudaGetDevice(&device));
-  CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-
-  std::printf("device=%s\n", prop.name);
-  std::printf("shape=hidden%d,vocab%d,embedding_bytes=%zu,"
-              "out_max_tokens=%d\n",
+  std::printf("benchmark_contract name=embedding_gather measurement=gather_kernel_only "
+              "timing=cuda_events_same_stream cache=warm_repeated_embedding_table "
+              "launch_overhead=excluded_from_gpu_elapsed_time aggregation=raw_trial_samples "
+              "correctness=first_row_vs_scaled_embedding_table warmup=%d iters=%d "
+              "trials=%d dtype=bf16 seed=0x%llx\n",
+              warmup, iters, trials, static_cast<unsigned long long>(seed));
+  std::printf("shape=hidden%d,vocab%d,embedding_bytes=%zu,out_max_tokens=%d\n",
               hidden_size, vocab_size, embedding_bytes, max_tokens);
-  std::printf("iters=%d,warmup_iters=%d,trials=%d\n", iters, warmup, trials);
   std::printf("tokens,best_ms,avg_ms,best_effective_gib_s,avg_effective_gib_s,effective_mib\n");
 
   for (int token_count : token_counts_up_to(max_tokens)) {
@@ -86,7 +112,7 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_token_ids), h_token_ids.data(),
                                static_cast<size_t>(token_count) *
                                    sizeof(int32_t),
-                               cudaMemcpyHostToDevice));
+                               cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     auto run_gather = [&]() {
@@ -97,6 +123,13 @@ int main(int argc, char **argv) {
 
     run_gather();
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int32_t first_token = h_token_ids.front();
+    const bool first_row_ok = matches_scaled_bf16_row(
+        raw_ptr(d_out), raw_ptr(d_embeddings) + size_t(first_token) * hidden_size,
+        hidden_size, GEMMA4_EMBEDDING_SCALE);
+    if (!first_row_ok) {
+      throw std::runtime_error("embedding gather first-row correctness failed");
+    }
 
     const TimingStats stats = time_ms(run_gather, stream, warmup, iters, trials);
     const double moved_bytes = 2.0 * static_cast<double>(token_count) *
@@ -109,6 +142,9 @@ int main(int argc, char **argv) {
     std::printf("%d,%.6f,%.6f,%.3f,%.3f,%.3f\n", token_count,
                 stats.best_ms, stats.avg_ms, best_gib_s, avg_gib_s,
                 moved_mib);
+    char context[64];
+    std::snprintf(context, sizeof(context), "tokens=%d", token_count);
+    gemma4_bench_print_timing_stats("embedding_gather", context, stats);
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));

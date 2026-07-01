@@ -14,16 +14,14 @@
 
 namespace {
 
-// Abort the test at the first CUDA error so the failing call site is explicit.
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
-    std::exit(1);
-  }
-}
-
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+#define CHECK_CUDA(expr)                                                        \
+  do {                                                                          \
+    if (const cudaError_t status = (expr); status != cudaSuccess) {              \
+      std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", __FILE__,          \
+                   __LINE__, #expr, cudaGetErrorString(status));                \
+      std::exit(1);                                                             \
+    }                                                                           \
+  } while (0)
 
 // Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
@@ -94,7 +92,7 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
 
 // Exercise out-of-range batch rows for the vector writer.
 void run_invalid_page_write_case() {
-  Gemma4KvCacheConfig config = {1, 2, 4, 2, 2, 16, 0};
+  Gemma4KvCacheConfig config = {1, 2, 4, 2, 1, 2, 16, 0};
   std::vector<int32_t> page_table(config.max_pages_per_seq, -1);
   std::vector<int32_t> token_batch = {1};
   std::vector<int32_t> token_position = {0};
