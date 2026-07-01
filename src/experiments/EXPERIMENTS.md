@@ -17039,113 +17039,6 @@ Conclusion:
 - Removed the token-level cooperative loop from the default path and restored
   the per-layer host loop over the existing fused layer kernel.
 
-## 2026-07-01 - Decode Attention Readiness Handoff Experiment
-
-Question: can the fused decode layer replace only the Q/K/V-prep to attention
-`grid.sync()` with per-KV-head readiness tags?
-
-Implementation:
-
-- Added an opt-in `GEMMA4_DECODE_ATTENTION_READY_HANDOFF=1` path.
-- Default builds keep the original full-grid sync before attention.
-- Experimental builds use one `uint32_t` readiness tag per model layer and
-  possible sliding KV head in decode scratch.
-- Producer CTAs finish one KV-head prep, run a block-local sync, fence, then
-  publish the tag with release ordering.
-- Attention CTAs wait on their KV-head tag with acquire polling and
-  `__nanosleep(64)`.
-- The projection-to-prep `grid.sync()` and all inter-layer ordering are
-  unchanged.
-
-Commands:
-
-```bash
-make test-decode-megakernel test-flash-attention-cpp
-
-make BUILD_DIR=build_ready \
-  NVCCFLAGS='-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_ATTENTION_READY_HANDOFF=1' \
-  test-decode-megakernel
-
-make BUILD_DIR=build_ready \
-  NVCCFLAGS='-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_ATTENTION_READY_HANDOFF=1' \
-  test-flash-attention-cpp
-
-./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
-  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
-  --max-new 4 --benchmark-mode decode-step --bench-warmup 3 \
-  --bench-iters 5 --bench-samples 3
-
-make BUILD_DIR=build_ready \
-  NVCCFLAGS='-std=c++17 -O3 -arch=sm_86 -DGEMMA4_DECODE_ATTENTION_READY_HANDOFF=1' \
-  prompt
-
-./build_ready/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
-  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
-  --max-new 4 --benchmark-mode decode-step --bench-warmup 3 \
-  --bench-iters 5 --bench-samples 3
-```
-
-Nsight Compute command for both default and readiness binaries:
-
-```bash
-ncu --target-processes all --kernel-name-base demangled \
-  --kernel-name 'regex:decode_megakernel_fused_layer_kernel' \
-  --launch-count 1 \
-  --metrics gpu__time_duration.sum,launch__grid_size,launch__block_size,launch__registers_per_thread,launch__shared_mem_per_block_static,launch__shared_mem_per_block_dynamic,dram__throughput.avg.pct_of_peak_sustained_elapsed,smsp__sass_inst_executed_op_local_ld.sum,smsp__sass_inst_executed_op_local_st.sum \
-  --page raw ./build_ready/gemma4_prompt \
-  --checkpoint models/gemma-4-12B-it/model.safetensors \
-  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
-  --max-new 4 --benchmark-mode decode-step --bench-warmup 0 \
-  --bench-iters 1 --bench-samples 1
-```
-
-Contract:
-
-- Hardware: NVIDIA RTX A6000, driver `580.159.03`.
-- CUDA/NVCC: CUDA compilation tools `13.0`, `V13.0.88`.
-- Batch 1, prompt `Hello`, decode-step benchmark after one prompt prefill.
-- Host-visible decode-step latency includes launch overhead.
-- Warmup/repeats: `3` warmup decode steps, `5` timed steps per sample,
-  `3` samples.
-- Cache state: uncontrolled/warm from repeated decode-step execution.
-- Clocks were not locked; persistence mode disabled.
-- Correctness tolerance: existing `test_decode_megakernel` and
-  `test_flash_attention_cpp` tolerances.
-
-Results:
-
-```text
-Correctness:
-  default test-decode-megakernel: pass
-  default test-flash-attention-cpp: pass
-  readiness test-decode-megakernel: pass
-  readiness test-flash-attention-cpp: pass
-
-Host-visible decode-step:
-  default p50 = 37.077 ms/token
-  readiness p50 = 37.132 ms/token
-  delta = +0.055 ms/token, readiness slower
-
-Nsight Compute first sliding fused layer:
-  default time = 715.52 us
-  readiness time = 712.19 us
-  default registers/thread = 90
-  readiness registers/thread = 90
-  default DRAM throughput = 89.54% of peak sustained elapsed
-  readiness DRAM throughput = 89.96% of peak sustained elapsed
-  default local load/store inst = 62209 / 63552
-  readiness local load/store inst = 62209 / 63552
-```
-
-Conclusion:
-
-- The experiment did not meet the keep bar of `>= 0.5 ms/token` decode-step
-  p50 improvement.
-- The per-layer `ncu` sample showed only a tiny first-layer improvement, not a
-  meaningful enough sync-wait removal to overcome the host-visible result.
-- Keep the path only as macro-gated experimental code for future A/B work; do
-  not enable it in the default production build.
-
 ## 2026-07-01 - Sliding decode K/V cp.async double-buffer ablation
 
 Implemented an opt-in decode-attention ablation guarded by
@@ -17366,5 +17259,161 @@ Conclusion:
   the earlier ablation.
 - The same short full decode-step command improved slightly versus the earlier
   direct-load baseline in this chat (`37.115 ms/token` p50 to `36.993`).
-- The readiness handoff experiment stayed macro-gated because it was slower in
-  full decode-step timing. The partial-O experiment stayed removed.
+- The partial-O experiment stayed removed.
+
+## 2026-07-01 - Decode bandwidth audit and sampling tile sweep
+
+Question: after promoting sliding K/V `cp.async`, are there still small
+decode-step wins from final-logit sampling tile shape or decode split size?
+
+Validation before timing:
+
+```bash
+make -j$(nproc) test-ffn-decode test-flash-attention test-decode-megakernel test-prefill-megakernel
+```
+
+All four focused tests passed.
+
+Baseline full decode-step command:
+
+```bash
+./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+  --max-new 4 --benchmark-mode decode-step --bench-warmup 3 \
+  --bench-iters 5 --bench-samples 3
+```
+
+Baseline result:
+
+```text
+decode_step_ms mean = 37.248
+decode_step_ms p50  = 37.002
+decode_step_ms min  = 36.770
+decode_step_ms max  = 37.971
+decode_step_tps_p50 = 27.025
+```
+
+Nsight Systems command:
+
+```bash
+nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt --sample=none \
+  --stats=true -o build/nsys/2026-07-01_decode_step_current \
+  ./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors \
+    --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello \
+    --max-new 4 --benchmark-mode decode-step --bench-warmup 1 \
+    --bench-iters 10 --bench-samples 1
+```
+
+Nsight Systems result:
+
+```text
+decode_step_ms p50 = 36.825
+sliding fused layer avg = 0.697664 ms over 440 launches
+global fused layer avg  = 0.750929 ms over 88 launches
+final_logits_sample_kernel avg = 2.836375 ms over 12 launches
+```
+
+Nsight Compute first sliding fused-layer result:
+
+```text
+kernel = decode_megakernel_fused_layer_kernel<Gemma4AttentionTraits<0>>
+time = 715.71 us
+grid = 84 CTAs x 512 threads
+registers/thread = 90
+static shared/block = 13.08 KiB
+waves/SM = 1
+DRAM throughput = 89.52% of peak sustained elapsed
+SM throughput = 16.83% of peak sustained elapsed
+local load/store inst = 62209 / 63552
+```
+
+Nsight Compute first global fused-layer result:
+
+```text
+kernel = decode_megakernel_fused_layer_kernel<Gemma4AttentionTraits<1>>
+time = 768.64 us
+grid = 84 CTAs x 512 threads
+registers/thread = 128
+static shared/block = 10.76 KiB
+waves/SM = 1
+DRAM throughput = 89.80% of peak sustained elapsed
+SM throughput = 16.19% of peak sustained elapsed
+local load/store inst = 77297 / 74832
+```
+
+Focused FFN and prefill checks:
+
+```text
+ffn_libtorch_bench, rows=1:
+  dualgemm_chain_decode_layout median = 0.516450 ms
+  dualgemm_chain_decode_layout graph median = 0.510413 ms
+
+flash_attention_bench, sliding prefill seq=1024:
+  norm_rope_plus_fa median = 0.293734 ms
+  approx_attention_tflops_in_total_path_median = 29.2724
+```
+
+Temporary sampling auto-tune:
+
+- Added compile-time overrides for `kFinalLogitsThreads` and
+  `kFinalLogitsColsPerBlock`.
+- Built isolated `build_sampling_*` binaries.
+- Removed the overrides after the sweep; no sampling source change was kept.
+
+Sampling contract:
+
+- `./build*/benches/gemma4_sampling_bench --warmup 5 --iters 20 --samples 5`
+- CUDA events on a nonblocking stream.
+- Warm repeated buffers.
+- Single process, clocks unlocked, persistence disabled.
+
+Sampling sweep:
+
+```text
+baseline 1024 threads, 8 cols:
+  median = 2.837146 ms
+
+512 threads, 8 cols:
+  median = 2.836378 ms
+
+256 threads, 8 cols:
+  median = 2.835507 ms
+
+512 threads, 16 cols:
+  median = 2.844006 ms
+
+1024 threads, 16 cols:
+  median = 3.701504 ms
+```
+
+Nsight Compute final logits result:
+
+```text
+kernel = final_logits_sample_kernel
+time = 2.85 ms
+grid = 84 CTAs x 1024 threads
+registers/thread = 64
+DRAM throughput = 97.16% of peak sustained elapsed
+SM throughput = 33.55% of peak sustained elapsed
+local load/store inst = 0 / 0
+```
+
+Decode split-size check:
+
+```text
+split=16: p50 = 37.132 ms, 26.931 tok/s
+split=20: p50 = 37.002 ms, 27.025 tok/s
+split=32: p50 = 37.008 ms, 27.021 tok/s
+```
+
+Conclusion:
+
+- No source-level optimization from this pass cleared the keep bar.
+- Final logits sampling is already at about `97%` DRAM throughput with no local
+  memory spills, so tile-shape tweaks are not worth keeping.
+- Sliding and global fused decode layers are also DRAM-bound, around `90%`
+  DRAM throughput and only about `16-17%` SM throughput.
+- The default decode split size `20` remains reasonable for the short prompt
+  benchmark; `32` tied it, and `16` was slightly slower.
+- Next useful work should focus on reducing bytes moved or avoiding full
+  weight streams, not on additional local arithmetic/scheduling tweaks.
