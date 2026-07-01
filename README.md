@@ -27,8 +27,6 @@ generation on Gemma 4 Unified's heterogeneous sliding/global KV shapes.
 
 ![p50 TTFT benchmark](docs/benchmarks/ttft_p50_gemma4_vllm_sglang_long.png)
 
-![decode throughput benchmark](docs/benchmarks/tps_gemma4_vllm_sglang_long.png)
-
 ### Current Decode Snapshot
 
 Small single-user decode snapshot on July 1, using 1 input token, 64 generated
