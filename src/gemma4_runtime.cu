@@ -1,9 +1,10 @@
 #include "gemma4_runtime.cuh"
 
 #include "gemma4_cuda_utils.cuh"
-#include "gemma4_rope.cuh"
 
 #include <algorithm>
+#include <cmath>
+#include <vector>
 
 namespace {
 
@@ -20,6 +21,27 @@ constexpr int32_t sliding_pages_per_sequence(int32_t max_seq_len,
     return div_up(max_seq_len, page_size);
   }
   return div_up(GEMMA4_SLIDING_WINDOW + page_size - 1, page_size);
+}
+
+// Fills compact row-major cos/sin tables for the runtime-owned RoPE cache.
+void fill_rope_tables(std::vector<float> &cos_table,
+                      std::vector<float> &sin_table,
+                      int32_t max_seq_len,
+                      int32_t rotary_half,
+                      float theta,
+                      int32_t exponent_dim) {
+  cos_table.resize(static_cast<size_t>(max_seq_len) * rotary_half);
+  sin_table.resize(cos_table.size());
+  for (int32_t pos = 0; pos < max_seq_len; ++pos) {
+    for (int32_t i = 0; i < rotary_half; ++i) {
+      const float exponent = -2.0f * static_cast<float>(i) /
+                             static_cast<float>(exponent_dim);
+      const float angle = static_cast<float>(pos) * std::pow(theta, exponent);
+      const size_t offset = static_cast<size_t>(pos) * rotary_half + i;
+      cos_table[offset] = std::cos(angle);
+      sin_table[offset] = std::sin(angle);
+    }
+  }
 }
 
 // Uploads page tables, sequence lengths, and the live token row metadata.
@@ -161,7 +183,7 @@ cudaError_t gemma4_runtime_state_init(
     std::vector<float> cos_table;
     std::vector<float> sin_table;
 
-    gemma4_rope::fill_tables(
+    fill_rope_tables(
         cos_table, sin_table, max_seq_len, kSlidingRotaryHalf,
         GEMMA4_ROPE_THETA_SLIDING, GEMMA4_SLIDING_HEAD_DIM);
     status = cudaMalloc(
@@ -181,7 +203,7 @@ cudaError_t gemma4_runtime_state_init(
         cudaMemcpyHostToDevice, stream);
     if (status != cudaSuccess) goto fail;
 
-    gemma4_rope::fill_tables(
+    fill_rope_tables(
         cos_table, sin_table, max_seq_len, kGlobalRotaryHalf,
         GEMMA4_ROPE_THETA_GLOBAL, GEMMA4_GLOBAL_HEAD_DIM);
     status = cudaMalloc(

@@ -160,11 +160,6 @@ void print_stats_line(const char *name, const TimingStats &stats) {
   print_stats_line(name, stats, "_ms");
 }
 
-// Prints one compact distribution line for throughput samples.
-void print_rate_stats_line(const char *name, const TimingStats &stats) {
-  print_stats_line(name, stats, "");
-}
-
 // Returns elapsed host-visible milliseconds between two steady-clock timestamps.
 float host_elapsed_ms(PromptClock::time_point start,
                       PromptClock::time_point stop) {
@@ -236,12 +231,11 @@ int run_prompt(const PromptOptions &options) {
 
   const int32_t split_size = options.decode_split_size;
   const int32_t sliding_keys = runtime.value.sliding_cache_config.window_size;
-  const int32_t sliding_splits =
-      (sliding_keys + split_size - 1) / split_size;
+  const int32_t sliding_splits = div_up(sliding_keys, split_size);
   const int32_t global_keys =
       runtime.value.global_cache_config.max_pages_per_seq *
       runtime.value.global_cache_config.page_size;
-  const int32_t global_splits = (global_keys + split_size - 1) / split_size;
+  const int32_t global_splits = div_up(global_keys, split_size);
   const int32_t max_splits = std::max(sliding_splits, global_splits);
   thrust::device_vector<float> d_partial_m(
       GEMMA4_NUM_QUERY_HEADS * max_splits);
@@ -461,8 +455,8 @@ int run_prompt(const PromptOptions &options) {
     print_stats_line("tpot_ms", summarize_timing_samples(std::move(tpot_ms)));
     print_stats_line("itl_ms", summarize_timing_samples(std::move(itl_ms)));
     print_stats_line("e2e_ms", summarize_timing_samples(std::move(e2e_ms)));
-    print_rate_stats_line("per_user_tps",
-                          summarize_timing_samples(std::move(per_user_tps)));
+    print_stats_line("per_user_tps",
+                     summarize_timing_samples(std::move(per_user_tps)), "");
     return 0;
   }
 

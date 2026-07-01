@@ -7,6 +7,7 @@
 #include <queue>
 #include <sstream>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -27,10 +28,16 @@ void skip_ws(const std::string &text, size_t *pos) {
 
 // Converts one hexadecimal digit to its integer value.
 bool hex_digit(char c, uint32_t *out) {
-    if (c >= '0' && c <= '9') { *out = c - '0';                    return true; }
-    c = std::tolower((unsigned char) c);
-    if (c >= 'a' && c <= 'f') { *out = c - 'a' + 10;              return true; }
-    return false;
+  if (c >= '0' && c <= '9') {
+    *out = c - '0';
+    return true;
+  }
+  c = std::tolower(static_cast<unsigned char>(c));
+  if (c >= 'a' && c <= 'f') {
+    *out = c - 'a' + 10;
+    return true;
+  }
+  return false;
 }
 
 // Appends one Unicode scalar as UTF-8.

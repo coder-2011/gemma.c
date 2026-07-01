@@ -1,6 +1,5 @@
 #pragma once
 
-#include <stdbool.h>
 #include <stdint.h>
 
 static constexpr int GEMMA4_VOCAB_SIZE = 262144;

@@ -123,31 +123,19 @@ cudaError_t load_layer_qkv_decode(
   const int q_width = spec.q_heads * spec.head_dim;
   const int kv_width = spec.kv_heads * spec.head_dim;
   const int v_width = spec.global ? 0 : kv_width;
-  const auto q_layout = cute::make_layout(
-      cute::make_shape(q_width, GEMMA4_HIDDEN_SIZE),
-      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
-  const auto kv_layout = cute::make_layout(
-      cute::make_shape(kv_width, GEMMA4_HIDDEN_SIZE),
-      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
-  const auto v_layout = cute::make_layout(
-      cute::make_shape(v_width, GEMMA4_HIDDEN_SIZE),
-      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
-  const auto qkv_layout = cute::make_layout(
-      cute::make_shape(q_width + kv_width + v_width, GEMMA4_HIDDEN_SIZE),
-      cute::make_stride(GEMMA4_HIDDEN_SIZE, 1));
-  const size_t q_elements = cute::size(q_layout);
-  const size_t kv_elements = cute::size(kv_layout);
-  const size_t v_elements = cute::size(v_layout);
+  const size_t q_elements = static_cast<size_t>(q_width) * GEMMA4_HIDDEN_SIZE;
+  const size_t kv_elements = static_cast<size_t>(kv_width) * GEMMA4_HIDDEN_SIZE;
+  const size_t v_elements = static_cast<size_t>(v_width) * GEMMA4_HIDDEN_SIZE;
   qkv_stage.resize(q_elements + kv_elements + v_elements);
 
-  __nv_bfloat16 *q_dst = qkv_stage.data() + qkv_layout(0, 0);
-  __nv_bfloat16 *k_dst = qkv_stage.data() + qkv_layout(q_width, 0);
-  __nv_bfloat16 *v_dst = qkv_stage.data() + qkv_layout(q_width + kv_width, 0);
+  __nv_bfloat16 *q_dst = qkv_stage.data();
+  __nv_bfloat16 *k_dst = q_dst + q_elements;
   memcpy(q_dst, src.q_proj_col_major, q_elements * sizeof(__nv_bfloat16));
   memcpy(k_dst, src.k_proj_col_major, kv_elements * sizeof(__nv_bfloat16));
 
   // Global layers have K=V semantics, so only sliding layers carry a V projection.
   if (v_elements != 0) {
+    __nv_bfloat16 *v_dst = k_dst + kv_elements;
     memcpy(v_dst, src.v_proj_col_major, v_elements * sizeof(__nv_bfloat16));
   }
 
@@ -163,9 +151,9 @@ cudaError_t load_layer_qkv_decode(
   }
 
   dst.q_proj_col_major = dst.qkv_proj_col_major;
-  dst.k_proj_col_major = dst.qkv_proj_col_major + qkv_layout(q_width, 0);
+  dst.k_proj_col_major = dst.qkv_proj_col_major + q_elements;
   dst.v_proj_col_major =
-      spec.global ? nullptr : dst.qkv_proj_col_major + qkv_layout(q_width + kv_width, 0);
+      spec.global ? nullptr : dst.qkv_proj_col_major + q_elements + kv_elements;
   return cudaSuccess;
 }
 
