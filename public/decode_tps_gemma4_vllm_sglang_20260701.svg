@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="520" viewBox="0 0 960 520" role="img" aria-labelledby="title desc">
+  <title id="title">Single-user decode throughput comparison</title>
+  <desc id="desc">Gemma 4 12B-it BF16 on an RTX A6000. vLLM serve reaches 25.941 tokens per second, gemma4_prompt local reaches 25.770 tokens per second, and SGLang serve reaches 24.188 tokens per second.</desc>
+  <style>
+    .bg { fill: #f8fafc; }
+    .panel { fill: #ffffff; stroke: #d6dde8; stroke-width: 1; }
+    .title { fill: #0f172a; font: 700 28px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .subtitle { fill: #475569; font: 16px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .label { fill: #1e293b; font: 600 17px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .value { fill: #0f172a; font: 700 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .axis { fill: #64748b; font: 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .note { fill: #475569; font: 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .grid { stroke: #e2e8f0; stroke-width: 1; }
+  </style>
+  <rect class="bg" width="960" height="520"/>
+  <rect class="panel" x="32" y="28" width="896" height="464" rx="8"/>
+  <text class="title" x="64" y="76">Single-user decode throughput</text>
+  <text class="subtitle" x="64" y="105">Gemma 4 12B-it BF16 on RTX A6000 • 1 input token / 64 output tokens • max concurrency 1</text>
+  <line class="grid" x1="282" y1="396" x2="842" y2="396"/>
+  <line class="grid" x1="282" y1="146" x2="282" y2="396"/>
+  <line class="grid" x1="489" y1="146" x2="489" y2="396"/>
+  <line class="grid" x1="697" y1="146" x2="697" y2="396"/>
+  <line class="grid" x1="842" y1="146" x2="842" y2="396"/>
+  <text class="axis" x="276" y="421">0</text>
+  <text class="axis" x="475" y="421">10</text>
+  <text class="axis" x="683" y="421">20</text>
+  <text class="axis" x="823" y="421">27</text>
+  <text class="axis" x="606" y="454">Decode/output tokens per second, higher is better</text>
+  <text class="label" x="64" y="181">vLLM serve</text>
+  <rect x="282" y="150" width="538" height="48" rx="4" fill="#2563eb"/>
+  <text class="value" x="834" y="181">25.941</text>
+  <text class="label" x="64" y="261">gemma4_prompt local</text>
+  <rect x="282" y="230" width="535" height="48" rx="4" fill="#16a34a"/>
+  <text class="value" x="834" y="261">25.770</text>
+  <text class="label" x="64" y="341">SGLang serve</text>
+  <rect x="282" y="310" width="502" height="48" rx="4" fill="#f97316"/>
+  <text class="value" x="834" y="341">24.188</text>
+  <text class="note" x="64" y="466">July 1, 2026 snapshot. Local row is in-process warm-serving; vLLM/SGLang rows are HTTP serving.</text>
+</svg>
