@@ -10,7 +10,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <string>
 
 #define CHECK_CUDA(expr)                                                        \
   do {                                                                          \

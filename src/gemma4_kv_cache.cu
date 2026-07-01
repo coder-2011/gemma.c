@@ -16,7 +16,6 @@ __device__ inline void kv_cache_write_vec_device(
     const int32_t *__restrict__ token_batch,
     const int32_t *__restrict__ token_position,
     const int32_t *__restrict__ page_table,
-    int32_t token_count,
     int32_t layer,
     const __nv_bfloat16 *__restrict__ k,
     const __nv_bfloat16 *__restrict__ v,
@@ -64,13 +63,12 @@ __global__ __launch_bounds__(kKvWriteVecThreads) void kv_cache_write_vec_kernel(
     const int32_t *__restrict__ token_batch,
     const int32_t *__restrict__ token_position,
     const int32_t *__restrict__ page_table,
-    int32_t token_count,
     int32_t layer,
     const __nv_bfloat16 *__restrict__ k,
     const __nv_bfloat16 *__restrict__ v) {
   kv_cache_write_vec_device(cache_k, cache_v, config, token_batch, token_position,
-                            page_table, token_count, layer, k, v,
-                            blockIdx.x, blockIdx.y, threadIdx.x, blockDim.x);
+                            page_table, layer, k, v, blockIdx.x, blockIdx.y,
+                            threadIdx.x, blockDim.x);
 }
 
 }  // namespace
@@ -177,6 +175,6 @@ extern "C" cudaError_t gemma4_kv_cache_write_bf16(
   const dim3 grid_dim(token_count, config.num_heads);
   kv_cache_write_vec_kernel<<<grid_dim, kKvWriteVecThreads, 0, stream>>>(
       d_cache_k, d_cache_v, config, d_token_batch, d_token_position, d_page_table,
-      token_count, layer, d_k, d_v);
+      layer, d_k, d_v);
   return cudaGetLastError();
 }

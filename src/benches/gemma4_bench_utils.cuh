@@ -375,15 +375,6 @@ inline uint64_t make_seed(const char *env_name) {
   return seed;
 }
 
-// Flags timings in the range where event overhead and enqueue jitter can dominate.
-inline void gemma4_bench_warn_if_tiny(const char *label, float ms) {
-  if (ms > 0.0f && ms < 0.010f) {
-    std::printf("benchmark_warning label=%s measured_ms=%.6f "
-                "reason=sub_10us_timing_needs_repetition_or_ncu_check\n",
-                label, ms);
-  }
-}
-
 // Times repeated CUDA work with events on the same stream as the work.
 template <typename Fn>
 float time_ms_once(Fn &&fn, cudaStream_t stream, int warmup, int iters) {

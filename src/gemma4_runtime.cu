@@ -278,14 +278,16 @@ cudaError_t gemma4_runtime_prepare_decode_step(
         static_cast<size_t>(batch) *
             state->global_cache_config.max_pages_per_seq +
         global_slot;
-    const int32_t sliding_page = gemma4_kv_cache_ensure_page(
-        state->h_sliding_page_table, state->h_sliding_slot_logical_pages,
-        state->sliding_cache_config, batch, pos);
-    if (sliding_page < 0) return cudaErrorInvalidValue;
-    const int32_t global_page = gemma4_kv_cache_ensure_page(
-        state->h_global_page_table, state->h_global_slot_logical_pages,
-        state->global_cache_config, batch, pos);
-    if (global_page < 0) return cudaErrorInvalidValue;
+    if (gemma4_kv_cache_ensure_page(
+            state->h_sliding_page_table, state->h_sliding_slot_logical_pages,
+            state->sliding_cache_config, batch, pos) < 0) {
+      return cudaErrorInvalidValue;
+    }
+    if (gemma4_kv_cache_ensure_page(
+            state->h_global_page_table, state->h_global_slot_logical_pages,
+            state->global_cache_config, batch, pos) < 0) {
+      return cudaErrorInvalidValue;
+    }
     state->h_token_batch[batch] = batch;
     state->h_token_position[batch] = pos;
     GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(

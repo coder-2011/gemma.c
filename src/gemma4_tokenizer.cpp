@@ -1,6 +1,7 @@
 #include "gemma4_tokenizer.cuh"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <limits>
 #include <queue>

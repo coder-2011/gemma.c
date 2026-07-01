@@ -65,7 +65,6 @@ void run_case(int vocab_size, const std::vector<int32_t> &token_ids) {
                         cudaMemcpyDeviceToHost));
 
   const uint16_t *out_bits = reinterpret_cast<const uint16_t *>(out.data());
-  const uint16_t *embedding_bits = reinterpret_cast<const uint16_t *>(embeddings.data());
   for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
     int32_t token_id = token_ids[token_idx];
     for (int c = 0; c < hidden_size; ++c) {
