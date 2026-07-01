@@ -2,12 +2,10 @@
 
 #include "gemma4_cuda_utils.cuh"
 #include "gemma4_ffn.cuh"
-#include "gemma4_matmul_kernels.cuh"
 #include "gemma4_rmsnorm.cuh"
 
 #include <math.h>
 #include <stdint.h>
-#include <utility>
 
 cudaError_t gemma4_decode_megakernel_flash_attention_layer_bf16(
     const Gemma4DecodeMegakernelLayerArgs &args,
@@ -19,18 +17,45 @@ struct DecodeScratch {
   Gemma4FfnDecodeScratch *ffn = nullptr;
   void *sample = nullptr;
   size_t sample_bytes = 0;
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+  uint32_t *attention_ready = nullptr;
+#endif
 };
 
-// Splits caller-owned decode scratch into FFN and final-sampling regions.
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+// Returns the scratch byte offset of the layer/KV-head readiness table.
+size_t decode_attention_ready_offset(void) {
+  const size_t sample_end =
+      sizeof(Gemma4FfnDecodeScratch) + gemma4_sample_next_scratch_bytes();
+  return (sample_end + alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1);
+}
+
+// Counts one readiness tag per model layer and possible sliding KV head.
+size_t decode_attention_ready_bytes(void) {
+  return static_cast<size_t>(GEMMA4_NUM_LAYERS) *
+         GEMMA4_SLIDING_KV_HEADS * sizeof(uint32_t);
+}
+#endif
+
+// Splits caller-owned decode scratch into FFN and sampling regions.
 DecodeScratch decode_scratch_from_buffer(void *scratch) {
   auto *ffn = reinterpret_cast<Gemma4FfnDecodeScratch *>(scratch);
   void *sample = reinterpret_cast<void *>(ffn + 1);
-  return {ffn, sample, gemma4_sample_next_scratch_bytes()};
+  const size_t sample_bytes = gemma4_sample_next_scratch_bytes();
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+  const size_t ready_offset = decode_attention_ready_offset();
+  auto *ready = reinterpret_cast<uint32_t *>(
+      static_cast<unsigned char *>(scratch) + ready_offset);
+  return {ffn, sample, sample_bytes, ready};
+#else
+  return {ffn, sample, sample_bytes};
+#endif
 }
 
-// Fills the per-layer FlashAttention+FFN argument block from runtime state.
+// Fills the per-layer cooperative FlashAttention+FFN argument block.
 Gemma4DecodeMegakernelLayerArgs decode_layer_args(
     const Gemma4DecodeMegakernelArgs &args,
+    Gemma4FfnDecodeScratch *ffn_scratch,
     int32_t layer,
     __nv_bfloat16 *hidden_in,
     __nv_bfloat16 *hidden_out) {
@@ -42,11 +67,12 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
   Gemma4DecodeMegakernelLayerArgs layer_args = {};
   layer_args.residual_out = hidden_out;
   layer_args.normed_out = args.normed;
-  layer_args.ffn_x = args.normed;
+  layer_args.ffn_x = args.attention_out;
   layer_args.ffn_residual = hidden_out;
   layer_args.ffn_norm_weight = w.post_feedforward_norm_weight;
   layer_args.ffn_gate_up_decode = w.ffn_gate_up_decode;
   layer_args.ffn_down_decode = w.ffn_down_decode;
+  layer_args.ffn_scratch = ffn_scratch;
   layer_args.layer_scalar = w.layer_scalar;
   layer_args.attention_q = args.attention_q;
   layer_args.attention_out = args.attention_out;
@@ -58,9 +84,11 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
   layer_args.attention_cache_v =
       global ? args.runtime->global_cache_v : args.runtime->sliding_cache_v;
   layer_args.attention_cache_config =
-      global ? args.runtime->global_cache_config : args.runtime->sliding_cache_config;
+      global ? args.runtime->global_cache_config
+             : args.runtime->sliding_cache_config;
   layer_args.attention_page_table =
-      global ? args.runtime->global_page_table : args.runtime->sliding_page_table;
+      global ? args.runtime->global_page_table
+             : args.runtime->sliding_page_table;
   layer_args.attention_token_position = args.runtime->token_position;
   layer_args.attention_seq_lengths = args.runtime->seq_lengths;
   layer_args.attention_cache_layer = gemma4_kv_cache_layer_index(layer, global);
@@ -69,56 +97,27 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
       global ? args.global_splits : args.sliding_splits;
   layer_args.attention_softmax_scale = 1.0f / sqrtf(float(head_dim));
   layer_args.attention_x = hidden_in;
+  layer_args.attention_input_norm_weight = w.input_norm_weight;
+  layer_args.attention_qkv_proj_col_major = w.qkv_proj_col_major;
   layer_args.attention_o_proj_col_major = w.o_proj_col_major;
   layer_args.attention_post_norm_weight = w.post_attention_norm_weight;
   layer_args.attention_pre_ffn_norm_weight = w.pre_feedforward_norm_weight;
   layer_args.attention_q_norm_weight = w.q_norm_weight;
   layer_args.attention_k_norm_weight = w.k_norm_weight;
-  layer_args.attention_cos = global ? args.runtime->global_cos : args.runtime->sliding_cos;
-  layer_args.attention_sin = global ? args.runtime->global_sin : args.runtime->sliding_sin;
-  return layer_args;
-}
-
-// Restores the fast decode-ingress shape: normalize once, run column-block GEMV
-// projections, then prepare Q/K/V for paged FlashAttention.
-cudaError_t prepare_decode_attention_inputs(
-    const Gemma4DecodeMegakernelArgs &args,
-    const Gemma4DecodeMegakernelLayerArgs &layer_args,
-    const Gemma4TextLayerWeightsDevice &w,
-    bool global,
-    const __nv_bfloat16 *__restrict__ hidden_in) {
-  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_rmsnorm_bf16(
-      args.normed, hidden_in, w.input_norm_weight, 1, GEMMA4_HIDDEN_SIZE,
-      GEMMA4_RMS_NORM_EPS, args.stream));
-
-  __nv_bfloat16 *raw_q = args.attention_q;
-  __nv_bfloat16 *raw_k = args.attention_out;
-  __nv_bfloat16 *raw_v = nullptr;
-
-  if (global) {
-    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_projection_decode(
-        GEMMA4_PROJECTION_GLOBAL_Q, args.normed, w.q_proj_col_major,
-        args.attention_q, args.stream));
-    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_projection_decode(
-        GEMMA4_PROJECTION_GLOBAL_K, args.normed, w.k_proj_col_major, raw_k,
-        args.stream));
-  } else {
-    // The sliding raw QKV row fits in attention_out before attention overwrites it.
-    raw_q = args.attention_out;
-    raw_k = raw_q + GEMMA4_SLIDING_Q_PROJ_SIZE;
-    raw_v = raw_k + GEMMA4_SLIDING_KV_PROJ_SIZE;
-    GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_projection_decode(
-        GEMMA4_PROJECTION_SLIDING_QKV, args.normed, w.qkv_proj_col_major,
-        args.attention_out, args.stream));
+  layer_args.attention_cos =
+      global ? args.runtime->global_cos : args.runtime->sliding_cos;
+  layer_args.attention_sin =
+      global ? args.runtime->global_sin : args.runtime->sliding_sin;
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+  if (args.attention_ready != nullptr) {
+    const size_t layer_ready_offset =
+        static_cast<size_t>(layer) * GEMMA4_SLIDING_KV_HEADS;
+    layer_args.attention_ready = args.attention_ready + layer_ready_offset;
+    layer_args.attention_ready_tag =
+        static_cast<uint32_t>(args.runtime->h_token_position[0] + 1);
   }
-
-  return gemma4_flash_attention_decode_prepare_q_paged_kv_bf16(
-      args.attention_q, layer_args.attention_cache_k,
-      layer_args.attention_cache_v, layer_args.attention_cache_config,
-      layer_args.attention_page_table, layer_args.attention_token_position, 1,
-      layer_args.attention_cache_layer, raw_q, raw_k, raw_v,
-      w.q_norm_weight, w.k_norm_weight, layer_args.attention_cos,
-      layer_args.attention_sin, args.stream);
+#endif
+  return layer_args;
 }
 
 }  // namespace
@@ -143,7 +142,11 @@ cudaError_t gemma4_megakernel_prepare_runtime(
 
 // Returns caller-owned scratch bytes needed by one full decode step.
 size_t gemma4_decode_megakernel_scratch_bytes(void) {
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+  return decode_attention_ready_offset() + decode_attention_ready_bytes();
+#else
   return sizeof(Gemma4FfnDecodeScratch) + gemma4_sample_next_scratch_bytes();
+#endif
 }
 
 // Applies final RMSNorm, softcapped sampling, and tied embedding gather.
@@ -190,33 +193,50 @@ cudaError_t gemma4_decode_megakernel(const Gemma4DecodeMegakernelArgs &args) {
   GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_megakernel_prepare_runtime(
       args.runtime, Gemma4MegakernelPrepMode::kDecode, 0, args.stream));
 
-  DecodeScratch scratch_parts = decode_scratch_from_buffer(args.scratch);
-  __nv_bfloat16 *hidden_in = args.hidden_a;
-  __nv_bfloat16 *hidden_out = args.hidden_b;
-  for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
-    Gemma4DecodeMegakernelLayerArgs layer_args =
-        decode_layer_args(args, layer, hidden_in, hidden_out);
-    layer_args.ffn_scratch = scratch_parts.ffn;
-    const bool global = gemma4_is_global_layer(layer);
-    const Gemma4TextLayerWeightsDevice &w = args.weights->layers[layer];
-    GEMMA4_RETURN_IF_CUDA_ERROR(prepare_decode_attention_inputs(
-        args, layer_args, w, global, hidden_in));
-    GEMMA4_RETURN_IF_CUDA_ERROR(
-        gemma4_decode_megakernel_flash_attention_layer_bf16(
-            layer_args, args.stream));
-    std::swap(hidden_in, hidden_out);
+  const int32_t seq_len = args.runtime->h_seq_lengths[0];
+  const int32_t window = args.runtime->sliding_cache_config.window_size;
+  const int32_t sliding_keys = seq_len < window ? seq_len : window;
+  Gemma4DecodeMegakernelArgs active_args = args;
+  active_args.sliding_splits = div_up(sliding_keys, args.split_size);
+  active_args.global_splits = div_up(seq_len, args.split_size);
+  if (active_args.sliding_splits > args.sliding_splits ||
+      active_args.global_splits > args.global_splits) {
+    return cudaErrorInvalidValue;
   }
 
+  DecodeScratch scratch_parts = decode_scratch_from_buffer(active_args.scratch);
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+  if (active_args.attention_ready == nullptr) {
+    active_args.attention_ready = scratch_parts.attention_ready;
+  }
+#endif
+  __nv_bfloat16 *hidden_in = active_args.hidden_a;
+  __nv_bfloat16 *hidden_out = active_args.hidden_b;
+  for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
+    Gemma4DecodeMegakernelLayerArgs layer_args =
+        decode_layer_args(
+            active_args, scratch_parts.ffn, layer, hidden_in, hidden_out);
+    GEMMA4_RETURN_IF_CUDA_ERROR(
+        gemma4_decode_megakernel_flash_attention_layer_bf16(
+            layer_args, active_args.stream));
+
+    __nv_bfloat16 *tmp = hidden_in;
+    hidden_in = hidden_out;
+    hidden_out = tmp;
+  }
+
+  const __nv_bfloat16 *final_hidden = hidden_in;
   GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_megakernel_sample_final_bf16(
-      args.sampled_hidden, args.next_token, args.normed, hidden_in,
-      args.weights, scratch_parts.sample, scratch_parts.sample_bytes,
-      Gemma4SamplingStage::kDecode, args.stream));
-  if (args.hidden_a == args.sampled_hidden) {
+      active_args.sampled_hidden, active_args.next_token, active_args.normed,
+      final_hidden, active_args.weights, scratch_parts.sample,
+      scratch_parts.sample_bytes, Gemma4SamplingStage::kDecode,
+      active_args.stream));
+  if (active_args.hidden_a == active_args.sampled_hidden) {
     return cudaSuccess;
   }
   const size_t row_bytes =
       static_cast<size_t>(GEMMA4_HIDDEN_SIZE) * sizeof(__nv_bfloat16);
   return cudaMemcpyAsync(
-      args.hidden_a, args.sampled_hidden, row_bytes, cudaMemcpyDeviceToDevice,
-      args.stream);
+      active_args.hidden_a, active_args.sampled_hidden, row_bytes,
+      cudaMemcpyDeviceToDevice, active_args.stream);
 }

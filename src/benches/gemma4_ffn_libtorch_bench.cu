@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <optional>
 #include <tuple>
 
@@ -33,6 +34,34 @@ void print_row(const char *path,
   std::printf("decode,1,%d,%d,%s,%.6f,%.6f,%.6g\n",
               GEMMA4_HIDDEN_SIZE, GEMMA4_INTERMEDIATE_SIZE, path,
               stats.best_ms, stats.avg_ms, max_abs);
+}
+
+// Times graph replay when capture works, but keeps stream-loop timing usable.
+template <typename Fn>
+std::optional<TimingStats> try_time_ms_graph(
+    const char *path,
+    Fn &&fn,
+    cudaStream_t stream,
+    int warmup,
+    int iters,
+    int trials) {
+  try {
+    return time_ms_graph(fn, stream, warmup, iters, trials);
+  } catch (const std::exception &error) {
+    std::printf("benchmark_graph_unavailable path=%s reason=\"%s\"\n",
+                path, error.what());
+    return std::nullopt;
+  }
+}
+
+// Prints an optional graph-replay timing row using the normal timing schema.
+void print_graph_stats(const char *path,
+                       const std::optional<TimingStats> &stats) {
+  if (!stats.has_value()) {
+    return;
+  }
+  gemma4_bench_print_timing_stats(
+      "ffn_libtorch_bench_graph", path, *stats);
 }
 
 }  // namespace
@@ -159,7 +188,8 @@ int main(int argc, char **argv) {
   const float dual_max_abs =
       std::max(dual_normed_diff.max_abs, dual_residual_diff.max_abs);
   constexpr float kTolerance = 0.125f;
-  if (std::max(custom_max_abs, dual_max_abs) > kTolerance) {
+  const float max_abs = std::max(custom_max_abs, dual_max_abs);
+  if (max_abs > kTolerance) {
     std::fprintf(stderr,
                  "FFN correctness failed custom_max_abs=%.6g "
                  "dualgemm_max_abs=%.6g "
@@ -174,6 +204,12 @@ int main(int argc, char **argv) {
       time_ms(run_dualgemm_chain, stream, warmup, iters, trials);
   const TimingStats custom_stats =
       time_ms(run_custom_decode, stream, warmup, iters, trials);
+  const std::optional<TimingStats> dual_graph_stats =
+      try_time_ms_graph("dualgemm_chain_decode_layout", run_dualgemm_chain,
+                        stream, warmup, iters, trials);
+  const std::optional<TimingStats> custom_graph_stats =
+      try_time_ms_graph("custom_fused_decode", run_custom_decode, stream,
+                        warmup, iters, trials);
 
   int device = 0;
   int memory_clock_khz = 0;
@@ -226,6 +262,8 @@ int main(int argc, char **argv) {
       "ffn_libtorch_bench", "path=dualgemm_chain_decode_layout", dual_stats);
   gemma4_bench_print_timing_stats(
       "ffn_libtorch_bench", "path=custom_fused_decode", custom_stats);
+  print_graph_stats("path=dualgemm_chain_decode_layout", dual_graph_stats);
+  print_graph_stats("path=custom_fused_decode", custom_graph_stats);
   std::printf("mode,rows,hidden,intermediate,path,best_ms,avg_ms,"
               "max_abs_vs_libtorch\n");
   print_row("libtorch_full_ffn", torch_stats, 0.0f);

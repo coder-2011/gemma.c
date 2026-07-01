@@ -224,22 +224,13 @@ void final_logits_sample_kernel(
 // Computes producer count while leaving one resident slot for the consumer CTA.
 cudaError_t producer_count_for_kernel(const void *kernel, int *producer_count) {
   int device = 0;
-  cudaError_t status = cudaGetDevice(&device);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDevice(&device));
 
   cudaDeviceProp prop = {};
-  status = cudaGetDeviceProperties(&prop, device);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDeviceProperties(&prop, device));
   int active_blocks_per_sm = 0;
-  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &active_blocks_per_sm, kernel, kFinalLogitsThreads, 0);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &active_blocks_per_sm, kernel, kFinalLogitsThreads, 0));
 
   *producer_count = active_blocks_per_sm * prop.multiProcessorCount - 1;
   if (*producer_count > kCandidateCount) {
@@ -285,15 +276,14 @@ cudaError_t gemma4_sample_next_bf16(
                                    candidate_bytes);
 
   int producer_count = 0;
-  cudaError_t status = producer_count_for_kernel(
+  GEMMA4_RETURN_IF_CUDA_ERROR(producer_count_for_kernel(
       reinterpret_cast<const void *>(final_logits_sample_kernel),
-      &producer_count);
-  if (status != cudaSuccess) { return status; }
+      &producer_count));
 
   const size_t active_ready_bytes =
       static_cast<size_t>(producer_count) * sizeof(uint32_t);
-  status = cudaMemsetAsync(d_ready_flags, 0, active_ready_bytes, stream);
-  if (status != cudaSuccess) { return status; }
+  GEMMA4_RETURN_IF_CUDA_ERROR(
+      cudaMemsetAsync(d_ready_flags, 0, active_ready_bytes, stream));
 
   const dim3 grid_dim(producer_count + 1);
   const dim3 block_dim(kFinalLogitsThreads);
@@ -301,18 +291,4 @@ cudaError_t gemma4_sample_next_bf16(
       d_next_hidden, d_next_token, d_final_hidden, d_lm_head_col_major,
       d_candidates, d_ready_flags, stage, producer_count);
   return cudaGetLastError();
-}
-
-// Launches fused decode-token selection from final hidden to next embedding.
-cudaError_t gemma4_sample_next_decode_bf16(
-    __nv_bfloat16 *__restrict__ d_next_hidden,
-    int32_t *__restrict__ d_next_token,
-    void *__restrict__ d_scratch,
-    size_t scratch_bytes,
-    const __nv_bfloat16 *__restrict__ d_final_hidden,
-    const __nv_bfloat16 *__restrict__ d_lm_head_col_major,
-    cudaStream_t stream) {
-  return gemma4_sample_next_bf16(
-      d_next_hidden, d_next_token, d_scratch, scratch_bytes, d_final_hidden,
-      d_lm_head_col_major, Gemma4SamplingStage::kDecode, stream);
 }

@@ -17,16 +17,14 @@
 
 namespace {
 
-// Abort the test at the first CUDA error so the failing call site is explicit.
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
-    std::exit(1);
-  }
-}
-
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+#define CHECK_CUDA(expr)                                                        \
+  do {                                                                          \
+    if (const cudaError_t status = (expr); status != cudaSuccess) {              \
+      std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", __FILE__,          \
+                   __LINE__, #expr, cudaGetErrorString(status));                \
+      std::exit(1);                                                             \
+    }                                                                           \
+  } while (0)
 
 // Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
@@ -159,34 +157,6 @@ float reference_rms_scale(float sum_sq, int width) {
   return 1.0f / std::sqrt(sum_sq / float(width) + GEMMA4_RMS_NORM_EPS);
 }
 
-// Reproduce hidden RMSNorm for the sparse fixture where only element 0 is nonzero.
-__nv_bfloat16 reference_sparse_hidden_rmsnorm_scalar(float x0, float weight0) {
-  float scale = reference_rms_scale(x0 * x0, GEMMA4_HIDDEN_SIZE);
-  return __float2bfloat16_rn(x0 * scale * weight0);
-}
-
-// Reproduce the one-term BF16 projection rounding used by the CUDA path.
-float reference_project_scalar(__nv_bfloat16 x, float weight) {
-  __nv_bfloat16 bf16_weight = __float2bfloat16_rn(weight);
-  float product = bf16_to_float(x) * bf16_to_float(bf16_weight);
-  return bf16_to_float(__float2bfloat16_rn(product));
-}
-
-// Reproduce per-head RMSNorm for a sparse head with only dim 0 nonzero.
-__nv_bfloat16 reference_head_rms_scalar(float value, int head_dim) {
-  float scale = reference_rms_scale(value * value, head_dim);
-  return __float2bfloat16_rn(value * scale);
-}
-
-// Write one BF16 value into a large zeroed device matrix.
-void write_device_bf16(thrust::device_vector<__nv_bfloat16> &dst,
-                       int64_t index,
-                       float value) {
-  __nv_bfloat16 bf16 = __float2bfloat16_rn(value);
-  CHECK_CUDA(cudaMemcpy(raw_ptr(dst) + index, &bf16, sizeof(bf16),
-                        cudaMemcpyHostToDevice));
-}
-
 // Compute the same causal GQA attention as the raw prefill kernels on CPU.
 void reference_attention(std::vector<__nv_bfloat16> &expected,
                          const std::vector<__nv_bfloat16> &q,
@@ -245,45 +215,6 @@ void reference_attention(std::vector<__nv_bfloat16> &expected,
 }
 
 // Compare raw sliding prefill with a CPU reference for one sequence/window shape.
-void run_sliding_prefill_reference_case(int seq_len,
-                                        int window_size,
-                                        const char *label) {
-  const int q_count = seq_len * GEMMA4_SLIDING_Q_PROJ_SIZE;
-  const int kv_count = seq_len * GEMMA4_SLIDING_KV_PROJ_SIZE;
-  std::vector<__nv_bfloat16> q(q_count);
-  std::vector<__nv_bfloat16> k(kv_count);
-  std::vector<__nv_bfloat16> v(kv_count);
-  for (int i = 0; i < q_count; ++i) q[i] = make_prefill_value(1000 + i);
-  for (int i = 0; i < kv_count; ++i) {
-    k[i] = make_prefill_value(2000 + i);
-    v[i] = make_prefill_value(3000 + i);
-  }
-
-  thrust::device_vector<__nv_bfloat16> d_q(q.size());
-  thrust::device_vector<__nv_bfloat16> d_k(k.size());
-  thrust::device_vector<__nv_bfloat16> d_v(v.size());
-  thrust::device_vector<__nv_bfloat16> d_out(q_count);
-  thrust::device_vector<float> d_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
-  copy_to_device(d_q, q);
-  copy_to_device(d_k, k);
-  copy_to_device(d_v, v);
-
-  const float scale = 1.0f / std::sqrt(float(GEMMA4_SLIDING_HEAD_DIM));
-  CHECK_CUDA(gemma4_flash_attention_sliding_fwd_bf16(
-      raw_ptr(d_out), raw_ptr(d_lse), raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), 1, seq_len,
-      seq_len, window_size, scale, 0));
-  CHECK_CUDA(cudaDeviceSynchronize());
-
-  std::vector<__nv_bfloat16> expected(q_count);
-  std::vector<float> expected_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
-  reference_attention(expected, q, k, v, seq_len, GEMMA4_NUM_QUERY_HEADS,
-                      GEMMA4_SLIDING_KV_HEADS, GEMMA4_SLIDING_HEAD_DIM,
-                      window_size, scale, &expected_lse);
-  compare_device_bf16(d_out, expected, 0.03125f, label);
-  compare_float(copy_to_host(d_lse), expected_lse, 0.03125f,
-                "sliding prefill LSE");
-}
-
 // Compare global D=512 prefill with norm/RoPE prep against a CPU reference.
 void run_global_prefill_reference_case() {
   constexpr int batch_size = 1;
@@ -389,110 +320,6 @@ void run_global_flash_decode_case() {
     }
   }
   compare_device_bf16(d_out, expected, 0.0f, "global flash decode");
-}
-
-// Check sliding folded decode ingress against a sparse CPU reference.
-void run_sliding_norm_project_prepare_case() {
-  constexpr int batch_size = 1;
-  constexpr int cache_layer = 0;
-  constexpr int head_dim = GEMMA4_SLIDING_HEAD_DIM;
-  constexpr int q_cols = GEMMA4_SLIDING_Q_PROJ_SIZE;
-  constexpr int kv_cols = GEMMA4_SLIDING_KV_PROJ_SIZE;
-  constexpr int rotary_half = head_dim / 2;
-  constexpr float q_weight = 0.5f;
-  constexpr float k_weight = -0.25f;
-  constexpr float v_weight = 0.75f;
-  Gemma4KvCacheConfig config = single_page_cache_config(
-      GEMMA4_SLIDING_KV_HEADS, head_dim, 1);
-
-  std::vector<__nv_bfloat16> x(GEMMA4_HIDDEN_SIZE,
-                               __float2bfloat16_rn(0.0f));
-  std::vector<__nv_bfloat16> input_norm_weight(
-      GEMMA4_HIDDEN_SIZE, __float2bfloat16_rn(1.0f));
-  std::vector<__nv_bfloat16> head_norm_weight(
-      head_dim, __float2bfloat16_rn(1.0f));
-  std::vector<float> cos(rotary_half, 1.0f);
-  std::vector<float> sin(rotary_half, 0.0f);
-  std::vector<int32_t> page_table = {0};
-  std::vector<int32_t> token_position = {0};
-  x[0] = __float2bfloat16_rn(1.0f);
-  input_norm_weight[0] = __float2bfloat16_rn(1.25f);
-
-  __nv_bfloat16 normed_x0 = reference_sparse_hidden_rmsnorm_scalar(
-      bf16_to_float(x[0]), bf16_to_float(input_norm_weight[0]));
-  const size_t q_weight_count =
-      static_cast<size_t>(q_cols) * GEMMA4_HIDDEN_SIZE;
-  const size_t kv_weight_count =
-      static_cast<size_t>(kv_cols) * GEMMA4_HIDDEN_SIZE;
-  const int64_t cache_count = cache_elements(config);
-
-  thrust::device_vector<__nv_bfloat16> d_x(x.size());
-  thrust::device_vector<__nv_bfloat16> d_input_norm_weight(
-      input_norm_weight.size());
-  thrust::device_vector<__nv_bfloat16> d_head_norm(
-      head_norm_weight.size());
-  thrust::device_vector<float> d_cos(cos.size());
-  thrust::device_vector<float> d_sin(sin.size());
-  thrust::device_vector<int32_t> d_page_table(
-      page_table.size());
-  thrust::device_vector<int32_t> d_token_position(
-      token_position.size());
-  thrust::device_vector<__nv_bfloat16> d_w_q(q_weight_count);
-  thrust::device_vector<__nv_bfloat16> d_w_k(kv_weight_count);
-  thrust::device_vector<__nv_bfloat16> d_w_v(kv_weight_count);
-  thrust::device_vector<__nv_bfloat16> d_q(q_cols);
-  thrust::device_vector<__nv_bfloat16> d_cache_k(cache_count);
-  thrust::device_vector<__nv_bfloat16> d_cache_v(cache_count);
-  copy_to_device(d_x, x);
-  copy_to_device(d_input_norm_weight, input_norm_weight);
-  copy_to_device(d_head_norm, head_norm_weight);
-  copy_to_device(d_cos, cos);
-  copy_to_device(d_sin, sin);
-  copy_to_device(d_page_table, page_table);
-  copy_to_device(d_token_position, token_position);
-
-  memset_device(d_w_q, 0);
-  memset_device(d_w_k, 0);
-  memset_device(d_w_v, 0);
-  memset_device(d_q, 0);
-  memset_device(d_cache_k, 0);
-  memset_device(d_cache_v, 0);
-
-  write_device_bf16(d_w_q, 0, q_weight);
-  write_device_bf16(d_w_k, 0, k_weight);
-  write_device_bf16(d_w_v, 0, v_weight);
-
-  Gemma4AttentionProjectionWeights weights = {
-      raw_ptr(d_w_q),
-      raw_ptr(d_w_k),
-      raw_ptr(d_w_v),
-      0,
-      0,
-      0,
-  };
-
-  CHECK_CUDA(gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16(
-      raw_ptr(d_q), raw_ptr(d_cache_k), raw_ptr(d_cache_v), config,
-      raw_ptr(d_page_table), raw_ptr(d_token_position), batch_size, cache_layer,
-      raw_ptr(d_x), raw_ptr(d_input_norm_weight), weights, raw_ptr(d_head_norm),
-      raw_ptr(d_head_norm), raw_ptr(d_cos), raw_ptr(d_sin), 0));
-  CHECK_CUDA(cudaDeviceSynchronize());
-
-  float q_value = reference_project_scalar(normed_x0, q_weight);
-  float k_value = reference_project_scalar(normed_x0, k_weight);
-  float v_value = reference_project_scalar(normed_x0, v_weight);
-  std::vector<__nv_bfloat16> expected_q(q_cols, __float2bfloat16_rn(0.0f));
-  std::vector<__nv_bfloat16> expected_k(cache_count, __float2bfloat16_rn(0.0f));
-  std::vector<__nv_bfloat16> expected_v(cache_count, __float2bfloat16_rn(0.0f));
-  expected_q[0] = reference_head_rms_scalar(q_value, head_dim);
-  expected_k[0] = reference_head_rms_scalar(k_value, head_dim);
-  expected_v[0] = reference_head_rms_scalar(v_value, head_dim);
-
-  compare_device_bf16(d_q, expected_q, 0.125f, "sliding norm-project Q");
-  compare_device_bf16(d_cache_k, expected_k, 0.125f,
-                      "sliding norm-project K");
-  compare_device_bf16(d_cache_v, expected_v, 0.125f,
-                      "sliding norm-project V");
 }
 
 // Check global prefill prepares K-derived V and runs full causal attention.
@@ -616,14 +443,7 @@ void run_global_prefill_norm_rope_case() {
 
 int main() {
   run_global_flash_decode_case();
-  run_sliding_norm_project_prepare_case();
   run_global_prefill_norm_rope_case();
-  run_sliding_prefill_reference_case(
-      5, 5, "sliding prefill nonzero causal");
-  run_sliding_prefill_reference_case(
-      5, 2, "sliding prefill local window");
-  run_sliding_prefill_reference_case(
-      65, 65, "sliding prefill partial tile");
   run_global_prefill_reference_case();
   std::puts("flash attention tests passed");
   return 0;

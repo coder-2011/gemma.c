@@ -282,10 +282,8 @@ __global__ void swizzle_gate_up_interleaved_kernel(
       int(gridDim.x), int(blockDim.x), int(threadIdx.x));
 }
 
-}  // namespace
-
 // Runs direct decode FFN math and post norm inside the caller's cooperative grid.
-extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
+__device__ inline void run_direct_decode_ffn_body(
     __nv_bfloat16 *__restrict__ residual_out,
     __nv_bfloat16 *__restrict__ normed_out,
     const __nv_bfloat16 *__restrict__ x,
@@ -389,6 +387,25 @@ extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
   }
 }
 
+}  // namespace
+
+// Runs the decode FFN tail inside a caller-owned cooperative CUDA grid.
+extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
+    __nv_bfloat16 *__restrict__ residual_out,
+    __nv_bfloat16 *__restrict__ normed_out,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ residual,
+    const __nv_bfloat16 *__restrict__ rms_weight,
+    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
+    const __nv_bfloat16 *__restrict__ w_down_decode,
+    Gemma4FfnDecodeScratch *__restrict__ scratch,
+    const __nv_bfloat16 *__restrict__ layer_scalar,
+    float eps) {
+  run_direct_decode_ffn_body(
+      residual_out, normed_out, x, residual, rms_weight, w_gate_up_decode,
+      w_down_decode, scratch, layer_scalar, eps);
+}
+
 namespace {
 
 // Runs direct decode FFN math and post norm in one cooperative launch.
@@ -403,7 +420,7 @@ __global__ __launch_bounds__(kFfnThreads, 1) void direct_decode_ffn_kernel(
     Gemma4FfnDecodeScratch *__restrict__ scratch,
     const __nv_bfloat16 *__restrict__ layer_scalar,
     float eps) {
-  gemma4_ffn_decode_fused_bf16_device(
+  run_direct_decode_ffn_body(
       residual_out, normed_out, x, residual, rms_weight, w_gate_up_decode,
       w_down_decode, scratch, layer_scalar, eps);
 }
@@ -559,6 +576,12 @@ cudaError_t run_gate_up_geglu_decode_layout_dual_gemm(
     int rows,
     cudaStream_t stream) {
   // Row thresholds mirror the measured 12B FFN gate/up DualGemm sweep.
+  if (rows == 1) {
+    // Decode only has one valid row, so use the smallest tensor-op M tile.
+    return run_gate_up_geglu_decode_layout_dual_gemm_config<
+        16, 64, 64, 16, 32, 4>(
+        act, x_swizzled, w_gate_up_decode, rows, stream);
+  }
   switch (rows <= 64 ? 64 : rows <= 128 ? 128 : 0) {
     case 64:
       return run_gate_up_geglu_decode_layout_dual_gemm_config<
@@ -584,6 +607,12 @@ cudaError_t launch_down_decode_layout_gemm(
     cudaStream_t stream) {
   // Row thresholds mirror the measured 12B FFN-down decode-layout sweep.
   // Template args: ThreadblockM, ThreadblockN, ThreadblockK, WarpM, WarpN, Stages.
+  if (rows == 1) {
+    // Decode favors a wider K tile than prefill to cut mainloop overhead.
+    return launch_cutlass_bf16_gemm<64, 64, 64, 32, 32, 6>(
+        act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+        GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
+  }
   switch (rows <= 64 ? 64
                      : rows <= 128 ? 128
                                    : rows <= 256 ? 256
@@ -634,21 +663,18 @@ cudaError_t launch_direct_decode_ffn(
   static int cached_device = -1;
   static int cached_active_blocks = 0;
   int device = 0;
-  cudaError_t status = cudaGetDevice(&device);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDevice(&device));
 
   if (cached_device != device || cached_active_blocks <= 0) {
     cudaDeviceProp prop = {};
-    status = cudaGetDeviceProperties(&prop, device);
-    GEMMA4_RETURN_IF_CUDA_ERROR(status);
+    GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDeviceProperties(&prop, device));
     if (!prop.cooperativeLaunch) {
       return cudaErrorNotSupported;
     }
 
     int active_blocks_per_sm = 0;
-    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_blocks_per_sm, direct_decode_ffn_kernel, kFfnThreads, 0);
-    GEMMA4_RETURN_IF_CUDA_ERROR(status);
+    GEMMA4_RETURN_IF_CUDA_ERROR(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks_per_sm, direct_decode_ffn_kernel, kFfnThreads, 0));
     if (active_blocks_per_sm <= 0) {
       return cudaErrorInvalidValue;
     }
@@ -676,12 +702,10 @@ cudaError_t launch_direct_decode_ffn(
       &scratch_arg,
       &layer_scalar_arg,
       &eps};
-  status = cudaLaunchCooperativeKernel(
+  const cudaError_t status = cudaLaunchCooperativeKernel(
       reinterpret_cast<void *>(direct_decode_ffn_kernel), cached_active_blocks,
       kFfnThreads, kernel_args, 0, stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(status);
   return cudaGetLastError();
 }
 
@@ -737,9 +761,9 @@ Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
   return scratch;
 }
 
-// Runs the prefill GeGLU MLP and leaves the down-projection in natural order.
-cudaError_t gemma4_ffn_prefill_mlp_bf16(
-    __nv_bfloat16 *__restrict__ out,
+// Runs the prefill GeGLU MLP and leaves the down-projection in swizzled order.
+static cudaError_t gemma4_ffn_prefill_mlp_swizzled_bf16(
+    __nv_bfloat16 *__restrict__ out_swizzled,
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_gate_up_decode,
     const __nv_bfloat16 *__restrict__ w_down_decode,
@@ -757,16 +781,27 @@ cudaError_t gemma4_ffn_prefill_mlp_bf16(
   const dim3 swizzle_grid_dim(kActualSwizzleBlocksPerRow, rows);
   swizzle_hidden_packs_kernel<<<swizzle_grid_dim, block_dim, 0, stream>>>(
       scratch.down, x, rows);
-  cudaError_t status = cudaGetLastError();
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetLastError());
 
-  status = run_gate_up_geglu_decode_layout_dual_gemm(
-      scratch.act, scratch.down, w_gate_up_decode, rows, stream);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
+  GEMMA4_RETURN_IF_CUDA_ERROR(run_gate_up_geglu_decode_layout_dual_gemm(
+      scratch.act, scratch.down, w_gate_up_decode, rows, stream));
 
-  status = launch_down_decode_layout_gemm(
-      scratch.act, w_down_decode, scratch.down, rows, stream);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
+  return launch_down_decode_layout_gemm(
+      scratch.act, w_down_decode, out_swizzled, rows, stream);
+}
+
+// Runs the prefill GeGLU MLP and leaves the down-projection in natural order.
+cudaError_t gemma4_ffn_prefill_mlp_bf16(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
+    const __nv_bfloat16 *__restrict__ w_down_decode,
+    Gemma4FfnPrefillScratch scratch,
+    int rows,
+    cudaStream_t stream) {
+  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_ffn_prefill_mlp_swizzled_bf16(
+      scratch.down, x, w_gate_up_decode, w_down_decode, scratch, rows,
+      stream));
 
   unswizzle_hidden_packs_kernel<<<rows, kFfnThreads, 0, stream>>>(
       out, scratch.down);

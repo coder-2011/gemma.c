@@ -12,6 +12,10 @@
 
 struct Gemma4FfnDecodeScratch;
 
+#ifndef GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+#define GEMMA4_DECODE_ATTENTION_READY_HANDOFF 0
+#endif
+
 enum class Gemma4MegakernelPrepMode {
   kPrefill,
   kDecode,
@@ -56,6 +60,8 @@ struct Gemma4DecodeMegakernelLayerArgs {
   int32_t attention_num_splits = 0;
   float attention_softmax_scale = 0.0f;
   const __nv_bfloat16 *attention_x = nullptr;
+  const __nv_bfloat16 *attention_input_norm_weight = nullptr;
+  const __nv_bfloat16 *attention_qkv_proj_col_major = nullptr;
   const __nv_bfloat16 *attention_o_proj_col_major = nullptr;
   const __nv_bfloat16 *attention_post_norm_weight = nullptr;
   const __nv_bfloat16 *attention_pre_ffn_norm_weight = nullptr;
@@ -63,6 +69,10 @@ struct Gemma4DecodeMegakernelLayerArgs {
   const __nv_bfloat16 *attention_k_norm_weight = nullptr;
   const float *attention_cos = nullptr;
   const float *attention_sin = nullptr;
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+  uint32_t *attention_ready = nullptr;
+  uint32_t attention_ready_tag = 0;
+#endif
 };
 
 struct Gemma4DecodeMegakernelArgs {
@@ -84,6 +94,9 @@ struct Gemma4DecodeMegakernelArgs {
   int32_t sliding_splits = 0;
   int32_t global_splits = 0;
   cudaStream_t stream = nullptr;
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+  uint32_t *attention_ready = nullptr;
+#endif
 };
 
 // Prepares shared runtime metadata for either prompt prefill or one decode append.

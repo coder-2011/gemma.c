@@ -250,7 +250,7 @@ cudaError_t gemma4_runtime_prepare_prefill(
   return upload_runtime_metadata(state, state->token_count, stream);
 }
 
-// Appends one decode position per batch and uploads the new runtime metadata.
+// Appends one decode position per batch and uploads the changed runtime metadata.
 cudaError_t gemma4_runtime_prepare_decode_step(
     Gemma4RuntimeState *state,
     cudaStream_t stream) {
@@ -264,6 +264,20 @@ cudaError_t gemma4_runtime_prepare_decode_step(
 
   for (int32_t batch = 0; batch < state->batch_size; ++batch) {
     const int32_t pos = state->h_seq_lengths[batch];
+    const int32_t sliding_slot =
+        (pos / state->sliding_cache_config.page_size) %
+        state->sliding_cache_config.max_pages_per_seq;
+    const int32_t global_slot =
+        (pos / state->global_cache_config.page_size) %
+        state->global_cache_config.max_pages_per_seq;
+    const size_t sliding_index =
+        static_cast<size_t>(batch) *
+            state->sliding_cache_config.max_pages_per_seq +
+        sliding_slot;
+    const size_t global_index =
+        static_cast<size_t>(batch) *
+            state->global_cache_config.max_pages_per_seq +
+        global_slot;
     const int32_t sliding_page = gemma4_kv_cache_ensure_page(
         state->h_sliding_page_table, state->h_sliding_slot_logical_pages,
         state->sliding_cache_config, batch, pos);
@@ -274,11 +288,30 @@ cudaError_t gemma4_runtime_prepare_decode_step(
     if (global_page < 0) return cudaErrorInvalidValue;
     state->h_token_batch[batch] = batch;
     state->h_token_position[batch] = pos;
+    GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
+        state->sliding_page_table + sliding_index,
+        state->h_sliding_page_table.data() + sliding_index,
+        sizeof(*state->sliding_page_table), cudaMemcpyHostToDevice, stream));
+    GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
+        state->global_page_table + global_index,
+        state->h_global_page_table.data() + global_index,
+        sizeof(*state->global_page_table), cudaMemcpyHostToDevice, stream));
   }
 
   for (int32_t batch = 0; batch < state->batch_size; ++batch) {
     ++state->h_seq_lengths[batch];
   }
   state->token_count = state->batch_size;
-  return upload_runtime_metadata(state, state->token_count, stream);
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
+      state->seq_lengths, state->h_seq_lengths.data(),
+      state->h_seq_lengths.size() * sizeof(*state->seq_lengths),
+      cudaMemcpyHostToDevice, stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaMemcpyAsync(
+      state->token_batch, state->h_token_batch.data(),
+      state->token_count * sizeof(*state->token_batch),
+      cudaMemcpyHostToDevice, stream));
+  return cudaMemcpyAsync(
+      state->token_position, state->h_token_position.data(),
+      state->token_count * sizeof(*state->token_position),
+      cudaMemcpyHostToDevice, stream);
 }

@@ -135,8 +135,8 @@ $(BUILD_DIR)/tests:
 $(BUILD_DIR)/tests/cuda_utils:
 	mkdir -p $(BUILD_DIR)/tests/cuda_utils
 
-$(BUILD_DIR)/benches/gemma4_decode_bench: src/benches/gemma4_decode_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/benches
-	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) -I$(CUDNN_INCLUDE) src/benches/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu $(CUDA_LDFLAGS) -lcublas $(CUDNN_LDFLAGS) -o $@
+$(BUILD_DIR)/benches/gemma4_decode_bench: src/benches/gemma4_decode_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4_matmul_kernels.cu src/gemma4_matmul_kernels.cuh src/gemma4_rmsnorm.cu src/gemma4_rmsnorm.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/benches
+	$(NVCC) $(NVCCFLAGS) $(FFN_CUTLASS_NVCCFLAGS) $(CPPFLAGS) $(FFN_CUTLASS_CPPFLAGS) -I$(CUDNN_INCLUDE) src/benches/gemma4_decode_bench.cu src/gemma4_matmul_kernels.cu src/gemma4_rmsnorm.cu $(CUDA_LDFLAGS) -lcublas $(CUDNN_LDFLAGS) -o $@
 
 $(BUILD_DIR)/benches/gemma4_embedding_gather_bench: src/benches/gemma4_embedding_gather_bench.cu src/benches/gemma4_bench_utils.cuh src/gemma4_embedding_gather.cu src/gemma4_embedding_gather.cuh src/gemma4_cuda_utils.cuh src/gemma4.h | $(BUILD_DIR)/benches
 	$(NVCC) $(NVCCFLAGS) $(CPPFLAGS) src/benches/gemma4_embedding_gather_bench.cu src/gemma4_embedding_gather.cu -o $@

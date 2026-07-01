@@ -31,9 +31,6 @@ constexpr int kKvHeads = GEMMA4_SLIDING_KV_HEADS;
 constexpr int kHeadDim = GEMMA4_SLIDING_HEAD_DIM;
 constexpr int kGqaRatio = kQHeads / kKvHeads;
 constexpr int kRotaryHalf = kHeadDim / 2;
-constexpr int kQElements = kQHeads * kHeadDim;
-constexpr int kKvElements = kKvHeads * kHeadDim;
-constexpr int kQkvElements = kQElements + 2 * kKvElements;
 
 int parse_arg(char **argv, int argc, int index, int default_value) {
   return index < argc ? std::atoi(argv[index]) : default_value;
@@ -216,48 +213,6 @@ void run_torch_decode_prep(at::Tensor &q_prepared,
   using at::indexing::Slice;
   cache_k.index_put_({0, physical_page, offset, Slice(), Slice()}, k_out);
   cache_v.index_put_({0, physical_page, offset, Slice(), Slice()}, v_out);
-}
-
-// Applies hidden-width RMSNorm before the packed QKV projection baseline.
-at::Tensor torch_hidden_rmsnorm(const at::Tensor &x, const at::Tensor &weight) {
-  at::Tensor y = x.to(at::kFloat);
-  at::Tensor mean_sq = y.square().mean(std::vector<int64_t>{-1}, true);
-  y = y * at::rsqrt(mean_sq + GEMMA4_RMS_NORM_EPS);
-  y = y * weight.to(at::kFloat).view({1, GEMMA4_HIDDEN_SIZE});
-  return y.to(at::kBFloat16);
-}
-
-// Runs the LibTorch packed projection plus decode-prep baseline.
-void run_torch_project_prepare(at::Tensor &q_prepared,
-                               at::Tensor &cache_k,
-                               at::Tensor &cache_v,
-                               const at::Tensor &x,
-                               const at::Tensor &input_norm_weight,
-                               const at::Tensor &qkv_weight,
-                               const at::Tensor &q_norm_weight,
-                               const at::Tensor &k_norm_weight,
-                               const at::Tensor &cos,
-                               const at::Tensor &sin,
-                               const at::Tensor &token_position,
-                               int batch_size,
-                               int pages_per_seq,
-                               int slot,
-                               int page_offset) {
-  at::Tensor x_normed = torch_hidden_rmsnorm(x, input_norm_weight);
-  at::Tensor qkv = at::matmul(x_normed, qkv_weight.t());
-  at::Tensor q = qkv.slice(1, 0, kQElements).view({batch_size, kQHeads, kHeadDim});
-  at::Tensor k = qkv.slice(1, kQElements, kQElements + kKvElements)
-                     .view({batch_size, kKvHeads, kHeadDim});
-  at::Tensor v = qkv.slice(1, kQElements + kKvElements, kQkvElements)
-                     .view({batch_size, kKvHeads, kHeadDim});
-  run_torch_decode_prep(q_prepared, cache_k, cache_v, q, k, v, q_norm_weight,
-                        k_norm_weight, cos, sin, token_position, batch_size,
-                        pages_per_seq, slot, page_offset);
-}
-
-// Returns a CUDA BF16 pointer from a LibTorch tensor for the C ABI row.
-__nv_bfloat16 *torch_bf16_ptr(at::Tensor &tensor) {
-  return reinterpret_cast<__nv_bfloat16 *>(tensor.data_ptr());
 }
 
 void fill_random_bf16(std::vector<__nv_bfloat16> &values, uint32_t seed) {
@@ -598,14 +553,31 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
       batch_size * decode_pages_per_seq, -1);
   const int decode_slot = ((seq_len - 1) / decode_page_size) % decode_pages_per_seq;
   const int decode_page_offset = (seq_len - 1) % decode_page_size;
+  // Decode attention scans the whole live window, so every logical page needs
+  // a valid mapping rather than only the final cache-write page.
   for (int b = 0; b < batch_size; ++b) {
-    h_decode_page_table[b * decode_pages_per_seq + decode_slot] =
-        b * decode_pages_per_seq + decode_slot;
+    for (int slot = 0; slot < decode_pages_per_seq; ++slot) {
+      h_decode_page_table[b * decode_pages_per_seq + slot] =
+          b * decode_pages_per_seq + slot;
+    }
   }
   const size_t decode_cache_elems =
       size_t(decode_cache_config.num_layers) * decode_cache_config.num_pages *
       decode_cache_config.page_size * decode_cache_config.num_heads *
       decode_cache_config.head_dim;
+  std::vector<__nv_bfloat16> h_decode_cache_k(decode_cache_elems);
+  std::vector<__nv_bfloat16> h_decode_cache_v(decode_cache_elems);
+  std::vector<int32_t> h_decode_seq_lengths(batch_size, seq_len);
+  fill_random_bf16(h_decode_cache_k, 0x468au);
+  fill_random_bf16(h_decode_cache_v, 0x579bu);
+  const int decode_split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
+  // The decode launcher validates capacity against the full sliding window;
+  // rows shorter than this cheaply exit overprovisioned split CTAs.
+  const int decode_num_splits =
+      (GEMMA4_SLIDING_WINDOW + decode_split_size - 1) / decode_split_size;
+  const size_t decode_out_elems = q_elements(batch_size, 1);
+  const size_t decode_partial_rows = size_t(batch_size) * kQHeads *
+                                     decode_num_splits;
   int64_t l2_flush_words = 0;
   if (cold_cache) {
     flush_bytes = flush_bytes > 0 ? flush_bytes : int64_t(64) * 1024 * 1024;
@@ -623,13 +595,19 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   thrust::device_vector<__nv_bfloat16> d_decode_q_prepared(h_decode_q.size());
   thrust::device_vector<__nv_bfloat16> d_decode_cache_k(decode_cache_elems);
   thrust::device_vector<__nv_bfloat16> d_decode_cache_v(decode_cache_elems);
+  thrust::device_vector<__nv_bfloat16> d_decode_out(decode_out_elems);
+  thrust::device_vector<float> d_decode_partial_m(decode_partial_rows);
+  thrust::device_vector<float> d_decode_partial_l(decode_partial_rows);
+  thrust::device_vector<float> d_decode_partial_acc(
+      decode_partial_rows * kHeadDim);
   thrust::device_vector<__nv_bfloat16> d_q_norm_weight(h_q_norm_weight.size());
   thrust::device_vector<__nv_bfloat16> d_k_norm_weight(h_k_norm_weight.size());
   thrust::device_vector<__nv_bfloat16> d_out(h_q.size());
-  thrust::device_vector<float> d_raw_lse(size_t(batch_size) * kQHeads * seq_len);
   thrust::device_vector<int32_t> d_decode_page_table(h_decode_page_table.size());
   thrust::device_vector<int32_t> d_decode_token_position(
       h_decode_token_position.size());
+  thrust::device_vector<int32_t> d_decode_seq_lengths(
+      h_decode_seq_lengths.size());
   thrust::device_vector<float> d_cos(h_cos.size());
   thrust::device_vector<float> d_sin(h_sin.size());
   thrust::device_vector<uint32_t> d_l2_scratch(static_cast<size_t>(l2_flush_words));
@@ -652,6 +630,12 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_v), h_decode_v.data(),
                         h_decode_v.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_cache_k), h_decode_cache_k.data(),
+                        h_decode_cache_k.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_cache_v), h_decode_cache_v.data(),
+                        h_decode_cache_v.size() * sizeof(__nv_bfloat16),
+                        cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(raw_ptr(d_q_norm_weight), h_q_norm_weight.data(),
                         h_q_norm_weight.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
@@ -668,15 +652,10 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_token_position), h_decode_token_position.data(),
                         h_decode_token_position.size() * sizeof(int32_t),
                         cudaMemcpyHostToDevice));
-
-  auto launch_raw_sliding_fa = [&]() {
-    CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16(
-        raw_ptr(d_out), raw_ptr(d_raw_lse), raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), batch_size, seq_len, seq_len,
-        window_size, scale, stream));
-  };
-  const TimingStats raw_sliding_timing =
-      time_cuda_samples(launch_raw_sliding_fa, stream, warmup, iters, samples,
-                        cold_cache, raw_ptr(d_l2_scratch), l2_flush_words);
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_seq_lengths),
+                        h_decode_seq_lengths.data(),
+                        h_decode_seq_lengths.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
 
   if (seq_len <= window_size) {
     c10::cuda::CUDAGuard torch_device_guard(0);
@@ -764,121 +743,6 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
                                   l2_flush_words));
   }
 
-  {
-    c10::cuda::CUDAGuard torch_device_guard(0);
-    const c10::cuda::CUDAStream torch_stream =
-        c10::cuda::getStreamFromPool(false, 0);
-    c10::cuda::CUDAStreamGuard torch_stream_guard(torch_stream);
-    at::manual_seed(0u);
-    const auto torch_options =
-        at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
-    const auto int_options =
-        at::TensorOptions().device(at::kCUDA).dtype(at::kInt);
-    const Gemma4KvCacheConfig project_config = {
-        1, batch_size * decode_pages_per_seq, decode_page_size,
-        decode_pages_per_seq, batch_size, kKvHeads, kHeadDim,
-        std::min(seq_len, GEMMA4_SLIDING_WINDOW)};
-    at::Tensor project_x =
-        at::randn({batch_size, GEMMA4_HIDDEN_SIZE}, torch_options);
-    at::Tensor project_input_weight =
-        at::randn({GEMMA4_HIDDEN_SIZE}, torch_options) * 0.01 + 1.0;
-    at::Tensor project_weight =
-        (at::randn({kQkvElements, GEMMA4_HIDDEN_SIZE}, torch_options) /
-         std::sqrt(float(GEMMA4_HIDDEN_SIZE)))
-            .contiguous();
-    at::Tensor project_q_weight =
-        at::randn({kHeadDim}, torch_options) * 0.01 + 1.0;
-    at::Tensor project_k_weight =
-        at::randn({kHeadDim}, torch_options) * 0.01 + 1.0;
-    at::Tensor project_cos =
-        at::from_blob(h_cos.data(), {seq_len, kRotaryHalf},
-                      at::TensorOptions().dtype(at::kFloat))
-            .clone()
-            .to(at::kCUDA);
-    at::Tensor project_sin =
-        at::from_blob(h_sin.data(), {seq_len, kRotaryHalf},
-                      at::TensorOptions().dtype(at::kFloat))
-            .clone()
-            .to(at::kCUDA);
-    at::Tensor project_position =
-        at::full({batch_size}, seq_len - 1, int_options);
-    at::Tensor project_page_table =
-        at::arange(batch_size * decode_pages_per_seq, int_options)
-            .view({batch_size, decode_pages_per_seq});
-    at::Tensor torch_project_q =
-        at::empty({batch_size, kQHeads, kHeadDim}, torch_options);
-    at::Tensor torch_project_cache_k =
-        at::zeros({1, batch_size * decode_pages_per_seq, decode_page_size,
-                   kKvHeads, kHeadDim},
-                  torch_options);
-    at::Tensor torch_project_cache_v = at::zeros_like(torch_project_cache_k);
-    at::Tensor custom_project_q = at::empty_like(torch_project_q);
-    at::Tensor custom_project_cache_k = at::zeros_like(torch_project_cache_k);
-    at::Tensor custom_project_cache_v = at::zeros_like(torch_project_cache_v);
-    const Gemma4AttentionProjectionWeights project_weights = {
-        torch_bf16_ptr(project_weight), torch_bf16_ptr(project_weight),
-        torch_bf16_ptr(project_weight), 0, kQElements,
-        kQElements + kKvElements};
-
-    auto launch_torch_project_prepare = [&]() {
-      run_torch_project_prepare(torch_project_q, torch_project_cache_k,
-                                torch_project_cache_v, project_x,
-                                project_input_weight, project_weight,
-                                project_q_weight, project_k_weight,
-                                project_cos, project_sin, project_position,
-                                batch_size, decode_pages_per_seq, decode_slot,
-                                decode_page_offset);
-    };
-    auto launch_custom_project_prepare = [&]() {
-      CUDA_CHECK(gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16(
-          torch_bf16_ptr(custom_project_q),
-          torch_bf16_ptr(custom_project_cache_k),
-          torch_bf16_ptr(custom_project_cache_v), project_config,
-          project_page_table.data_ptr<int32_t>(),
-          project_position.data_ptr<int32_t>(), batch_size, 0,
-          torch_bf16_ptr(project_x), torch_bf16_ptr(project_input_weight),
-          project_weights, torch_bf16_ptr(project_q_weight),
-          torch_bf16_ptr(project_k_weight),
-          reinterpret_cast<const float *>(project_cos.data_ptr()),
-          reinterpret_cast<const float *>(project_sin.data_ptr()),
-          torch_stream.stream()));
-    };
-
-    launch_torch_project_prepare();
-    launch_custom_project_prepare();
-    CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
-    const float q_diff =
-        (torch_project_q.to(at::kFloat) - custom_project_q.to(at::kFloat))
-            .abs()
-            .max()
-            .item<float>();
-    const float k_diff =
-        (torch_project_cache_k.to(at::kFloat) -
-         custom_project_cache_k.to(at::kFloat))
-            .abs()
-            .max()
-            .item<float>();
-    const float v_diff =
-        (torch_project_cache_v.to(at::kFloat) -
-         custom_project_cache_v.to(at::kFloat))
-            .abs()
-            .max()
-            .item<float>();
-    std::cout << "project_prepare_correctness q_max_abs=" << q_diff
-              << " cache_k_max_abs=" << k_diff
-              << " cache_v_max_abs=" << v_diff << "\n";
-    print_stats("torch_project_prepare",
-                time_cuda_samples(launch_torch_project_prepare,
-                                  torch_stream.stream(), warmup, iters,
-                                  samples, cold_cache, raw_ptr(d_l2_scratch),
-                                  l2_flush_words));
-    print_stats("custom_project_prepare",
-                time_cuda_samples(launch_custom_project_prepare,
-                                  torch_stream.stream(), warmup, iters,
-                                  samples, cold_cache, raw_ptr(d_l2_scratch),
-                                  l2_flush_words));
-  }
-
   auto launch_norm_rope_fa = [&]() {
     CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
       raw_ptr(d_out), nullptr, raw_ptr(d_q_prepared), raw_ptr(d_k_prepared), raw_ptr(d_v_prepared),
@@ -892,25 +756,40 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
                         (double(norm_rope_timing.median_ms) * 1.0e-3) / 1.0e12;
 
   auto launch_decode_prep_cache = [&]() {
-    CUDA_CHECK(gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_bf16(
-        raw_ptr(d_decode_q_prepared), raw_ptr(d_decode_cache_k), raw_ptr(d_decode_cache_v),
-        decode_cache_config, raw_ptr(d_decode_page_table), raw_ptr(d_decode_token_position),
-        batch_size, 0, raw_ptr(d_decode_q), raw_ptr(d_decode_k), raw_ptr(d_decode_v), raw_ptr(d_q_norm_weight),
+    CUDA_CHECK(gemma4_flash_attention_decode_prepare_q_paged_kv_bf16(
+        raw_ptr(d_decode_q_prepared), raw_ptr(d_decode_cache_k),
+        raw_ptr(d_decode_cache_v), decode_cache_config,
+        raw_ptr(d_decode_page_table), raw_ptr(d_decode_token_position),
+        batch_size, 0, raw_ptr(d_decode_q), raw_ptr(d_decode_k),
+        raw_ptr(d_decode_v), raw_ptr(d_q_norm_weight),
         raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin), stream));
   };
   const TimingStats decode_prep_cache_timing =
       time_cuda_samples(launch_decode_prep_cache, stream, warmup, iters,
                         samples, cold_cache, raw_ptr(d_l2_scratch), l2_flush_words);
+  auto launch_decode_attention = [&]() {
+    CUDA_CHECK(gemma4_flash_attention_decode_paged_bf16(
+        raw_ptr(d_decode_out), raw_ptr(d_decode_partial_m),
+        raw_ptr(d_decode_partial_l), raw_ptr(d_decode_partial_acc),
+        raw_ptr(d_decode_q_prepared), raw_ptr(d_decode_cache_k),
+        raw_ptr(d_decode_cache_v), raw_ptr(d_decode_page_table),
+        raw_ptr(d_decode_seq_lengths), decode_cache_config, 0, batch_size,
+        scale, decode_split_size, decode_num_splits, stream));
+  };
+  const TimingStats decode_attention_timing =
+      time_cuda_samples(launch_decode_attention, stream, warmup, iters,
+                        samples, cold_cache, raw_ptr(d_l2_scratch),
+                        l2_flush_words);
 
   std::cout << "benchmark_contract name=flash_attention_bench"
-            << " measurement=sliding_prefill_and_decode_prepare"
+            << " measurement=sliding_prefill_decode_prepare_decode_attention"
             << " timing=cuda_events_same_stream"
             << " cache_mode=" << cache_mode
             << " l2_flush_bytes=" << (cold_cache ? flush_bytes : 0)
             << " launch_overhead=queued_launches_only"
             << " host_wall_time=excluded"
             << " aggregation=raw_samples"
-            << " correctness=cpp_reference_and_torch_project_prepare"
+            << " correctness=cpp_reference"
             << " warmup=" << warmup
             << " iters_per_sample=" << iters
             << " samples=" << samples
@@ -924,16 +803,11 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
             << " cache=" << cache_mode
             << " flush_bytes=" << (cold_cache ? flush_bytes : 0)
             << " timing=cuda_events_same_stream"
-            << " return_lse=false"
             << " launch_overhead=included\n";
-  print_stats("sliding_fwd_bf16_return_lse", raw_sliding_timing);
   print_stats("norm_rope_plus_fa", norm_rope_timing);
   print_stats("decode_norm_rope_paged_kv_write", decode_prep_cache_timing);
+  print_stats("decode_paged_attention", decode_attention_timing);
   std::cout << "approx_attention_tflops_in_total_path_median=" << tflops << "\n";
-  std::cout << "kernel threads_per_block="
-            << gemma4_flash_attention_sliding_threads_per_block()
-            << " dynamic_smem_bytes="
-            << gemma4_flash_attention_sliding_smem_bytes() << "\n";
 
 }
 

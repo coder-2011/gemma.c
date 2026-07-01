@@ -32,16 +32,6 @@ struct SamplingBenchArgs {
   int samples = 21;
 };
 
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
-    std::exit(1);
-  }
-}
-
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
-
 // Parses positional args plus the deleted Python wrapper's named aliases.
 bool parse_args(int argc, char **argv, SamplingBenchArgs *args) {
   int positional = 0;
@@ -151,29 +141,29 @@ std::vector<float> time_samples(Fn &&fn,
   for (int i = 0; i < warmup; ++i) {
     fn();
   }
-  CHECK_CUDA(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
-  CHECK_CUDA(cudaEventCreate(&start));
-  CHECK_CUDA(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
 
   std::vector<float> values;
   values.reserve(samples);
   for (int sample = 0; sample < samples; ++sample) {
-    CHECK_CUDA(cudaEventRecord(start, stream));
+    CUDA_CHECK(cudaEventRecord(start, stream));
     for (int i = 0; i < iters; ++i) {
       fn();
     }
-    CHECK_CUDA(cudaEventRecord(stop, stream));
-    CHECK_CUDA(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
     float total_ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
     values.push_back(total_ms / float(iters));
   }
 
-  CHECK_CUDA(cudaEventDestroy(start));
-  CHECK_CUDA(cudaEventDestroy(stop));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
   return values;
 }
 
@@ -187,29 +177,29 @@ std::vector<float> time_libtorch_graph_samples(at::cuda::CUDAGraph &graph,
   for (int i = 0; i < warmup; ++i) {
     graph.replay();
   }
-  CHECK_CUDA(cudaStreamSynchronize(stream.stream()));
+  CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
 
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
-  CHECK_CUDA(cudaEventCreate(&start));
-  CHECK_CUDA(cudaEventCreate(&stop));
+  CUDA_CHECK(cudaEventCreate(&start));
+  CUDA_CHECK(cudaEventCreate(&stop));
 
   std::vector<float> values;
   values.reserve(samples);
   for (int sample = 0; sample < samples; ++sample) {
-    CHECK_CUDA(cudaEventRecord(start, stream.stream()));
+    CUDA_CHECK(cudaEventRecord(start, stream.stream()));
     for (int i = 0; i < iters; ++i) {
       graph.replay();
     }
-    CHECK_CUDA(cudaEventRecord(stop, stream.stream()));
-    CHECK_CUDA(cudaEventSynchronize(stop));
+    CUDA_CHECK(cudaEventRecord(stop, stream.stream()));
+    CUDA_CHECK(cudaEventSynchronize(stop));
     float total_ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, start, stop));
     values.push_back(total_ms / float(iters));
   }
 
-  CHECK_CUDA(cudaEventDestroy(start));
-  CHECK_CUDA(cudaEventDestroy(stop));
+  CUDA_CHECK(cudaEventDestroy(start));
+  CUDA_CHECK(cudaEventDestroy(stop));
   return values;
 }
 
@@ -257,7 +247,7 @@ int main(int argc, char **argv) {
   const int samples = args.samples;
 
   cudaStream_t stream = nullptr;
-  CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
   gemma4_bench_print_common_metadata("sampling_bench");
   std::printf("benchmark_guardrail stability_scope=single_process "
               "minimum_effect_us=25 close_call_requires_process_rerun=true "
@@ -308,7 +298,7 @@ int main(int argc, char **argv) {
                                   torch_hidden, torch_lm_head,
                                   torch_lm_head_t);
       }
-      CHECK_CUDA(cudaStreamSynchronize(torch_stream.stream()));
+      CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
 
       torch_graph.capture_begin();
       run_libtorch_sampling_ops(torch_logits, torch_values, torch_token,
@@ -316,7 +306,7 @@ int main(int argc, char **argv) {
                                 torch_hidden, torch_lm_head, torch_lm_head_t);
       torch_graph.capture_end();
       torch_graph.replay();
-      CHECK_CUDA(cudaStreamSynchronize(torch_stream.stream()));
+      CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
     }
     const int64_t torch_token_id = check_libtorch_sampling_correctness(
         torch_lm_head, torch_token, torch_next_hidden);
@@ -344,16 +334,16 @@ int main(int argc, char **argv) {
   fill_random_bf16(raw_ptr(d_lm_head), lm_head_elems, 0x5678u, 0.05f, stream);
   fill_random_bf16(
       raw_ptr(d_final_hidden), GEMMA4_HIDDEN_SIZE, 0x2468u, 0.05f, stream);
-  CHECK_CUDA(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
   auto fused_sample = [&]() {
-    CHECK_CUDA(gemma4_sample_next_decode_bf16(
+    CUDA_CHECK(gemma4_sample_next_bf16(
         raw_ptr(d_fused_hidden), raw_ptr(d_fused_token),
         raw_ptr(d_fused_scratch), fused_scratch_bytes, raw_ptr(d_final_hidden),
-        raw_ptr(d_lm_head), stream));
+        raw_ptr(d_lm_head), Gemma4SamplingStage::kDecode, stream));
   };
   auto materialized_sample = [&]() {
-    CHECK_CUDA(gemma4_projection_decode(
+    CUDA_CHECK(gemma4_projection_decode(
         GEMMA4_PROJECTION_FINAL_LOGITS, raw_ptr(d_final_hidden),
         raw_ptr(d_lm_head), raw_ptr(d_materialized_logits), stream));
     materialized_logits_sample_embed_kernel<<<
@@ -361,17 +351,17 @@ int main(int argc, char **argv) {
         raw_ptr(d_materialized_hidden),
         raw_ptr(d_materialized_token), raw_ptr(d_lm_head),
         raw_ptr(d_materialized_logits));
-    CHECK_CUDA(cudaGetLastError());
+    CUDA_CHECK(cudaGetLastError());
   };
   fused_sample();
   materialized_sample();
-  CHECK_CUDA(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
   int32_t fused_token = -1;
   int32_t materialized_token = -2;
-  CHECK_CUDA(cudaMemcpy(&fused_token, raw_ptr(d_fused_token),
+  CUDA_CHECK(cudaMemcpy(&fused_token, raw_ptr(d_fused_token),
                         sizeof(fused_token), cudaMemcpyDeviceToHost));
-  CHECK_CUDA(cudaMemcpy(&materialized_token,
+  CUDA_CHECK(cudaMemcpy(&materialized_token,
                         raw_ptr(d_materialized_token),
                         sizeof(materialized_token),
                         cudaMemcpyDeviceToHost));
@@ -388,6 +378,6 @@ int main(int argc, char **argv) {
   print_stats("materialized_lm_head_sample_full_vocab", 1, 1, 1.0f, 0.0f,
               time_samples(materialized_sample, stream, warmup, iters,
                            samples));
-  CHECK_CUDA(cudaStreamDestroy(stream));
+  CUDA_CHECK(cudaStreamDestroy(stream));
   return 0;
 }

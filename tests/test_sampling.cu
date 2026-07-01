@@ -14,15 +14,14 @@
 
 namespace {
 
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", file, line, expr,
-                 cudaGetErrorString(status));
-    std::exit(1);
-  }
-}
-
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+#define CHECK_CUDA(expr)                                                        \
+  do {                                                                          \
+    if (const cudaError_t status = (expr); status != cudaSuccess) {              \
+      std::fprintf(stderr, "%s:%d: CUDA error for %s: %s\n", __FILE__,          \
+                   __LINE__, #expr, cudaGetErrorString(status));                \
+      std::exit(1);                                                             \
+    }                                                                           \
+  } while (0)
 
 // Returns the raw CUDA pointer owned by a Thrust device vector.
 template <typename T>
@@ -98,9 +97,9 @@ void run_case(thrust::device_vector<__nv_bfloat16> &d_lm_head,
               const std::vector<__nv_bfloat16> &expected_row,
               int32_t expected_token,
               const char *label) {
-  CHECK_CUDA(gemma4_sample_next_decode_bf16(
+  CHECK_CUDA(gemma4_sample_next_bf16(
       raw_ptr(d_next_hidden), raw_ptr(d_next_token), raw_ptr(d_scratch), scratch_bytes,
-      raw_ptr(d_hidden), raw_ptr(d_lm_head), 0));
+      raw_ptr(d_hidden), raw_ptr(d_lm_head), Gemma4SamplingStage::kDecode, 0));
 
   int32_t actual_token = -1;
   CHECK_CUDA(cudaMemcpy(&actual_token, raw_ptr(d_next_token), sizeof(actual_token),

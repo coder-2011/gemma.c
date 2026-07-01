@@ -1,4 +1,5 @@
 #include <cuda_bf16.h>
+#include <cuda/atomic>
 #include <cuda/cmath>
 #include <cuda_runtime.h>
 
@@ -42,67 +43,174 @@ constexpr int kDecodeMegaThreads = 512;
 constexpr int kDecodeMegaWarps = kDecodeMegaThreads / kWarpSize;
 constexpr int kFfnHiddenPacks = gemma4_ffn_decode_device::kHiddenPacks;
 
-// Projects attention output to hidden width inside the cooperative decode grid.
-template <int AttentionWidth>
-__device__ inline void decode_attention_o_projection(
+// Returns scratch after live split attention partials for the post-O RMS scale.
+template <typename Traits>
+__device__ inline float *attention_tail_scratch(
     const Gemma4DecodeMegakernelLayerArgs &args) {
-  constexpr int kColsPerBlock = 8;
-  constexpr int kHiddenBlocks = GEMMA4_HIDDEN_SIZE / kColsPerBlock;
-  constexpr int packs = AttentionWidth / kBf16Packed128Elements;
-  __shared__ float s_warp_sums[kColsPerBlock][kDecodeMegaWarps];
+  if (args.attention_num_splits == 1) {
+    return args.attention_partial_acc;
+  }
+  const int64_t attention_partial_count =
+      int64_t(GEMMA4_NUM_QUERY_HEADS) * args.attention_num_splits *
+      Traits::kHeadDim;
+  return args.attention_partial_acc + attention_partial_count;
+}
 
-  for (int col_block = int(blockIdx.x); col_block < kHiddenBlocks;
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+// Publishes one KV-head prep result after all writes from the producer CTA land.
+__device__ inline void signal_attention_ready(
+    const Gemma4DecodeMegakernelLayerArgs &args,
+    int kv_head) {
+  if (args.attention_ready == nullptr) {
+    return;
+  }
+  if (threadIdx.x == 0) {
+    __threadfence();
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ready(
+        args.attention_ready[kv_head]);
+    ready.store(args.attention_ready_tag, cuda::memory_order_release);
+  }
+}
+
+// Blocks this CTA until the producer for the requested KV head has published.
+__device__ inline void wait_attention_ready(
+    const Gemma4DecodeMegakernelLayerArgs &args,
+    int kv_head) {
+  if (args.attention_ready == nullptr) {
+    return;
+  }
+  if (threadIdx.x == 0) {
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_device> ready(
+        args.attention_ready[kv_head]);
+    while (ready.load(cuda::memory_order_acquire) !=
+           args.attention_ready_tag) {
+      __nanosleep(64);
+    }
+  }
+  __syncthreads();
+}
+#endif
+
+// Projects the final attention row through O with hidden-column CTA ownership.
+template <typename Traits>
+__device__ inline void project_attention_out_post_attention(
+    const Gemma4DecodeMegakernelLayerArgs &args,
+    cg::grid_group grid) {
+  constexpr int kColsPerBlock = kBf16Packed128Elements;
+  constexpr int kHiddenBlocks = GEMMA4_HIDDEN_SIZE / kColsPerBlock;
+  constexpr int kAttentionWidth = GEMMA4_NUM_QUERY_HEADS * Traits::kHeadDim;
+  constexpr int kAttentionPacks = kAttentionWidth / kBf16Packed128Elements;
+  static_assert(GEMMA4_HIDDEN_SIZE % kColsPerBlock == 0,
+                "hidden size must be a whole BF16 pack tile");
+  static_assert(kAttentionWidth % kBf16Packed128Elements == 0,
+                "attention width must be a whole BF16 pack tile");
+
+  float *__restrict__ tile_sums = attention_tail_scratch<Traits>(args);
+  float *__restrict__ scale_slot = tile_sums + int(gridDim.x);
+  __shared__ float warp_sums[kColsPerBlock][kDecodeMegaWarps];
+
+  const int block = int(blockIdx.x);
+  const int thread = int(threadIdx.x);
+  const int lane = thread & (kWarpSize - 1);
+  const int warp = thread / kWarpSize;
+
+  float local_sumsq = 0.0f;
+  for (int col_block = block; col_block < kHiddenBlocks;
        col_block += int(gridDim.x)) {
     float sums[kColsPerBlock] = {};
-    for (int pack = int(threadIdx.x); pack < packs; pack += kDecodeMegaThreads) {
+    for (int pack = thread; pack < kAttentionPacks;
+         pack += kDecodeMegaThreads) {
       const int element = pack * kBf16Packed128Elements;
       const Bf16Packed128 x_pack =
-          Bf16Packed128{*reinterpret_cast<const int4 *>(args.attention_out + element)};
+          Bf16Packed128{*reinterpret_cast<const int4 *>(
+              args.attention_out + element)};
 #pragma unroll
       for (int col = 0; col < kColsPerBlock; ++col) {
         const int hidden_col = col_block * kColsPerBlock + col;
         const int64_t weight_offset =
-            int64_t(hidden_col) * AttentionWidth + element;
-        const Bf16Packed128 w_pack = Bf16Packed128{
-            *reinterpret_cast<const int4 *>(args.attention_o_proj_col_major +
-                                            weight_offset)};
+            int64_t(hidden_col) * kAttentionWidth + element;
+        const Bf16Packed128 w_pack =
+            Bf16Packed128{*reinterpret_cast<const int4 *>(
+                args.attention_o_proj_col_major + weight_offset)};
         gemma4_bf16_pack_accumulate_dot(x_pack, w_pack, sums[col]);
       }
     }
 
     warp_reduce_sum_to_lane0(sums);
-    const int lane = int(threadIdx.x) & (warpSize - 1);
-    const int warp = int(threadIdx.x) / warpSize;
     if (lane == 0) {
 #pragma unroll
       for (int col = 0; col < kColsPerBlock; ++col) {
-        s_warp_sums[col][warp] = sums[col];
+        warp_sums[col][warp] = sums[col];
       }
     }
     __syncthreads();
 
 #pragma unroll
     for (int col = 0; col < kColsPerBlock; ++col) {
-      sums[col] = threadIdx.x < kDecodeMegaWarps ? s_warp_sums[col][lane] : 0.0f;
+      sums[col] = thread < kDecodeMegaWarps ? warp_sums[col][lane] : 0.0f;
     }
     if (warp == 0) {
       warp_reduce_sum_to_lane0(sums);
     }
-    if (threadIdx.x == 0) {
-      Bf16Packed128 out_pack;
+    if (thread == 0) {
+      const int hidden_col0 = col_block * kColsPerBlock;
+      Bf16Packed128 o_pack;
 #pragma unroll
       for (int col = 0; col < kColsPerBlock; ++col) {
-        out_pack[col] = __float2bfloat16_rn(sums[col]);
+        o_pack[col] = __float2bfloat16_rn(sums[col]);
       }
-      const int offset = col_block * kColsPerBlock;
-      *reinterpret_cast<int4 *>(args.residual_out + offset) = out_pack.bits();
+      *reinterpret_cast<int4 *>(args.residual_out + hidden_col0) =
+          o_pack.bits();
+      gemma4_bf16_pack_accumulate_square(o_pack, local_sumsq);
     }
     __syncthreads();
   }
+
+  if (thread == 0) {
+    tile_sums[block] = local_sumsq;
+  }
+  grid.sync();
+
+  float total_sumsq = 0.0f;
+  if (block == 0) {
+    for (int i = thread; i < int(gridDim.x); i += kDecodeMegaThreads) {
+      total_sumsq += tile_sums[i];
+    }
+    total_sumsq = gemma4_block_reduce_sum<kDecodeMegaThreads>(
+        total_sumsq, warp_sums[0], thread);
+    if (thread == 0) {
+      *scale_slot =
+          rsqrtf(total_sumsq / float(GEMMA4_HIDDEN_SIZE) + GEMMA4_RMS_NORM_EPS);
+    }
+  }
+  grid.sync();
+
+  for (int col_block = block; col_block < kHiddenBlocks;
+       col_block += int(gridDim.x)) {
+    const int hidden_col0 = col_block * kColsPerBlock;
+    const Bf16Packed128 o_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(
+            args.residual_out + hidden_col0)};
+    const Bf16Packed128 weight =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(
+            args.attention_post_norm_weight + hidden_col0)};
+    const Bf16Packed128 normed =
+        gemma4_bf16_pack_apply_scale_weight(o_pack, weight, *scale_slot);
+    *reinterpret_cast<int4 *>(args.normed_out + hidden_col0) = normed.bits();
+
+    const Bf16Packed128 residual =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(
+            args.attention_x + hidden_col0)};
+    const Bf16Packed128 ffn_residual = gemma4_bf16_pack_add(residual, normed);
+    *reinterpret_cast<int4 *>(args.ffn_residual + hidden_col0) =
+        ffn_residual.bits();
+  }
+  // The remaining pre-FFN RMSNorm is CTA-0-owned and reads all residual tiles.
+  grid.sync();
 }
 
-// Builds the post-attention residual row and pre-FFN normalized row.
-__device__ inline void decode_attention_to_ffn(
+// Builds the pre-FFN normalized row from the fused post-attention residual.
+__device__ inline void decode_pre_ffn_norm(
     const Gemma4DecodeMegakernelLayerArgs &args) {
   if (blockIdx.x != 0) {
     return;
@@ -111,23 +219,6 @@ __device__ inline void decode_attention_to_ffn(
   __shared__ Bf16Packed128 cached_input[kFfnHiddenPacks];
   __shared__ float warp_sums[kDecodeMegaWarps];
   __shared__ float scale;
-  gemma4_rmsnorm_hidden_row_512_bf16_device(
-      args.normed_out, args.residual_out, args.attention_post_norm_weight,
-      GEMMA4_RMS_NORM_EPS, cached_input, warp_sums, &scale, int(threadIdx.x));
-  __syncthreads();
-
-  for (int pack = int(threadIdx.x); pack < kFfnHiddenPacks;
-       pack += kDecodeMegaThreads) {
-    const int offset = pack * kBf16Packed128Elements;
-    const Bf16Packed128 residual =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(args.attention_x + offset)};
-    const Bf16Packed128 delta =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(args.normed_out + offset)};
-    const Bf16Packed128 sum = gemma4_bf16_pack_add(residual, delta);
-    *reinterpret_cast<int4 *>(args.ffn_residual + offset) = sum.bits();
-  }
-  __syncthreads();
-
   gemma4_rmsnorm_hidden_row_512_bf16_device(
       args.ffn_x, args.ffn_residual, args.attention_pre_ffn_norm_weight,
       GEMMA4_RMS_NORM_EPS, cached_input, warp_sums, &scale, int(threadIdx.x));
@@ -152,7 +243,7 @@ struct Gemma4FlashFwdParams {
 
 template <int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_>
 struct Gemma4FlashFwdKernelTraits {
-  // ponytail: RTX A6000/sm86 only; restore a trait base if pre-SM80 grows back.
+  // This repo targets RTX A6000/sm86; restore a trait base if pre-SM80 grows back.
   using Element = ::gemma4_flash_attention::Element;
 
   using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>;
@@ -219,8 +310,8 @@ using Gemma4SlidingFa2KernelTraits =
 using Gemma4GlobalFa2KernelTraits =
     Gemma4FlashFwdKernelTraits<GEMMA4_GLOBAL_HEAD_DIM, 32, 32, 2>;
 
-// Caches host-side cooperative launch geometry for one decoded layer kernel.
-struct DecodeLayerLaunchCache {
+// Caches host-side cooperative launch geometry for one decode cooperative kernel.
+struct DecodeCooperativeLaunchCache {
   void *kernel = nullptr;
   int device = -1;
   int active_blocks = 0;
@@ -267,8 +358,8 @@ struct Gemma4AttentionDerived {
 
 // Return the maximum value across the 4 lanes that jointly own one score row.
 __device__ __forceinline__ float gemma4_fa_quad_reduce_max(float x) {
-  x = max(x, __shfl_xor_sync(uint32_t(-1), x, 2));
-  x = max(x, __shfl_xor_sync(uint32_t(-1), x, 1));
+  x = std::max(x, __shfl_xor_sync(uint32_t(-1), x, 2));
+  x = std::max(x, __shfl_xor_sync(uint32_t(-1), x, 1));
   return x;
 }
 
@@ -367,6 +458,39 @@ __device__ __forceinline__ void gemma4_fa_cp_async_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
+struct alignas(16) DecodeKvCpAsyncStorage {
+  __nv_bfloat16 k[2][GEMMA4_SLIDING_HEAD_DIM];
+  __nv_bfloat16 v[2][GEMMA4_SLIDING_HEAD_DIM];
+};
+
+// Copies one aligned 16-byte pack from global memory into shared memory.
+__device__ __forceinline__ void decode_kv_cp_async_16(
+    void *__restrict__ dst,
+    const void *__restrict__ src) {
+  const uint32_t smem_addr =
+      static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+  asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr),
+      "l"(src));
+}
+
+// Starts one async K/V token copy; the caller owns wait and buffer lifetime.
+__device__ __forceinline__ void decode_kv_cp_async_prefetch(
+    DecodeKvCpAsyncStorage &storage,
+    const __nv_bfloat16 *__restrict__ cache_k,
+    const __nv_bfloat16 *__restrict__ cache_v,
+    int64_t kv_base,
+    int stage,
+    int thread_idx) {
+  constexpr int kPacks = GEMMA4_SLIDING_HEAD_DIM / kBf16Packed128Elements;
+  if (thread_idx < kPacks) {
+    const int dim0 = thread_idx * kBf16Packed128Elements;
+    decode_kv_cp_async_16(storage.k[stage] + dim0, cache_k + kv_base + dim0);
+    decode_kv_cp_async_16(storage.v[stage] + dim0, cache_v + kv_base + dim0);
+  }
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
 __device__ __forceinline__ int32_t gemma4_warp_uniform_ldg_i32(
     const int32_t *__restrict__ ptr,
     int lane) {
@@ -449,13 +573,6 @@ __device__ __forceinline__ void gemma4_fa_reduce_rows_sum(
 
 // Apply exp2(score * scale - row_max * scale). Using exp2 lets the kernel keep
 // the softmax scale in log2 units, matching upstream FlashAttention.
-__forceinline__ __device__ float gemma4_fa_scaled_max(
-    float max_value,
-    float scale) {
-  if (max_value == -INFINITY) return 0.0f;
-  return max_value * scale;
-}
-
 template <typename Engine0, typename Layout0, typename Engine1,
           typename Layout1>
 __forceinline__ __device__ void gemma4_fa_scale_apply_exp2(
@@ -464,7 +581,8 @@ __forceinline__ __device__ void gemma4_fa_scale_apply_exp2(
     const float scale) {
 #pragma unroll
   for (int mi = 0; mi < size<0>(tensor); ++mi) {
-    const float max_scaled = gemma4_fa_scaled_max(max_values(mi), scale);
+    const float row_max = max_values(mi);
+    const float max_scaled = row_max == -INFINITY ? 0.0f : row_max * scale;
 #pragma unroll
     for (int ni = 0; ni < size<1>(tensor); ++ni) {
       tensor(mi, ni) = exp2f(tensor(mi, ni) * scale - max_scaled);
@@ -485,7 +603,8 @@ __forceinline__ __device__ void gemma4_fa_scale_apply_exp2_sum(
     const float scale) {
 #pragma unroll
   for (int mi = 0; mi < size<0>(tensor); ++mi) {
-    const float max_scaled = gemma4_fa_scaled_max(max_values(mi), scale);
+    const float row_max = max_values(mi);
+    const float max_scaled = row_max == -INFINITY ? 0.0f : row_max * scale;
     float sum = ZeroInit ? 0.0f : row_sum(mi);
 #pragma unroll
     for (int ni = 0; ni < size<1>(tensor); ++ni) {
@@ -910,7 +1029,7 @@ inline __device__ void gemma4_compute_attn_1rowblock(
   constexpr int kHeadRatio = GEMMA4_NUM_QUERY_HEADS / kKVHeads;
   constexpr int kQRowStride = GEMMA4_NUM_QUERY_HEADS * kHeadDim;
   constexpr int kKVRowStride = kKVHeads * kHeadDim;
-  // ponytail: fixed batch-major tensors; add block-info back only for ragged batches.
+  // Fixed batch-major tensors keep batch offset math direct.
   const index_t batch = index_t(bidb);
   const int q_tile_start = m_block * kBlockM;
   const int q_tile_remaining = params.seqlen_q - q_tile_start;
@@ -1144,7 +1263,7 @@ bool gemma4_fa_valid_sliding_args(
 }
 
 // Dynamic shared memory exceeds the default limit for these FA tiles, so the
-// selected kernel must opt in before launch or attribute introspection.
+// selected kernel must opt in before launch.
 template <typename KernelTraits, bool IsLocal>
 cudaError_t set_kernel_smem() {
   static bool initialized = false;
@@ -1164,8 +1283,8 @@ cudaError_t launch_attention(
     const Gemma4FlashFwdParams &params,
     int batch_size,
     cudaStream_t stream) {
-  const cudaError_t status = set_kernel_smem<KernelTraits, IsLocal>();
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
+  const cudaError_t smem_status = set_kernel_smem<KernelTraits, IsLocal>();
+  GEMMA4_RETURN_IF_CUDA_ERROR(smem_status);
   const dim3 grid_dim(cute::ceil_div(params.seqlen_q, KernelTraits::kBlockM),
                       batch_size,
                       GEMMA4_NUM_QUERY_HEADS);
@@ -1173,22 +1292,6 @@ cudaError_t launch_attention(
   gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal>
       <<<grid_dim, block_dim, KernelTraits::kSmemSize, stream>>>(params);
   return cudaGetLastError();
-}
-
-// Gemma 4 sliding layers: head_dim=256, block 64x64, local causal window.
-cudaError_t launch_sliding(
-    const Gemma4FlashFwdParams &params,
-    int batch_size,
-    cudaStream_t stream) {
-  return launch_attention<Gemma4SlidingFa2KernelTraits, true>(params, batch_size, stream);
-}
-
-// Gemma 4 global layers: head_dim=512, block 32x32, full causal attention.
-cudaError_t launch_global(
-    const Gemma4FlashFwdParams &params,
-    int batch_size,
-    cudaStream_t stream) {
-  return launch_attention<Gemma4GlobalFa2KernelTraits, false>(params, batch_size, stream);
 }
 
 template <typename Traits>
@@ -1290,64 +1393,6 @@ __device__ __forceinline__ void prep_scale_free_head(
   float values[Gemma4AttentionDerived<Traits>::kValuesPerLane];
   prep_load_head_values<Traits>(in, lane, values);
   prep_scale_free_head_values<Traits>(out, values, lane);
-}
-
-// Compute the hidden RMSNorm scale once per warp for on-the-fly decode ingress.
-__device__ __forceinline__ float hidden_rms_scale_bf16(
-    const __nv_bfloat16 *__restrict__ x,
-    int lane) {
-  constexpr int kPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-  float sum = 0.0f;
-  for (int pack = lane; pack < kPacks; pack += kWarpSize) {
-    const int element = pack * kBf16Packed128Elements;
-    const Bf16Packed128 x_pack =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element)};
-    gemma4_bf16_pack_accumulate_square(x_pack, sum);
-  }
-  sum = warp_reduce_sum(sum);
-  return rsqrtf(sum / float(GEMMA4_HIDDEN_SIZE) + GEMMA4_RMS_NORM_EPS);
-}
-
-// Project from RMSNorm(x) without materializing the normalized hidden row.
-template <typename Traits>
-__device__ __forceinline__ void project_normed_head_values_bf16(
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ input_norm_weight,
-    const __nv_bfloat16 *__restrict__ w_col_major,
-    int col_base,
-    int lane,
-    float hidden_scale,
-    float (&values)[Gemma4AttentionDerived<Traits>::kValuesPerLane]) {
-  using Derived = Gemma4AttentionDerived<Traits>;
-  constexpr int kPacks = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
-#pragma unroll
-  for (int i = 0; i < Derived::kValuesPerLane; ++i) {
-    values[i] = 0.0f;
-  }
-
-  for (int pack = 0; pack < kPacks; ++pack) {
-    const int element = pack * kBf16Packed128Elements;
-    const Bf16Packed128 x_pack =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(x + element)};
-    const Bf16Packed128 gamma_pack =
-        Bf16Packed128{*reinterpret_cast<const int4 *>(input_norm_weight + element)};
-    const Bf16Packed128 normed_pack =
-        gemma4_bf16_pack_apply_scale_weight(x_pack, gamma_pack, hidden_scale);
-#pragma unroll
-    for (int i = 0; i < Derived::kValuesPerLane; ++i) {
-      const int dim = lane + i * kWarpSize;
-      const int col = col_base + dim;
-      const int64_t weight_offset = int64_t(col) * GEMMA4_HIDDEN_SIZE + element;
-      const Bf16Packed128 w_pack =
-          Bf16Packed128{*reinterpret_cast<const int4 *>(w_col_major + weight_offset)};
-      gemma4_bf16_pack_accumulate_dot(normed_pack, w_pack, values[i]);
-    }
-  }
-
-#pragma unroll
-  for (int i = 0; i < Derived::kValuesPerLane; ++i) {
-    values[i] = __bfloat162float(__float2bfloat16_rn(values[i]));
-  }
 }
 
 // Prepare one prefill Q/K/V head group for the caller-provided CTA coordinates.
@@ -1542,117 +1587,6 @@ void gemma4_decode_q_paged_kv_norm_rope_kernel(
       int(gridDim.x));
 }
 
-// Project from RMSNorm(x), then prepare Q and paged K/V for one decode token.
-template <typename Traits>
-__device__ __forceinline__ void phase_decode_norm_project_prepare_paged_kv(
-    __nv_bfloat16 *__restrict__ q_prepared,
-    __nv_bfloat16 *__restrict__ cache_k,
-    __nv_bfloat16 *__restrict__ cache_v,
-    Gemma4KvCacheConfig cache_config,
-    const int32_t *__restrict__ page_table,
-    const int32_t *__restrict__ token_position,
-    int cache_layer,
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ input_norm_weight,
-    Gemma4AttentionProjectionWeights weights,
-    const __nv_bfloat16 *__restrict__ q_norm_weight,
-    const __nv_bfloat16 *__restrict__ k_norm_weight,
-    const float *__restrict__ cos,
-    const float *__restrict__ sin,
-    int batch,
-    int kv_head,
-    int thread_idx,
-    int batch_count) {
-  using Derived = Gemma4AttentionDerived<Traits>;
-  constexpr int kQHeads = GEMMA4_NUM_QUERY_HEADS;
-  constexpr int kHeadDim = Traits::kHeadDim;
-
-  const int lane = thread_idx & (kWarpSize - 1);
-  const int warp = thread_idx / kWarpSize;
-
-  const int position =
-      gemma4_warp_uniform_ldg_i32(token_position + batch, lane);
-  if (position < 0) return;
-  const float *cos_row = cos + int64_t(position) * Derived::kRotaryHalf;
-  const float *sin_row = sin + int64_t(position) * Derived::kRotaryHalf;
-  const __nv_bfloat16 *x_row = x + int64_t(batch) * GEMMA4_HIDDEN_SIZE;
-  // One CTA owns this hidden row; warp 0 computes the RMS scale once and shares
-  // it with the projection warps before any role-specific early returns.
-  __shared__ float hidden_scale_shared;
-  if (warp == 0) {
-    const float hidden_scale = hidden_rms_scale_bf16(x_row, lane);
-    if (lane == 0) hidden_scale_shared = hidden_scale;
-  }
-  __syncthreads();
-  const float hidden_scale = hidden_scale_shared;
-
-  if (warp < Derived::kGqaRatio) {
-    const int q_head = kv_head * Derived::kGqaRatio + warp;
-    float q_values[Derived::kValuesPerLane];
-    project_normed_head_values_bf16<Traits>(
-        x_row, input_norm_weight, weights.d_q_col_major,
-        weights.q_col_base + q_head * kHeadDim, lane, hidden_scale,
-        q_values);
-    const int64_t q_offset = (int64_t(batch) * kQHeads + q_head) * kHeadDim;
-    prep_weighted_rope_head_values<Traits>(
-        q_prepared + q_offset, q_values, q_norm_weight, cos_row, sin_row, lane);
-    if (warp != Derived::kDecodeKWarp) return;
-  }
-
-  if (warp != Derived::kDecodeKWarp &&
-      (!Traits::kHasVProjection || warp != Derived::kDecodeVWarp)) {
-    return;
-  }
-  const int64_t cache_offset = decode_cache_head_offset<Traits>(
-      cache_config, page_table, batch, position, cache_layer, kv_head, lane,
-      batch_count);
-  if (cache_offset < 0) return;
-
-  float values[Derived::kValuesPerLane];
-  if (warp == Derived::kDecodeKWarp) {
-    project_normed_head_values_bf16<Traits>(
-        x_row, input_norm_weight, weights.d_k_col_major,
-        weights.k_col_base + kv_head * kHeadDim, lane, hidden_scale,
-        values);
-    prep_weighted_rope_head_values<Traits>(
-        cache_k + cache_offset, values, k_norm_weight, cos_row, sin_row, lane);
-    if constexpr (!Traits::kHasVProjection) {
-      prep_scale_free_head_values<Traits>(cache_v + cache_offset, values, lane);
-    }
-  } else if constexpr (Traits::kHasVProjection) {
-    project_normed_head_values_bf16<Traits>(
-        x_row, input_norm_weight, weights.d_v_col_major,
-        weights.v_col_base + kv_head * kHeadDim, lane, hidden_scale,
-        values);
-    prep_scale_free_head_values<Traits>(cache_v + cache_offset, values, lane);
-  }
-}
-
-// Wrapper: decode ingress with input RMSNorm folded into projection loads.
-template <typename Traits>
-__global__ __launch_bounds__(Gemma4AttentionDerived<Traits>::kPrepThreads)
-void gemma4_decode_norm_project_prepare_paged_kv_kernel(
-    __nv_bfloat16 *__restrict__ q_prepared,
-    __nv_bfloat16 *__restrict__ cache_k,
-    __nv_bfloat16 *__restrict__ cache_v,
-    Gemma4KvCacheConfig cache_config,
-    const int32_t *__restrict__ page_table,
-    const int32_t *__restrict__ token_position,
-    int cache_layer,
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ input_norm_weight,
-    Gemma4AttentionProjectionWeights weights,
-    const __nv_bfloat16 *__restrict__ q_norm_weight,
-    const __nv_bfloat16 *__restrict__ k_norm_weight,
-    const float *__restrict__ cos,
-    const float *__restrict__ sin) {
-  phase_decode_norm_project_prepare_paged_kv<Traits>(
-      q_prepared, cache_k, cache_v, cache_config, page_table,
-      token_position, cache_layer, x, input_norm_weight, weights,
-      q_norm_weight, k_norm_weight, cos, sin, int(blockIdx.x),
-      int(blockIdx.y), int(threadIdx.x), int(gridDim.x));
-}
-
 template <typename Traits>
 bool gemma4_fa_valid_cache_config(
     const Gemma4KvCacheConfig &config,
@@ -1668,21 +1602,6 @@ bool gemma4_fa_valid_cache_config(
          (Traits::kIsGlobal ? config.window_size == 0
                             : config.window_size > 0 &&
                                   token_capacity >= config.window_size);
-}
-
-template <typename Traits>
-bool valid_projection_weights(const Gemma4AttentionProjectionWeights &weights) {
-  if (weights.d_q_col_major == nullptr || weights.d_k_col_major == nullptr ||
-      !is_aligned_16(weights.d_q_col_major) ||
-      !is_aligned_16(weights.d_k_col_major)) {
-    return false;
-  }
-  if constexpr (Traits::kHasVProjection) {
-    return weights.d_v_col_major != nullptr &&
-           is_aligned_16(weights.d_v_col_major);
-  } else {
-    return true;
-  }
 }
 
 // Launch the prefill Q/K/V preparation kernel after caller-side buffer validation.
@@ -1762,87 +1681,178 @@ cudaError_t prepare_decode_q_paged_kv_norm_rope(
   return cudaGetLastError();
 }
 
-template <typename Traits>
-cudaError_t norm_project_prepare_decode_paged_kv_impl(
-    __nv_bfloat16 *__restrict__ d_q_prepared,
-    __nv_bfloat16 *__restrict__ d_cache_k,
-    __nv_bfloat16 *__restrict__ d_cache_v,
-    Gemma4KvCacheConfig cache_config,
-    const int32_t *__restrict__ d_page_table,
-    const int32_t *__restrict__ d_token_position,
-    int32_t batch_size,
-    int32_t cache_layer,
-    const __nv_bfloat16 *__restrict__ d_x,
-    const __nv_bfloat16 *__restrict__ d_input_norm_weight,
-    Gemma4AttentionProjectionWeights weights,
-    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
-    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
-    const float *__restrict__ d_cos,
-    const float *__restrict__ d_sin,
-    cudaStream_t stream) {
-  using Derived = Gemma4AttentionDerived<Traits>;
-  if (d_q_prepared == nullptr || d_cache_k == nullptr ||
-      d_cache_v == nullptr || d_page_table == nullptr ||
-      d_token_position == nullptr || d_x == nullptr ||
-      d_input_norm_weight == nullptr ||
-      !valid_projection_weights<Traits>(weights) ||
-      d_q_norm_weight == nullptr ||
-      d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr ||
-      batch_size <= 0 ||
-      !is_aligned_16(d_x) ||
-      !is_aligned_16(d_input_norm_weight) ||
-      !is_aligned_16(d_q_prepared) ||
-      !gemma4_fa_valid_cache_config<Traits>(cache_config, cache_layer)) {
-    return cudaErrorInvalidValue;
-  }
-  if (batch_size > cache_config.batch_size) {
-    return cudaErrorInvalidValue;
-  }
+// Reduces one projection tile's partial sums across a CTA.
+template <int ColsPerBlock, int Threads>
+__device__ inline void project_reduce_cols(
+    int thread_idx,
+    float (&warp_sums)[ColsPerBlock][Threads / kWarpSize],
+    float (&sums)[ColsPerBlock]) {
+  constexpr int warps = Threads / kWarpSize;
+  const int lane = thread_idx & (kWarpSize - 1);
+  const int warp = thread_idx / kWarpSize;
 
-  const dim3 grid_dim(batch_size, Traits::kKvHeads);
-  constexpr dim3 block_dim(Derived::kPrepThreads);
-  gemma4_decode_norm_project_prepare_paged_kv_kernel<Traits>
-      <<<grid_dim, block_dim, 0, stream>>>(
-      d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
-      d_token_position, cache_layer, d_x, d_input_norm_weight, weights,
-      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin);
-  return cudaGetLastError();
+  warp_reduce_sum_to_lane0(sums);
+  if (lane == 0) {
+#pragma unroll
+    for (int col = 0; col < ColsPerBlock; ++col) {
+      warp_sums[col][warp] = sums[col];
+    }
+  }
+  __syncthreads();
+
+#pragma unroll
+  for (int col = 0; col < ColsPerBlock; ++col) {
+    sums[col] = thread_idx < warps ? warp_sums[col][lane] : 0.0f;
+  }
+  if (warp == 0) {
+    warp_reduce_sum_to_lane0(sums);
+  }
 }
 
-cudaError_t norm_project_prepare_decode_paged_kv(
-    __nv_bfloat16 *__restrict__ d_q_prepared,
-    __nv_bfloat16 *__restrict__ d_cache_k,
-    __nv_bfloat16 *__restrict__ d_cache_v,
-    Gemma4KvCacheConfig cache_config,
-    const int32_t *__restrict__ d_page_table,
-    const int32_t *__restrict__ d_token_position,
-    int32_t batch_size,
-    int32_t cache_layer,
-    const __nv_bfloat16 *__restrict__ d_x,
-    const __nv_bfloat16 *__restrict__ d_input_norm_weight,
-    Gemma4AttentionProjectionWeights weights,
-    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
-    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
-    const float *__restrict__ d_cos,
-    const float *__restrict__ d_sin,
-    cudaStream_t stream) {
-  if (cache_config.head_dim == GEMMA4_SLIDING_HEAD_DIM &&
-      cache_config.num_heads == GEMMA4_SLIDING_KV_HEADS) {
-    return norm_project_prepare_decode_paged_kv_impl<
-        Gemma4AttentionTraits<false>>(
-        d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
-        d_token_position, batch_size, cache_layer, d_x, d_input_norm_weight,
-        weights, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
+// Loads one hidden row pack per thread and computes the row RMSNorm scale.
+template <int Threads>
+__device__ inline float project_load_hidden_pack_and_rms_scale_bf16(
+    const __nv_bfloat16 *__restrict__ x,
+    int thread_idx,
+    float *__restrict__ warp_sums,
+    Bf16Packed128 &x_pack) {
+  constexpr int packs = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+  static_assert(Threads >= packs,
+                "decode project+prep keeps one hidden pack per thread");
+
+  float sum = 0.0f;
+  if (thread_idx < packs) {
+    const int element = thread_idx * kBf16Packed128Elements;
+    x_pack = Bf16Packed128{*reinterpret_cast<const int4 *>(x + element)};
+    gemma4_bf16_pack_accumulate_square(x_pack, sum);
   }
-  if (cache_config.head_dim == GEMMA4_GLOBAL_HEAD_DIM &&
-      cache_config.num_heads == GEMMA4_GLOBAL_KV_HEADS) {
-    return norm_project_prepare_decode_paged_kv_impl<
-        Gemma4AttentionTraits<true>>(
-        d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
-        d_token_position, batch_size, cache_layer, d_x, d_input_norm_weight,
-        weights, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
+  sum = gemma4_block_reduce_sum<Threads>(sum, warp_sums, thread_idx);
+  return rsqrtf(sum / float(GEMMA4_HIDDEN_SIZE) + GEMMA4_RMS_NORM_EPS);
+}
+
+// Dots one output-column tile against this thread's cached BF16 RMSNorm pack.
+template <int ColsPerBlock, int Threads>
+__device__ inline void project_dot_cached_rmsnorm_cols(
+    const Bf16Packed128 &normed_pack,
+    const __nv_bfloat16 *__restrict__ w_col_major,
+    int col0,
+    int thread_idx,
+    float (&sums)[ColsPerBlock]) {
+  constexpr int packs_per_col = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+  if (thread_idx >= packs_per_col) {
+    return;
   }
-  return cudaErrorInvalidValue;
+
+  const int element_idx = thread_idx * kBf16Packed128Elements;
+#pragma unroll
+  for (int col = 0; col < ColsPerBlock; ++col) {
+    const int weight_idx = (col0 + col) * GEMMA4_HIDDEN_SIZE + element_idx;
+    const Bf16Packed128 w_pack =
+        Bf16Packed128{
+            *reinterpret_cast<const int4 *>(w_col_major + weight_idx)};
+    gemma4_bf16_pack_accumulate_dot(normed_pack, w_pack, sums[col]);
+  }
+}
+
+// Projects BF16(input RMSNorm(hidden)) into raw QKV/QK scratch for one layer.
+template <int ProjectionWidth>
+__device__ inline void phase_decode_rmsnorm_project_bf16(
+    const Gemma4DecodeMegakernelLayerArgs &args,
+    __nv_bfloat16 *__restrict__ raw_qkv_scratch) {
+  constexpr int cols_per_block = 8;
+  constexpr int tiles = ProjectionWidth / cols_per_block;
+  static_assert(ProjectionWidth % cols_per_block == 0,
+                "projection width must be divisible by the packed tile");
+
+  __shared__ float warp_sums[cols_per_block][kDecodeMegaWarps];
+  __shared__ float rms_scale_shared;
+
+  const int thread_idx = int(threadIdx.x);
+  Bf16Packed128 hidden_pack;
+  float block_rms_scale =
+      project_load_hidden_pack_and_rms_scale_bf16<kDecodeMegaThreads>(
+          args.attention_x, thread_idx, &warp_sums[0][0], hidden_pack);
+  if (thread_idx == 0) {
+    rms_scale_shared = block_rms_scale;
+  }
+  __syncthreads();
+
+  constexpr int hidden_packs = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+  Bf16Packed128 normed_pack;
+  if (thread_idx < hidden_packs) {
+    const int element = thread_idx * kBf16Packed128Elements;
+    const Bf16Packed128 weight_pack =
+        Bf16Packed128{
+            *reinterpret_cast<const int4 *>(
+                args.attention_input_norm_weight + element)};
+    normed_pack = gemma4_bf16_pack_apply_scale_weight(
+        hidden_pack, weight_pack, rms_scale_shared);
+  }
+
+  for (int tile = int(blockIdx.x); tile < tiles; tile += int(gridDim.x)) {
+    float sums[cols_per_block] = {};
+    const int col0 = tile * cols_per_block;
+    project_dot_cached_rmsnorm_cols<cols_per_block, kDecodeMegaThreads>(
+        normed_pack, args.attention_qkv_proj_col_major, col0, thread_idx,
+        sums);
+    project_reduce_cols<cols_per_block, kDecodeMegaThreads>(
+        thread_idx, warp_sums, sums);
+    if (thread_idx == 0) {
+      Bf16Packed128 out;
+#pragma unroll
+      for (int col = 0; col < cols_per_block; ++col) {
+        out[col] = __float2bfloat16_rn(sums[col]);
+      }
+      *reinterpret_cast<int4 *>(raw_qkv_scratch + col0) = out.bits();
+    }
+    __syncthreads();
+  }
+}
+
+// Projects raw attention inputs, then prepares Q and the paged K/V cache.
+template <typename Traits, int ProjectionWidth>
+__device__ inline void phase_megakernel_project_prepare_paged_kv(
+    const Gemma4DecodeMegakernelLayerArgs &args,
+    __nv_bfloat16 *__restrict__ raw_qkv_scratch,
+    cg::grid_group grid) {
+  phase_decode_rmsnorm_project_bf16<ProjectionWidth>(args, raw_qkv_scratch);
+  grid.sync();
+  constexpr int q_width = GEMMA4_NUM_QUERY_HEADS * Traits::kHeadDim;
+  constexpr int kv_width = Traits::kKvHeads * Traits::kHeadDim;
+  const __nv_bfloat16 *raw_q = raw_qkv_scratch;
+  const __nv_bfloat16 *raw_k = raw_q + q_width;
+  const __nv_bfloat16 *raw_v = nullptr;
+  if constexpr (Traits::kHasVProjection) {
+    raw_v = raw_k + kv_width;
+  }
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+  const bool use_attention_ready = args.attention_ready != nullptr;
+#endif
+
+  for (int kv_head = int(blockIdx.x); kv_head < Traits::kKvHeads;
+       kv_head += int(gridDim.x)) {
+    phase_decode_q_paged_kv_norm_rope<Traits>(
+        args.attention_q, args.attention_cache_k, args.attention_cache_v,
+        args.attention_cache_config, args.attention_page_table,
+        args.attention_token_position, args.attention_cache_layer, raw_q,
+        raw_k, raw_v, args.attention_q_norm_weight,
+        args.attention_k_norm_weight, args.attention_cos, args.attention_sin,
+        0, kv_head,
+        int(threadIdx.x), 1);
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+    if (use_attention_ready) {
+      __syncthreads();
+      signal_attention_ready(args, kv_head);
+    }
+#endif
+  }
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+  if (!use_attention_ready) {
+    grid.sync();
+  }
+#else
+  grid.sync();
+#endif
 }
 
 // Online softmax update for one output lane. `m` tracks the running max,
@@ -1860,6 +1870,153 @@ __device__ __forceinline__ void decode_online_update(
   acc = acc * old_scale + v_value * new_scale;
   l = l * old_scale + new_scale;
   m = new_m;
+}
+
+// Processes one valid sliding-cache page span with a two-stage K/V copy pipe.
+template <typename Traits,
+          int DecodeThreads = Gemma4AttentionDerived<Traits>::kDecodeThreads>
+__device__ __forceinline__ void phase_decode_paged_grouped_split_cp_async_span(
+    DecodeKvCpAsyncStorage &storage,
+    float (&acc)[Gemma4AttentionDerived<Traits>::kGqaRatio],
+    float (&m)[Gemma4AttentionDerived<Traits>::kGqaRatio],
+    float (&l)[Gemma4AttentionDerived<Traits>::kGqaRatio],
+    const float (&q_values)[Gemma4AttentionDerived<Traits>::kGqaRatio],
+    typename cub::BlockReduce<float, DecodeThreads>::TempStorage
+        (&reduce_storage)[Gemma4AttentionDerived<Traits>::kGqaRatio],
+    float (&s_score)[Gemma4AttentionDerived<Traits>::kGqaRatio],
+    const __nv_bfloat16 *__restrict__ cache_k,
+    const __nv_bfloat16 *__restrict__ cache_v,
+    int64_t kv_base,
+    int64_t kv_token_stride,
+    int32_t &page_pos,
+    int32_t span_end,
+    float softmax_scale,
+    int32_t dim,
+    bool active_dim) {
+  using Derived = Gemma4AttentionDerived<Traits>;
+  static_assert(!Traits::kIsGlobal);
+  static_assert(Traits::kHeadDim == GEMMA4_SLIDING_HEAD_DIM);
+
+  int stage = 0;
+  decode_kv_cp_async_prefetch(
+      storage, cache_k, cache_v, kv_base, stage, dim);
+  gemma4_fa_cp_async_wait<0>();
+  __syncthreads();
+
+  for (; page_pos < span_end; ++page_pos, kv_base += kv_token_stride) {
+    const bool has_next = page_pos + 1 < span_end;
+    if (has_next) {
+      decode_kv_cp_async_prefetch(
+          storage, cache_k, cache_v, kv_base + kv_token_stride, stage ^ 1,
+          dim);
+    }
+
+    const float k_value =
+        active_dim ? __bfloat162float(storage.k[stage][dim]) : 0.0f;
+    const float v_value =
+        active_dim ? __bfloat162float(storage.v[stage][dim]) : 0.0f;
+
+    float scores[Derived::kGqaRatio];
+#pragma unroll
+    for (int i = 0; i < Derived::kGqaRatio; ++i) {
+      scores[i] =
+          cub::BlockReduce<float, DecodeThreads>(reduce_storage[i])
+              .Sum(q_values[i] * k_value);
+      if (dim == 0) s_score[i] = scores[i];
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int i = 0; i < Derived::kGqaRatio; ++i) {
+      decode_online_update(
+          s_score[i] * softmax_scale, v_value, m[i], l[i], acc[i]);
+    }
+
+    if (has_next) {
+      gemma4_fa_cp_async_wait<0>();
+      __syncthreads();
+      stage ^= 1;
+    }
+  }
+}
+
+// Computes one global-attention Q-head row when the live key range fits in one split.
+template <int DecodeThreads>
+__device__ __forceinline__ void phase_decode_global_q_head_direct(
+    __nv_bfloat16 *__restrict__ out,
+    const __nv_bfloat16 *__restrict__ q,
+    const __nv_bfloat16 *__restrict__ cache_k,
+    const __nv_bfloat16 *__restrict__ cache_v,
+    const int32_t *__restrict__ page_table,
+    const int32_t *__restrict__ seq_lengths,
+    Gemma4KvCacheConfig config,
+    int32_t layer,
+    float softmax_scale,
+    int32_t split_size,
+    int32_t q_head,
+    int32_t dim,
+    int32_t batch_count) {
+  constexpr int kHeadDim = GEMMA4_GLOBAL_HEAD_DIM;
+  const bool active_dim = dim < kHeadDim;
+  const int32_t lane = dim & (kWarpSize - 1);
+  const int32_t seq_len = gemma4_warp_uniform_ldg_i32(seq_lengths, lane);
+  if (seq_len <= 0) {
+    if (active_dim) {
+      out[int64_t(q_head) * kHeadDim + dim] = __float2bfloat16_rn(0.0f);
+    }
+    return;
+  }
+
+  const int32_t split_end = std::min(seq_len, split_size);
+  const int64_t q_base = int64_t(q_head) * kHeadDim;
+  const float q_value =
+      active_dim ? __bfloat162float(loadg(q + q_base + dim)) : 0.0f;
+  float acc = 0.0f;
+  float m = -INFINITY;
+  float l = 0.0f;
+
+  using DecodeBlockReduce = cub::BlockReduce<float, DecodeThreads>;
+  __shared__ typename DecodeBlockReduce::TempStorage reduce_storage;
+  __shared__ float s_score;
+  auto page_table_layout = make_layout(
+      make_shape(batch_count, config.max_pages_per_seq),
+      make_stride(config.max_pages_per_seq, 1));
+
+  for (int32_t page_pos = 0; page_pos < split_end;) {
+    const int32_t logical_page = page_pos / config.page_size;
+    const int32_t page_offset0 = page_pos - logical_page * config.page_size;
+    const int32_t span_end =
+        std::min(split_end, page_pos + config.page_size - page_offset0);
+    const int32_t page_slot = logical_page % config.max_pages_per_seq;
+    const int32_t physical_page = gemma4_warp_uniform_ldg_i32(
+        page_table + page_table_layout(0, page_slot), lane);
+    if (physical_page < 0 || physical_page >= config.num_pages) {
+      page_pos = span_end;
+      continue;
+    }
+
+    int64_t kv_base = gemma4_kv_cache_offset(
+        config, layer, physical_page, page_offset0, 0, 0);
+    const int64_t kv_token_stride =
+        int64_t(config.num_heads) * config.head_dim;
+    for (; page_pos < span_end; ++page_pos, kv_base += kv_token_stride) {
+      const float k_value =
+          active_dim ? __bfloat162float(loadg(cache_k + kv_base + dim)) : 0.0f;
+      const float v_value =
+          active_dim ? __bfloat162float(loadg(cache_v + kv_base + dim)) : 0.0f;
+      const float score =
+          DecodeBlockReduce(reduce_storage).Sum(q_value * k_value);
+      if (dim == 0) s_score = score;
+      __syncthreads();
+      decode_online_update(s_score * softmax_scale, v_value, m, l, acc);
+    }
+  }
+
+  const float attention_value = active_dim && l > 0.0f ? acc / l : 0.0f;
+  if (active_dim) {
+    out[int64_t(q_head) * kHeadDim + dim] =
+        __float2bfloat16_rn(attention_value);
+  }
 }
 
 // Compute one paged-decode split for a caller-selected batch/KV-head/split CTA.
@@ -1898,19 +2055,19 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
     q_heads[i] = kv_head * Derived::kGqaRatio + i;
   }
 
-  // The launch keeps a fixed max `num_splits` for graph compatibility, but
-  // each row can have fewer live splits after applying the sliding window.
+  // The caller selects `num_splits`; graph callers may overprovision, while
+  // no-graph decode can pass only the live split count for this step.
   const int32_t seq_len =
       gemma4_warp_uniform_ldg_i32(seq_lengths + batch, lane);
   const int32_t first_key =
-      config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
-  const int32_t key_count = max(0, seq_len - first_key);
+      config.window_size > 0 ? std::max(0, seq_len - config.window_size) : 0;
+  const int32_t key_count = std::max(0, seq_len - first_key);
   const int32_t actual_splits = (key_count + split_size - 1) / split_size;
   if (key_count == 0 && write_direct) {
-    if (active_dim) {
 #pragma unroll
-      for (int i = 0; i < Derived::kGqaRatio; ++i) {
-        const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_heads[i];
+    for (int i = 0; i < Derived::kGqaRatio; ++i) {
+      const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_heads[i];
+      if (active_dim) {
         direct_out[int64_t(row) * Traits::kHeadDim + dim] =
             __float2bfloat16_rn(0.0f);
       }
@@ -1921,10 +2078,10 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
   // stop at the same live split count.
   if (split >= actual_splits) return;
 
-  // Keep the partial buffer stride as `num_splits` even though this row only
-  // writes `actual_splits`; that preserves the fixed graph/scratch layout.
+  // Keep the partial buffer stride as `num_splits` even if graph callers
+  // overprovision beyond the row's live split count.
   const int32_t split_begin = first_key + split * split_size;
-  const int32_t split_end = min(seq_len, split_begin + split_size);
+  const int32_t split_end = std::min(seq_len, split_begin + split_size);
   int32_t partials[Derived::kGqaRatio];
 #pragma unroll
   for (int i = 0; i < Derived::kGqaRatio; ++i) {
@@ -1969,7 +2126,7 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
     const int32_t logical_page = page_pos / config.page_size;
     const int32_t page_offset0 = page_pos - logical_page * config.page_size;
     const int32_t span_end =
-        min(split_end, page_pos + config.page_size - page_offset0);
+        std::min(split_end, page_pos + config.page_size - page_offset0);
     const int32_t page_slot = logical_page % config.max_pages_per_seq;
     const int32_t physical_page = gemma4_warp_uniform_ldg_i32(
         page_table + page_table_layout(batch, page_slot), lane);
@@ -1978,32 +2135,44 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
       continue;
     }
 
-    // Cache layout is [layer, page, page_offset, kv_head, dim]. Threads read
-    // consecutive BF16 lanes, so K and V stay direct read-only global loads.
-    // Advancing one token inside a page is a fixed stride over all KV heads.
+    // Cache layout is [layer, page, page_offset, kv_head, dim]. Advancing one
+    // token inside a page is a fixed stride over all KV heads.
     int64_t kv_base = gemma4_kv_cache_offset(
         config, layer, physical_page, page_offset0, kv_head, 0);
     const int64_t kv_token_stride =
         int64_t(config.num_heads) * config.head_dim;
-    for (; page_pos < span_end; ++page_pos, kv_base += kv_token_stride) {
-      const float k_value =
-          active_dim ? __bfloat162float(loadg(cache_k + kv_base + dim)) : 0.0f;
-      const float v_value =
-          active_dim ? __bfloat162float(loadg(cache_v + kv_base + dim)) : 0.0f;
+    if constexpr (!Traits::kIsGlobal &&
+                  Traits::kHeadDim == GEMMA4_SLIDING_HEAD_DIM) {
+      __shared__ DecodeKvCpAsyncStorage cp_async_storage;
+      phase_decode_paged_grouped_split_cp_async_span<Traits, DecodeThreads>(
+          cp_async_storage, acc, m, l, q_values, reduce_storage, s_score,
+          cache_k, cache_v, kv_base, kv_token_stride, page_pos, span_end,
+          softmax_scale, dim, active_dim);
+    } else {
+      for (; page_pos < span_end; ++page_pos, kv_base += kv_token_stride) {
+        const float k_value = active_dim
+                                  ? __bfloat162float(loadg(
+                                        cache_k + kv_base + dim))
+                                  : 0.0f;
+        const float v_value = active_dim
+                                  ? __bfloat162float(loadg(
+                                        cache_v + kv_base + dim))
+                                  : 0.0f;
 
-      float scores[Derived::kGqaRatio];
+        float scores[Derived::kGqaRatio];
 #pragma unroll
-      for (int i = 0; i < Derived::kGqaRatio; ++i) {
-        scores[i] =
-            DecodeBlockReduce(reduce_storage[i]).Sum(q_values[i] * k_value);
-        if (dim == 0) s_score[i] = scores[i];
-      }
-      __syncthreads();
+        for (int i = 0; i < Derived::kGqaRatio; ++i) {
+          scores[i] =
+              DecodeBlockReduce(reduce_storage[i]).Sum(q_values[i] * k_value);
+          if (dim == 0) s_score[i] = scores[i];
+        }
+        __syncthreads();
 
 #pragma unroll
-      for (int i = 0; i < Derived::kGqaRatio; ++i) {
-        decode_online_update(
-            s_score[i] * softmax_scale, v_value, m[i], l[i], acc[i]);
+        for (int i = 0; i < Derived::kGqaRatio; ++i) {
+          decode_online_update(
+              s_score[i] * softmax_scale, v_value, m[i], l[i], acc[i]);
+        }
       }
     }
   }
@@ -2014,10 +2183,11 @@ __device__ __forceinline__ void phase_decode_paged_grouped_split(
 #pragma unroll
     for (int i = 0; i < Derived::kGqaRatio; ++i) {
       const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_heads[i];
+      const float attention_value =
+          active_dim && l[i] > 0.0f ? acc[i] / l[i] : 0.0f;
       if (active_dim) {
         direct_out[int64_t(row) * Traits::kHeadDim + dim] =
-            l[i] > 0.0f ? __float2bfloat16_rn(acc[i] / l[i])
-                        : __float2bfloat16_rn(0.0f);
+            __float2bfloat16_rn(attention_value);
       }
     }
     return;
@@ -2087,21 +2257,20 @@ __device__ __forceinline__ void phase_decode_paged_reduce(
   const int32_t lane = dim & (kWarpSize - 1);
   const int32_t row = batch * GEMMA4_NUM_QUERY_HEADS + q_head;
 
-  // Partial buffers are still laid out with the max `num_splits` stride even
-  // when this row has fewer live splits.
+  // Partial buffers are laid out with the caller-selected `num_splits` stride.
   const int32_t partial_row = row * num_splits;
   const int64_t partial_acc_row =
       int64_t(row) * num_splits * Traits::kHeadDim;
 
-  // Recompute the live split count from device sequence lengths so fixed-shape
-  // graph launches can ignore stale scratch beyond `actual_splits`.
+  // Recompute the live split count from device sequence lengths so
+  // overprovisioned launches can ignore stale scratch beyond `actual_splits`.
   const int32_t seq_len =
       gemma4_warp_uniform_ldg_i32(seq_lengths + batch, lane);
   const int32_t first_key =
-      config.window_size > 0 ? max(0, seq_len - config.window_size) : 0;
-  const int32_t key_count = max(0, seq_len - first_key);
+      config.window_size > 0 ? std::max(0, seq_len - config.window_size) : 0;
+  const int32_t key_count = std::max(0, seq_len - first_key);
   const int32_t actual_splits = (key_count + split_size - 1) / split_size;
-  const int32_t reduce_splits = min(actual_splits, num_splits);
+  const int32_t reduce_splits = std::min(actual_splits, num_splits);
 
   // A zero-length row has no attention mass. This should be rare, but returning
   // zeros keeps the kernel total for defensive tests and future graph captures.
@@ -2156,9 +2325,11 @@ __device__ __forceinline__ void phase_decode_paged_reduce(
                  __expf(partial_m[partial_row + split] - s_m);
       }
     }
+  }
+  const float attention_value = active_dim && s_l > 0.0f ? value / s_l : 0.0f;
+  if (active_dim) {
     out[(int64_t(row) * Traits::kHeadDim) + dim] =
-        s_l > 0.0f ? __float2bfloat16_rn(value / s_l)
-                   : __float2bfloat16_rn(0.0f);
+        __float2bfloat16_rn(attention_value);
   }
 }
 
@@ -2180,17 +2351,41 @@ void decode_paged_reduce_kernel(
       int32_t(threadIdx.x), int32_t(blockDim.x));
 }
 
-// Runs split-KV decode attention after Q and the cache row are already prepared.
+// Runs split-KV decode attention, then projects the final row through O.
 template <typename Traits>
-__device__ inline void phase_megakernel_flash_attention_from_prepared(
+__device__ inline void phase_megakernel_flash_attention_o_projection(
     const Gemma4DecodeMegakernelLayerArgs &args,
     cg::grid_group grid) {
   const int block = int(blockIdx.x);
   const int stride = int(gridDim.x);
+  if constexpr (Traits::kIsGlobal) {
+    if (args.attention_num_splits == 1) {
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+      wait_attention_ready(args, 0);
+#endif
+      for (int q_head = block; q_head < GEMMA4_NUM_QUERY_HEADS;
+           q_head += stride) {
+        phase_decode_global_q_head_direct<kDecodeMegaThreads>(
+            args.attention_out, args.attention_q,
+            args.attention_cache_k, args.attention_cache_v,
+            args.attention_page_table, args.attention_seq_lengths,
+            args.attention_cache_config, args.attention_cache_layer,
+            args.attention_softmax_scale, args.attention_split_size, q_head,
+            int(threadIdx.x), 1);
+      }
+      grid.sync();
+      project_attention_out_post_attention<Traits>(args, grid);
+      return;
+    }
+  }
+
   const int split_tasks = Traits::kKvHeads * args.attention_num_splits;
   for (int task = block; task < split_tasks; task += stride) {
     const int kv_head = task / args.attention_num_splits;
     const int split = task - kv_head * args.attention_num_splits;
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+    wait_attention_ready(args, kv_head);
+#endif
     phase_decode_paged_grouped_split<Traits, kDecodeMegaThreads>(
         args.attention_out, args.attention_num_splits == 1,
         args.attention_partial_m, args.attention_partial_l,
@@ -2204,6 +2399,7 @@ __device__ inline void phase_megakernel_flash_attention_from_prepared(
   grid.sync();
 
   if (args.attention_num_splits == 1) {
+    project_attention_out_post_attention<Traits>(args, grid);
     return;
   }
   for (int q_head = block; q_head < GEMMA4_NUM_QUERY_HEADS;
@@ -2215,14 +2411,32 @@ __device__ inline void phase_megakernel_flash_attention_from_prepared(
         args.attention_split_size, args.attention_num_splits, 0, q_head,
         int(threadIdx.x), int(blockDim.x));
   }
+  grid.sync();
+  project_attention_out_post_attention<Traits>(args, grid);
 }
 
-// Runs split-KV FlashAttention inside the cooperative layer after Q/K/V prep.
+// Runs one fused decode layer body inside an existing cooperative grid.
 template <typename Traits>
-__device__ inline void phase_megakernel_flash_attention(
-    const Gemma4DecodeMegakernelLayerArgs &args,
+__device__ __forceinline__ void decode_megakernel_fused_layer_device(
+    Gemma4DecodeMegakernelLayerArgs args,
     cg::grid_group grid) {
-  phase_megakernel_flash_attention_from_prepared<Traits>(args, grid);
+  if constexpr (Traits::kIsGlobal) {
+    phase_megakernel_project_prepare_paged_kv<
+        Traits, GEMMA4_GLOBAL_QK_PROJ_SIZE>(args, args.attention_q, grid);
+  } else {
+    phase_megakernel_project_prepare_paged_kv<
+        Traits, GEMMA4_SLIDING_QKV_SIZE>(args, args.attention_out, grid);
+  }
+
+  phase_megakernel_flash_attention_o_projection<Traits>(args, grid);
+
+  decode_pre_ffn_norm(args);
+  grid.sync();
+  // Reuse attention scratch for FFN normed output; args.normed_out stays post-attn.
+  gemma4_ffn_decode_fused_bf16_device(
+      args.residual_out, args.attention_out, args.ffn_x, args.ffn_residual,
+      args.ffn_norm_weight, args.ffn_gate_up_decode, args.ffn_down_decode,
+      args.ffn_scratch, args.layer_scalar, GEMMA4_RMS_NORM_EPS);
 }
 
 // Runs one fused decode layer from attention ingress through the FFN tail.
@@ -2231,34 +2445,7 @@ __global__ __launch_bounds__(kDecodeMegaThreads, 1)
 void decode_megakernel_fused_layer_kernel(
     Gemma4DecodeMegakernelLayerArgs args) {
   cg::grid_group grid = cg::this_grid();
-
-  phase_megakernel_flash_attention<Traits>(args, grid);
-  grid.sync();
-
-  decode_attention_o_projection<GEMMA4_NUM_QUERY_HEADS * Traits::kHeadDim>(
-      args);
-  grid.sync();
-
-  decode_attention_to_ffn(args);
-  grid.sync();
-  gemma4_ffn_decode_fused_bf16_device(
-      args.residual_out, args.normed_out, args.ffn_x, args.ffn_residual,
-      args.ffn_norm_weight, args.ffn_gate_up_decode, args.ffn_down_decode,
-      args.ffn_scratch, args.layer_scalar, GEMMA4_RMS_NORM_EPS);
-}
-
-using SlidingAttentionTraits = Gemma4AttentionTraits<false>;
-
-constexpr int kSlidingPersistentStateI32 = 4;
-
-size_t sliding_decode_persistent_scratch_i32_count(
-    int32_t batch_size,
-    int32_t num_splits) {
-  if (batch_size <= 0 || num_splits <= 0) return 0;
-  const int64_t q_rows = int64_t(batch_size) * GEMMA4_NUM_QUERY_HEADS;
-  const int64_t split_tasks =
-      int64_t(batch_size) * GEMMA4_SLIDING_KV_HEADS * num_splits;
-  return size_t(kSlidingPersistentStateI32 + q_rows + split_tasks + q_rows);
+  decode_megakernel_fused_layer_device<Traits>(args, grid);
 }
 
 template <typename Traits>
@@ -2276,7 +2463,8 @@ bool valid_decode_paged_args(
     int32_t cache_layer,
     int32_t batch_size,
     int32_t split_size,
-    int32_t num_splits) {
+    int32_t num_splits,
+    bool require_full_capacity) {
   if (!gemma4_fa_valid_cache_config<Traits>(cache_config, cache_layer)) {
     return false;
   }
@@ -2284,7 +2472,7 @@ bool valid_decode_paged_args(
   const int64_t required_keys =
       Traits::kIsGlobal
           ? int64_t(cache_config.max_pages_per_seq) * cache_config.page_size
-         : cache_config.window_size;
+          : cache_config.window_size;
   const bool needs_partials = num_splits > 1;
   return d_out != nullptr &&
          (!needs_partials ||
@@ -2294,7 +2482,7 @@ bool valid_decode_paged_args(
          d_page_table != nullptr && d_seq_lengths != nullptr &&
          batch_size > 0 && split_size > 0 && num_splits > 0 &&
          batch_size <= cache_config.batch_size &&
-         split_capacity >= required_keys;
+         (!require_full_capacity || split_capacity >= required_keys);
 }
 
 template <typename Traits>
@@ -2316,8 +2504,8 @@ cudaError_t launch_decode_paged_impl(
     int32_t num_splits,
     cudaStream_t stream) {
   using Derived = Gemma4AttentionDerived<Traits>;
-  // Phase 1 computes per-split online-softmax partials. The grid intentionally
-  // launches the max split count; each CTA cheaply exits if its row has no work.
+  // Phase 1 computes per-split online-softmax partials. Overprovisioned graph
+  // launches cheaply exit CTAs whose row has no work.
   const dim3 split_grid(batch_size, Traits::kKvHeads, num_splits);
   constexpr dim3 block_dim(Derived::kDecodeThreads);
   decode_paged_grouped_split_kernel<Traits>
@@ -2326,8 +2514,7 @@ cudaError_t launch_decode_paged_impl(
       d_partial_acc, d_q_prepared, d_cache_k, d_cache_v, d_page_table,
       d_seq_lengths, cache_config, cache_layer, softmax_scale, split_size,
       num_splits);
-  const cudaError_t status = cudaGetLastError();
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetLastError());
   if (num_splits == 1) return cudaSuccess;
 
   // Phase 2 reduces live split partials into the final projection-ready BF16
@@ -2362,7 +2549,7 @@ cudaError_t launch_decode_paged(
     if (!valid_decode_paged_args<Gemma4AttentionTraits<false>>(
             d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
             d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
-            cache_layer, batch_size, split_size, num_splits)) {
+            cache_layer, batch_size, split_size, num_splits, true)) {
       return cudaErrorInvalidValue;
     }
     return launch_decode_paged_impl<Gemma4AttentionTraits<false>>(
@@ -2375,7 +2562,7 @@ cudaError_t launch_decode_paged(
     if (!valid_decode_paged_args<Gemma4AttentionTraits<true>>(
             d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
             d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
-            cache_layer, batch_size, split_size, num_splits)) {
+            cache_layer, batch_size, split_size, num_splits, true)) {
       return cudaErrorInvalidValue;
     }
     return launch_decode_paged_impl<Gemma4AttentionTraits<true>>(
@@ -2396,7 +2583,7 @@ bool valid_decode_megakernel_layer_args(
           args.attention_q, args.attention_cache_k, args.attention_cache_v,
           args.attention_page_table, args.attention_seq_lengths,
           args.attention_cache_config, args.attention_cache_layer, 1,
-          args.attention_split_size, args.attention_num_splits)) {
+          args.attention_split_size, args.attention_num_splits, false)) {
     return false;
   }
   return args.residual_out != nullptr &&
@@ -2416,6 +2603,12 @@ bool valid_decode_megakernel_layer_args(
          args.attention_k_norm_weight != nullptr &&
          args.attention_cos != nullptr &&
          args.attention_sin != nullptr &&
+         args.attention_partial_acc != nullptr &&
+         args.attention_input_norm_weight != nullptr &&
+         args.attention_qkv_proj_col_major != nullptr &&
+#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
+         (args.attention_ready == nullptr || args.attention_ready_tag != 0) &&
+#endif
          args.attention_softmax_scale > 0.0f &&
          is_aligned_16(args.attention_x) &&
          is_aligned_16(args.ffn_x) &&
@@ -2425,31 +2618,9 @@ bool valid_decode_megakernel_layer_args(
          is_aligned_16(args.ffn_down_decode) &&
          is_aligned_16(args.attention_q) &&
          is_aligned_16(args.attention_out) &&
+         is_aligned_16(args.attention_input_norm_weight) &&
+         is_aligned_16(args.attention_qkv_proj_col_major) &&
          is_aligned_16(args.attention_o_proj_col_major);
-}
-
-// Small diagnostic helper for tests/benchmarks that want register count,
-// dynamic shared memory, binary target, and related CUDA function attributes.
-template <typename KernelTraits, bool IsLocal>
-cudaError_t selected_kernel_attributes(long long *out, int len) {
-  if (out == nullptr || len < 10) return cudaErrorInvalidValue;
-  cudaError_t status = set_kernel_smem<KernelTraits, IsLocal>();
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
-  auto kernel = &gemma4_flash_fwd_bf16_kernel<KernelTraits, IsLocal>;
-  cudaFuncAttributes attr{};
-  status = cudaFuncGetAttributes(&attr, kernel);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
-  out[0] = static_cast<long long>(attr.sharedSizeBytes);
-  out[1] = static_cast<long long>(attr.constSizeBytes);
-  out[2] = static_cast<long long>(attr.localSizeBytes);
-  out[3] = attr.maxThreadsPerBlock;
-  out[4] = attr.numRegs;
-  out[5] = attr.ptxVersion;
-  out[6] = attr.binaryVersion;
-  out[7] = attr.cacheModeCA;
-  out[8] = attr.maxDynamicSharedSizeBytes;
-  out[9] = attr.preferredShmemCarveout;
-  return cudaSuccess;
 }
 
 // Launches the cooperative decode grid that owns the fused layer body.
@@ -2458,15 +2629,14 @@ cudaError_t launch_decode_layer(
     const Gemma4DecodeMegakernelLayerArgs &args,
     cudaStream_t stream,
     Kernel kernel) {
-  static DecodeLayerLaunchCache launch_cache[2];
+  static DecodeCooperativeLaunchCache launch_cache[2];
   int device = 0;
-  cudaError_t status = cudaGetDevice(&device);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
+  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDevice(&device));
   void *kernel_ptr = reinterpret_cast<void *>(kernel);
 
   // Device properties and occupancy are invariant across all 48 decode layers.
-  DecodeLayerLaunchCache *cached = nullptr;
-  for (DecodeLayerLaunchCache &entry : launch_cache) {
+  DecodeCooperativeLaunchCache *cached = nullptr;
+  for (DecodeCooperativeLaunchCache &entry : launch_cache) {
     if (entry.kernel == kernel_ptr && entry.device == device &&
         entry.active_blocks > 0) {
       cached = &entry;
@@ -2476,16 +2646,14 @@ cudaError_t launch_decode_layer(
     cached = launch_cache[0].kernel == nullptr ? &launch_cache[0]
                                                : &launch_cache[1];
     cudaDeviceProp prop = {};
-    status = cudaGetDeviceProperties(&prop, device);
-    GEMMA4_RETURN_IF_CUDA_ERROR(status);
+    GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDeviceProperties(&prop, device));
     if (!prop.cooperativeLaunch) {
       return cudaErrorNotSupported;
     }
 
     int active_blocks_per_sm = 0;
-    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_blocks_per_sm, kernel, kDecodeMegaThreads, 0);
-    GEMMA4_RETURN_IF_CUDA_ERROR(status);
+    GEMMA4_RETURN_IF_CUDA_ERROR(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &active_blocks_per_sm, kernel, kDecodeMegaThreads, 0));
     cached->kernel = kernel_ptr;
     cached->device = device;
     cached->active_blocks = active_blocks_per_sm * prop.multiProcessorCount;
@@ -2496,12 +2664,10 @@ cudaError_t launch_decode_layer(
 
   Gemma4DecodeMegakernelLayerArgs kernel_args_value = args;
   void *kernel_args[] = {&kernel_args_value};
-  status = cudaLaunchCooperativeKernel(
+  const cudaError_t status = cudaLaunchCooperativeKernel(
       kernel_ptr, cached->active_blocks, kDecodeMegaThreads, kernel_args, 0,
       stream);
-  if (status != cudaSuccess) {
-    return status;
-  }
+  GEMMA4_RETURN_IF_CUDA_ERROR(status);
   return cudaGetLastError();
 }
 
@@ -2512,60 +2678,31 @@ cudaError_t gemma4_decode_megakernel_flash_attention_layer_bf16(
     const Gemma4DecodeMegakernelLayerArgs &args,
     cudaStream_t stream) {
   const Gemma4KvCacheConfig &config = args.attention_cache_config;
-  cudaError_t status = cudaErrorInvalidValue;
   if (config.head_dim == GEMMA4_SLIDING_HEAD_DIM &&
       config.num_heads == GEMMA4_SLIDING_KV_HEADS) {
     if (!gemma4_flash_attention::valid_decode_megakernel_layer_args<
             gemma4_flash_attention::Gemma4AttentionTraits<false>>(args)) {
       return cudaErrorInvalidValue;
     }
-    status = gemma4_flash_attention::launch_decode_layer(
+    return gemma4_flash_attention::launch_decode_layer(
         args, stream,
         gemma4_flash_attention::
             decode_megakernel_fused_layer_kernel<
                 gemma4_flash_attention::Gemma4AttentionTraits<false>>);
-  } else if (config.head_dim == GEMMA4_GLOBAL_HEAD_DIM &&
-             config.num_heads == GEMMA4_GLOBAL_KV_HEADS) {
+  }
+  if (config.head_dim == GEMMA4_GLOBAL_HEAD_DIM &&
+      config.num_heads == GEMMA4_GLOBAL_KV_HEADS) {
     if (!gemma4_flash_attention::valid_decode_megakernel_layer_args<
             gemma4_flash_attention::Gemma4AttentionTraits<true>>(args)) {
       return cudaErrorInvalidValue;
     }
-    status = gemma4_flash_attention::launch_decode_layer(
+    return gemma4_flash_attention::launch_decode_layer(
         args, stream,
         gemma4_flash_attention::
             decode_megakernel_fused_layer_kernel<
                 gemma4_flash_attention::Gemma4AttentionTraits<true>>);
   }
-  return status;
-}
-
-// Host launcher for Gemma 4 sliding-window attention. Inputs and output are
-// BF16 contiguous batch-major tensors in the layout documented by make_params().
-extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16(
-    __nv_bfloat16 *__restrict__ d_out,
-    float *__restrict__ d_softmax_lse,
-    const __nv_bfloat16 *__restrict__ d_q,
-    const __nv_bfloat16 *__restrict__ d_k,
-    const __nv_bfloat16 *__restrict__ d_v,
-    int batch_size,
-    int seqlen_q,
-    int seqlen_k,
-    int window_size,
-    float softmax_scale,
-    cudaStream_t stream) {
-  // Reject invalid pointers and dimensions before the kernel can touch device
-  // memory.
-  if (!gemma4_flash_attention::gemma4_fa_valid_sliding_args(
-          d_out, d_q, d_k, d_v, batch_size, seqlen_q, seqlen_k,
-          window_size)) {
-    return cudaErrorInvalidValue;
-  }
-
-  const gemma4_flash_attention::Gemma4FlashFwdParams params =
-      gemma4_flash_attention::make_params(d_out, d_softmax_lse, d_q, d_k, d_v,
-                                          seqlen_q, seqlen_k, window_size,
-                                          softmax_scale);
-  return gemma4_flash_attention::launch_sliding(params, batch_size, stream);
+  return cudaErrorInvalidValue;
 }
 
 // Gemma sliding prefill helper: Q/K get learned RMSNorm then RoPE; V gets
@@ -2601,14 +2738,14 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
       d_k_norm_weight == nullptr || d_cos == nullptr || d_sin == nullptr) {
     return cudaErrorInvalidValue;
   }
-  // ponytail: prefill-only until the paged decode cache lands; decode should
-  // prep just the appended token and write Layout-A cache pages once.
+  // This prefill helper assumes contiguous self-attention rows. Decode appends
+  // use paged-cache prep instead.
   if (seqlen_q != seqlen_k) {
     return cudaErrorInvalidValue;
   }
 
   const cudaError_t status = gemma4_flash_attention::prepare_qkv_norm_rope<
-      gemma4_flash_attention::SlidingAttentionTraits>(
+      gemma4_flash_attention::Gemma4AttentionTraits<false>>(
       d_q_prepared, d_k_prepared, d_v_prepared, d_q, d_k, d_v,
       d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, d_token_position,
       batch_size, seqlen_q, stream);
@@ -2618,7 +2755,9 @@ extern "C" cudaError_t gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
       gemma4_flash_attention::make_params(
           d_out, d_softmax_lse, d_q_prepared, d_k_prepared, d_v_prepared,
           seqlen_q, seqlen_k, window_size, softmax_scale);
-  return gemma4_flash_attention::launch_sliding(params, batch_size, stream);
+  return gemma4_flash_attention::launch_attention<
+      gemma4_flash_attention::Gemma4SlidingFa2KernelTraits, true>(
+      params, batch_size, stream);
 }
 
 // Gemma global prefill helper: Q/K get learned RMSNorm then p-RoPE; V is
@@ -2660,36 +2799,12 @@ extern "C" cudaError_t gemma4_flash_attention_global_fwd_bf16_norm_rope(
       gemma4_flash_attention::make_params(
           d_out, d_softmax_lse, d_q_prepared, d_k_prepared, d_v_prepared,
           seqlen_q, seqlen_k, 0, softmax_scale);
-  return gemma4_flash_attention::launch_global(params, batch_size, stream);
+  return gemma4_flash_attention::launch_attention<
+      gemma4_flash_attention::Gemma4GlobalFa2KernelTraits, false>(
+      params, batch_size, stream);
 }
 
-// Gemma sliding decode prep-cache helper: Q gets learned RMSNorm+RoPE into the
-// current-token attention buffer; K gets learned RMSNorm+RoPE into the paged
-// cache; V gets scale-free RMSNorm into the same paged cache page.
-extern "C" cudaError_t gemma4_flash_attention_sliding_decode_prepare_q_paged_kv_bf16(
-    __nv_bfloat16 *__restrict__ d_q_prepared,
-    __nv_bfloat16 *__restrict__ d_cache_k,
-    __nv_bfloat16 *__restrict__ d_cache_v,
-    Gemma4KvCacheConfig cache_config,
-    const int32_t *__restrict__ d_page_table,
-    const int32_t *__restrict__ d_token_position,
-    int32_t batch_size,
-    int32_t cache_layer,
-    const __nv_bfloat16 *__restrict__ d_q,
-    const __nv_bfloat16 *__restrict__ d_k,
-    const __nv_bfloat16 *__restrict__ d_v,
-    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
-    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
-    const float *__restrict__ d_cos,
-    const float *__restrict__ d_sin,
-    cudaStream_t stream) {
-  return gemma4_flash_attention::prepare_decode_q_paged_kv_norm_rope<
-      gemma4_flash_attention::SlidingAttentionTraits>(
-      d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
-      d_token_position, batch_size, cache_layer, d_q, d_k, d_v,
-      d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
-}
-
+// Dispatches decode Q/K/V prep to sliding or global attention from cache shape.
 extern "C" cudaError_t gemma4_flash_attention_decode_prepare_q_paged_kv_bf16(
     __nv_bfloat16 *__restrict__ d_q_prepared,
     __nv_bfloat16 *__restrict__ d_cache_k,
@@ -2726,59 +2841,7 @@ extern "C" cudaError_t gemma4_flash_attention_decode_prepare_q_paged_kv_bf16(
   return cudaErrorInvalidValue;
 }
 
-extern "C" cudaError_t gemma4_flash_attention_decode_norm_project_prepare_paged_kv_bf16(
-    __nv_bfloat16 *__restrict__ d_q_prepared,
-    __nv_bfloat16 *__restrict__ d_cache_k,
-    __nv_bfloat16 *__restrict__ d_cache_v,
-    Gemma4KvCacheConfig cache_config,
-    const int32_t *__restrict__ d_page_table,
-    const int32_t *__restrict__ d_token_position,
-    int32_t batch_size,
-    int32_t cache_layer,
-    const __nv_bfloat16 *__restrict__ d_x,
-    const __nv_bfloat16 *__restrict__ d_input_norm_weight,
-    Gemma4AttentionProjectionWeights weights,
-    const __nv_bfloat16 *__restrict__ d_q_norm_weight,
-    const __nv_bfloat16 *__restrict__ d_k_norm_weight,
-    const float *__restrict__ d_cos,
-    const float *__restrict__ d_sin,
-    cudaStream_t stream) {
-  return gemma4_flash_attention::norm_project_prepare_decode_paged_kv(
-      d_q_prepared, d_cache_k, d_cache_v, cache_config, d_page_table,
-      d_token_position, batch_size, cache_layer, d_x, d_input_norm_weight,
-      weights, d_q_norm_weight, d_k_norm_weight, d_cos, d_sin, stream);
-}
-
-// Gemma sliding decode attention over the Layout-A paged cache. This path is
-// specialized for q_len=1 and uses CUDA cores rather than trying to force a
-// tensor-core tile shape with only one query row.
-extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_bf16(
-    __nv_bfloat16 *__restrict__ d_out,
-    float *__restrict__ d_partial_m,
-    float *__restrict__ d_partial_l,
-    float *__restrict__ d_partial_acc,
-    const __nv_bfloat16 *__restrict__ d_q_prepared,
-    const __nv_bfloat16 *__restrict__ d_cache_k,
-    const __nv_bfloat16 *__restrict__ d_cache_v,
-    const int32_t *__restrict__ d_page_table,
-    const int32_t *__restrict__ d_seq_lengths,
-    Gemma4KvCacheConfig cache_config,
-    int32_t cache_layer,
-    int32_t batch_size,
-    float softmax_scale,
-    int32_t split_size,
-    int32_t num_splits,
-    cudaStream_t stream) {
-  if (cache_config.head_dim != GEMMA4_SLIDING_HEAD_DIM ||
-      cache_config.num_heads != GEMMA4_SLIDING_KV_HEADS) {
-    return cudaErrorInvalidValue;
-  }
-  return gemma4_flash_attention_decode_paged_bf16(
-      d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
-      d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
-      cache_layer, batch_size, softmax_scale, split_size, num_splits, stream);
-}
-
+// Dispatches one-token paged decode attention from cache shape.
 extern "C" cudaError_t gemma4_flash_attention_decode_paged_bf16(
     __nv_bfloat16 *__restrict__ d_out,
     float *__restrict__ d_partial_m,
@@ -2800,75 +2863,4 @@ extern "C" cudaError_t gemma4_flash_attention_decode_paged_bf16(
       d_out, d_partial_m, d_partial_l, d_partial_acc, d_q_prepared,
       d_cache_k, d_cache_v, d_page_table, d_seq_lengths, cache_config,
       cache_layer, batch_size, softmax_scale, split_size, num_splits, stream);
-}
-
-extern "C" size_t gemma4_flash_attention_sliding_decode_persistent_scratch_i32(
-    int32_t batch_size,
-    int32_t num_splits) {
-  return gemma4_flash_attention::sliding_decode_persistent_scratch_i32_count(
-      batch_size, num_splits);
-}
-
-// Persistent-work-queue decode is parked until it has a narrow measured reason.
-// The direct paged decode path above is the active correctness implementation.
-extern "C" cudaError_t gemma4_flash_attention_sliding_decode_paged_persistent_bf16(
-    __nv_bfloat16 *__restrict__ d_out,
-    float *__restrict__ d_partial_m,
-    float *__restrict__ d_partial_l,
-    float *__restrict__ d_partial_acc,
-    int32_t *__restrict__ d_work_scratch,
-    int32_t work_scratch_i32,
-    const __nv_bfloat16 *__restrict__ d_q_prepared,
-    const __nv_bfloat16 *__restrict__ d_cache_k,
-    const __nv_bfloat16 *__restrict__ d_cache_v,
-    const int32_t *__restrict__ d_page_table,
-    const int32_t *__restrict__ d_seq_lengths,
-    Gemma4KvCacheConfig cache_config,
-    int32_t cache_layer,
-    int32_t batch_size,
-    float softmax_scale,
-    int32_t split_size,
-    int32_t num_splits,
-    int32_t persistent_blocks,
-    cudaStream_t stream) {
-  (void)d_out;
-  (void)d_partial_m;
-  (void)d_partial_l;
-  (void)d_partial_acc;
-  (void)d_work_scratch;
-  (void)work_scratch_i32;
-  (void)d_q_prepared;
-  (void)d_cache_k;
-  (void)d_cache_v;
-  (void)d_page_table;
-  (void)d_seq_lengths;
-  (void)cache_config;
-  (void)cache_layer;
-  (void)batch_size;
-  (void)softmax_scale;
-  (void)split_size;
-  (void)num_splits;
-  (void)persistent_blocks;
-  (void)stream;
-  return cudaErrorNotSupported;
-}
-
-// Expose launch metadata so tests and benchmarks can sanity-check occupancy and
-// shared-memory requirements without duplicating template internals.
-// Return the dynamic shared-memory bytes required by sliding attention.
-extern "C" size_t gemma4_flash_attention_sliding_smem_bytes() {
-  return gemma4_flash_attention::Gemma4SlidingFa2KernelTraits::kSmemSize;
-}
-
-// Return the CUDA threadblock size used by sliding attention.
-extern "C" int gemma4_flash_attention_sliding_threads_per_block() {
-  return gemma4_flash_attention::Gemma4SlidingFa2KernelTraits::kNThreads;
-}
-
-// Fill a small attribute array for the compiled sliding attention kernel.
-extern "C" cudaError_t gemma4_flash_attention_sliding_kernel_attributes(
-    long long *out,
-    int len) {
-  return gemma4_flash_attention::selected_kernel_attributes<
-      gemma4_flash_attention::Gemma4SlidingFa2KernelTraits, true>(out, len);
 }
