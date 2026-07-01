@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -33,18 +32,6 @@ inline void gemma4_bench_cuda_check(cudaError_t status, const char *expr,
 
 #define CUDA_CHECK(expr)                                                        \
   gemma4_bench_cuda_check((expr), #expr, __FILE__, __LINE__)
-
-inline void gemma4_bench_cublas_check(cublasStatus_t status, const char *expr,
-                                      const char *file, int line) {
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    throw std::runtime_error(std::string(file) + ":" + std::to_string(line) +
-                             ": cuBLAS error for " + expr + ": " +
-                             std::to_string(status));
-  }
-}
-
-#define CUBLAS_CHECK(expr)                                                      \
-  gemma4_bench_cublas_check((expr), #expr, __FILE__, __LINE__)
 
 struct TimingStats {
   float best_ms = 0.0f;
@@ -320,36 +307,6 @@ inline void fill_random_bf16(__nv_bfloat16 *ptr,
   const int blocks = int((count + threads - 1) / threads);
   gemma4_bench_fill_random_bf16_kernel<<<blocks, threads, 0, stream>>>(
       ptr, count, seed, scale);
-  CUDA_CHECK(cudaGetLastError());
-}
-
-// Streams a scratch buffer through L2 so cold-cache bench regions are explicit.
-static __global__ void gemma4_bench_flush_cache_kernel(
-    const uint32_t *__restrict__ in,
-    uint32_t *__restrict__ out,
-    size_t count) {
-  uint32_t acc = 0;
-  const size_t thread_index = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
-  const size_t stride = size_t(blockDim.x) * gridDim.x;
-  for (size_t i = thread_index; i < count; i += stride) {
-    acc ^= in[i] + uint32_t(i);
-  }
-  out[thread_index] = acc;
-}
-
-// Launches the fixed-shape cache flush used by cold-cache microbenchmarks.
-inline void flush_cache(const uint32_t *in,
-                        uint32_t *out,
-                        size_t count,
-                        cudaStream_t stream) {
-  if (count == 0) {
-    return;
-  }
-
-  constexpr int threads = 256;
-  constexpr int blocks = 4096;
-  gemma4_bench_flush_cache_kernel<<<blocks, threads, 0, stream>>>(
-      in, out, count);
   CUDA_CHECK(cudaGetLastError());
 }
 

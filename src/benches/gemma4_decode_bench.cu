@@ -11,8 +11,20 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
+
+static inline void cublas_check(cublasStatus_t status, const char *expr,
+                                const char *file, int line) {
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    throw std::runtime_error(std::string(file) + ":" + std::to_string(line) +
+                             ": cuBLAS error for " + expr + ": " +
+                             std::to_string(status));
+  }
+}
+
+#define CUBLAS_CHECK(expr) cublas_check((expr), #expr, __FILE__, __LINE__)
 
 struct DecodeOp {
   const char *name;
@@ -197,10 +209,14 @@ static void run_op(const DecodeOp &op, int iters, int warmup, int trials,
   constexpr float kWeightScale = 0.5f;
   fill_random_bf16(raw_ptr(x), x_count, x_seed, kInputScale, stream);
   fill_random_bf16(raw_ptr(w), w_count, w_seed, kWeightScale, stream);
-  CUDA_CHECK(cudaMemsetAsync(raw_ptr(custom_y), 0, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMemsetAsync(raw_ptr(gemv_y), 0, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMemsetAsync(raw_ptr(gemm_y), 0, y_count * sizeof(__nv_bfloat16)));
-  CUDA_CHECK(cudaMemsetAsync(raw_ptr(cudnn_y), 0, y_count * sizeof(__nv_bfloat16)));
+  CUDA_CHECK(cudaMemsetAsync(
+      raw_ptr(custom_y), 0, y_count * sizeof(__nv_bfloat16), stream));
+  CUDA_CHECK(cudaMemsetAsync(
+      raw_ptr(gemv_y), 0, y_count * sizeof(__nv_bfloat16), stream));
+  CUDA_CHECK(cudaMemsetAsync(
+      raw_ptr(gemm_y), 0, y_count * sizeof(__nv_bfloat16), stream));
+  CUDA_CHECK(cudaMemsetAsync(
+      raw_ptr(cudnn_y), 0, y_count * sizeof(__nv_bfloat16), stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   auto run_custom = [&]() {

@@ -557,7 +557,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
             << " launch_overhead=queued_launches_only"
             << " host_wall_time=excluded"
             << " aggregation=raw_samples"
-            << " correctness=cpp_reference"
+            << " correctness=cpp_reference_diff_reported_when_check_seq_positive"
             << " warmup=" << warmup
             << " iters_per_sample=" << iters
             << " samples=" << samples
@@ -571,7 +571,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
             << " cache=" << cache_mode
             << " flush_bytes=" << (cold_cache ? flush_bytes : 0)
             << " timing=cuda_events_same_stream"
-            << " launch_overhead=included\n";
+            << " launch_overhead=queued_launches_only\n";
   gemma4_bench_print_timing_stats("norm_rope_plus_fa", norm_rope_timing);
   std::cout << "approx_attention_tflops_in_total_path_median=" << tflops << "\n";
 

@@ -112,16 +112,6 @@ std::optional<TimingStats> try_time_ms_graph(
   }
 }
 
-// Prints an optional graph-replay timing row using the normal timing schema.
-void print_graph_stats(const char *path,
-                       const std::optional<TimingStats> &stats) {
-  if (!stats.has_value()) {
-    return;
-  }
-  gemma4_bench_print_timing_stats(
-      "ffn_libtorch_bench_graph", path, *stats);
-}
-
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -283,7 +273,11 @@ int main(int argc, char **argv) {
       "ffn_libtorch_bench", "path=libtorch_full_ffn", torch_stats);
   gemma4_bench_print_timing_stats(
       "ffn_libtorch_bench", "path=dualgemm_chain_decode_layout", dual_stats);
-  print_graph_stats("path=dualgemm_chain_decode_layout", dual_graph_stats);
+  if (dual_graph_stats.has_value()) {
+    gemma4_bench_print_timing_stats(
+        "ffn_libtorch_bench_graph", "path=dualgemm_chain_decode_layout",
+        *dual_graph_stats);
+  }
   std::printf("mode,rows,hidden,intermediate,path,best_ms,avg_ms,"
               "max_abs_vs_libtorch\n");
   print_row("libtorch_full_ffn", torch_stats, 0.0f);

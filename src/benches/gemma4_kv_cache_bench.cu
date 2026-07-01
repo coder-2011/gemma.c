@@ -204,7 +204,7 @@ int main(int argc, char **argv) {
   const int layer = 0;
 
   std::printf(
-      "benchmark_contract name=kv_cache_bench contract=typical_kernel_microbenchmark timing=CUDA_event_gpu_timeline "
+      "benchmark_contract name=kv_cache_bench contract=typical_kernel_microbenchmark timing=cuda_events_same_stream "
       "cache_mode=%s l2_flush_bytes=%lld launch_overhead=queued_launches_only "
       "host_wall_time=excluded stability_scope=single_process "
       "min_effect_for_claim_pct=5 seq_len=%d page_size=%d warmup=%d "
@@ -255,38 +255,38 @@ int main(int argc, char **argv) {
   uint32_t *d_l2_scratch =
       reinterpret_cast<uint32_t *>(raw_ptr(d_l2_scratch_bytes));
   if (flush_bytes > 0) {
-    CUDA_CHECK(cudaMemsetAsync(d_l2_scratch, 0, flush_bytes));
+    CUDA_CHECK(cudaMemsetAsync(d_l2_scratch, 0, flush_bytes, stream));
   }
 
   CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_k), h_k.data(), h_k.size() * sizeof(h_k[0]),
-                             cudaMemcpyHostToDevice));
+                             cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_v), h_v.data(), h_v.size() * sizeof(h_v[0]),
-                             cudaMemcpyHostToDevice));
+                             cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_one_k),
                              h_k.data() + (seq_len - 1) * config.num_heads *
                                               config.head_dim,
                              config.num_heads * config.head_dim *
                                  sizeof(h_k[0]),
-                             cudaMemcpyHostToDevice));
+                             cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_one_v),
                              h_v.data() + (seq_len - 1) * config.num_heads *
                                               config.head_dim,
                              config.num_heads * config.head_dim *
                                  sizeof(h_v[0]),
-                             cudaMemcpyHostToDevice));
+                             cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_page_table), page_table.data(),
                              page_table.size() * sizeof(int32_t),
-                             cudaMemcpyHostToDevice));
+                             cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_token_batch), token_batch.data(),
                              token_batch.size() * sizeof(int32_t),
-                             cudaMemcpyHostToDevice));
+                             cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_token_position), token_position.data(),
                              token_position.size() * sizeof(int32_t),
-                             cudaMemcpyHostToDevice));
+                             cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_one_batch), one_batch.data(), sizeof(int32_t),
-                             cudaMemcpyHostToDevice));
+                             cudaMemcpyHostToDevice, stream));
   CUDA_CHECK(cudaMemcpyAsync(raw_ptr(d_one_position), one_position.data(),
-                             sizeof(int32_t), cudaMemcpyHostToDevice));
+                             sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
   CUDA_CHECK(gemma4_kv_cache_write_bf16(
       raw_ptr(d_cache_k), raw_ptr(d_cache_v), config, raw_ptr(d_page_table), raw_ptr(d_token_batch),

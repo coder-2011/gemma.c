@@ -237,12 +237,10 @@ int main(int argc, char **argv) {
     run_fused();
     run_split();
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    float fused_split_max_abs = -1.0f;
     if (has_fused) {
       const DiffStats fused_split_diff =
           diff_stats_bf16(raw_ptr(d_fused_normed), raw_ptr(d_split_normed),
                           count);
-      fused_split_max_abs = fused_split_diff.max_abs;
       std::printf("benchmark_correctness name=rmsnorm_fused_vs_split rows=%d "
                   "max_abs=%.6g mean_abs=%.6g max_rel=%.6g\n",
                   rows, fused_split_diff.max_abs, fused_split_diff.mean_abs,
@@ -419,9 +417,6 @@ int main(int argc, char **argv) {
                 fused_graph_ms, split_graph_ms, fused_graph_vs_split_graph,
                 cudnn_split_ms, cudnn_split_graph_ms, fused_vs_cudnn_split,
                 cudnn_split_max_abs);
-    if (has_fused && fused_split_max_abs < 0.0f) {
-      throw std::runtime_error("missing fused residual+rmsnorm correctness check");
-    }
   }
 
   CUDA_CHECK(cudaStreamDestroy(stream));

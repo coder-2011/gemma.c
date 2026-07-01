@@ -1,5 +1,4 @@
 #include "gemma4_sampling.cuh"
-#include "gemma4_cuda_utils.cuh"
 #include "gemma4_embedding_gather.cuh"
 #include "gemma4_matmul_kernels.cuh"
 #include "gemma4_bench_utils.cuh"
@@ -22,7 +21,6 @@
 
 namespace {
 
-constexpr int kFinalLogitsColsPerBlock = 8;
 constexpr int kMaterializedSampleThreads = 1024;
 
 struct SamplingBenchArgs {
@@ -31,7 +29,7 @@ struct SamplingBenchArgs {
   int samples = 21;
 };
 
-// Parses positional args plus the deleted Python wrapper's named aliases.
+// Parses positional args plus named aliases used by benchmark scripts.
 bool parse_args(int argc, char **argv, SamplingBenchArgs *args) {
   int positional = 0;
   for (int i = 1; i < argc; ++i) {
@@ -256,7 +254,7 @@ int main(int argc, char **argv) {
               "process_repeats=not_run\n");
 
   std::printf("benchmark_contract name=sampling_bench measurement=sampling_decode "
-              "timing=cuda_events "
+              "timing=cuda_events_same_stream "
               "stream=nonblocking cache=warm_repeated_buffers "
               "launch_overhead=cpu_enqueue_excluded_by_cuda_events "
               "aggregation=raw_samples warmup=%d iters=%d samples=%d dtype=bf16 "
@@ -325,9 +323,7 @@ int main(int argc, char **argv) {
   thrust::device_vector<__nv_bfloat16> d_materialized_logits(GEMMA4_VOCAB_SIZE);
   thrust::device_vector<int32_t> d_fused_token(1);
   thrust::device_vector<int32_t> d_materialized_token(1);
-  constexpr size_t fused_scratch_bytes =
-      static_cast<size_t>(GEMMA4_VOCAB_SIZE / kFinalLogitsColsPerBlock) *
-      (sizeof(Gemma4SampleCandidate) + sizeof(uint32_t));
+  const size_t fused_scratch_bytes = gemma4_sample_next_scratch_bytes();
   thrust::device_vector<unsigned char> d_fused_scratch(fused_scratch_bytes);
 
   fill_random_bf16(raw_ptr(d_lm_head), lm_head_elems, 0x5678u, 0.05f, stream);
