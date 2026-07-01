@@ -2,7 +2,6 @@
 #include <cuda_runtime.h>
 
 #include <ATen/ATen.h>
-#include <ATen/TensorIndexing.h>
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -136,10 +135,6 @@ TimingStats time_cuda_samples(Fn &&fn,
   return summarize_timing_samples(std::move(values));
 }
 
-void print_stats(const char *name, const TimingStats &stats) {
-  gemma4_bench_print_timing_stats(name, stats);
-}
-
 // Runs the LibTorch SDPA baseline for raw sliding prefill tensors.
 at::Tensor run_torch_prefill_sdpa(const at::Tensor &q,
                                   const at::Tensor &k,
@@ -152,67 +147,6 @@ at::Tensor run_torch_prefill_sdpa(const at::Tensor &q,
       q_t, k_t, v_t, std::nullopt, 0.0, true,
       std::optional<double>(scale), true);
   return out_t.permute({0, 2, 1, 3}).contiguous();
-}
-
-// Applies Gemma Q/K RMSNorm in LibTorch for the decode-prep baseline row.
-at::Tensor torch_rmsnorm(const at::Tensor &x,
-                         const at::Tensor &weight,
-                         bool use_weight) {
-  at::Tensor y = x.to(at::kFloat);
-  at::Tensor mean_sq = y.square().mean(std::vector<int64_t>{-1}, true);
-  y = y * at::rsqrt(mean_sq + GEMMA4_RMS_NORM_EPS);
-  if (use_weight) {
-    y = y * weight.to(at::kFloat).view({1, 1, kHeadDim});
-  }
-  return y;
-}
-
-// Applies sliding RoPE using token-position-selected cos/sin rows.
-at::Tensor torch_apply_rope(const at::Tensor &x,
-                            const at::Tensor &cos,
-                            const at::Tensor &sin,
-                            const at::Tensor &token_position) {
-  at::Tensor rows = token_position.to(at::kLong);
-  at::Tensor c = cos.index_select(0, rows).unsqueeze(1);
-  at::Tensor s = sin.index_select(0, rows).unsqueeze(1);
-  at::Tensor lo = x.slice(-1, 0, kRotaryHalf);
-  at::Tensor hi = x.slice(-1, kRotaryHalf, kHeadDim);
-  return at::cat({lo * c - hi * s, lo * s + hi * c}, -1).to(at::kBFloat16);
-}
-
-// Runs the LibTorch decode Q/K/V norm, RoPE, and paged-cache write baseline.
-void run_torch_decode_prep(at::Tensor &q_prepared,
-                           at::Tensor &cache_k,
-                           at::Tensor &cache_v,
-                           const at::Tensor &q,
-                           const at::Tensor &k,
-                           const at::Tensor &v,
-                           const at::Tensor &q_norm_weight,
-                           const at::Tensor &k_norm_weight,
-                           const at::Tensor &cos,
-                           const at::Tensor &sin,
-                           const at::Tensor &token_position,
-                           int batch_size,
-                           int pages_per_seq,
-                           int slot,
-                           int page_offset) {
-  at::Tensor q_out =
-      torch_apply_rope(torch_rmsnorm(q, q_norm_weight, true), cos, sin,
-                       token_position);
-  at::Tensor k_out =
-      torch_apply_rope(torch_rmsnorm(k, k_norm_weight, true), cos, sin,
-                       token_position);
-  at::Tensor v_out = torch_rmsnorm(v, k_norm_weight, false).to(at::kBFloat16);
-  q_prepared.copy_(q_out);
-
-  const auto long_options =
-      at::TensorOptions().device(at::kCUDA).dtype(at::kLong);
-  at::Tensor batch_index = at::arange(batch_size, long_options);
-  at::Tensor physical_page = batch_index * pages_per_seq + slot;
-  at::Tensor offset = at::full({batch_size}, page_offset, long_options);
-  using at::indexing::Slice;
-  cache_k.index_put_({0, physical_page, offset, Slice(), Slice()}, k_out);
-  cache_v.index_put_({0, physical_page, offset, Slice(), Slice()}, v_out);
 }
 
 void fill_random_bf16(std::vector<__nv_bfloat16> &values, uint32_t seed) {
@@ -403,12 +337,18 @@ void run_correctness(int batch_size, int seq_len, int window_size,
   std::vector<__nv_bfloat16> h_k_norm_weight(kHeadDim);
   std::vector<float> h_cos(rope_table_elements(seq_len));
   std::vector<float> h_sin(rope_table_elements(seq_len));
+  std::vector<int32_t> h_token_position(size_t(batch_size) * seq_len);
   fill_random_bf16(h_q, 0x4a17u);
   fill_random_bf16(h_k, 0x5b23u);
   fill_random_bf16(h_v, 0x6c31u);
   fill_norm_weight_bf16(h_q_norm_weight, 0x7d41u);
   fill_norm_weight_bf16(h_k_norm_weight, 0x8e59u);
   fill_rope_tables(h_cos, h_sin, seq_len);
+  for (int b = 0; b < batch_size; ++b) {
+    for (int row = 0; row < seq_len; ++row) {
+      h_token_position[size_t(b) * seq_len + row] = row;
+    }
+  }
   prepare_qkv_norm_rope_host(h_q_prepared, h_k_prepared, h_v_prepared,
                              h_q, h_k, h_v, h_q_norm_weight,
                              h_k_norm_weight, h_cos, h_sin,
@@ -425,7 +365,7 @@ void run_correctness(int batch_size, int seq_len, int window_size,
   thrust::device_vector<__nv_bfloat16> d_out(h_q.size());
   thrust::device_vector<float> d_cos(h_cos.size());
   thrust::device_vector<float> d_sin(h_sin.size());
-  thrust::device_vector<float> d_lse(size_t(batch_size) * kQHeads * seq_len);
+  thrust::device_vector<int32_t> d_token_position(h_token_position.size());
   CUDA_CHECK(cudaMemcpy(raw_ptr(d_q), h_q.data(), h_q.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(raw_ptr(d_k), h_k.data(), h_k.size() * sizeof(__nv_bfloat16),
@@ -442,11 +382,14 @@ void run_correctness(int batch_size, int seq_len, int window_size,
                         cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(raw_ptr(d_sin), h_sin.data(), h_sin.size() * sizeof(float),
                         cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_token_position), h_token_position.data(),
+                        h_token_position.size() * sizeof(int32_t),
+                        cudaMemcpyHostToDevice));
 
   CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
-      raw_ptr(d_out), raw_ptr(d_lse), raw_ptr(d_q_prepared), raw_ptr(d_k_prepared), raw_ptr(d_v_prepared),
+      raw_ptr(d_out), raw_ptr(d_q_prepared), raw_ptr(d_k_prepared), raw_ptr(d_v_prepared),
       raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), raw_ptr(d_q_norm_weight), raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin),
-      nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
+      raw_ptr(d_token_position), batch_size, seq_len, seq_len, window_size, scale, stream));
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   std::vector<__nv_bfloat16> h_out(h_q.size());
@@ -472,24 +415,10 @@ void run_correctness(int batch_size, int seq_len, int window_size,
   const DiffStats v_diff = diff_stats_host(h_v_gpu, h_v_prepared);
   const DiffStats diff = diff_stats_host(h_out, h_ref);
 
-  CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
-      raw_ptr(d_out), nullptr, raw_ptr(d_q_prepared), raw_ptr(d_k_prepared), raw_ptr(d_v_prepared),
-      raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), raw_ptr(d_q_norm_weight), raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin),
-      nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
-  CUDA_CHECK(cudaStreamSynchronize(stream));
-  std::vector<__nv_bfloat16> h_out_no_lse(h_q.size());
-  CUDA_CHECK(cudaMemcpy(h_out_no_lse.data(), raw_ptr(d_out),
-                        h_out_no_lse.size() * sizeof(__nv_bfloat16),
-                        cudaMemcpyDeviceToHost));
-  const DiffStats no_lse_diff = diff_stats_host(h_out_no_lse, h_ref);
-
   std::cout << "correctness seq=" << seq_len
             << " max_abs=" << diff.max_abs
             << " mean_abs=" << diff.mean_abs
             << " max_rel=" << diff.max_rel << "\n";
-  std::cout << "no_lse_correctness max_abs=" << no_lse_diff.max_abs
-            << " mean_abs=" << no_lse_diff.mean_abs
-            << " max_rel=" << no_lse_diff.max_rel << "\n";
   std::cout << "norm_rope_prep_correctness q_max_abs=" << q_diff.max_abs
             << " k_max_abs=" << k_diff.max_abs
             << " v_max_abs=" << v_diff.max_abs << "\n";
@@ -518,66 +447,23 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   std::vector<__nv_bfloat16> h_q(q_elements(batch_size, seq_len));
   std::vector<__nv_bfloat16> h_k(kv_elements(batch_size, seq_len));
   std::vector<__nv_bfloat16> h_v(kv_elements(batch_size, seq_len));
-  std::vector<__nv_bfloat16> h_decode_q(q_elements(batch_size, 1));
-  std::vector<__nv_bfloat16> h_decode_k(kv_elements(batch_size, 1));
-  std::vector<__nv_bfloat16> h_decode_v(kv_elements(batch_size, 1));
   std::vector<__nv_bfloat16> h_q_norm_weight(kHeadDim);
   std::vector<__nv_bfloat16> h_k_norm_weight(kHeadDim);
   std::vector<float> h_cos(rope_table_elements(seq_len));
   std::vector<float> h_sin(rope_table_elements(seq_len));
+  std::vector<int32_t> h_token_position(size_t(batch_size) * seq_len);
   fill_random_bf16(h_q, 0x1234u);
   fill_random_bf16(h_k, 0x2345u);
   fill_random_bf16(h_v, 0x3456u);
-  fill_random_bf16(h_decode_q, 0x1357u);
-  fill_random_bf16(h_decode_k, 0x2468u);
-  fill_random_bf16(h_decode_v, 0x3579u);
   fill_norm_weight_bf16(h_q_norm_weight, 0x4567u);
   fill_norm_weight_bf16(h_k_norm_weight, 0x5678u);
   fill_rope_tables(h_cos, h_sin, seq_len);
-
-  const int decode_page_size = 64;
-  const int decode_pages_per_seq =
-      std::max(1, (seq_len + decode_page_size - 1) / decode_page_size);
-  const Gemma4KvCacheConfig decode_cache_config = {
-      1,
-      batch_size * decode_pages_per_seq,
-      decode_page_size,
-      decode_pages_per_seq,
-      batch_size,
-      kKvHeads,
-      kHeadDim,
-      GEMMA4_SLIDING_WINDOW,
-  };
-  std::vector<int32_t> h_decode_token_position(batch_size, seq_len - 1);
-  std::vector<int32_t> h_decode_page_table(
-      batch_size * decode_pages_per_seq, -1);
-  const int decode_slot = ((seq_len - 1) / decode_page_size) % decode_pages_per_seq;
-  const int decode_page_offset = (seq_len - 1) % decode_page_size;
-  // Decode attention scans the whole live window, so every logical page needs
-  // a valid mapping rather than only the final cache-write page.
   for (int b = 0; b < batch_size; ++b) {
-    for (int slot = 0; slot < decode_pages_per_seq; ++slot) {
-      h_decode_page_table[b * decode_pages_per_seq + slot] =
-          b * decode_pages_per_seq + slot;
+    for (int row = 0; row < seq_len; ++row) {
+      h_token_position[size_t(b) * seq_len + row] = row;
     }
   }
-  const size_t decode_cache_elems =
-      size_t(decode_cache_config.num_layers) * decode_cache_config.num_pages *
-      decode_cache_config.page_size * decode_cache_config.num_heads *
-      decode_cache_config.head_dim;
-  std::vector<__nv_bfloat16> h_decode_cache_k(decode_cache_elems);
-  std::vector<__nv_bfloat16> h_decode_cache_v(decode_cache_elems);
-  std::vector<int32_t> h_decode_seq_lengths(batch_size, seq_len);
-  fill_random_bf16(h_decode_cache_k, 0x468au);
-  fill_random_bf16(h_decode_cache_v, 0x579bu);
-  const int decode_split_size = GEMMA4_SLIDING_DECODE_SPLIT_SIZE;
-  // The decode launcher validates capacity against the full sliding window;
-  // rows shorter than this cheaply exit overprovisioned split CTAs.
-  const int decode_num_splits =
-      (GEMMA4_SLIDING_WINDOW + decode_split_size - 1) / decode_split_size;
-  const size_t decode_out_elems = q_elements(batch_size, 1);
-  const size_t decode_partial_rows = size_t(batch_size) * kQHeads *
-                                     decode_num_splits;
+
   int64_t l2_flush_words = 0;
   if (cold_cache) {
     flush_bytes = flush_bytes > 0 ? flush_bytes : int64_t(64) * 1024 * 1024;
@@ -586,30 +472,15 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   thrust::device_vector<__nv_bfloat16> d_q(h_q.size());
   thrust::device_vector<__nv_bfloat16> d_k(h_k.size());
   thrust::device_vector<__nv_bfloat16> d_v(h_v.size());
-  thrust::device_vector<__nv_bfloat16> d_decode_q(h_decode_q.size());
-  thrust::device_vector<__nv_bfloat16> d_decode_k(h_decode_k.size());
-  thrust::device_vector<__nv_bfloat16> d_decode_v(h_decode_v.size());
   thrust::device_vector<__nv_bfloat16> d_q_prepared(h_q.size());
   thrust::device_vector<__nv_bfloat16> d_k_prepared(h_k.size());
   thrust::device_vector<__nv_bfloat16> d_v_prepared(h_v.size());
-  thrust::device_vector<__nv_bfloat16> d_decode_q_prepared(h_decode_q.size());
-  thrust::device_vector<__nv_bfloat16> d_decode_cache_k(decode_cache_elems);
-  thrust::device_vector<__nv_bfloat16> d_decode_cache_v(decode_cache_elems);
-  thrust::device_vector<__nv_bfloat16> d_decode_out(decode_out_elems);
-  thrust::device_vector<float> d_decode_partial_m(decode_partial_rows);
-  thrust::device_vector<float> d_decode_partial_l(decode_partial_rows);
-  thrust::device_vector<float> d_decode_partial_acc(
-      decode_partial_rows * kHeadDim);
   thrust::device_vector<__nv_bfloat16> d_q_norm_weight(h_q_norm_weight.size());
   thrust::device_vector<__nv_bfloat16> d_k_norm_weight(h_k_norm_weight.size());
   thrust::device_vector<__nv_bfloat16> d_out(h_q.size());
-  thrust::device_vector<int32_t> d_decode_page_table(h_decode_page_table.size());
-  thrust::device_vector<int32_t> d_decode_token_position(
-      h_decode_token_position.size());
-  thrust::device_vector<int32_t> d_decode_seq_lengths(
-      h_decode_seq_lengths.size());
   thrust::device_vector<float> d_cos(h_cos.size());
   thrust::device_vector<float> d_sin(h_sin.size());
+  thrust::device_vector<int32_t> d_token_position(h_token_position.size());
   thrust::device_vector<uint32_t> d_l2_scratch(static_cast<size_t>(l2_flush_words));
   if (cold_cache) {
     CUDA_CHECK(cudaMemset(raw_ptr(d_l2_scratch), 0,
@@ -621,21 +492,6 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
                         cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(raw_ptr(d_v), h_v.data(), h_v.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_q), h_decode_q.data(),
-                        h_decode_q.size() * sizeof(__nv_bfloat16),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_k), h_decode_k.data(),
-                        h_decode_k.size() * sizeof(__nv_bfloat16),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_v), h_decode_v.data(),
-                        h_decode_v.size() * sizeof(__nv_bfloat16),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_cache_k), h_decode_cache_k.data(),
-                        h_decode_cache_k.size() * sizeof(__nv_bfloat16),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_cache_v), h_decode_cache_v.data(),
-                        h_decode_cache_v.size() * sizeof(__nv_bfloat16),
-                        cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(raw_ptr(d_q_norm_weight), h_q_norm_weight.data(),
                         h_q_norm_weight.size() * sizeof(__nv_bfloat16),
                         cudaMemcpyHostToDevice));
@@ -646,15 +502,8 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
                         cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(raw_ptr(d_sin), h_sin.data(), h_sin.size() * sizeof(float),
                         cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_page_table), h_decode_page_table.data(),
-                        h_decode_page_table.size() * sizeof(int32_t),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_token_position), h_decode_token_position.data(),
-                        h_decode_token_position.size() * sizeof(int32_t),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(raw_ptr(d_decode_seq_lengths),
-                        h_decode_seq_lengths.data(),
-                        h_decode_seq_lengths.size() * sizeof(int32_t),
+  CUDA_CHECK(cudaMemcpy(raw_ptr(d_token_position), h_token_position.data(),
+                        h_token_position.size() * sizeof(int32_t),
                         cudaMemcpyHostToDevice));
 
   if (seq_len <= window_size) {
@@ -679,75 +528,20 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
     CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
     std::cout << "benchmark_libtorch torch_version=" << TORCH_VERSION
               << "\n";
-    print_stats("prefill_torch_sdpa_graphless",
-                time_cuda_samples(launch_torch_prefill, torch_stream.stream(),
-                                  warmup, iters, samples, cold_cache,
-                                  raw_ptr(d_l2_scratch), l2_flush_words));
+    gemma4_bench_print_timing_stats(
+        "prefill_torch_sdpa_graphless",
+        time_cuda_samples(launch_torch_prefill, torch_stream.stream(),
+                          warmup, iters, samples, cold_cache,
+                          raw_ptr(d_l2_scratch), l2_flush_words));
   } else {
     std::cout << "prefill_torch_sdpa_graphless skipped=seq_exceeds_window\n";
   }
 
-  {
-    c10::cuda::CUDAGuard torch_device_guard(0);
-    const c10::cuda::CUDAStream torch_stream =
-        c10::cuda::getStreamFromPool(false, 0);
-    c10::cuda::CUDAStreamGuard torch_stream_guard(torch_stream);
-    at::manual_seed(1234u);
-    const auto torch_options =
-        at::TensorOptions().device(at::kCUDA).dtype(at::kBFloat16);
-    const auto int_options =
-        at::TensorOptions().device(at::kCUDA).dtype(at::kInt);
-    at::Tensor torch_decode_q =
-        at::randn({batch_size, kQHeads, kHeadDim}, torch_options);
-    at::Tensor torch_decode_k =
-        at::randn({batch_size, kKvHeads, kHeadDim}, torch_options);
-    at::Tensor torch_decode_v =
-        at::randn({batch_size, kKvHeads, kHeadDim}, torch_options);
-    at::Tensor torch_q_weight =
-        at::randn({kHeadDim}, torch_options) * 0.05 + 0.95;
-    at::Tensor torch_k_weight =
-        at::randn({kHeadDim}, torch_options) * 0.05 + 0.95;
-    at::Tensor torch_cos =
-        at::from_blob(h_cos.data(), {seq_len, kRotaryHalf},
-                      at::TensorOptions().dtype(at::kFloat))
-            .clone()
-            .to(at::kCUDA);
-    at::Tensor torch_sin =
-        at::from_blob(h_sin.data(), {seq_len, kRotaryHalf},
-                      at::TensorOptions().dtype(at::kFloat))
-            .clone()
-            .to(at::kCUDA);
-    at::Tensor torch_token_position =
-        at::full({batch_size}, seq_len - 1, int_options);
-    at::Tensor torch_q_prepared =
-        at::empty({batch_size, kQHeads, kHeadDim}, torch_options);
-    at::Tensor torch_cache_k =
-        at::zeros({1, batch_size * decode_pages_per_seq, decode_page_size,
-                   kKvHeads, kHeadDim},
-                  torch_options);
-    at::Tensor torch_cache_v = at::zeros_like(torch_cache_k);
-    auto launch_torch_decode_prep = [&]() {
-      run_torch_decode_prep(torch_q_prepared, torch_cache_k, torch_cache_v,
-                            torch_decode_q, torch_decode_k, torch_decode_v,
-                            torch_q_weight, torch_k_weight, torch_cos,
-                            torch_sin, torch_token_position, batch_size,
-                            decode_pages_per_seq, decode_slot,
-                            decode_page_offset);
-    };
-    launch_torch_decode_prep();
-    CUDA_CHECK(cudaStreamSynchronize(torch_stream.stream()));
-    print_stats("torch_decode_norm_rope_paged_kv_write",
-                time_cuda_samples(launch_torch_decode_prep,
-                                  torch_stream.stream(), warmup, iters,
-                                  samples, cold_cache, raw_ptr(d_l2_scratch),
-                                  l2_flush_words));
-  }
-
   auto launch_norm_rope_fa = [&]() {
     CUDA_CHECK(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
-      raw_ptr(d_out), nullptr, raw_ptr(d_q_prepared), raw_ptr(d_k_prepared), raw_ptr(d_v_prepared),
+      raw_ptr(d_out), raw_ptr(d_q_prepared), raw_ptr(d_k_prepared), raw_ptr(d_v_prepared),
       raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_v), raw_ptr(d_q_norm_weight), raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin),
-      nullptr, batch_size, seq_len, seq_len, window_size, scale, stream));
+      raw_ptr(d_token_position), batch_size, seq_len, seq_len, window_size, scale, stream));
   };
   const TimingStats norm_rope_timing =
       time_cuda_samples(launch_norm_rope_fa, stream, warmup, iters, samples,
@@ -755,34 +549,8 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
   const double tflops = sliding_attention_flops(batch_size, seq_len, window_size) /
                         (double(norm_rope_timing.median_ms) * 1.0e-3) / 1.0e12;
 
-  auto launch_decode_prep_cache = [&]() {
-    CUDA_CHECK(gemma4_flash_attention_decode_prepare_q_paged_kv_bf16(
-        raw_ptr(d_decode_q_prepared), raw_ptr(d_decode_cache_k),
-        raw_ptr(d_decode_cache_v), decode_cache_config,
-        raw_ptr(d_decode_page_table), raw_ptr(d_decode_token_position),
-        batch_size, 0, raw_ptr(d_decode_q), raw_ptr(d_decode_k),
-        raw_ptr(d_decode_v), raw_ptr(d_q_norm_weight),
-        raw_ptr(d_k_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin), stream));
-  };
-  const TimingStats decode_prep_cache_timing =
-      time_cuda_samples(launch_decode_prep_cache, stream, warmup, iters,
-                        samples, cold_cache, raw_ptr(d_l2_scratch), l2_flush_words);
-  auto launch_decode_attention = [&]() {
-    CUDA_CHECK(gemma4_flash_attention_decode_paged_bf16(
-        raw_ptr(d_decode_out), raw_ptr(d_decode_partial_m),
-        raw_ptr(d_decode_partial_l), raw_ptr(d_decode_partial_acc),
-        raw_ptr(d_decode_q_prepared), raw_ptr(d_decode_cache_k),
-        raw_ptr(d_decode_cache_v), raw_ptr(d_decode_page_table),
-        raw_ptr(d_decode_seq_lengths), decode_cache_config, 0, batch_size,
-        scale, decode_split_size, decode_num_splits, stream));
-  };
-  const TimingStats decode_attention_timing =
-      time_cuda_samples(launch_decode_attention, stream, warmup, iters,
-                        samples, cold_cache, raw_ptr(d_l2_scratch),
-                        l2_flush_words);
-
   std::cout << "benchmark_contract name=flash_attention_bench"
-            << " measurement=sliding_prefill_decode_prepare_decode_attention"
+            << " measurement=sliding_prefill_attention"
             << " timing=cuda_events_same_stream"
             << " cache_mode=" << cache_mode
             << " l2_flush_bytes=" << (cold_cache ? flush_bytes : 0)
@@ -804,9 +572,7 @@ void run_benchmark(int batch_size, int seq_len, int window_size, int warmup,
             << " flush_bytes=" << (cold_cache ? flush_bytes : 0)
             << " timing=cuda_events_same_stream"
             << " launch_overhead=included\n";
-  print_stats("norm_rope_plus_fa", norm_rope_timing);
-  print_stats("decode_norm_rope_paged_kv_write", decode_prep_cache_timing);
-  print_stats("decode_paged_attention", decode_attention_timing);
+  gemma4_bench_print_timing_stats("norm_rope_plus_fa", norm_rope_timing);
   std::cout << "approx_attention_tflops_in_total_path_median=" << tflops << "\n";
 
 }

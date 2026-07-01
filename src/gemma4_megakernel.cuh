@@ -12,10 +12,6 @@
 
 struct Gemma4FfnDecodeScratch;
 
-#ifndef GEMMA4_DECODE_ATTENTION_READY_HANDOFF
-#define GEMMA4_DECODE_ATTENTION_READY_HANDOFF 0
-#endif
-
 enum class Gemma4MegakernelPrepMode {
   kPrefill,
   kDecode,
@@ -69,10 +65,6 @@ struct Gemma4DecodeMegakernelLayerArgs {
   const __nv_bfloat16 *attention_k_norm_weight = nullptr;
   const float *attention_cos = nullptr;
   const float *attention_sin = nullptr;
-#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
-  uint32_t *attention_ready = nullptr;
-  uint32_t attention_ready_tag = 0;
-#endif
 };
 
 struct Gemma4DecodeMegakernelArgs {
@@ -94,9 +86,6 @@ struct Gemma4DecodeMegakernelArgs {
   int32_t sliding_splits = 0;
   int32_t global_splits = 0;
   cudaStream_t stream = nullptr;
-#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
-  uint32_t *attention_ready = nullptr;
-#endif
 };
 
 // Prepares shared runtime metadata for either prompt prefill or one decode append.
@@ -109,7 +98,7 @@ cudaError_t gemma4_megakernel_prepare_runtime(
 // Returns caller-owned BF16 scratch elements needed by the full prefill path.
 size_t gemma4_prefill_megakernel_scratch_elements(int32_t rows);
 
-// Runs all 48 prefill layers over caller-provided prompt embeddings.
+// Runs all model prefill layers over caller-provided prompt embeddings.
 cudaError_t gemma4_prefill_megakernel(const Gemma4PrefillMegakernelArgs &args);
 
 // Returns caller-owned scratch bytes needed by one full decode step.
@@ -127,5 +116,5 @@ cudaError_t gemma4_megakernel_sample_final_bf16(
     Gemma4SamplingStage stage,
     cudaStream_t stream);
 
-// Runs the batch-1 48-layer decode step and writes the next token embedding.
+// Runs one batch-1 model decode step and writes the next token embedding.
 cudaError_t gemma4_decode_megakernel(const Gemma4DecodeMegakernelArgs &args);

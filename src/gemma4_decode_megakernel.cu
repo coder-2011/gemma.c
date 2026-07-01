@@ -17,39 +17,14 @@ struct DecodeScratch {
   Gemma4FfnDecodeScratch *ffn = nullptr;
   void *sample = nullptr;
   size_t sample_bytes = 0;
-#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
-  uint32_t *attention_ready = nullptr;
-#endif
 };
-
-#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
-// Returns the scratch byte offset of the layer/KV-head readiness table.
-size_t decode_attention_ready_offset(void) {
-  const size_t sample_end =
-      sizeof(Gemma4FfnDecodeScratch) + gemma4_sample_next_scratch_bytes();
-  return (sample_end + alignof(uint32_t) - 1) & ~(alignof(uint32_t) - 1);
-}
-
-// Counts one readiness tag per model layer and possible sliding KV head.
-size_t decode_attention_ready_bytes(void) {
-  return static_cast<size_t>(GEMMA4_NUM_LAYERS) *
-         GEMMA4_SLIDING_KV_HEADS * sizeof(uint32_t);
-}
-#endif
 
 // Splits caller-owned decode scratch into FFN and sampling regions.
 DecodeScratch decode_scratch_from_buffer(void *scratch) {
   auto *ffn = reinterpret_cast<Gemma4FfnDecodeScratch *>(scratch);
   void *sample = reinterpret_cast<void *>(ffn + 1);
   const size_t sample_bytes = gemma4_sample_next_scratch_bytes();
-#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
-  const size_t ready_offset = decode_attention_ready_offset();
-  auto *ready = reinterpret_cast<uint32_t *>(
-      static_cast<unsigned char *>(scratch) + ready_offset);
-  return {ffn, sample, sample_bytes, ready};
-#else
   return {ffn, sample, sample_bytes};
-#endif
 }
 
 // Fills the per-layer cooperative FlashAttention+FFN argument block.
@@ -108,15 +83,6 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
       global ? args.runtime->global_cos : args.runtime->sliding_cos;
   layer_args.attention_sin =
       global ? args.runtime->global_sin : args.runtime->sliding_sin;
-#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
-  if (args.attention_ready != nullptr) {
-    const size_t layer_ready_offset =
-        static_cast<size_t>(layer) * GEMMA4_SLIDING_KV_HEADS;
-    layer_args.attention_ready = args.attention_ready + layer_ready_offset;
-    layer_args.attention_ready_tag =
-        static_cast<uint32_t>(args.runtime->h_token_position[0] + 1);
-  }
-#endif
   return layer_args;
 }
 
@@ -142,11 +108,7 @@ cudaError_t gemma4_megakernel_prepare_runtime(
 
 // Returns caller-owned scratch bytes needed by one full decode step.
 size_t gemma4_decode_megakernel_scratch_bytes(void) {
-#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
-  return decode_attention_ready_offset() + decode_attention_ready_bytes();
-#else
   return sizeof(Gemma4FfnDecodeScratch) + gemma4_sample_next_scratch_bytes();
-#endif
 }
 
 // Applies final RMSNorm, softcapped sampling, and tied embedding gather.
@@ -173,7 +135,7 @@ cudaError_t gemma4_megakernel_sample_final_bf16(
       weights->token_embedding, stage, stream);
 }
 
-// Runs the batch-1 48-layer decode step and writes the next token embedding.
+// Runs one batch-1 model decode step and writes the next token embedding.
 cudaError_t gemma4_decode_megakernel(const Gemma4DecodeMegakernelArgs &args) {
   if (args.hidden_a == nullptr || args.hidden_b == nullptr ||
       args.normed == nullptr || args.sampled_hidden == nullptr ||
@@ -205,11 +167,6 @@ cudaError_t gemma4_decode_megakernel(const Gemma4DecodeMegakernelArgs &args) {
   }
 
   DecodeScratch scratch_parts = decode_scratch_from_buffer(active_args.scratch);
-#if GEMMA4_DECODE_ATTENTION_READY_HANDOFF
-  if (active_args.attention_ready == nullptr) {
-    active_args.attention_ready = scratch_parts.attention_ready;
-  }
-#endif
   __nv_bfloat16 *hidden_in = active_args.hidden_a;
   __nv_bfloat16 *hidden_out = active_args.hidden_b;
   for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {

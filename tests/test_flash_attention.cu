@@ -1,4 +1,3 @@
-#include "gemma4_kv_cache.cuh"
 #include "gemma4_flash_attention.cuh"
 #include "gemma4.h"
 
@@ -51,19 +50,6 @@ __nv_bfloat16 make_value(int seed) {
 __nv_bfloat16 make_prefill_value(int seed) {
   int centered = ((seed * 29 + 11) % 257) - 128;
   return __float2bfloat16_rn(static_cast<float>(centered) / 512.0f);
-}
-
-// Return total BF16 slots in the paged K/V cache layout.
-int64_t cache_elements(const Gemma4KvCacheConfig &config) {
-  return int64_t(config.num_layers) * config.num_pages * config.page_size *
-         config.num_heads * config.head_dim;
-}
-
-// Build the one-page cache configs used by tiny attention tests.
-Gemma4KvCacheConfig single_page_cache_config(int heads,
-                                             int head_dim,
-                                             int window_size) {
-  return {1, 1, 1, 1, 1, heads, head_dim, window_size};
 }
 
 // Return the row-major packed-token offset used by CPU references.
@@ -121,29 +107,6 @@ void compare_bf16(const std::vector<__nv_bfloat16> &actual,
   }
 }
 
-// Compare float vectors with an absolute tolerance.
-void compare_float(const std::vector<float> &actual,
-                   const std::vector<float> &expected,
-                   float tolerance,
-                   const char *label) {
-  float max_abs = 0.0f;
-  int max_index = 0;
-  for (int i = 0; i < static_cast<int>(actual.size()); ++i) {
-    float diff = std::fabs(actual[i] - expected[i]);
-    if (diff > max_abs) {
-      max_abs = diff;
-      max_index = i;
-    }
-  }
-  if (max_abs > tolerance) {
-    std::fprintf(stderr,
-                 "%s max_abs=%g index=%d actual=%g expected=%g tolerance=%g\n",
-                 label, max_abs, max_index, actual[max_index],
-                 expected[max_index], tolerance);
-    std::exit(1);
-  }
-}
-
 // Compare a full BF16 device buffer after copying it back to host memory.
 void compare_device_bf16(const thrust::device_vector<__nv_bfloat16> &actual,
                          const std::vector<__nv_bfloat16> &expected,
@@ -167,8 +130,7 @@ void reference_attention(std::vector<__nv_bfloat16> &expected,
                          int kv_heads,
                          int head_dim,
                          int window_size,
-                         float softmax_scale,
-                         std::vector<float> *expected_lse = nullptr) {
+                         float softmax_scale) {
   const int group = q_heads / kv_heads;
   std::vector<float> scores(seq_len);
   for (int row = 0; row < seq_len; ++row) {
@@ -194,11 +156,6 @@ void reference_attention(std::vector<__nv_bfloat16> &expected,
         scores[col] = std::exp(scores[col] - max_score);
         denom += scores[col];
       }
-      // LSE is the scaled row max plus the log of the shifted denominator.
-      if (expected_lse != nullptr) {
-        (*expected_lse)[qh * seq_len + row] = max_score + std::log(denom);
-      }
-
       for (int d = 0; d < head_dim; ++d) {
         float out = 0.0f;
         for (int col = left; col <= row; ++col) {
@@ -214,7 +171,6 @@ void reference_attention(std::vector<__nv_bfloat16> &expected,
   }
 }
 
-// Compare raw sliding prefill with a CPU reference for one sequence/window shape.
 // Compare global D=512 prefill with norm/RoPE prep against a CPU reference.
 void run_global_prefill_reference_case() {
   constexpr int batch_size = 1;
@@ -240,7 +196,6 @@ void run_global_prefill_reference_case() {
   thrust::device_vector<__nv_bfloat16> d_k_prepared(kv_count);
   thrust::device_vector<__nv_bfloat16> d_v_prepared(kv_count);
   thrust::device_vector<__nv_bfloat16> d_out(q_count);
-  thrust::device_vector<float> d_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
   thrust::device_vector<__nv_bfloat16> d_norm_weight(
       norm_weight.size());
   thrust::device_vector<float> d_cos(cos.size());
@@ -256,7 +211,7 @@ void run_global_prefill_reference_case() {
 
   const float scale = 1.0f / std::sqrt(float(GEMMA4_GLOBAL_HEAD_DIM));
   CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
-      raw_ptr(d_out), raw_ptr(d_lse), raw_ptr(d_q_prepared), raw_ptr(d_k_prepared),
+      raw_ptr(d_out), raw_ptr(d_q_prepared), raw_ptr(d_k_prepared),
       raw_ptr(d_v_prepared), raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_norm_weight),
       raw_ptr(d_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin), raw_ptr(d_token_position),
       batch_size, seq_len, seq_len, scale, 0));
@@ -266,60 +221,11 @@ void run_global_prefill_reference_case() {
   std::vector<__nv_bfloat16> q_prepared = copy_to_host(d_q_prepared);
   std::vector<__nv_bfloat16> k_prepared = copy_to_host(d_k_prepared);
   std::vector<__nv_bfloat16> v_prepared = copy_to_host(d_v_prepared);
-  std::vector<float> expected_lse(GEMMA4_NUM_QUERY_HEADS * seq_len);
   reference_attention(expected, q_prepared, k_prepared, v_prepared, seq_len,
                       GEMMA4_NUM_QUERY_HEADS, GEMMA4_GLOBAL_KV_HEADS,
-                      GEMMA4_GLOBAL_HEAD_DIM, 0, scale, &expected_lse);
+                      GEMMA4_GLOBAL_HEAD_DIM, 0, scale);
   compare_device_bf16(d_out, expected, 0.03125f,
                       "global D512 prefill partial tile");
-  compare_float(copy_to_host(d_lse), expected_lse, 0.03125f,
-                "global D512 prefill LSE");
-}
-
-// Validate global paged decode with one live key and direct single-split output.
-void run_global_flash_decode_case() {
-  Gemma4KvCacheConfig config = single_page_cache_config(
-      GEMMA4_GLOBAL_KV_HEADS, GEMMA4_GLOBAL_HEAD_DIM, 0);
-  const int q_heads = GEMMA4_NUM_QUERY_HEADS;
-  const int q_count = q_heads * config.head_dim;
-  const int64_t cache_count = cache_elements(config);
-  std::vector<__nv_bfloat16> cache_v(cache_count);
-  const int64_t v_row = gemma4_kv_cache_offset(config, 0, 0, 0, 0, 0);
-  for (int d = 0; d < config.head_dim; ++d) {
-    cache_v[v_row + d] = make_value(51000 + d);
-  }
-  std::vector<int32_t> page_table = {0};
-  std::vector<int32_t> seq_lengths = {1};
-
-  thrust::device_vector<__nv_bfloat16> d_q(q_count);
-  thrust::device_vector<__nv_bfloat16> d_out(q_count);
-  thrust::device_vector<__nv_bfloat16> d_cache_k(cache_count);
-  thrust::device_vector<__nv_bfloat16> d_cache_v(
-      cache_v.size());
-  thrust::device_vector<int32_t> d_page_table(
-      page_table.size());
-  thrust::device_vector<int32_t> d_seq_lengths(
-      seq_lengths.size());
-  copy_to_device(d_cache_v, cache_v);
-  copy_to_device(d_page_table, page_table);
-  copy_to_device(d_seq_lengths, seq_lengths);
-  memset_device(d_q, 0);
-  memset_device(d_cache_k, 0);
-  memset_device(d_out, 0x5a);
-
-  CHECK_CUDA(gemma4_flash_attention_decode_paged_bf16(
-      raw_ptr(d_out), nullptr, nullptr, nullptr, raw_ptr(d_q), raw_ptr(d_cache_k),
-      raw_ptr(d_cache_v), raw_ptr(d_page_table), raw_ptr(d_seq_lengths), config, 0, 1,
-      1.0f, 1, 1, 0));
-  CHECK_CUDA(cudaDeviceSynchronize());
-
-  std::vector<__nv_bfloat16> expected(q_count);
-  for (int qh = 0; qh < q_heads; ++qh) {
-    for (int d = 0; d < config.head_dim; ++d) {
-      expected[qh * config.head_dim + d] = cache_v[v_row + d];
-    }
-  }
-  compare_device_bf16(d_out, expected, 0.0f, "global flash decode");
 }
 
 // Check global prefill prepares K-derived V and runs full causal attention.
@@ -368,7 +274,7 @@ void run_global_prefill_norm_rope_case() {
 
   const float scale = 1.0f / std::sqrt(float(GEMMA4_GLOBAL_HEAD_DIM));
   CHECK_CUDA(gemma4_flash_attention_global_fwd_bf16_norm_rope(
-      raw_ptr(d_out), nullptr, raw_ptr(d_q_prepared), raw_ptr(d_k_prepared),
+      raw_ptr(d_out), raw_ptr(d_q_prepared), raw_ptr(d_k_prepared),
       raw_ptr(d_v_prepared), raw_ptr(d_q), raw_ptr(d_k), raw_ptr(d_norm_weight),
       raw_ptr(d_norm_weight), raw_ptr(d_cos), raw_ptr(d_sin), raw_ptr(d_token_position),
       batch_size, seq_len, seq_len, scale, 0));
@@ -442,7 +348,6 @@ void run_global_prefill_norm_rope_case() {
 }  // namespace
 
 int main() {
-  run_global_flash_decode_case();
   run_global_prefill_norm_rope_case();
   run_global_prefill_reference_case();
   std::puts("flash attention tests passed");

@@ -172,18 +172,17 @@ cudaError_t run_prefill_layer(
         scratch.hidden_work, weights.v_proj_col_major, scratch.v, rows,
         GEMMA4_HIDDEN_SIZE, shape.kv_width, stream));
     GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_flash_attention_sliding_fwd_bf16_norm_rope(
-        scratch.attention_out, nullptr, scratch.q_prepared,
-        scratch.k_prepared, scratch.v_prepared, scratch.q, scratch.k,
-        scratch.v, weights.q_norm_weight, weights.k_norm_weight, cos, sin,
+        scratch.attention_out, scratch.q_prepared, scratch.k_prepared,
+        scratch.v_prepared, scratch.q, scratch.k, scratch.v,
+        weights.q_norm_weight, weights.k_norm_weight, cos, sin,
         runtime->token_position, batch_size, seq_len, seq_len,
         shape.window_size, softmax_scale, stream));
   } else {
     GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_flash_attention_global_fwd_bf16_norm_rope(
-        scratch.attention_out, nullptr, scratch.q_prepared,
-        scratch.k_prepared, scratch.v_prepared, scratch.q, scratch.k,
-        weights.q_norm_weight, weights.k_norm_weight, cos, sin,
-        runtime->token_position, batch_size, seq_len, seq_len,
-        softmax_scale, stream));
+        scratch.attention_out, scratch.q_prepared, scratch.k_prepared,
+        scratch.v_prepared, scratch.q, scratch.k, weights.q_norm_weight,
+        weights.k_norm_weight, cos, sin, runtime->token_position, batch_size,
+        seq_len, seq_len, softmax_scale, stream));
   }
 
   if (global || seq_len <= GEMMA4_SLIDING_WINDOW) {
@@ -248,7 +247,7 @@ size_t gemma4_prefill_megakernel_scratch_elements(int32_t rows) {
   return sliding > global ? sliding : global;
 }
 
-// Runs all 48 prefill layers over caller-provided prompt embeddings.
+// Runs all model prefill layers over caller-provided prompt embeddings.
 cudaError_t gemma4_prefill_megakernel(const Gemma4PrefillMegakernelArgs &args) {
   if (args.hidden_a == nullptr || args.hidden_b == nullptr ||
       args.scratch == nullptr || args.weights == nullptr ||
