@@ -223,7 +223,6 @@ int run_prompt(const PromptOptions &options) {
   thrust::device_vector<__nv_bfloat16> d_decode_a(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_decode_b(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_normed(GEMMA4_HIDDEN_SIZE);
-  thrust::device_vector<__nv_bfloat16> d_sampled(GEMMA4_HIDDEN_SIZE);
   thrust::device_vector<__nv_bfloat16> d_attention_q(
       GEMMA4_GLOBAL_QK_PROJ_SIZE);
   thrust::device_vector<__nv_bfloat16> d_attention_out(
@@ -293,7 +292,7 @@ int run_prompt(const PromptOptions &options) {
     args.hidden_a = raw_ptr(d_decode_a);
     args.hidden_b = raw_ptr(d_decode_b);
     args.normed = raw_ptr(d_normed);
-    args.sampled_hidden = raw_ptr(d_sampled);
+    args.sampled_hidden = raw_ptr(d_decode_a);
     args.next_token = raw_ptr(d_next_token);
     args.attention_q = raw_ptr(d_attention_q);
     args.attention_out = raw_ptr(d_attention_out);
