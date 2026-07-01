@@ -87,7 +87,7 @@ constexpr int kFfnWarps = kFfnThreads / 32;
 constexpr int kSwizzleThreads = 96;
 constexpr int kActualSwizzleBlocksPerRow =
     div_up(kHiddenPacks, kSwizzleThreads);
-constexpr int kDecodeIntermediateTileCols = 2;
+constexpr int kDecodeIntermediateTileCols = 1;
 constexpr int kDecodeIntermediateTiles =
     GEMMA4_INTERMEDIATE_SIZE / kDecodeIntermediateTileCols;
 static_assert((GEMMA4_INTERMEDIATE_SIZE % kDecodeIntermediateTileCols) == 0,

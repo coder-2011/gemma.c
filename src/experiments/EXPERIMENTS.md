@@ -17594,3 +17594,4 @@ Conclusion:
   HTTP serving overhead.
 - SGLang `0.5.14` can run the checkpoint with Triton attention, but in this
   graph-disabled smoke benchmark it trails vLLM/custom at `24.188 tok/s`.
+## 2026-07-01 - Decode megakernel micro-autotune: RTX A6000, CUDA 12/NVCC sm_86 build, `./build/gemma4_prompt --checkpoint models/gemma-4-12B-it/model.safetensors --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt Hello --benchmark-mode decode-step`; probes removed after tuning; cp.async kept over direct loads (`37.86` vs `37.94` ms p50 short), final-logit shape kept at 1024x8, FFN gate/up tile 1 kept over tile 2/4 (`37.682` final vs `37.869`/`38.853` ms p50 short), sampled-hidden alias removed one D2D copy, wider final p50 `38.874` ms; decode/FFN/flash tests passed.
