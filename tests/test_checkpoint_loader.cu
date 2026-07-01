@@ -12,18 +12,16 @@
 #include <sys/mman.h>
 #include <string>
 
-#define CHECK_CUDA(expr) check_cuda((expr), #expr, __FILE__, __LINE__)
+#define CHECK_CUDA(expr)                                                        \
+  do {                                                                          \
+    if (const cudaError_t status = (expr); status != cudaSuccess) {              \
+      fprintf(stderr, "%s:%d: %s failed: %s\n", __FILE__, __LINE__, #expr,      \
+              cudaGetErrorString(status));                                      \
+      exit(1);                                                                  \
+    }                                                                           \
+  } while (0)
 
 constexpr int kBf16PackWidth = 8;
-
-// Fails the test with the CUDA status and source location.
-void check_cuda(cudaError_t status, const char *expr, const char *file, int line) {
-  if (status != cudaSuccess) {
-    fprintf(stderr, "%s:%d: %s failed: %s\n", file, line, expr,
-            cudaGetErrorString(status));
-    exit(1);
-  }
-}
 
 // Converts BF16 values to their raw bits for exact checkpoint-layout checks.
 uint16_t bf16_bits(__nv_bfloat16 value) {
