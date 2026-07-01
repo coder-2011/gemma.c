@@ -31,6 +31,7 @@ DecodeScratch decode_scratch_from_buffer(void *scratch) {
 Gemma4DecodeMegakernelLayerArgs decode_layer_args(
     const Gemma4DecodeMegakernelArgs &args,
     Gemma4FfnDecodeScratch *ffn_scratch,
+    float *pre_ffn_scale,
     int32_t layer,
     __nv_bfloat16 *hidden_in,
     __nv_bfloat16 *hidden_out) {
@@ -49,6 +50,7 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
   layer_args.ffn_down_decode = w.ffn_down_decode;
   layer_args.ffn_scratch = ffn_scratch;
   layer_args.layer_scalar = w.layer_scalar;
+  layer_args.pre_ffn_scale = pre_ffn_scale;
   layer_args.attention_q = args.attention_q;
   layer_args.attention_out = args.attention_out;
   layer_args.attention_partial_m = args.partial_m;
@@ -155,6 +157,18 @@ cudaError_t gemma4_decode_megakernel(const Gemma4DecodeMegakernelArgs &args) {
   GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_megakernel_prepare_runtime(
       args.runtime, Gemma4MegakernelPrepMode::kDecode, 0, args.stream));
 
+  // The caller allocates partial_acc for its capacity splits; the folded
+  // pre-FFN norm scale lives in the final float of the tail scratch reserved
+  // past the split accumulators (see gemma4_prompt.cu tail scratch).
+  const int32_t max_alloc_splits = args.sliding_splits > args.global_splits
+                                       ? args.sliding_splits
+                                       : args.global_splits;
+  float *pre_ffn_scale =
+      args.partial_acc +
+      static_cast<size_t>(GEMMA4_NUM_QUERY_HEADS) * max_alloc_splits *
+          GEMMA4_GLOBAL_HEAD_DIM +
+      GEMMA4_HIDDEN_SIZE;
+
   const int32_t seq_len = args.runtime->h_seq_lengths[0];
   const int32_t window = args.runtime->sliding_cache_config.window_size;
   const int32_t sliding_keys = seq_len < window ? seq_len : window;
@@ -172,7 +186,8 @@ cudaError_t gemma4_decode_megakernel(const Gemma4DecodeMegakernelArgs &args) {
   for (int32_t layer = 0; layer < GEMMA4_NUM_LAYERS; ++layer) {
     Gemma4DecodeMegakernelLayerArgs layer_args =
         decode_layer_args(
-            active_args, scratch_parts.ffn, layer, hidden_in, hidden_out);
+            active_args, scratch_parts.ffn, pre_ffn_scale, layer, hidden_in,
+            hidden_out);
     GEMMA4_RETURN_IF_CUDA_ERROR(
         gemma4_decode_megakernel_flash_attention_layer_bf16(
             layer_args, active_args.stream));

@@ -110,6 +110,9 @@ __device__ inline void project_attention_out_post_attention(
         GEMMA4_RMS_NORM_EPS, cached_input, rms_warp_sums, &rms_scale, thread);
     __syncthreads();
 
+#if GEMMA4_FFN_FOLDED_PRE_NORM
+    float pre_ffn_sum_sq = 0.0f;
+#endif
     if (thread < kFfnHiddenPacks) {
       const int hidden_col0 = thread * kBf16Packed128Elements;
       const Bf16Packed128 residual =
@@ -122,7 +125,38 @@ __device__ inline void project_attention_out_post_attention(
           gemma4_bf16_pack_add(residual, normed);
       *reinterpret_cast<int4 *>(args.ffn_residual + hidden_col0) =
           ffn_residual.bits();
+#if GEMMA4_FFN_FOLDED_PRE_NORM
+      // Square the rounded packs so s2 matches the folded-away pre-FFN norm.
+      gemma4_bf16_pack_accumulate_square(ffn_residual, pre_ffn_sum_sq);
+      // Stage gamma_pre * y in the same pass so the FFN gate/up stream keeps
+      // its baseline load pattern; the row scale s2 is applied post-reduction.
+      const Bf16Packed128 pre_norm_gamma =
+          Bf16Packed128{*reinterpret_cast<const int4 *>(
+              args.attention_pre_ffn_norm_weight + hidden_col0)};
+      const Bf16Packed128 gamma_scaled = gemma4_bf16_pack_apply_scale_weight(
+          ffn_residual, pre_norm_gamma, 1.0f);
+      *reinterpret_cast<int4 *>(args.ffn_x + hidden_col0) =
+          gamma_scaled.bits();
+#endif
     }
+#if GEMMA4_FFN_FOLDED_PRE_NORM
+    __shared__ float pre_ffn_warp_sums[kDecodeMegaWarps];
+    pre_ffn_sum_sq = warp_reduce_sum(pre_ffn_sum_sq);
+    if (lane == 0) {
+      pre_ffn_warp_sums[warp] = pre_ffn_sum_sq;
+    }
+    __syncthreads();
+    pre_ffn_sum_sq = thread < kDecodeMegaWarps
+                         ? pre_ffn_warp_sums[lane]
+                         : 0.0f;
+    if (warp == 0) {
+      pre_ffn_sum_sq = warp_reduce_sum(pre_ffn_sum_sq);
+    }
+    if (thread == 0) {
+      *args.pre_ffn_scale = rsqrtf(
+          pre_ffn_sum_sq / float(GEMMA4_HIDDEN_SIZE) + GEMMA4_RMS_NORM_EPS);
+    }
+#endif
   }
   // The remaining pre-FFN RMSNorm is CTA-0-owned and reads all residual tiles.
   grid.sync();
@@ -1055,6 +1089,17 @@ void decode_megakernel_fused_layer_kernel(
 
   phase_megakernel_flash_attention_o_projection<Traits>(args, grid);
 
+#if GEMMA4_FFN_FOLDED_PRE_NORM
+  // The pre-FFN norm scale is folded into the gate/up epilogue: the FFN
+  // consumes the CTA0-staged gamma*y row plus the s2 scale stored before the
+  // last grid sync, so the gate/up weight stream keeps its baseline pattern.
+  gemma4_ffn_decode_fused_bf16_device(
+      args.residual_out, args.attention_out, args.ffn_x,
+      args.ffn_residual, args.ffn_norm_weight, args.ffn_gate_up_decode,
+      args.ffn_down_decode, args.ffn_scratch, args.layer_scalar,
+      GEMMA4_RMS_NORM_EPS, args.attention_pre_ffn_norm_weight,
+      args.pre_ffn_scale);
+#else
   // CTA 0 builds the pre-FFN normalized row after the post-attention residual.
   if (blockIdx.x == 0) {
     __shared__ Bf16Packed128 cached_input[kFfnHiddenPacks];
@@ -1069,7 +1114,9 @@ void decode_megakernel_fused_layer_kernel(
   gemma4_ffn_decode_fused_bf16_device(
       args.residual_out, args.attention_out, args.ffn_x, args.ffn_residual,
       args.ffn_norm_weight, args.ffn_gate_up_decode, args.ffn_down_decode,
-      args.ffn_scratch, args.layer_scalar, GEMMA4_RMS_NORM_EPS);
+      args.ffn_scratch, args.layer_scalar, GEMMA4_RMS_NORM_EPS,
+      args.attention_pre_ffn_norm_weight, args.pre_ffn_scale);
+#endif
 }
 
 // Launches the cooperative decode grid that owns the fused layer body.

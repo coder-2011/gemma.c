@@ -108,6 +108,9 @@ static_assert((GEMMA4_INTERMEDIATE_SIZE % kDecodeIntermediateTileCols) == 0,
 #ifndef GEMMA4_FFN_WARP_TILED
 #define GEMMA4_FFN_WARP_TILED 0
 #endif
+#if GEMMA4_FFN_FOLDED_PRE_NORM && GEMMA4_FFN_WARP_TILED
+#error "GEMMA4_FFN_FOLDED_PRE_NORM requires the default FFN path (GEMMA4_FFN_WARP_TILED=0)"
+#endif
 // Warps per super tile; matches the 512-thread fused decode megakernel CTA.
 constexpr int kDecodeSuperTileWarps = 16;
 
@@ -192,6 +195,8 @@ __device__ inline float reduce_ffn_hidden_pack_sum(
 // Computes one decode intermediate tile and immediately folds it into the MLP output.
 __device__ inline void accumulate_decode_intermediate_tile(
     const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ pre_norm_weight,
+    const float *__restrict__ pre_ffn_scale,
     const __nv_bfloat16 *__restrict__ w_gate_up_decode,
     const __nv_bfloat16 *__restrict__ w_down_decode,
     int intermediate_begin,
@@ -203,6 +208,21 @@ __device__ inline void accumulate_decode_intermediate_tile(
   float gate[kDecodeIntermediateTileCols] = {};
   float up[kDecodeIntermediateTileCols] = {};
 
+#if GEMMA4_FFN_FOLDED_PRE_NORM
+  // x already carries gamma_pre (staged by the attention CTA0 pass); only the
+  // row scale s2 remains, applied once per column after the block reduction.
+  matmul_dev::gemma4_ffn_gate_up_tile_bf16_device(
+      x, w_gate_up_decode, intermediate_begin, int(threadIdx.x),
+      &warp_sums[0][0][0], gate, up);
+
+  if (threadIdx.x == 0) {
+    const float s2 = __ldg(pre_ffn_scale);
+#pragma unroll
+    for (int t = 0; t < kDecodeIntermediateTileCols; ++t) {
+      activation[t] = gelu_tanh(s2 * gate[t]) * (s2 * up[t]);
+    }
+  }
+#else
   matmul_dev::gemma4_ffn_gate_up_tile_bf16_device(
       x, w_gate_up_decode, intermediate_begin, int(threadIdx.x),
       &warp_sums[0][0][0], gate, up);
@@ -213,6 +233,7 @@ __device__ inline void accumulate_decode_intermediate_tile(
       activation[t] = gelu_tanh(gate[t]) * up[t];
     }
   }
+#endif
   __syncthreads();
 
   const __nv_bfloat16 *down_row =
@@ -264,7 +285,9 @@ extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
     const __nv_bfloat16 *__restrict__ w_down_decode,
     Gemma4FfnDecodeScratch *__restrict__ scratch,
     const __nv_bfloat16 *__restrict__ layer_scalar,
-    float eps) {
+    float eps,
+    const __nv_bfloat16 *__restrict__ pre_norm_weight,
+    const float *__restrict__ pre_ffn_scale) {
   cooperative_groups::grid_group grid = cooperative_groups::this_grid();
   const int thread_idx = int(threadIdx.x);
   const bool active_hidden_pack = thread_idx < kFfnThreads;
@@ -336,7 +359,7 @@ extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
   for (int tile = int(blockIdx.x); tile < kDecodeIntermediateTiles;
        tile += int(gridDim.x)) {
     accumulate_decode_intermediate_tile(
-        x, w_gate_up_decode, w_down_decode,
+        x, pre_norm_weight, pre_ffn_scale, w_gate_up_decode, w_down_decode,
         tile * kDecodeIntermediateTileCols, swizzled_hidden_col, partial,
         s_warp_sums, s_activation, active_hidden_pack);
   }

@@ -7,6 +7,13 @@
 #include <cuda_runtime.h>
 #include <stddef.h>
 
+// GEMMA4_FFN_FOLDED_PRE_NORM=1 folds the pre-FFN RMSNorm into the gate/up
+// GEMV: the FFN reads the raw residual row, multiplies gamma inside the dot,
+// and applies the scalar s2 after the block reduction (default FFN path only).
+#ifndef GEMMA4_FFN_FOLDED_PRE_NORM
+#define GEMMA4_FFN_FOLDED_PRE_NORM 0
+#endif
+
 static constexpr int GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS = kBf16Packed128Elements;
 static constexpr int GEMMA4_FFN_DECODE_HIDDEN_PACKS =
     GEMMA4_HIDDEN_SIZE / GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS;
@@ -54,7 +61,9 @@ extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
     const __nv_bfloat16 *__restrict__ w_down_decode,
     Gemma4FfnDecodeScratch *__restrict__ scratch,
     const __nv_bfloat16 *__restrict__ layer_scalar,
-    float eps);
+    float eps,
+    const __nv_bfloat16 *__restrict__ pre_norm_weight,
+    const float *__restrict__ pre_ffn_scale);
 
 namespace gemma4_ffn_decode_device {
 

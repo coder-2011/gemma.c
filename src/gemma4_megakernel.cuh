@@ -38,6 +38,8 @@ struct Gemma4DecodeMegakernelLayerArgs {
   const __nv_bfloat16 *ffn_down_decode = nullptr;
   Gemma4FfnDecodeScratch *ffn_scratch = nullptr;
   const __nv_bfloat16 *layer_scalar = nullptr;
+  // Folded pre-FFN norm scale slot in the partial_acc tail scratch.
+  float *pre_ffn_scale = nullptr;
 
   __nv_bfloat16 *attention_q = nullptr;
   __nv_bfloat16 *attention_out = nullptr;

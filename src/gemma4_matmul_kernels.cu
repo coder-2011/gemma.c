@@ -9,6 +9,7 @@
 #include <cutlass/gemm/device/gemm.h>
 #include <cutlass/numeric_types.h>
 
+
 namespace gemma4_matmul_kernel_impl {
 
 constexpr int kFfnGateUpTileCols = 2;
