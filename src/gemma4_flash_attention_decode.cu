@@ -1033,9 +1033,15 @@ __device__ inline void phase_megakernel_flash_attention_o_projection(
   project_attention_out_post_attention<Traits>(args, grid);
 }
 
+// GEMMA4_DECODE_MEGA_MIN_BLOCKS=2 trades registers per thread (ptxas cap 64
+// on sm_86) for a second resident CTA per SM, doubling latency-hiding warps.
+#ifndef GEMMA4_DECODE_MEGA_MIN_BLOCKS
+#define GEMMA4_DECODE_MEGA_MIN_BLOCKS 1
+#endif
+
 // Runs one fused decode layer from attention ingress through the FFN tail.
 template <typename Traits>
-__global__ __launch_bounds__(kDecodeMegaThreads, 1)
+__global__ __launch_bounds__(kDecodeMegaThreads, GEMMA4_DECODE_MEGA_MIN_BLOCKS)
 void decode_megakernel_fused_layer_kernel(
     Gemma4DecodeMegakernelLayerArgs args) {
   cg::grid_group grid = cg::this_grid();

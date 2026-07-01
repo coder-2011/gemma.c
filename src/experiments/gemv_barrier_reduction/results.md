@@ -49,3 +49,34 @@ Follow-ups this motivates, in order:
    the floor itself.
 3. Keep `GEMMA4_FFN_WARP_TILED` default 0. The flag and helper stay on this
    branch as documentation of the negative result.
+
+## Addendum: occupancy and split-size levers (3090 only, same date)
+
+2-CTA/SM variant (`GEMMA4_DECODE_MEGA_MIN_BLOCKS=2` + global `-maxrregcount=64`,
+build_sm86_occ2):
+
+| seq | baseline p50 | occ2 p50 |
+| ---: | ---: | ---: |
+| 121 | 33.461 | 35.212 (+5.2%) |
+| 1001 | 37.455 | 38.072 (+1.6%) |
+| 4001 | 40.273 | cuda OOM |
+
+NCU sliding layer at seq 1001: grid 164 (2 CTAs/SM), achieved occupancy 66.5%
+(2x), DRAM busy 80.1% (up from 77.7) - but duration 708 us vs 684 us. ptxas
+spills 21,022 local-memory requests per launch (100% overhead): the extra DRAM
+busy is spill traffic, not useful weight bytes. The spill backing store also
+inflates context local memory enough to OOM the 24 GB card at 4k prompts.
+Conclusion: the register cap costs more than the doubled warp count buys; a
+spill-free <=64-reg version needs a redesign of the per-phase accumulator
+tiling, not a compiler cap.
+
+decode_split_size sweep at seq 4001 (CLI only): 20 -> 40.264 ms,
+32 -> 40.441, 64 -> 40.127, 128 -> 43.114. Flat within 0.4% up to 64; keep 20.
+
+## Overall status on sm_86
+
+Three levers measured, none clears the keep bar: barriers (overlapped anyway),
+occupancy via reg cap (spills), split size (flat). The fused layers run at
+77.7%/74.7% of DRAM peak vs 97.4% for the phase-free final-logits GEMV on the
+same GPU; the remaining gap lives in the fused phase structure (grid syncs and
+phase dependency drains), not in the GEMV inner loops.
