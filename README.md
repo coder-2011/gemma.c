@@ -6,36 +6,20 @@ We currently have a fully built decode megakernel, but prefill isn't fused yet. 
 
 ## Current Decode Snapshot
 
-Small single-user decode snapshot on July 1, 2026, using Gemma 4 12B-it BF16 on
-an RTX A6000, 1 input token, 64 generated tokens, 32 measured requests, 2
-warmups, and max concurrency `1`. Server startup, model load, and graph capture
-are outside the measured window.
+Small single-user decode snapshot on July 1, using 1 input token, 64 generated
+tokens, 32 measured requests, and max concurrency `1`. The custom bar uses
+`36.8 ms` decode-step TPOT converted to tokens/s.
 
-![current decode throughput benchmark](public/decode_tps_gemma4_vllm_sglang_20260701.svg)
+![current decode throughput benchmark](public/decode_tps_gemma4_vllm_sglang_20260701.png)
 
-| Runner | Mode | p50 TTFT | p50 TPOT | Decode TPS |
-| --- | --- | ---: | ---: | ---: |
-| vLLM serve | OpenAI HTTP, CUDA graphs | 85.823 ms | 37.751 ms | 25.941 tok/s |
-| `gemma4_prompt` local | in-process warm-serving, no CUDA graphs | 37.173 ms | 38.844 ms | 25.770 tok/s |
-| SGLang serve | OpenAI HTTP, Triton attention, graphs disabled | 85.291 ms | 40.614 ms | 24.188 tok/s |
+## Benchmark
 
-## Decode-Step Microtune
+Single-user Gemma 4 12B prompt benchmark on an NVIDIA RTX A6000 (Jun 26):
 
-Follow-up micro-autotuning kept the existing sliding K/V `cp.async` path,
-rejected final-logit tile changes, and changed the FFN gate/up decode tile from
-2 columns to 1 column. The short decode-step run below used prompt `Hello`,
-prompt length `1`, `--benchmark-mode decode-step`, 2 warmups, 4 timed
-iterations, and 3 samples.
-
-![decode-step microtune before and after](public/decode_step_microtune_20260701.svg)
-
-| Run | p50 TPOT | Decode TPS | Delta |
+| Runner | p50 TTFT | p50 TPOT | p50 decode TPS |
 | --- | ---: | ---: | ---: |
-| Before microtune | 37.869 ms | 26.407 tok/s | - |
-| After microtune | 37.682 ms | 26.538 tok/s | -0.187 ms/token |
-
-The wider 5-sample run was noisier but showed the same scale of movement:
-`39.054 ms -> 38.874 ms` p50, or about `0.18 ms/token`.
+| `gemma4_prompt` local | 38.469 ms | 73.707 ms | 13.567 tok/s |
+| vLLM serve, compiled, no CUDA graph | 422.551 ms | 181.401 ms | 5.513 tok/s |
 
 
 My agents tell me they love working in this repo. It is built heavily w/ them in mind!

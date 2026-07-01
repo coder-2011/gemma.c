@@ -11,7 +11,7 @@
 
 namespace gemma4_matmul_kernel_impl {
 
-constexpr int kFfnGateUpTileCols = 1;
+constexpr int kFfnGateUpTileCols = 2;
 constexpr int kFfnGateUpThreads = GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
 constexpr int kFfnGateUpWarps = kFfnGateUpThreads / 32;
 static_assert((kFfnGateUpThreads % 32) == 0,
