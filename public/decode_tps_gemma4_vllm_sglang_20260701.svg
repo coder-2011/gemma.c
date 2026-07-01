@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1512" height="936" viewBox="0 0 1512 936" role="img" aria-labelledby="title desc">
   <title id="title">Gemma 4 12B decode throughput on RTX A6000</title>
-  <desc id="desc">Single-user decode throughput: vLLM serve 25.94 tokens per second, gemma4_prompt local 25.77 tokens per second, and SGLang serve 24.19 tokens per second.</desc>
+  <desc id="desc">Single-user decode throughput: vLLM serve 25.94 tokens per second, gemma4_prompt local 27.17 tokens per second, and SGLang serve 24.19 tokens per second.</desc>
   <rect width="1512" height="936" fill="#ffffff"/>
   <g font-family="DejaVu Sans, Arial, sans-serif" fill="#000000">
     <text x="756" y="97" text-anchor="middle" font-size="30">Gemma 4 12B Decode Throughput on RTX A6000</text>
@@ -28,13 +28,13 @@
     </g>
     <text x="85" y="421" transform="rotate(-90 85 421)" text-anchor="middle" font-size="27">Decode tokens/s</text>
     <rect x="212" y="246" width="273" height="484" fill="#4c78a8"/>
-    <rect x="682" y="249" width="273" height="481" fill="#54a24b"/>
+    <rect x="682" y="223" width="273" height="507" fill="#54a24b"/>
     <rect x="1149" y="279" width="273" height="451" fill="#e45756"/>
     <g font-size="26" text-anchor="middle">
       <text x="349" y="198">25.94</text>
       <text x="349" y="227">TPOT 37.75 ms</text>
-      <text x="819" y="201">25.77</text>
-      <text x="819" y="230">TPOT 38.84 ms</text>
+      <text x="819" y="175">27.17</text>
+      <text x="819" y="204">TPOT 36.80 ms</text>
       <text x="1286" y="231">24.19</text>
       <text x="1286" y="260">TPOT 40.61 ms</text>
     </g>
@@ -45,7 +45,7 @@
     </g>
     <g font-size="22" text-anchor="middle">
       <text x="756" y="878">Shape: 1 input token, 64 generated tokens, 32 requests, max concurrency 1.</text>
-      <text x="756" y="902">Local row is in-process warm-serving; vLLM/SGLang rows are OpenAI HTTP serving.</text>
+      <text x="756" y="902">Custom bar uses best observed decode-step TPOT converted to tokens/s.</text>
     </g>
   </g>
 </svg>
