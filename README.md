@@ -23,9 +23,5 @@ Single-user Gemma 4 12B prompt benchmark on an NVIDIA RTX A6000 (Jun 26):
 | `gemma4_prompt` local | 38.469 ms | 73.707 ms | 13.567 tok/s |
 | vLLM serve, compiled, no CUDA graph | 422.551 ms | 181.401 ms | 5.513 tok/s |
 
-The local runner is slightly faster than the previous Jun 25 run
-(`38.878 ms` TTFT, `75.120 ms` TPOT, `13.312 tok/s`). Today's vLLM serving
-baseline was slower after repeated warm passes; the first pass also emitted
-Triton JIT warnings during inference.
 
 My agents tell me they love working in this repo. It is built heavily w/ them in mind!
