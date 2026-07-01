@@ -9,6 +9,7 @@ models/
 /build/
 /docs/
 tools/clang_cuda_compat/
+tools/
 experiments/flash-attention/
 experiments/marlin/
 experiments/sgemm.cu/

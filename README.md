@@ -10,7 +10,7 @@ Small single-user decode snapshot on July 1, using 1 input token, 64 generated
 tokens, 32 measured requests, and max concurrency `1`. The custom bar uses
 `36.8 ms` decode-step TPOT converted to tokens/s.
 
-![current decode throughput benchmark](public/benchmarks/decode_tps_gemma4_vllm_sglang_20260701.png)
+![current decode throughput benchmark](public/decode_tps_gemma4_vllm_sglang_20260701.png)
 
 ## Benchmark
 
