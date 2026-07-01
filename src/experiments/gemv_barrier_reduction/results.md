@@ -106,3 +106,21 @@ worth ~0.5-1% on sm_86, not the multi-percent hoped for. The 20-point DRAM%
 gap vs the phase-free logits GEMV is mostly NOT serial-phase overhead; the
 untested remainder is chunk-level cross-phase pipelining (consumers starting
 on partial rows).
+
+## Final stacked result (3090, interleaved 2 reps, tokens identical A/B)
+
+Stack = GEMMA4_FFN_FOLDED_PRE_NORM + GEMMA4_FOLDED_INPUT_NORM +
+GEMMA4_TRIM_REDUNDANT_SYNC (all default 0; enable together).
+
+| seq | baseline p50 ms | folded p50 ms | delta | tok/s |
+| ---: | ---: | ---: | ---: | --- |
+| 121 | 33.552 | 33.162 | -1.16% | 29.81 -> 30.16 |
+| 1001 | 37.537 | 37.099 | -1.17% | 26.64 -> 26.96 |
+| 4001 | 40.356 | 39.932 | -1.05% | 24.78 -> 25.04 |
+
+Also measured and rejected: GEMMA4_FOLDED_POST_NORM (distributed post-attn
+norm, design_folded_post_norm.md) - fold2-vs-fold3 interleaved showed the
+distributed epilogue ~0.2 ms/step SLOWER than the CTA0-staged version (37.25
+vs 37.45 @1k, 40.05 vs 40.26 @4k); per-CTA slot traffic and the per-entry
+slot-sum epilogue cost more than the serial CTA0 pass it replaced. Reverted;
+the design doc records the approach.

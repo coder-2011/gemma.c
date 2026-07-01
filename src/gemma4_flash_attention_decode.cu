@@ -31,6 +31,16 @@ constexpr int kDecodeMegaThreads = 512;
 constexpr int kDecodeMegaWarps = kDecodeMegaThreads / kWarpSize;
 constexpr int kFfnHiddenPacks = gemma4_ffn_decode_device::kHiddenPacks;
 
+// GEMMA4_TRIM_REDUNDANT_SYNC=1 drops the post-attention trailing grid.sync;
+// the FFN's internal entry sync then carries the ordering, which is only
+// valid when the CTA-0 pre-FFN norm phase is folded away.
+#ifndef GEMMA4_TRIM_REDUNDANT_SYNC
+#define GEMMA4_TRIM_REDUNDANT_SYNC 0
+#endif
+#if GEMMA4_TRIM_REDUNDANT_SYNC && !GEMMA4_FFN_FOLDED_PRE_NORM
+#error "GEMMA4_TRIM_REDUNDANT_SYNC requires GEMMA4_FFN_FOLDED_PRE_NORM=1"
+#endif
+
 // Projects the final attention row through O with hidden-column CTA ownership.
 template <typename Traits>
 __device__ inline void project_attention_out_post_attention(
@@ -158,8 +168,14 @@ __device__ inline void project_attention_out_post_attention(
     }
 #endif
   }
+#if GEMMA4_TRIM_REDUNDANT_SYNC
+  // The FFN entry's own grid.sync (after its accum zeroing, which touches only
+  // disjoint scratch) publishes the CTA-0 ffn_residual/ffn_x/scale writes; a
+  // second device-wide barrier here would order nothing extra.
+#else
   // The remaining pre-FFN RMSNorm is CTA-0-owned and reads all residual tiles.
   grid.sync();
+#endif
 }
 
 // Caches host-side cooperative launch geometry for one decode cooperative kernel.
