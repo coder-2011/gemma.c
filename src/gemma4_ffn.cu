@@ -287,7 +287,9 @@ extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
     const __nv_bfloat16 *__restrict__ layer_scalar,
     float eps,
     const __nv_bfloat16 *__restrict__ pre_norm_weight,
-    const float *__restrict__ pre_ffn_scale) {
+    const float *__restrict__ pre_ffn_scale,
+    const __nv_bfloat16 *__restrict__ next_input_norm_weight,
+    __nv_bfloat16 *__restrict__ staged_next_input) {
   cooperative_groups::grid_group grid = cooperative_groups::this_grid();
   const int thread_idx = int(threadIdx.x);
   const bool active_hidden_pack = thread_idx < kFfnThreads;
@@ -423,6 +425,20 @@ extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
       *reinterpret_cast<int4 *>(normed_out + offset) = normed_pack.bits();
       *reinterpret_cast<int4 *>(residual_out + offset) =
           scaled_residual_out_pack.bits();
+#if GEMMA4_FOLDED_INPUT_NORM
+      // Stage gamma_next * residual_out so the next layer skips its input-norm
+      // phase; its QK/V head RMSNorms erase the missing rsqrt row scale.
+      if (next_input_norm_weight != nullptr && staged_next_input != nullptr) {
+        const ffn_dev::FfnBf16Pack next_gamma_pack =
+            ffn_dev::FfnBf16Pack{*reinterpret_cast<const int4 *>(
+                next_input_norm_weight + offset)};
+        const ffn_dev::FfnBf16Pack staged_pack =
+            gemma4_bf16_pack_apply_scale_weight(
+                scaled_residual_out_pack, next_gamma_pack, 1.0f);
+        *reinterpret_cast<int4 *>(staged_next_input + offset) =
+            staged_pack.bits();
+      }
+#endif
     }
   }
 }

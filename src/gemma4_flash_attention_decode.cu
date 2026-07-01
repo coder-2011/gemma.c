@@ -489,6 +489,23 @@ __device__ inline void phase_decode_rmsnorm_project_bf16(
                 "projection width must be divisible by the packed tile");
 
   const int thread_idx = int(threadIdx.x);
+#if GEMMA4_FOLDED_INPUT_NORM
+  // Layers with a staged row read gamma_in * x published by the previous
+  // layer's FFN tail (kernel launch order on the stream orders the write), so
+  // both the CTA0 input-norm phase and the grid.sync that publishes it drop.
+  if (!args.attention_input_staged) {
+    if (blockIdx.x == 0) {
+      __shared__ Bf16Packed128 cached_input[kFfnHiddenPacks];
+      __shared__ float rms_warp_sums[kDecodeMegaWarps];
+      __shared__ float rms_scale;
+      gemma4_rmsnorm_hidden_row_512_bf16_device(
+          args.normed_out, args.attention_x, args.attention_input_norm_weight,
+          GEMMA4_RMS_NORM_EPS, cached_input, rms_warp_sums, &rms_scale,
+          thread_idx);
+    }
+    grid.sync();
+  }
+#else
   if (blockIdx.x == 0) {
     __shared__ Bf16Packed128 cached_input[kFfnHiddenPacks];
     __shared__ float rms_warp_sums[kDecodeMegaWarps];
@@ -499,6 +516,7 @@ __device__ inline void phase_decode_rmsnorm_project_bf16(
         thread_idx);
   }
   grid.sync();
+#endif
 
   __shared__ float warp_sums[cols_per_block][kDecodeMegaWarps];
 
@@ -1098,7 +1116,8 @@ void decode_megakernel_fused_layer_kernel(
       args.ffn_residual, args.ffn_norm_weight, args.ffn_gate_up_decode,
       args.ffn_down_decode, args.ffn_scratch, args.layer_scalar,
       GEMMA4_RMS_NORM_EPS, args.attention_pre_ffn_norm_weight,
-      args.pre_ffn_scale);
+      args.pre_ffn_scale, args.ffn_next_input_norm_weight,
+      args.ffn_staged_next_input);
 #else
   // CTA 0 builds the pre-FFN normalized row after the post-attention residual.
   if (blockIdx.x == 0) {
@@ -1115,7 +1134,8 @@ void decode_megakernel_fused_layer_kernel(
       args.residual_out, args.attention_out, args.ffn_x, args.ffn_residual,
       args.ffn_norm_weight, args.ffn_gate_up_decode, args.ffn_down_decode,
       args.ffn_scratch, args.layer_scalar, GEMMA4_RMS_NORM_EPS,
-      args.attention_pre_ffn_norm_weight, args.pre_ffn_scale);
+      args.attention_pre_ffn_norm_weight, args.pre_ffn_scale,
+      args.ffn_next_input_norm_weight, args.ffn_staged_next_input);
 #endif
 }
 

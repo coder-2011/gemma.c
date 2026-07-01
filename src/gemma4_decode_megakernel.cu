@@ -51,6 +51,16 @@ Gemma4DecodeMegakernelLayerArgs decode_layer_args(
   layer_args.ffn_scratch = ffn_scratch;
   layer_args.layer_scalar = w.layer_scalar;
   layer_args.pre_ffn_scale = pre_ffn_scale;
+#if GEMMA4_FOLDED_INPUT_NORM
+  // Layer 0 has no staged row; every later layer reads the gamma-folded
+  // residual staged into args.normed by the previous layer's FFN tail.
+  layer_args.attention_input_staged = layer > 0;
+  layer_args.ffn_next_input_norm_weight =
+      layer + 1 < GEMMA4_NUM_LAYERS
+          ? args.weights->layers[layer + 1].input_norm_weight
+          : nullptr;
+  layer_args.ffn_staged_next_input = args.normed;
+#endif
   layer_args.attention_q = args.attention_q;
   layer_args.attention_out = args.attention_out;
   layer_args.attention_partial_m = args.partial_m;

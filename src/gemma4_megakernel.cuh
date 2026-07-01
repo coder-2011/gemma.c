@@ -40,6 +40,12 @@ struct Gemma4DecodeMegakernelLayerArgs {
   const __nv_bfloat16 *layer_scalar = nullptr;
   // Folded pre-FFN norm scale slot in the partial_acc tail scratch.
   float *pre_ffn_scale = nullptr;
+  // Folded input norm: normed_out already holds gamma_in * x staged by the
+  // previous layer's FFN tail, so the input-norm phase and its sync are skipped.
+  bool attention_input_staged = false;
+  // Next layer's input-norm gamma and the staging row the FFN tail writes.
+  const __nv_bfloat16 *ffn_next_input_norm_weight = nullptr;
+  __nv_bfloat16 *ffn_staged_next_input = nullptr;
 
   __nv_bfloat16 *attention_q = nullptr;
   __nv_bfloat16 *attention_out = nullptr;

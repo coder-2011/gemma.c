@@ -14,6 +14,14 @@
 #define GEMMA4_FFN_FOLDED_PRE_NORM 0
 #endif
 
+// GEMMA4_FOLDED_INPUT_NORM=1 folds the attention input RMSNorm across the
+// layer boundary: layer i's FFN tail stages gamma_next * residual_out and
+// layer i+1 skips its CTA0 input-norm phase plus its grid.sync (the learned
+// QK/V head RMSNorms erase the missing rsqrt row scale).
+#ifndef GEMMA4_FOLDED_INPUT_NORM
+#define GEMMA4_FOLDED_INPUT_NORM 0
+#endif
+
 static constexpr int GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS = kBf16Packed128Elements;
 static constexpr int GEMMA4_FFN_DECODE_HIDDEN_PACKS =
     GEMMA4_HIDDEN_SIZE / GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS;
@@ -63,7 +71,9 @@ extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
     const __nv_bfloat16 *__restrict__ layer_scalar,
     float eps,
     const __nv_bfloat16 *__restrict__ pre_norm_weight,
-    const float *__restrict__ pre_ffn_scale);
+    const float *__restrict__ pre_ffn_scale,
+    const __nv_bfloat16 *__restrict__ next_input_norm_weight,
+    __nv_bfloat16 *__restrict__ staged_next_input);
 
 namespace gemma4_ffn_decode_device {
 
