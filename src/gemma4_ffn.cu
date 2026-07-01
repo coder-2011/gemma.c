@@ -2,7 +2,6 @@
 #include "gemma4_matmul_kernels.cuh"
 
 #include <cooperative_groups.h>
-#include <cute/layout.hpp>
 #include <cutlass/array.h>
 #include <cutlass/epilogue/thread/activation.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
@@ -13,38 +12,28 @@
 
 #include "device/dual_gemm.h"
 
-
 namespace gemma4_ffn_decode_device {
 
 // Swizzles one row of hidden-width BF16 packs for decode-friendly layout.
 __device__ inline void swizzle_hidden_packs(
     __nv_bfloat16 *__restrict__ dst,
     const __nv_bfloat16 *__restrict__ src,
-    int row_count,
     int row,
     int block_idx,
     int grid_x,
     int block_dim,
     int thread_idx) {
   constexpr int hidden_size = kHiddenPacks * kBf16Packed128Elements;
-  const auto row_layout = cute::make_layout(
-      cute::make_shape(row_count, hidden_size),
-      cute::make_stride(
-          static_cast<int64_t>(hidden_size),
-          static_cast<int64_t>(1)));
-  const auto hidden_layout = cute::make_layout(
-      cute::make_shape(kHiddenPacks),
-      cute::make_stride(kBf16Packed128Elements));
+  const int64_t row_offset = static_cast<int64_t>(row) * hidden_size;
   const int pack_stride = grid_x * block_dim;
   for (int pack = block_idx * block_dim + thread_idx;
        pack < kHiddenPacks; pack += pack_stride) {
-    const int src_col = hidden_layout(pack);
-    const int dst_col = hidden_layout(hidden_pack_swizzle_index(pack));
-    const int64_t src_offset = row_layout(row, src_col);
-    const int64_t dst_offset = row_layout(row, dst_col);
+    const int src_col = pack * kBf16Packed128Elements;
+    const int dst_col =
+        hidden_pack_swizzle_index(pack) * kBf16Packed128Elements;
     const FfnBf16Pack pack_value =
-        FfnBf16Pack{*reinterpret_cast<const int4 *>(src + src_offset)};
-    *reinterpret_cast<int4 *>(dst + dst_offset) = pack_value.bits();
+        FfnBf16Pack{*reinterpret_cast<const int4 *>(src + row_offset + src_col)};
+    *reinterpret_cast<int4 *>(dst + row_offset + dst_col) = pack_value.bits();
   }
 }
 
@@ -52,65 +41,21 @@ __device__ inline void swizzle_hidden_packs(
 __device__ inline void unswizzle_hidden_packs(
     __nv_bfloat16 *__restrict__ dst,
     const __nv_bfloat16 *__restrict__ src,
-    int row_count,
     int row,
     int block_dim,
     int thread_idx) {
   constexpr int hidden_size = kHiddenPacks * kBf16Packed128Elements;
-  const auto row_layout = cute::make_layout(
-      cute::make_shape(row_count, hidden_size),
-      cute::make_stride(
-          static_cast<int64_t>(hidden_size),
-          static_cast<int64_t>(1)));
-  const auto hidden_layout = cute::make_layout(
-      cute::make_shape(kHiddenPacks),
-      cute::make_stride(kBf16Packed128Elements));
+  const int64_t row_offset = static_cast<int64_t>(row) * hidden_size;
 
   for (int hidden_pack = thread_idx; hidden_pack < kHiddenPacks;
        hidden_pack += block_dim) {
-    const int natural_col = hidden_layout(hidden_pack);
+    const int natural_col = hidden_pack * kBf16Packed128Elements;
     const int swizzled_col =
-        hidden_layout(hidden_pack_swizzle_index(hidden_pack));
-    const int64_t src_offset = row_layout(row, swizzled_col);
-    const int64_t dst_offset = row_layout(row, natural_col);
+        hidden_pack_swizzle_index(hidden_pack) * kBf16Packed128Elements;
     const FfnBf16Pack pack =
-        FfnBf16Pack{*reinterpret_cast<const int4 *>(src + src_offset)};
-    *reinterpret_cast<int4 *>(dst + dst_offset) = pack.bits();
-  }
-}
-
-// Interleaves gate/up rows while applying the hidden-pack decode swizzle.
-__device__ inline void swizzle_gate_up_interleaved(
-    __nv_bfloat16 *__restrict__ dst,
-    const __nv_bfloat16 *__restrict__ src,
-    int row_count,
-    int dst_row,
-    int block_idx,
-    int grid_x,
-    int block_dim,
-    int thread_idx) {
-  const int src_row =
-      (dst_row & 1) == 0 ? dst_row / 2
-                         : GEMMA4_INTERMEDIATE_SIZE + dst_row / 2;
-  constexpr int hidden_size = kHiddenPacks * kBf16Packed128Elements;
-  const auto row_layout = cute::make_layout(
-      cute::make_shape(row_count, hidden_size),
-      cute::make_stride(
-          static_cast<int64_t>(hidden_size),
-          static_cast<int64_t>(1)));
-  const auto hidden_layout = cute::make_layout(
-      cute::make_shape(kHiddenPacks),
-      cute::make_stride(kBf16Packed128Elements));
-  const int pack_stride = grid_x * block_dim;
-  for (int pack = block_idx * block_dim + thread_idx;
-       pack < kHiddenPacks; pack += pack_stride) {
-    const int src_col = hidden_layout(pack);
-    const int dst_col = hidden_layout(hidden_pack_swizzle_index(pack));
-    const int64_t src_offset = row_layout(src_row, src_col);
-    const int64_t dst_offset = row_layout(dst_row, dst_col);
-    const FfnBf16Pack pack_value =
-        FfnBf16Pack{*reinterpret_cast<const int4 *>(src + src_offset)};
-    *reinterpret_cast<int4 *>(dst + dst_offset) = pack_value.bits();
+        FfnBf16Pack{*reinterpret_cast<const int4 *>(
+            src + row_offset + swizzled_col)};
+    *reinterpret_cast<int4 *>(dst + row_offset + natural_col) = pack.bits();
   }
 }
 
@@ -121,19 +66,17 @@ namespace {
 namespace ffn_dev = gemma4_ffn_decode_device;
 namespace matmul_dev = gemma4_matmul_kernel_impl;
 
-constexpr int kFfnThreads = GEMMA4_FFN_DECODE_THREADS;
-constexpr int kFfnWarps = kFfnThreads / 32;
 constexpr int kHiddenPacks = ffn_dev::kHiddenPacks;
-static_assert(kFfnThreads == kHiddenPacks,
-              "FFN decode maps one CTA thread to one hidden pack");
+constexpr int kFfnThreads = kHiddenPacks;
+constexpr int kFfnWarps = kFfnThreads / 32;
 constexpr int kSwizzleThreads = 96;
 constexpr int kActualSwizzleBlocksPerRow =
     div_up(kHiddenPacks, kSwizzleThreads);
-constexpr int kDirectTile = 2;
-constexpr int kDirectIntermediateTiles =
-    GEMMA4_INTERMEDIATE_SIZE / kDirectTile;
-static_assert((GEMMA4_INTERMEDIATE_SIZE % kDirectTile) == 0,
-              "direct FFN decode intermediate tile must divide F");
+constexpr int kDecodeIntermediateTileCols = 2;
+constexpr int kDecodeIntermediateTiles =
+    GEMMA4_INTERMEDIATE_SIZE / kDecodeIntermediateTileCols;
+static_assert((GEMMA4_INTERMEDIATE_SIZE % kDecodeIntermediateTileCols) == 0,
+              "decode FFN intermediate tile must divide F");
 
 // Applies GeGLU in the DualGemm epilogue after gate/up fragments are materialized.
 template <typename ElementOutput_,
@@ -141,7 +84,6 @@ template <typename ElementOutput_,
           typename ElementAccumulator_,
           typename ElementCompute_,
           cutlass::FloatRoundStyle Round = cutlass::FloatRoundStyle::round_to_nearest>
-
 class GateGeluTanhUpMul {
  public:
   using FragmentOutput = cutlass::Array<ElementOutput_, Count>;
@@ -152,10 +94,13 @@ class GateGeluTanhUpMul {
 
   CUTLASS_HOST_DEVICE explicit GateGeluTanhUpMul(Params const &) {}
 
-  CUTLASS_HOST_DEVICE FragmentOutput operator()(FragmentAccumulator const &gate,
-                            FragmentAccumulator const &up) const {
-    cutlass::NumericArrayConverter<ElementCompute_, ElementAccumulator_, Count, Round> to_compute;
-    cutlass::NumericArrayConverter<ElementOutput_, ElementCompute_, Count, Round> to_output;
+  CUTLASS_HOST_DEVICE FragmentOutput operator()(
+      FragmentAccumulator const &gate,
+      FragmentAccumulator const &up) const {
+    cutlass::NumericArrayConverter<
+        ElementCompute_, ElementAccumulator_, Count, Round> to_compute;
+    cutlass::NumericArrayConverter<
+        ElementOutput_, ElementCompute_, Count, Round> to_output;
 
     const FragmentCompute gate_compute = to_compute(gate);
     const FragmentCompute up_compute = to_compute(up);
@@ -210,19 +155,19 @@ __device__ inline float reduce_ffn_hidden_pack_sum(
   return value;
 }
 
-// Computes one intermediate tile and immediately folds it into the MLP output.
-__device__ inline void accumulate_direct_intermediate_tile(
+// Computes one decode intermediate tile and immediately folds it into the MLP output.
+__device__ inline void accumulate_decode_intermediate_tile(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_gate_up_decode,
     const __nv_bfloat16 *__restrict__ w_down_decode,
     int intermediate_begin,
     int swizzled_hidden_col,
     float (&partial)[kBf16Packed128Elements],
-    float (&warp_sums)[2][kDirectTile][kFfnWarps],
-    float (&activation)[kDirectTile],
+    float (&warp_sums)[2][kDecodeIntermediateTileCols][kFfnWarps],
+    float (&activation)[kDecodeIntermediateTileCols],
     bool active_hidden_pack) {
-  float gate[kDirectTile] = {};
-  float up[kDirectTile] = {};
+  float gate[kDecodeIntermediateTileCols] = {};
+  float up[kDecodeIntermediateTileCols] = {};
 
   matmul_dev::gemma4_ffn_gate_up_tile_bf16_device(
       x, w_gate_up_decode, intermediate_begin, int(threadIdx.x),
@@ -230,7 +175,7 @@ __device__ inline void accumulate_direct_intermediate_tile(
 
   if (threadIdx.x == 0) {
 #pragma unroll
-    for (int t = 0; t < kDirectTile; ++t) {
+    for (int t = 0; t < kDecodeIntermediateTileCols; ++t) {
       activation[t] = gelu_tanh(gate[t]) * up[t];
     }
   }
@@ -241,7 +186,7 @@ __device__ inline void accumulate_direct_intermediate_tile(
       static_cast<int64_t>(intermediate_begin) * GEMMA4_HIDDEN_SIZE +
       swizzled_hidden_col;
 #pragma unroll
-  for (int t = 0; t < kDirectTile; ++t) {
+  for (int t = 0; t < kDecodeIntermediateTileCols; ++t) {
     if (active_hidden_pack) {
       const ffn_dev::FfnBf16Pack down_pack =
           ffn_dev::FfnBf16Pack{
@@ -252,13 +197,12 @@ __device__ inline void accumulate_direct_intermediate_tile(
   }
 }
 
-// Launch wrapper for swizzling hidden packs into decode weight layout.
+// Launches activation swizzling into the decode hidden-pack layout.
 __global__ void swizzle_hidden_packs_kernel(
     __nv_bfloat16 *__restrict__ dst,
-    const __nv_bfloat16 *__restrict__ src,
-    int rows) {
+    const __nv_bfloat16 *__restrict__ src) {
   ffn_dev::swizzle_hidden_packs(
-      dst, src, rows, int(blockIdx.y), int(blockIdx.x),
+      dst, src, int(blockIdx.y), int(blockIdx.x),
       int(gridDim.x), int(blockDim.x), int(threadIdx.x));
 }
 
@@ -269,21 +213,13 @@ unswizzle_hidden_packs_kernel(
     __nv_bfloat16 *__restrict__ dst,
     const __nv_bfloat16 *__restrict__ src) {
   ffn_dev::unswizzle_hidden_packs(
-      dst, src, int(gridDim.x), int(blockIdx.x), int(blockDim.x),
-      int(threadIdx.x));
+      dst, src, int(blockIdx.x), int(blockDim.x), int(threadIdx.x));
 }
 
-// Launch wrapper for gate/up row interleaving plus hidden-pack swizzling.
-__global__ void swizzle_gate_up_interleaved_kernel(
-    __nv_bfloat16 *__restrict__ dst,
-    const __nv_bfloat16 *__restrict__ src) {
-  ffn_dev::swizzle_gate_up_interleaved(
-      dst, src, int(gridDim.y), int(blockIdx.y), int(blockIdx.x),
-      int(gridDim.x), int(blockDim.x), int(threadIdx.x));
-}
+}  // namespace
 
-// Runs direct decode FFN math and post norm inside the caller's cooperative grid.
-__device__ inline void run_direct_decode_ffn_body(
+// Runs tiled decode FFN math and post norm inside the caller's cooperative grid.
+extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
     __nv_bfloat16 *__restrict__ residual_out,
     __nv_bfloat16 *__restrict__ normed_out,
     const __nv_bfloat16 *__restrict__ x,
@@ -300,16 +236,15 @@ __device__ inline void run_direct_decode_ffn_body(
   const int global_thread =
       int(blockIdx.x) * int(blockDim.x) + thread_idx;
   const int global_stride = int(gridDim.x) * int(blockDim.x);
-  constexpr int accum_values =
-      GEMMA4_FFN_DECODE_BF16_PACK_ELEMENTS * GEMMA4_FFN_DECODE_HIDDEN_PACKS;
+  constexpr int accum_values = kBf16Packed128Elements * kHiddenPacks;
   float *accum = &scratch->accum[0][0];
   for (int i = global_thread; i < accum_values; i += global_stride) {
     accum[i] = 0.0f;
   }
   grid.sync();
 
-  __shared__ float s_warp_sums[2][kDirectTile][kFfnWarps];
-  __shared__ float s_activation[kDirectTile];
+  __shared__ float s_warp_sums[2][kDecodeIntermediateTileCols][kFfnWarps];
+  __shared__ float s_activation[kDecodeIntermediateTileCols];
   float partial[kBf16Packed128Elements] = {};
   const int swizzled_hidden_col =
       active_hidden_pack
@@ -317,12 +252,12 @@ __device__ inline void run_direct_decode_ffn_body(
                 kBf16Packed128Elements
           : 0;
 
-  for (int tile = int(blockIdx.x); tile < kDirectIntermediateTiles;
+  for (int tile = int(blockIdx.x); tile < kDecodeIntermediateTiles;
        tile += int(gridDim.x)) {
-    accumulate_direct_intermediate_tile(
-        x, w_gate_up_decode, w_down_decode, tile * kDirectTile,
-        swizzled_hidden_col, partial, s_warp_sums, s_activation,
-        active_hidden_pack);
+    accumulate_decode_intermediate_tile(
+        x, w_gate_up_decode, w_down_decode,
+        tile * kDecodeIntermediateTileCols, swizzled_hidden_col, partial,
+        s_warp_sums, s_activation, active_hidden_pack);
   }
 
   if (active_hidden_pack) {
@@ -387,45 +322,9 @@ __device__ inline void run_direct_decode_ffn_body(
   }
 }
 
-}  // namespace
-
-// Runs the decode FFN tail inside a caller-owned cooperative CUDA grid.
-extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
-    __nv_bfloat16 *__restrict__ residual_out,
-    __nv_bfloat16 *__restrict__ normed_out,
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ residual,
-    const __nv_bfloat16 *__restrict__ rms_weight,
-    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
-    const __nv_bfloat16 *__restrict__ w_down_decode,
-    Gemma4FfnDecodeScratch *__restrict__ scratch,
-    const __nv_bfloat16 *__restrict__ layer_scalar,
-    float eps) {
-  run_direct_decode_ffn_body(
-      residual_out, normed_out, x, residual, rms_weight, w_gate_up_decode,
-      w_down_decode, scratch, layer_scalar, eps);
-}
-
 namespace {
 
-// Runs direct decode FFN math and post norm in one cooperative launch.
-__global__ __launch_bounds__(kFfnThreads, 1) void direct_decode_ffn_kernel(
-    __nv_bfloat16 *__restrict__ residual_out,
-    __nv_bfloat16 *__restrict__ normed_out,
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ residual,
-    const __nv_bfloat16 *__restrict__ rms_weight,
-    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
-    const __nv_bfloat16 *__restrict__ w_down_decode,
-    Gemma4FfnDecodeScratch *__restrict__ scratch,
-    const __nv_bfloat16 *__restrict__ layer_scalar,
-    float eps) {
-  run_direct_decode_ffn_body(
-      residual_out, normed_out, x, residual, rms_weight, w_gate_up_decode,
-      w_down_decode, scratch, layer_scalar, eps);
-}
-
-
+// Launches one CUTLASS BF16 GEMM variant selected by the row-count policy.
 template <int ThreadblockM,
           int ThreadblockN,
           int ThreadblockK,
@@ -582,20 +481,19 @@ cudaError_t run_gate_up_geglu_decode_layout_dual_gemm(
         16, 64, 64, 16, 32, 4>(
         act, x_swizzled, w_gate_up_decode, rows, stream);
   }
-  switch (rows <= 64 ? 64 : rows <= 128 ? 128 : 0) {
-    case 64:
-      return run_gate_up_geglu_decode_layout_dual_gemm_config<
-          64, 64, 32, 64, 32, 3>(
-          act, x_swizzled, w_gate_up_decode, rows, stream);
-    case 128:
-      return run_gate_up_geglu_decode_layout_dual_gemm_config<
-          128, 64, 32, 64, 32, 5>(
-          act, x_swizzled, w_gate_up_decode, rows, stream);
-    default:
-      return run_gate_up_geglu_decode_layout_dual_gemm_config<
-          256, 64, 32, 64, 32, 3>(
-          act, x_swizzled, w_gate_up_decode, rows, stream);
+  if (rows <= 64) {
+    return run_gate_up_geglu_decode_layout_dual_gemm_config<
+        64, 64, 32, 64, 32, 3>(
+        act, x_swizzled, w_gate_up_decode, rows, stream);
   }
+  if (rows <= 128) {
+    return run_gate_up_geglu_decode_layout_dual_gemm_config<
+        128, 64, 32, 64, 32, 5>(
+        act, x_swizzled, w_gate_up_decode, rows, stream);
+  }
+  return run_gate_up_geglu_decode_layout_dual_gemm_config<
+      256, 64, 32, 64, 32, 3>(
+      act, x_swizzled, w_gate_up_decode, rows, stream);
 }
 
 // Launches the measured FFN-down GEMM for decode-swizzled weight layout.
@@ -613,137 +511,44 @@ cudaError_t launch_down_decode_layout_gemm(
         act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
         GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
   }
-  switch (rows <= 64 ? 64
-                     : rows <= 128 ? 128
-                                   : rows <= 256 ? 256
-                                                 : rows <= 512 ? 512 : 0) {
-    case 64:
-      return launch_cutlass_bf16_gemm<64, 64, 32, 32, 32, 10>(
-          act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
-          GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
-    case 128:
-      return launch_cutlass_bf16_gemm<64, 128, 32, 32, 64, 6>(
-          act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
-          GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
-    case 256:
-      return launch_cutlass_bf16_gemm<128, 128, 64, 64, 64, 3>(
-          act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
-          GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
-    case 512:
-      return launch_cutlass_bf16_gemm<256, 128, 32, 64, 64, 3>(
-          act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
-          GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
-    default:
-      return launch_cutlass_bf16_gemm<128, 128, 32, 64, 64, 5>(
-          act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
-          GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
+  if (rows <= 64) {
+    return launch_cutlass_bf16_gemm<64, 64, 32, 32, 32, 10>(
+        act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+        GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
   }
-}
-
-// Launches the one-token direct FFN cooperative kernel.
-cudaError_t launch_direct_decode_ffn(
-    __nv_bfloat16 *__restrict__ residual_out,
-    __nv_bfloat16 *__restrict__ normed_out,
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ residual,
-    const __nv_bfloat16 *__restrict__ rms_weight,
-    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
-    const __nv_bfloat16 *__restrict__ w_down_decode,
-    Gemma4FfnDecodeScratch *__restrict__ scratch,
-    const __nv_bfloat16 *__restrict__ layer_scalar,
-    float eps,
-    cudaStream_t stream) {
-  if (residual_out == nullptr || normed_out == nullptr || x == nullptr ||
-      residual == nullptr || rms_weight == nullptr ||
-      w_gate_up_decode == nullptr || w_down_decode == nullptr ||
-      scratch == nullptr) {
-    return cudaErrorInvalidValue;
+  if (rows <= 128) {
+    return launch_cutlass_bf16_gemm<64, 128, 32, 32, 64, 6>(
+        act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+        GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
   }
-
-  static int cached_device = -1;
-  static int cached_active_blocks = 0;
-  int device = 0;
-  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDevice(&device));
-
-  if (cached_device != device || cached_active_blocks <= 0) {
-    cudaDeviceProp prop = {};
-    GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetDeviceProperties(&prop, device));
-    if (!prop.cooperativeLaunch) {
-      return cudaErrorNotSupported;
-    }
-
-    int active_blocks_per_sm = 0;
-    GEMMA4_RETURN_IF_CUDA_ERROR(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_blocks_per_sm, direct_decode_ffn_kernel, kFfnThreads, 0));
-    if (active_blocks_per_sm <= 0) {
-      return cudaErrorInvalidValue;
-    }
-    cached_device = device;
-    cached_active_blocks = active_blocks_per_sm * prop.multiProcessorCount;
+  if (rows <= 256) {
+    return launch_cutlass_bf16_gemm<128, 128, 64, 64, 64, 3>(
+        act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+        GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
   }
-
-  __nv_bfloat16 *residual_out_arg = residual_out;
-  __nv_bfloat16 *normed_out_arg = normed_out;
-  const __nv_bfloat16 *x_arg = x;
-  const __nv_bfloat16 *residual_arg = residual;
-  const __nv_bfloat16 *rms_weight_arg = rms_weight;
-  const __nv_bfloat16 *w_gate_up_arg = w_gate_up_decode;
-  const __nv_bfloat16 *w_down_arg = w_down_decode;
-  Gemma4FfnDecodeScratch *scratch_arg = scratch;
-  const __nv_bfloat16 *layer_scalar_arg = layer_scalar;
-  void *kernel_args[] = {
-      &residual_out_arg,
-      &normed_out_arg,
-      &x_arg,
-      &residual_arg,
-      &rms_weight_arg,
-      &w_gate_up_arg,
-      &w_down_arg,
-      &scratch_arg,
-      &layer_scalar_arg,
-      &eps};
-  const cudaError_t status = cudaLaunchCooperativeKernel(
-      reinterpret_cast<void *>(direct_decode_ffn_kernel), cached_active_blocks,
-      kFfnThreads, kernel_args, 0, stream);
-  GEMMA4_RETURN_IF_CUDA_ERROR(status);
-  return cudaGetLastError();
+  if (rows <= 512) {
+    return launch_cutlass_bf16_gemm<256, 128, 32, 64, 64, 3>(
+        act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+        GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
+  }
+  return launch_cutlass_bf16_gemm<128, 128, 32, 64, 64, 5>(
+      act, w_down_decode, down, rows, GEMMA4_INTERMEDIATE_SIZE,
+      GEMMA4_HIDDEN_SIZE, GEMMA4_HIDDEN_SIZE, stream);
 }
 
 }  // namespace
 
-cudaError_t gemma4_ffn_decode_swizzle_weights_bf16(
-    __nv_bfloat16 *__restrict__ w_gate_up_swizzled,
-    const __nv_bfloat16 *__restrict__ w_gate_up_col_major,
-    __nv_bfloat16 *__restrict__ w_down_swizzled,
-    const __nv_bfloat16 *__restrict__ w_down_row_major,
-    cudaStream_t stream) {
-  const dim3 block_dim(kSwizzleThreads);
-  const dim3 gate_up_grid_dim(kActualSwizzleBlocksPerRow,
-                              GEMMA4_PACKED_FFN_SIZE);
-  swizzle_gate_up_interleaved_kernel<<<
-      gate_up_grid_dim, block_dim, 0, stream>>>(
-      w_gate_up_swizzled, w_gate_up_col_major);
-  GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetLastError());
-
-  const dim3 down_grid_dim(kActualSwizzleBlocksPerRow,
-                           GEMMA4_INTERMEDIATE_SIZE);
-  swizzle_hidden_packs_kernel<<<down_grid_dim, block_dim, 0, stream>>>(
-      w_down_swizzled, w_down_row_major, GEMMA4_INTERMEDIATE_SIZE);
-  return cudaGetLastError();
-}
-
+// Returns the packed activation and down-output workspace for prefill FFN.
 size_t gemma4_ffn_prefill_scratch_elements(int rows) {
   if (rows <= 0) {
     return 0;
   }
 
-  const auto act_layout =
-      cute::make_layout(cute::make_shape(rows, GEMMA4_INTERMEDIATE_SIZE));
-  const auto down_layout =
-      cute::make_layout(cute::make_shape(rows, GEMMA4_HIDDEN_SIZE));
-  return cute::size(act_layout) + cute::size(down_layout);
+  return static_cast<size_t>(rows) *
+         (GEMMA4_INTERMEDIATE_SIZE + GEMMA4_HIDDEN_SIZE);
 }
 
+// Splits a caller-owned prefill FFN workspace without taking ownership.
 Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
     __nv_bfloat16 *buffer,
     int rows) {
@@ -753,17 +558,16 @@ Gemma4FfnPrefillScratch gemma4_ffn_prefill_scratch_from_buffer(
     return scratch;
   }
 
-  const auto act_layout =
-      cute::make_layout(cute::make_shape(rows, GEMMA4_INTERMEDIATE_SIZE));
-  const size_t act_elements = cute::size(act_layout);
+  const size_t act_elements =
+      static_cast<size_t>(rows) * GEMMA4_INTERMEDIATE_SIZE;
   scratch.act = buffer;
   scratch.down = scratch.act + act_elements;
   return scratch;
 }
 
-// Runs the prefill GeGLU MLP and leaves the down-projection in swizzled order.
-static cudaError_t gemma4_ffn_prefill_mlp_swizzled_bf16(
-    __nv_bfloat16 *__restrict__ out_swizzled,
+// Runs the prefill GeGLU MLP and leaves the down-projection in natural order.
+cudaError_t gemma4_ffn_prefill_mlp_bf16(
+    __nv_bfloat16 *__restrict__ out,
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ w_gate_up_decode,
     const __nv_bfloat16 *__restrict__ w_down_decode,
@@ -780,48 +584,16 @@ static cudaError_t gemma4_ffn_prefill_mlp_swizzled_bf16(
   const dim3 block_dim(kSwizzleThreads);
   const dim3 swizzle_grid_dim(kActualSwizzleBlocksPerRow, rows);
   swizzle_hidden_packs_kernel<<<swizzle_grid_dim, block_dim, 0, stream>>>(
-      scratch.down, x, rows);
+      scratch.down, x);
   GEMMA4_RETURN_IF_CUDA_ERROR(cudaGetLastError());
 
   GEMMA4_RETURN_IF_CUDA_ERROR(run_gate_up_geglu_decode_layout_dual_gemm(
       scratch.act, scratch.down, w_gate_up_decode, rows, stream));
 
-  return launch_down_decode_layout_gemm(
-      scratch.act, w_down_decode, out_swizzled, rows, stream);
-}
-
-// Runs the prefill GeGLU MLP and leaves the down-projection in natural order.
-cudaError_t gemma4_ffn_prefill_mlp_bf16(
-    __nv_bfloat16 *__restrict__ out,
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
-    const __nv_bfloat16 *__restrict__ w_down_decode,
-    Gemma4FfnPrefillScratch scratch,
-    int rows,
-    cudaStream_t stream) {
-  GEMMA4_RETURN_IF_CUDA_ERROR(gemma4_ffn_prefill_mlp_swizzled_bf16(
-      scratch.down, x, w_gate_up_decode, w_down_decode, scratch, rows,
-      stream));
+  GEMMA4_RETURN_IF_CUDA_ERROR(launch_down_decode_layout_gemm(
+      scratch.act, w_down_decode, scratch.down, rows, stream));
 
   unswizzle_hidden_packs_kernel<<<rows, kFfnThreads, 0, stream>>>(
       out, scratch.down);
   return cudaGetLastError();
-}
-
-// Runs one-token decode FFN using pre-swizzled decode weights.
-cudaError_t gemma4_ffn_decode_fused_bf16(
-    __nv_bfloat16 *__restrict__ residual_out,
-    __nv_bfloat16 *__restrict__ normed_out,
-    const __nv_bfloat16 *__restrict__ x,
-    const __nv_bfloat16 *__restrict__ residual,
-    const __nv_bfloat16 *__restrict__ rms_weight,
-    const __nv_bfloat16 *__restrict__ w_gate_up_decode,
-    const __nv_bfloat16 *__restrict__ w_down_decode,
-    Gemma4FfnDecodeScratch *__restrict__ scratch,
-    const __nv_bfloat16 *__restrict__ layer_scalar,
-    float eps,
-    cudaStream_t stream) {
-  return launch_direct_decode_ffn(
-      residual_out, normed_out, x, residual, rms_weight,
-      w_gate_up_decode, w_down_decode, scratch, layer_scalar, eps, stream);
 }

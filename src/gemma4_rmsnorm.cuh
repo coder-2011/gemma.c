@@ -43,3 +43,10 @@ extern "C" __device__ void gemma4_rmsnorm_hidden_row_512_bf16_device(
     float *__restrict__ warp_sums,
     float *__restrict__ scale,
     int thread_idx);
+
+// Returns the RMSNorm scale for values owned collectively by one warp.
+extern "C" __device__ float gemma4_rmsnorm_warp_scale_f32_device(
+    const float *__restrict__ values,
+    int values_per_lane,
+    int width,
+    float eps);

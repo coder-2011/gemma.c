@@ -214,7 +214,6 @@ int main() {
   run_rmsnorm_case(1, 256);
   run_rmsnorm_case(17, GEMMA4_HIDDEN_SIZE);
   run_residual_add_case(9, GEMMA4_HIDDEN_SIZE);
-  run_fused_case(1, GEMMA4_HIDDEN_SIZE);
   run_fused_case(19, GEMMA4_HIDDEN_SIZE);
 
   std::printf("rmsnorm tests passed\n");

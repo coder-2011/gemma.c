@@ -12,7 +12,6 @@
 #define GEMMA4_HAS_CUDNN_FRONTEND 0
 #endif
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -205,9 +204,6 @@ int main(int argc, char **argv) {
         double(rows) * width * sizeof(__nv_bfloat16) * 3.0;
     const double residual_bytes =
         double(rows) * width * sizeof(__nv_bfloat16) * 3.0;
-    const double fused_bytes =
-        double(rows) * width * sizeof(__nv_bfloat16) * 5.0;
-    const double split_bytes = residual_bytes + rms_bytes;
     const bool has_fused = width == GEMMA4_HIDDEN_SIZE;
 
     auto run_rms = [&]() {
