@@ -17594,3 +17594,156 @@ Conclusion:
   HTTP serving overhead.
 - SGLang `0.5.14` can run the checkpoint with Triton attention, but in this
   graph-disabled smoke benchmark it trails vLLM/custom at `24.188 tok/s`.
+
+## 2026-07-01 - Decode megakernel profile on anvil: RTX PRO 6000 Blackwell (sm_120) vs RTX 3090 (sm_86), seq-length sweep + ncu top-kernel deep dive
+
+Setup:
+
+- Machine: anvil, driver 610.43.02, CUDA 13.2 (nvcc V13.2.51), ncu 2026.1.1, nsys 2025.6.3.
+- GPU0 RTX PRO 6000 Blackwell Workstation (188 SMs, 96 GB GDDR7, 1792 GB/s peak, 128 MB L2).
+  NOTE: a separate python process (~22 GB, ~31% util) was running on GPU0 during all GPU0
+  measurements; contention noise is possible but p50-p95 spreads stayed tight.
+- GPU1 RTX 3090 (82 SMs, 24 GB GDDR6X, 936 GB/s peak, 6 MB L2), idle.
+- Checkpoint: `models/gemma-4-12B-it` symlinked to the HF hub snapshot of google/gemma-4-12B-it
+  (22 GB single-file safetensors). The `models/` dir was missing from the worktree.
+- Clocks not locked. Warm page cache. cutlass submodule had to be re-inited.
+
+Builds:
+
+```bash
+make prompt BUILD_DIR=build_sm86  NVCCFLAGS="-std=c++17 -O3 -arch=sm_86"  -j16
+# sm_120 needs a register cap on the FFN TU: nvlink rejects the link because
+# decode_megakernel_fused_layer_kernel (__launch_bounds__(512,1) => 128 reg cap)
+# calls gemma4_ffn_decode_fused_bf16_device which compiles to 134 regs on sm_120.
+make build_sm120/gemma4_ffn.o BUILD_DIR=build_sm120 NVCCFLAGS="-std=c++17 -O3 -arch=sm_120 -maxrregcount=128"
+make prompt BUILD_DIR=build_sm120 NVCCFLAGS="-std=c++17 -O3 -arch=sm_120" -j16
+# nvlink then applies -maxrregcount=128 link-wide ("Some objects do not have
+# -maxrregcount specified but others do"). Decode kernels are unaffected (their
+# launch bounds already cap them); unbounded prefill kernels may differ from sm_86.
+# For ncu source correlation the same builds were repeated with -lineinfo.
+```
+
+Benchmark command per (GPU, seq) cell, decode-step regime, prompt = "hello " x N:
+
+```bash
+CUDA_VISIBLE_DEVICES=$G ./build_*/gemma4_prompt \
+  --checkpoint models/gemma-4-12B-it/model.safetensors \
+  --tokenizer models/gemma-4-12B-it/tokenizer.json --prompt "$P" --max-new 4 \
+  --benchmark-mode decode-step --bench-warmup 2 --bench-iters 10 --bench-samples 3
+# nsys pass: --trace=cuda --sample=none, bench-warmup 2 iters 10 samples 1 (12 steps)
+```
+
+decode_step_ms p50 (tok/s):
+
+| prompt_len | RTX PRO 6000 | RTX 3090 |
+| ---: | ---: | ---: |
+| 121   | 17.80 (56.2) | 33.47 (29.9) |
+| 1001  | 18.90 (52.9) | 37.45 (26.7) |
+| 4001  | 19.58 (51.1) | 40.27 (24.8) |
+| 16001 | 21.67 (46.1) | OOM (thrust bad_alloc during prefill alloc; 22 GB weights + 16k activations > 24 GB) |
+
+Per-decode-step kernel accounting from nsys sqlite (decode region only; GPU busy >= 99.5%
+of decode wall, so launch gaps are irrelevant). A decode step is exactly:
+40x sliding fused layer + 8x global fused layer + 1x gemma4_rmsnorm_bf16_kernel +
+1x final_logits_sample_kernel + 1 DtoD memcpy (~1-2 us) + ~5 tiny HtoD prep copies.
+
+Avg us per launch (per-step share at that seq):
+
+| kernel | BW seq121 | BW 1k | BW 4k | BW 16k | 3090 seq121 | 3090 1k | 3090 4k |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sliding fused layer (x40) | 330 (74%) | 355 (76%) | 355 (73%) | 356 (66%) | 628 (75%) | 713 (77%) | 735 (73%) |
+| global fused layer (x8)   | 425 (19%) | 421 (18%) | 506 (21%) | 767 (28%) | 762 (18%) | 781 (17%) | 1081 (21%) |
+| final_logits_sample (x1)  | 1231 (6.9%) | 1230 | 1231 | 1243 (5.7%) | 2271 (6.8%) | 2271 | 2271 (5.6%) |
+| final rmsnorm (x1)        | 1.9 | 1.8 | 1.8 | 1.8 | 3.6 | 3.5 | 3.6 |
+
+ncu deep dive (--set full, lineinfo builds; Blackwell at seq 4001 + global also at 16001;
+3090 at seq 1001 because ncu's own device buffers OOM the 24 GB card at seq 4001):
+
+| kernel/GPU | dur us | DRAM % | eff GB/s | SM % | occ theo/ach | regs | grid | top stall mix |
+| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- |
+| sliding, BW 4k    | 366 | 75.3 | 1287 | 10.6 | 33.3/33.0 | 126 | 188 | long_sb 53%, barrier 35% |
+| global, BW 4k     | 527 | 56.8 |  970 | 12.7 | 33.3/33.4 | 127 | 188 | long_sb 43%, barrier 42% |
+| global, BW 16k    | 804 | 39.3 |  671 | 23.0 | 33.3/33.3 | 127 | 188 | barrier 40%, long_sb 31%, short_sb 12% |
+| logits, BW 4k     | 1234 | 95.7 | 1635 | 18.6 | 66.7/66.5 | 56 | 188 | barrier 57%, long_sb 33% |
+| rmsnorm decode, BW | 2.9 | 0.6 | n/a | 0.1 | 66.7/28.3 | 48 | 1 | single-CTA latency |
+| sliding, 3090 1k  | 684 | 77.7 |  708 | 19.7 | 33.3/33.5 | 96 | 82 | long_sb 35%, barrier 32%, wait 10% |
+| global, 3090 1k   | 752 | 74.7 |  680 | 15.9 | 33.3/33.5 | 114 | 82 | long_sb 40%, barrier 34% |
+| logits, 3090 1k   | 2271 | 97.4 |  887 | 33.6 | 66.7/66.7 | 64 | 82 | barrier 52%, long_sb 23% |
+| rmsnorm decode, 3090 | 5.0 | 0.5 | n/a | 0.2 | 100/30.9 | 32 | 1 | single-CTA latency |
+
+DRAM bytes per launch (Blackwell counters): sliding reads 459 MB (~= 448 MB layer weights
++ sliding KV), global reads 494 MB @4k / 517 MB @16k, logits reads 2013 MB (the full
+262144x3840 bf16 embedding). All kernels sit at 2-4% of FP32 peak on the roofline with
+AI ~= 1 FLOP/byte: everything is on the memory-bound side; DRAM streaming is the workload.
+
+Top warp-stall source lines (ncu PC sampling, lineinfo):
+
+- sliding/global fused layers, both GPUs: long_scoreboard concentrates on the GEMV weight
+  stream: `gemma4_cuda_utils.cuh:99` (bf16x2->f32 unpack of weight packs),
+  `gemma4_ffn.cu:210` (`accumulate_scaled_pack` down-proj FMA),
+  `gemma4_matmul_kernels.cu:141` (`gemma4_bf16_pack_accumulate_dot` gate/up),
+  `gemma4_flash_attention_decode.cu:70/442` (QKV / O projection dots).
+  barrier concentrates on `gemma4_matmul_kernels.cu:161` + `gemma4_ffn.cu:197`
+  (block reductions after gate/up loops) and on the grid.sync()s at
+  `gemma4_flash_attention_decode.cu:1019/1033/1050`.
+- global layer at 16k (Blackwell): profile shifts to the split-reduction tail:
+  `warp_reduce_shfl.cuh:213` (short_scoreboard 10.4k samples) +
+  `block_reduce_warp_reductions.cuh:156` (barrier 11.4k) + `...decode.cu:823/843`
+  (paged KV loads / online-softmax update). With split_size=20 a 16k context makes
+  ~800 splits/q-head; the reduce phase, not DRAM, drives the 527->804 us growth
+  (DRAM% actually falls 57->39).
+- final_logits_sample: barrier at `gemma4_sampling.cu:55/59/116` (block reduction over
+  vocab-column partial dots and candidate scan) + long_scoreboard on bf16 embedding
+  unpacks (`cuda_bf16.hpp:708/379`). At 96-97% DRAM the barriers largely overlap the
+  stream; not much left on the table.
+
+Speed-of-light framing per decode step (weights+embedding ~= 24.3 GB DRAM reads/step):
+
+- Blackwell: floor ~= 13.6 ms vs 19.6 ms measured at 4k -> 69% of SoL end to end
+  (sliding 72%, global 54% @4k / 37% @16k, logits 91% of peak BW).
+- 3090: floor ~= 25.9 ms vs 37.4 ms measured at 1k -> 69% of SoL
+  (sliding 76%, global 73%, logits 95%).
+
+Conclusions:
+
+- The decode pass is weight-streaming bound everywhere; the sliding fused layer is 2/3 to
+  3/4 of a decode step at every context length on both GPUs and runs at only 72-78% of
+  DRAM peak while stalled 35% on CTA barriers - the block reductions between GEMV phases
+  and the per-phase grid.sync()s are the concrete gap to ~90% DRAM.
+- Occupancy of the fused layers is capped at 33% by 126-128 regs/thread (1 CTA of 512
+  threads per SM, block-limit = registers). 16 warps/SM is not enough to hide GDDR
+  latency between barrier phases; that shows up as long_scoreboard 35-53%.
+- The global layer degrades with context on Blackwell not because of KV bytes (33 MB at
+  16k, trivial) but because the split-reduce tail scales with num_splits; larger
+  attention_split_size (or a two-stage/tree reduce) at long context is the obvious lever.
+- final_logits_sample is already at 96-97% DRAM peak on both GPUs - done.
+- final rmsnorm is a grid=1 launch (3-5 us with the whole GPU idle); harmless today but
+  free to fuse into the sampling kernel.
+- 3090 cannot hold BF16 12B + 16k-context activations (OOM), and under ncu it OOMs
+  already at 4k prompts; profile the 3090 at <=1k prompts or quantize.
+
+## 2026-07-01 - Decode FFN warp-per-column gate/up (barrier elimination) - negative result
+
+Branch `exp/gemv-barrier-reduction`, folder `src/experiments/gemv_barrier_reduction/`
+(README + results.md there hold the full protocol and tables).
+
+- Added `gemma4_ffn_gate_up_warp_col_bf16_device` (one gate/up pair per warp,
+  shuffle-only reduce) and a `GEMMA4_FFN_WARP_TILED=1` decode FFN loop: 16-column
+  super tiles, double-buffered activation staging, one `__syncthreads()` per super
+  tile instead of two per 2-column tile (16x fewer block barriers).
+- v1 regression trap: the down-projection loop bound was `blockDim/32` (runtime),
+  ptxas could not unroll it, so only one down-row load stayed in flight
+  (+2.8-3.1% on Blackwell). v2 fixed it with compile-time
+  `kDecodeSuperTileWarps=16` + `#pragma unroll`.
+- Outcome: 3090 sm_86 neutral (-0.1% across seq 121/1001/4001); RTX PRO 6000
+  sm_120 +2.3% slower at seq 4001 in a clean window. Tokens identical A/B on both
+  GPUs for 24-step greedy decode (note: raw-prompt output is degenerate "1"s in
+  both builds, so equality is necessary but weak evidence).
+- NCU sliding layer: barrier stall share dropped 31.7%->18.8% (3090) and
+  34.9%->~20% (Blackwell) but duration and DRAM% did not move (3090) or got
+  slightly worse (Blackwell); the stall mass reappeared as long_scoreboard on the
+  same weight loads.
+- Conclusion: at 33% occupancy the block-barrier time in the decode FFN was
+  already overlapped with the DRAM weight stream; synchronization is not the
+  binding constraint. Next levers: register diet to reach 2 CTAs/SM (32 warps),
+  then quantized weights. Flag stays default-off.

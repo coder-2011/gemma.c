@@ -23,6 +23,15 @@ extern "C" __device__ void gemma4_ffn_gate_up_tile_bf16_device(
     float *__restrict__ gate,
     float *__restrict__ up);
 
+// Computes one gate/up column pair per warp with shuffle-only reduction.
+extern "C" __device__ void gemma4_ffn_gate_up_warp_col_bf16_device(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_interleaved_row_major,
+    int col,
+    int lane,
+    float *__restrict__ gate,
+    float *__restrict__ up);
+
 }  // namespace gemma4_matmul_kernel_impl
 
 namespace gemma4_ffn_decode_device {
@@ -92,6 +101,15 @@ constexpr int kDecodeIntermediateTiles =
     GEMMA4_INTERMEDIATE_SIZE / kDecodeIntermediateTileCols;
 static_assert((GEMMA4_INTERMEDIATE_SIZE % kDecodeIntermediateTileCols) == 0,
               "decode FFN intermediate tile must divide F");
+
+// GEMMA4_FFN_WARP_TILED=1 selects the barrier-light decode FFN loop: one
+// gate/up column pair per warp (shuffle-only reduce) and one block barrier per
+// warps-wide super tile instead of two per 2-column tile.
+#ifndef GEMMA4_FFN_WARP_TILED
+#define GEMMA4_FFN_WARP_TILED 0
+#endif
+// Warps per super tile; matches the 512-thread fused decode megakernel CTA.
+constexpr int kDecodeSuperTileWarps = 16;
 
 // Applies GeGLU in the DualGemm epilogue after gate/up fragments are materialized.
 template <typename ElementOutput_,
@@ -170,6 +188,7 @@ __device__ inline float reduce_ffn_hidden_pack_sum(
   return value;
 }
 
+#if !GEMMA4_FFN_WARP_TILED
 // Computes one decode intermediate tile and immediately folds it into the MLP output.
 __device__ inline void accumulate_decode_intermediate_tile(
     const __nv_bfloat16 *__restrict__ x,
@@ -211,6 +230,7 @@ __device__ inline void accumulate_decode_intermediate_tile(
     }
   }
 }
+#endif  // !GEMMA4_FFN_WARP_TILED
 
 // Launches activation swizzling into the decode hidden-pack layout.
 __global__ void swizzle_hidden_packs_kernel(
@@ -258,14 +278,60 @@ extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
   }
   grid.sync();
 
-  __shared__ float s_warp_sums[2][kDecodeIntermediateTileCols][kFfnWarps];
-  __shared__ float s_activation[kDecodeIntermediateTileCols];
   float partial[kBf16Packed128Elements] = {};
   const int swizzled_hidden_col =
       active_hidden_pack
           ? ffn_dev::hidden_pack_swizzle_index(thread_idx) *
                 kBf16Packed128Elements
           : 0;
+
+#if GEMMA4_FFN_WARP_TILED
+  // Double-buffered activations let one barrier per super tile order both the
+  // read-after-write on this tile and the write-after-read on the previous one.
+  // The compile-time warp count keeps the down-projection loop unrollable so
+  // all 16 row loads stay in flight; the fused megakernel launches 512 threads.
+  __shared__ float s_act[2][kDecodeSuperTileWarps];
+  const int warp = thread_idx / warpSize;
+  const int lane = thread_idx & (warpSize - 1);
+  constexpr int super_tiles =
+      GEMMA4_INTERMEDIATE_SIZE / kDecodeSuperTileWarps;
+  static_assert(
+      (GEMMA4_INTERMEDIATE_SIZE % kDecodeSuperTileWarps) == 0,
+      "decode FFN super tile must divide F");
+  int buf = 0;
+
+  for (int tile = int(blockIdx.x); tile < super_tiles;
+       tile += int(gridDim.x)) {
+    const int col0 = tile * kDecodeSuperTileWarps;
+    float gate = 0.0f;
+    float up = 0.0f;
+    if (warp < kDecodeSuperTileWarps) {
+      matmul_dev::gemma4_ffn_gate_up_warp_col_bf16_device(
+          x, w_gate_up_decode, col0 + warp, lane, &gate, &up);
+      if (lane == 0) {
+        s_act[buf][warp] = gelu_tanh(gate) * up;
+      }
+    }
+    __syncthreads();
+
+    const __nv_bfloat16 *down_rows =
+        w_down_decode +
+        static_cast<int64_t>(col0) * GEMMA4_HIDDEN_SIZE + swizzled_hidden_col;
+    if (active_hidden_pack) {
+#pragma unroll
+      for (int t = 0; t < kDecodeSuperTileWarps; ++t) {
+        const ffn_dev::FfnBf16Pack down_pack =
+            ffn_dev::FfnBf16Pack{
+                *reinterpret_cast<const int4 *>(
+                    down_rows + static_cast<int64_t>(t) * GEMMA4_HIDDEN_SIZE)};
+        accumulate_scaled_pack(s_act[buf][t], down_pack, partial);
+      }
+    }
+    buf ^= 1;
+  }
+#else
+  __shared__ float s_warp_sums[2][kDecodeIntermediateTileCols][kFfnWarps];
+  __shared__ float s_activation[kDecodeIntermediateTileCols];
 
   for (int tile = int(blockIdx.x); tile < kDecodeIntermediateTiles;
        tile += int(gridDim.x)) {
@@ -274,6 +340,7 @@ extern "C" __device__ void gemma4_ffn_decode_fused_bf16_device(
         tile * kDecodeIntermediateTileCols, swizzled_hidden_col, partial,
         s_warp_sums, s_activation, active_hidden_pack);
   }
+#endif
 
   if (active_hidden_pack) {
 #pragma unroll

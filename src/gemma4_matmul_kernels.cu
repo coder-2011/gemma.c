@@ -103,6 +103,51 @@ __device__ inline int shared_pack_index(int chunk) {
   return static_cast<int>((u & ~(kSwizzleChunks - 1u)) | (col ^ row));
 }
 
+// Computes one gate/up column pair with warp-local reduction only. The caller
+// assigns one interleaved gate/up pair per warp, so no block barrier is needed
+// between the dot loop and the reduction; consecutive lanes read consecutive
+// (swizzle-permuted) 16-byte packs, which stays 128-byte coalesced because the
+// swizzle permutes packs only inside each 8-pack block.
+extern "C" __device__ void gemma4_ffn_gate_up_warp_col_bf16_device(
+    const __nv_bfloat16 *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ w_interleaved_row_major,
+    int col,
+    int lane,
+    float *__restrict__ gate,
+    float *__restrict__ up) {
+  constexpr int kWarpThreads = 32;
+  constexpr int packs_per_col =
+      GEMMA4_HIDDEN_SIZE / kBf16Packed128Elements;
+  static_assert((packs_per_col % kWarpThreads) == 0,
+                "warp-col gate/up requires whole warp iterations");
+
+  const __nv_bfloat16 *gate_row =
+      w_interleaved_row_major +
+      static_cast<int64_t>(2 * col) * GEMMA4_HIDDEN_SIZE;
+  const __nv_bfloat16 *up_row = gate_row + GEMMA4_HIDDEN_SIZE;
+
+  float gate_sum = 0.0f;
+  float up_sum = 0.0f;
+#pragma unroll
+  for (int iter = 0; iter < packs_per_col / kWarpThreads; ++iter) {
+    const int pack_idx = lane + iter * kWarpThreads;
+    const int x_col = pack_idx * kBf16Packed128Elements;
+    const int weight_col =
+        shared_pack_index(pack_idx) * kBf16Packed128Elements;
+    const Bf16Packed128 x_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(x + x_col)};
+    const Bf16Packed128 gate_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(gate_row + weight_col)};
+    const Bf16Packed128 up_pack =
+        Bf16Packed128{*reinterpret_cast<const int4 *>(up_row + weight_col)};
+    gemma4_bf16_pack_accumulate_dot(x_pack, gate_pack, gate_sum);
+    gemma4_bf16_pack_accumulate_dot(x_pack, up_pack, up_sum);
+  }
+
+  *gate = warp_reduce_sum(gate_sum);
+  *up = warp_reduce_sum(up_sum);
+}
+
 // Computes one Gemma 4 FFN gate/up decode tile for a caller-owned CTA.
 extern "C" __device__ void gemma4_ffn_gate_up_tile_bf16_device(
     const __nv_bfloat16 *__restrict__ x,
