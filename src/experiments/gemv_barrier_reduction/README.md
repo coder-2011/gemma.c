@@ -38,3 +38,13 @@ steps at prompt lengths 121/1001/4001(/16001 Blackwell only), plus NCU
 sliding-layer capture for DRAM%, stall mix.
 
 Results: see `results.md` in this folder and the dated EXPERIMENTS.md entry.
+
+## Status (2026-07-01, final)
+
+Complete. Shipped stack: `GEMMA4_FFN_FOLDED_PRE_NORM` +
+`GEMMA4_FOLDED_INPUT_NORM` + `GEMMA4_TRIM_REDUNDANT_SYNC` (all default 0),
+-1.05% to -1.17% decode p50 on the RTX 3090 at seq 121/1001/4001 with
+bit-identical greedy tokens. Rejected with data: warp-tiled FFN, 2-CTA/SM
+register cap, runtime gamma in the dot loop, distributed post-attention norm,
+split-size retune. Full tables in results.md; PR:
+https://github.com/coder-2011/gemma.c/pull/13
