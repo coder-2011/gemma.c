@@ -3,6 +3,68 @@
 AI-updated and directed log of the experiments I ran throughout this project to optimize the kernels. 
 Expect this to be very messy and pretty much useless for most people to look at.  it is meant to be a place for me and my agents to fuck around
 
+## 2026-07-01 - Decode fused-layer bottleneck audit
+
+Question:
+
+- Is the Nsight "sliding attention" bottleneck actually attention/split work, or
+  is the fused sliding-layer kernel dominated by another phase?
+
+Findings:
+
+- The Nsight label is misleading: `decode_megakernel_fused_layer_kernel` covers
+  attention ingress, attention/O, pre-FFN norm, and the FFN tail. Sliding layers
+  are costly mostly because there are 40 of these full fused-layer launches.
+- Phase-ablation builds at prompt length `513`, split `20` measured:
+  - stop after project/prep: `8.429 ms`
+  - stop after attention/O: `15.118 ms`
+  - stop after pre-FFN norm: `15.192 ms`
+  - full baseline: about `40.5 ms`
+- The implied FFN tail cost was therefore about `25.3 ms/token`, much larger
+  than the actual attention/O portion. This matches the Nsight byte accounting:
+  each sliding fused layer streams hundreds of MiB of projection/FFN weights.
+
+Experiments:
+
+```bash
+make -j$(nproc) CUTLASS_ROOT=/root/gemma.c/third_party/cutlass \
+  build/gemma4_prompt test-ffn-decode test-decode-megakernel
+
+./build/gemma4_prompt --checkpoint /root/gemma.c/models/gemma-4-12B-it/model.safetensors \
+  --tokenizer /root/gemma.c/models/gemma-4-12B-it/tokenizer.json \
+  --prompt Hello --max-new 4 --benchmark-mode decode-step \
+  --bench-warmup 3 --bench-iters 8 --bench-samples 3
+```
+
+Results:
+
+- Decode split sweep at prompt length `513` showed split `8` slightly ahead,
+  but the difference was small and did not explain the fused-layer cost.
+- Widening the decode FFN tile to `4` first produced an invalid apparent win:
+  the caller consumed four columns while the gate/up helper still produced two.
+  After tying the caller/helper tile contract and testing the corrected tile-4
+  path, short decode-step regressed to `39.390 ms` p50.
+- Tile `1` did not repeat: one short run showed `38.283 ms` p50, but the
+  five-sample rerun was `38.870 ms` p50.
+- A separate `--maxrregcount=64` build linked and ran, but short decode-step was
+  `38.604 ms` p50, so forced lower register count/extra occupancy was rejected.
+- Skipping softcap before greedy argmax was semantically safe but measured as a
+  tie: fused sampling median `2.835758 ms`, in the existing `~2.836 ms` band.
+
+Source outcome:
+
+- No source change was kept from this pass. The temporary shared tile-width
+  constant was backed out after the small-knob experiments failed to clear the
+  keep bar without quantization.
+
+Conclusion:
+
+- The current small-knob fixes did not clear the keep bar. The real bottleneck
+  is dense BF16 weight streaming in the fused layer FFN/projection path, plus
+  the full-vocab final projection. Meaningful next work should reduce bytes
+  moved, such as weight-only quantization or a deeper FFN schedule, rather than
+  tuning decode split size or launch occupancy.
+
 ## 2026-06-30 - Decode layer fused ingress
 
 Change:
