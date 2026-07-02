@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="360" viewBox="0 0 900 360">
+<style>
+  text { font-family: Arial, sans-serif; fill: #1f2937; }
+  .title { font-size: 20px; font-weight: 700; }
+  .subtitle { font-size: 12px; fill: #4b5563; }
+  .axis { stroke: #374151; stroke-width: 1; }
+  .grid { stroke: #e5e7eb; stroke-width: 1; }
+  .label { font-size: 12px; }
+  .small { font-size: 10px; fill: #4b5563; }
+</style>
+<rect x="0" y="0" width="900" height="360" fill="#ffffff"/>
+<text x="60" y="36" class="title">Nsight Compute: one decode-token GPU time breakdown</text>
+<text x="60" y="58" class="subtitle">Full set profile, 50 launches, kernel replay with cache-control=all. Total 37.772 ms.</text>
+<text x="60" y="97" class="label">sliding_fused_layer</text>
+<rect x="230" y="80" width="560.0" height="26" fill="#2563eb" rx="3"/>
+<text x="798.0" y="98" class="label">28.881 ms (76.5%)</text>
+<text x="60" y="152" class="label">global_fused_layer</text>
+<rect x="230" y="135" width="117.3" height="26" fill="#dc2626" rx="3"/>
+<text x="355.3" y="153" class="label">6.050 ms (16.0%)</text>
+<text x="60" y="207" class="label">final_logits_sample</text>
+<rect x="230" y="190" width="55.0" height="26" fill="#f59e0b" rx="3"/>
+<text x="293.0" y="208" class="label">2.836 ms (7.5%)</text>
+<text x="60" y="262" class="label">final_rmsnorm</text>
+<rect x="230" y="245" width="0.1" height="26" fill="#64748b" rx="3"/>
+<text x="238.1" y="263" class="label">0.003 ms (0.0%)</text>
+</svg>

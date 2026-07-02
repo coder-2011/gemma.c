@@ -1,0 +1,58 @@
+==WARNING== Note: Running with unmodified GPU clocks. If not controlled otherwise, profiling results may be inconsistent.
+==PROF== Connected to process 2165863 (/root/gemma.c/build/gemma4_prompt)
+==PROF== Profiling "decode_megakernel_fused_layer..." - 0 (1/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 1 (2/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 2 (3/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 3 (4/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 4 (5/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 5 (6/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 6 (7/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 7 (8/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 8 (9/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 9 (10/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 10 (11/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 11 (12/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 12 (13/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 13 (14/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 14 (15/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 15 (16/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 16 (17/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 17 (18/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 18 (19/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 19 (20/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 20 (21/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 21 (22/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 22 (23/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 23 (24/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 24 (25/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 25 (26/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 26 (27/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 27 (28/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 28 (29/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 29 (30/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 30 (31/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 31 (32/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 32 (33/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 33 (34/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 34 (35/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 35 (36/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 36 (37/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 37 (38/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 38 (39/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 39 (40/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 40 (41/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 41 (42/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 42 (43/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 43 (44/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 44 (45/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 45 (46/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 46 (47/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "decode_megakernel_fused_layer..." - 47 (48/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "gemma4_rmsnorm_bf16_kernel" - 48 (49/50): 0%....50%....100% - 43 passes
+==PROF== Profiling "final_logits_sample_kernel" - 49 (50/50): 0%....50%....100% - 43 passes
+prompt tokens: 1
+benchmark mode=decode-step prompt_len=1 warmup=2 iters=4 samples=2 split=20
+decode_step_ms n=2 mean_ms=39.886 p50_ms=39.886 p95_ms=40.330 p99_ms=40.370 min_ms=39.392 max_ms=40.380
+decode_step_tps_p50=25.072
+==PROF== Disconnected from process 2165863
+==PROF== Report: /root/gemma.c/src/experiments/results/2026-07-01_decode_nsight/decode_step_ncu_one_decode_full.ncu-rep

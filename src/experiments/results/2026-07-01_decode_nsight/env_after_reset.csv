@@ -1,0 +1,2 @@
+name, pci.bus_id, driver_version, persistence_mode, ecc.mode.current, mig.mode.current, power.limit [W], clocks.current.sm [MHz], clocks.current.memory [MHz], temperature.gpu, power.draw [W], utilization.gpu [%], memory.total [MiB], memory.used [MiB]
+NVIDIA RTX A6000, 00000000:05:00.0, 580.159.03, Disabled, Disabled, [N/A], 300.00 W, 1800 MHz, 8001 MHz, 52, 72.99 W, 4 %, 49140 MiB, 0 MiB

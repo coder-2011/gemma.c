@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="360" viewBox="0 0 920 360">
+<style>
+  text { font-family: Arial, sans-serif; fill: #1f2937; }
+  .title { font-size: 20px; font-weight: 700; }
+  .subtitle { font-size: 12px; fill: #4b5563; }
+  .axis { stroke: #374151; stroke-width: 1; }
+  .grid { stroke: #e5e7eb; stroke-width: 1; }
+  .label { font-size: 12px; }
+  .small { font-size: 10px; fill: #4b5563; }
+</style>
+<rect x="0" y="0" width="920" height="360" fill="#ffffff"/>
+<text x="60" y="36" class="title">Nsight Compute: top PC-sampled warp stall reasons</text>
+<text x="60" y="58" class="subtitle">Percent of sampled not-issued warp reasons inside each kernel family.</text>
+<text x="60" y="103" class="label">sliding_fused_layer</text>
+<rect x="220.0" y="85" width="268.9" height="28" fill="#2563eb"/>
+<rect x="488.9" y="85" width="180.1" height="28" fill="#dc2626"/>
+<rect x="669.1" y="85" width="39.7" height="28" fill="#f59e0b"/>
+<rect x="708.7" y="85" width="22.2" height="28" fill="#10b981"/>
+<rect x="730.9" y="85" width="19.3" height="28" fill="#7c3aed"/>
+<rect x="750.2" y="85" width="12.9" height="28" fill="#64748b"/>
+<text x="788" y="103" class="small">top six shown</text>
+<text x="60" y="168" class="label">global_fused_layer</text>
+<rect x="220.0" y="150" width="305.3" height="28" fill="#2563eb"/>
+<rect x="525.3" y="150" width="170.4" height="28" fill="#dc2626"/>
+<rect x="695.6" y="150" width="37.8" height="28" fill="#f59e0b"/>
+<rect x="733.5" y="150" width="20.7" height="28" fill="#10b981"/>
+<rect x="754.1" y="150" width="6.1" height="28" fill="#7c3aed"/>
+<rect x="760.3" y="150" width="0.9" height="28" fill="#64748b"/>
+<text x="788" y="168" class="small">top six shown</text>
+<text x="60" y="233" class="label">final_logits_sample</text>
+<rect x="220.0" y="215" width="175.6" height="28" fill="#2563eb"/>
+<rect x="395.6" y="215" width="313.8" height="28" fill="#dc2626"/>
+<rect x="709.4" y="215" width="15.2" height="28" fill="#f59e0b"/>
+<rect x="724.5" y="215" width="16.1" height="28" fill="#10b981"/>
+<rect x="740.7" y="215" width="1.2" height="28" fill="#7c3aed"/>
+<rect x="741.8" y="215" width="29.4" height="28" fill="#64748b"/>
+<text x="788" y="233" class="small">top six shown</text>
+<rect x="60" y="300" width="12" height="12" fill="#2563eb"/>
+<text x="77" y="311" class="small">long_scoreboard</text>
+<rect x="195" y="300" width="12" height="12" fill="#dc2626"/>
+<text x="212" y="311" class="small">barrier</text>
+<rect x="330" y="300" width="12" height="12" fill="#f59e0b"/>
+<text x="347" y="311" class="small">wait</text>
+<rect x="465" y="300" width="12" height="12" fill="#10b981"/>
+<text x="482" y="311" class="small">short_scoreboard</text>
+<rect x="600" y="300" width="12" height="12" fill="#7c3aed"/>
+<text x="617" y="311" class="small">lg_throttle</text>
+<rect x="735" y="300" width="12" height="12" fill="#64748b"/>
+<text x="752" y="311" class="small">mio_throttle</text>
+</svg>

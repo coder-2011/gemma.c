@@ -1,0 +1,4 @@
+src/experiments/results/**/*.ncu-rep filter=lfs diff=lfs merge=lfs -text
+src/experiments/results/**/*.nsys-rep filter=lfs diff=lfs merge=lfs -text
+src/experiments/results/**/*.sqlite filter=lfs diff=lfs merge=lfs -text
+src/experiments/results/**/ncu_source.txt filter=lfs diff=lfs merge=lfs -text

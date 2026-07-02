@@ -1,0 +1,5 @@
+kind,count,gpu__time_duration.sum,gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__bytes.sum.per_second,dram__bytes_read.sum,dram__bytes_write.sum,l1tex__t_sector_hit_rate.pct,lts__t_sector_hit_rate.pct,smsp__warps_active.avg.per_cycle_active,smsp__warps_eligible.avg.per_cycle_active,launch__registers_per_thread,launch__shared_mem_per_block
+sliding_fused_layer,40,28.881408,89.81263982499999,15.448119424999998,654.670699225,18.198328,709.379328,37.715835475,22.381302175,3.9938983,0.20350700000000002,96.0,27.884000000000004
+global_fused_layer,8,6.0504,90.6738785,14.704650625,660.9491665,3.922705,76.25664,18.7432025,4.00374025,3.9997971249999997,0.189152875,120.0,27.156
+final_rmsnorm,1,0.003488,0.931393,0.156836,6.715596,2.2e-05,0.00128,0.0,57.099081,3.886099,0.292228,30.0,8.784
+final_logits_sample,1,2.836288,97.476441,26.248467,710.566194,2.013314,2.055936,11.081501,0.059592,8.00647,0.321573,64.0,2.052
