@@ -8,6 +8,7 @@ skills-lock.json
 models/
 /build/
 /docs/
+src/experiments/results/2026-07-01_decode_nsight/
 tools/clang_cuda_compat/
 tools/
 experiments/flash-attention/
